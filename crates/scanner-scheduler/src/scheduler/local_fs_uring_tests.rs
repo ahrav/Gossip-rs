@@ -65,10 +65,10 @@ impl ScanEngine for DuplicateDropEngine {
         }
         let rec = FindingRec {
             rule_id: RuleId(0),
-            root_hint_start: 0,
-            root_hint_end: 6,
-            span_start: 0,
-            span_end: 6,
+            blob_offset_start: 0,
+            blob_offset_end: 6,
+            window_start: 0,
+            window_end: 6,
             confidence_score: 0,
         };
         // Emit duplicates so scheduler dedupe prunes one finding.
@@ -147,10 +147,10 @@ impl ScanEngine for DistinctHashEngine {
 
         let rec = FindingRec {
             rule_id: RuleId(0),
-            root_hint_start: 0,
-            root_hint_end: 6,
-            span_start: 0,
-            span_end: 6,
+            blob_offset_start: 0,
+            blob_offset_end: 6,
+            window_start: 0,
+            window_end: 6,
             confidence_score: 0,
         };
         scratch.findings.push(FindingWithHash::new(rec, [0xA1; 32]));

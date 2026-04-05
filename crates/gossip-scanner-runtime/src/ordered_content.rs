@@ -67,34 +67,34 @@
 
 use std::io::{self, Read};
 use std::path::PathBuf;
-use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
 use std::time::Instant;
 
 use anyhow::anyhow;
 use gossip_contracts::{
     connector::{
-        ordered::OrderedContentSource, validate_page_sequence, Budgets, Cursor, EnumerateError,
-        ErrorClass, PageBuf, PageState, ReadError, ScanItem,
+        Budgets, Cursor, EnumerateError, ErrorClass, PageBuf, PageState, ReadError, ScanItem,
+        ordered::OrderedContentSource, validate_page_sequence,
     },
     coordination::{CursorSemantics, RestoredShardState, ShardSpec},
     persistence::{
-        derive_ovid_hash, DoneLedger, DoneLedgerErrorCode, DoneLedgerStatus, OvidHashInputs,
-        WriteContext, RECOMMENDED_MAX_BATCH_SIZE,
+        DoneLedger, DoneLedgerErrorCode, DoneLedgerStatus, OvidHashInputs,
+        RECOMMENDED_MAX_BATCH_SIZE, WriteContext, derive_ovid_hash,
     },
 };
-use scanner_engine::content_policy::{classify_content, ContentVerdict, CHECK_LEN};
+use scanner_engine::content_policy::{CHECK_LEN, ContentVerdict, classify_content};
 use scanner_scheduler::events::EventOutput;
-use scanner_scheduler::scheduler::parallel_scan::{parallel_scan_dir, ParallelScanConfig};
+use scanner_scheduler::scheduler::parallel_scan::{ParallelScanConfig, parallel_scan_dir};
 use scanner_scheduler::{
-    carry_overlap_prefix, scan_chunk_postprocess, EngineScratch, FileId, FindingWithHashRecord,
-    FsFindingRecord, RealEngineScratch, ScanEngine, WorkerMetricsLocal,
+    EngineScratch, FileId, FindingWithHashRecord, FsFindingRecord, RealEngineScratch, ScanEngine,
+    WorkerMetricsLocal, carry_overlap_prefix, scan_chunk_postprocess,
 };
 
 use crate::{
-    build_runtime_engine, forward_commits, forward_core_events, join_scoped, AssignmentOutcome,
-    CancellationToken, ChannelEventOutput, ChannelStoreProducer, FsScanConfig, ScanBudgets,
-    ScanReport, ScanRuntimeError, COMMIT_CHANNEL_CAP, EVENT_CHANNEL_CAP,
+    AssignmentOutcome, COMMIT_CHANNEL_CAP, CancellationToken, ChannelEventOutput,
+    ChannelStoreProducer, EVENT_CHANNEL_CAP, FsScanConfig, ScanBudgets, ScanReport,
+    ScanRuntimeError, build_runtime_engine, forward_commits, forward_core_events, join_scoped,
 };
 
 /// Inputs required to acquire and validate one ordered connector page.
@@ -1777,7 +1777,7 @@ mod tests {
 
     use gossip_contracts::{
         connector::{
-            ordered::OrderedContentCapabilities, ItemKey, ItemRef, ReadError, TokenBytes, VersionId,
+            ItemKey, ItemRef, ReadError, TokenBytes, VersionId, ordered::OrderedContentCapabilities,
         },
         identity::{LogicalTime, ObjectVersionId, StableItemId},
         persistence::{

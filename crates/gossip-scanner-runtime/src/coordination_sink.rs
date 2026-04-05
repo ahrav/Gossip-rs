@@ -177,7 +177,7 @@ fn sentinel_to_option(id: u32) -> Option<u32> {
 /// derivation. The engine produces blob-absolute offsets for both root and
 /// transform findings — for root findings via `base_offset +
 /// match_span.start`, for transform findings via
-/// `RootSpanMapCtx::map_span(decoded_span)` — so Git and FS scans of the
+/// `base_offset + RootSpanMapCtx::map_span(decoded_span).start` — so Git and FS scans of the
 /// same content converge on the same occurrence identity.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct GitFindingForPersistence {

@@ -137,7 +137,7 @@ fn scan_file_chunked_drops_prefix_duplicates() -> io::Result<()> {
 /// regardless of how the multi-chunk scanner split the input.
 ///
 /// Root-hint offsets feed persistence identity derivation via
-/// `PersistenceFinding::span_start/span_end`, so this is the end-to-end
+/// `PersistenceFinding::blob_offset_start/blob_offset_end`, so this is the end-to-end
 /// guarantee that OccurrenceId is stable across chunker alignment changes.
 #[test]
 fn scan_file_chunked_realistic_multi_chunk_root_hint_is_file_absolute() -> io::Result<()> {

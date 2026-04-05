@@ -139,7 +139,7 @@ impl Default for EngineAdapterConfig {
 /// `FindingRec.root_hint_start/root_hint_end` — the full regex match span
 /// (group 0) mapped to root-file coordinates. The engine populates
 /// `root_hint_*` via `base_offset + match_span.start` (root findings) or
-/// `RootSpanMapCtx::map_span(decoded_span)` (transform findings), so these
+/// `base_offset + RootSpanMapCtx::map_span(decoded_span).start` (transform findings), so these
 /// offsets are stable across chunker alignment changes and drive
 /// cross-source persistence identity convergence between Git and FS scans
 /// (see `GitFindingForPersistence` in

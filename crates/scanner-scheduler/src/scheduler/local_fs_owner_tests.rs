@@ -1,4 +1,5 @@
 use super::*;
+use crate::Engine;
 use crate::api::{FileId, RuleSpec, TransformConfig, Tuning, ValidatorKind};
 use crate::archive::PartialReason;
 use crate::events::VecEventOutput;
@@ -6,9 +7,8 @@ use crate::scheduler::engine_stub::{FindingRec, MockEngine, MockRule, RuleId};
 use crate::scheduler::engine_trait::{
     EngineScratch, FindingRecord, FindingWithHash, FindingWithHashRecord, ScanEngine,
 };
-use crate::scheduler::local_fs_archive_ctx::{apply_entry_budget_clamp, ArchiveEnd};
+use crate::scheduler::local_fs_archive_ctx::{ArchiveEnd, apply_entry_budget_clamp};
 use crate::store::{EmitOnlyStoreProducer, FailingStoreProducer, InMemoryStoreProducer};
-use crate::Engine;
 use regex::bytes::Regex;
 use std::fs;
 use std::io::Write;
@@ -1094,7 +1094,7 @@ fn file_exactly_chunk_size() {
 
 /// Multi-chunk scans must emit findings whose persistence identity
 /// coordinates are blob-absolute. `FsFindingRecord.blob_offset_start` is the
-/// coordinate consumed by `PersistenceFinding::span_start` for `OccurrenceId`
+/// coordinate consumed by `PersistenceFinding::blob_offset_start` for `OccurrenceId`
 /// derivation — if it were window-local, a finding found in chunk N would
 /// report an offset relative to the Nth chunk buffer instead of the file.
 #[test]

@@ -30,8 +30,9 @@ pub enum CoreEvent<'a> {
 /// regex match span (group 0) mapped to root-file coordinates. Both scan
 /// paths populate them from the engine's `FindingRec::root_hint_start` and
 /// `root_hint_end`, which the engine computes via `base_offset +
-/// match_span.start` (root findings) or `RootSpanMapCtx::map_span` (transform
-/// findings). These offsets feed both user-facing event output and
+/// match_span.start` (root findings) or `base_offset +
+/// RootSpanMapCtx::map_span(decoded_span).start` (transform findings). These
+/// offsets feed both user-facing event output and
 /// persistence identity derivation, so Git and FS scans of the same content
 /// converge on the same `OccurrenceId` regardless of chunker alignment.
 pub struct FindingEvent<'a> {

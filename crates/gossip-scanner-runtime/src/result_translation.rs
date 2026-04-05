@@ -17,8 +17,9 @@
 //! - `done_ledger.findings_count` is the number of distinct stable findings.
 //!
 //! Occurrence span boundaries come from [`gossip_contracts::persistence::PersistenceFinding`]
-//! implementors. Root-hint fields remain scanner-local metadata and never
-//! participate in persistence identity derivation.
+//! implementors and must be blob-absolute (root-file coordinates). The FS
+//! path maps `blob_offset_start/blob_offset_end` through the trait; the Git
+//! path carries blob-absolute offsets directly in `GitFindingForPersistence`.
 
 use std::{
     collections::HashSet,
@@ -762,7 +763,7 @@ mod tests {
         }
     }
 
-    fn fs_finding_with_root_hint(
+    fn fs_finding_with_offsets(
         rule_id: u32,
         blob_offset_start: u64,
         blob_offset_end: u64,
@@ -903,13 +904,31 @@ mod tests {
 
     #[test]
     fn persistence_finding_trait_fs_impl_round_trip() {
-        let rec = finding(42, 10, 50, 0xAB);
+        // Use divergent root-hint vs buffer-local span so the test fails if
+        // the trait impl accidentally returns window_start/window_end.
+        let rec = fs_finding_with_offsets(42, 100, 150, 10, 50, [0xAB; 32], 7);
         let wrapper = FsFindingRef(&rec);
         assert_eq!(wrapper.rule_id(), 42);
         assert_eq!(wrapper.norm_hash(), NormHash::from_digest([0xAB; 32]));
-        assert_eq!(wrapper.blob_offset_start(), 10);
-        assert_eq!(wrapper.blob_offset_end(), 50);
-        assert_eq!(wrapper.blob_offset_len(), 40);
+        assert_eq!(wrapper.blob_offset_start(), 100);
+        assert_eq!(wrapper.blob_offset_end(), 150);
+        assert_eq!(wrapper.blob_offset_len(), 50);
+    }
+
+    #[test]
+    fn fs_finding_ref_returns_root_hint_not_buffer_span() {
+        let rec = fs_finding_with_offsets(7, 100, 200, 10, 20, [0xAA; 32], 5);
+        let r = FsFindingRef(&rec);
+        assert_eq!(
+            r.blob_offset_start(),
+            100,
+            "must return blob_offset_start, not window_start"
+        );
+        assert_eq!(
+            r.blob_offset_end(),
+            200,
+            "must return blob_offset_end, not window_end"
+        );
     }
 
     #[test]
@@ -972,7 +991,7 @@ mod tests {
         // engine's buffer-local span. Two findings with identical rule, hash,
         // and blob_offset must produce the same OccurrenceId regardless of
         // whatever buffer-local `window_start/window_end` each scan path recorded.
-        let fs = fs_finding_with_root_hint(7, 100, 124, 10, 22, [0xAB; 32], 7);
+        let fs = fs_finding_with_offsets(7, 100, 124, 10, 22, [0xAB; 32], 7);
         // Git's GitFindingForPersistence.blob_offset_start/blob_offset_end carry the
         // blob-absolute root-hint offsets (see coordination_sink.rs doc).
         let git = git_finding(7, 100, 124, 0xAB);
@@ -1040,7 +1059,19 @@ mod tests {
     #[test]
     fn translation_rejects_empty_or_inverted_spans() {
         let item = scan_item();
-        let invalid = [finding(1, 22, 22, 0xDD), finding(2, 30, 29, 0xEE)];
+        // Validation checks blob_offset_start/blob_offset_end (the root-hint
+        // coordinates returned by the trait). Use divergent window values so
+        // the test fails if validation accidentally inspects window fields.
+        let invalid = [
+            // Equal root-hint offsets (blob_offset_start == blob_offset_end),
+            // valid buffer-local span.
+            fs_finding_with_offsets(3, 50, 50, 10, 20, [0xAA; 32], 7),
+            // Inverted root-hint offsets (blob_offset_start > blob_offset_end),
+            // valid buffer-local span.
+            fs_finding_with_offsets(3, 100, 10, 10, 20, [0xBB; 32], 7),
+            // Zero root-hint offsets (both 0), valid buffer-local span.
+            fs_finding_with_offsets(3, 0, 0, 10, 20, [0xCC; 32], 7),
+        ];
 
         for (index, bad) in invalid.into_iter().enumerate() {
             let err = translate_item_result(
@@ -1070,8 +1101,10 @@ mod tests {
             }
         }
 
-        // Boundary twin: a 1-byte span (end == start + 1) must be accepted.
-        let boundary = finding(3, 22, 23, 0xFF);
+        // Boundary twin: a 1-byte root-hint span (blob_offset_end == blob_offset_start + 1)
+        // must be accepted. Buffer-local span differs to confirm the validator
+        // checks blob offsets, not window offsets.
+        let boundary = fs_finding_with_offsets(3, 22, 23, 5, 15, [0xFF; 32], 7);
         let ok = translate_item_result(
             write_context(),
             &tenant_secret_key(),
@@ -1541,7 +1574,7 @@ mod tests {
             // span == root_hint and span != root_hint.
             let fs_span_start = fs_span_offset;
             let fs_span_end = fs_span_start.saturating_add(root_hint_len);
-            let fs_rec = fs_finding_with_root_hint(
+            let fs_rec = fs_finding_with_offsets(
                 rule_id,
                 root_hint_start,
                 root_hint_end,

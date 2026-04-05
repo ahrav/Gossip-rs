@@ -37,17 +37,17 @@ use std::{collections::HashSet, error::Error, num::NonZeroU64, sync::Arc};
 use crate::{
     connector::Location,
     identity::{
-        derive_finding_id, derive_observation_id, derive_occurrence_id, FenceEpoch, FindingId,
-        FindingIdInputs, LogicalTime, NormHash, ObjectVersionId, ObservationId,
-        ObservationIdInputs, OccurrenceId, OccurrenceIdInputs, PolicyHash, RuleFingerprint, RunId,
-        SecretHash, ShardId, StableItemId, TenantId,
+        FenceEpoch, FindingId, FindingIdInputs, LogicalTime, NormHash, ObjectVersionId,
+        ObservationId, ObservationIdInputs, OccurrenceId, OccurrenceIdInputs, PolicyHash,
+        RuleFingerprint, RunId, SecretHash, ShardId, StableItemId, TenantId, derive_finding_id,
+        derive_observation_id, derive_occurrence_id,
     },
 };
 
 use super::{
+    PersistenceInputError, WriteContext,
     commit::{CommitHandle, FindingsCommitReceipt},
     ovid::OvidHash,
-    PersistenceInputError, WriteContext,
 };
 
 /// Unified identity surface for findings destined for persistence.
@@ -80,7 +80,7 @@ use super::{
 /// `FindingRec.root_hint_start/root_hint_end` (or an equivalently mapped
 /// value) instead, because the engine populates those with blob-absolute
 /// coordinates via `base_offset + match_span.start` (root findings) or
-/// `RootSpanMapCtx::map_span(decoded_span)` (transform findings).
+/// `base_offset + RootSpanMapCtx::map_span(decoded_span).start` (transform findings).
 ///
 /// # Invariants
 ///
