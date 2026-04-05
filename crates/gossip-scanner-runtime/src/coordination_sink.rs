@@ -305,27 +305,48 @@ pub(crate) struct FindingsCaptureSink {
     ///
     /// Populated from `GitEvent::CommitMeta` and drained after the scan joins.
     /// A `Mutex` keeps the capture path aligned with the crate's poisoning
-    /// recovery conventions; contention stays low because commit metadata is
-    /// emitted at most once per commit.
+    /// recovery conventions; contention stays low because scanner-git guarantees
+    /// at most one `CommitMeta` event per `commit_id` (gated by `AtomicBitSet`
+    /// in `CommitMetaContext`).
     commit_oid_map: Mutex<HashMap<u32, OidBytes>>,
 }
 
 impl FindingsCaptureSink {
     /// Defense-in-depth ceiling for the sparse commit-OID lookup.
     ///
-    /// At ~80 bytes per entry (u32 key + 33-byte OidBytes + HashMap overhead),
-    /// 500K entries consume ~40 MB — well above any realistic scan but prevents
-    /// a pathological repository from exhausting worker memory.
+    /// At roughly 50 bytes per entry (u32 key + 33-byte OidBytes + hashbrown
+    /// control and alignment overhead), 500K entries consume ~25 MB — well
+    /// above any realistic scan but prevents a pathological repository from
+    /// exhausting worker memory.
+    #[cfg(not(test))]
     const MAX_COMMIT_OID_MAP_ENTRIES: usize = 500_000;
 
+    /// Test-only ceiling small enough to exercise the capacity guard without
+    /// inserting hundreds of thousands of entries.
+    #[cfg(test)]
+    const MAX_COMMIT_OID_MAP_ENTRIES: usize = 8;
+
+    /// Sensible default when no caller-supplied hint is available.
+    ///
+    /// `CommitMeta` events fire only for finding-bearing commits (gated by a
+    /// non-empty `findings_buf` in `EngineAdapter::stream_findings`), so the
+    /// map typically holds a few dozen entries. 64 avoids early reallocations
+    /// without over-reserving for the common case.
+    pub(crate) const DEFAULT_COMMIT_OID_CAPACITY: usize = 64;
+
     /// Wrap an existing coordination event sink with findings capture state.
-    pub(crate) fn new(inner: Arc<CoordinationEventSink>) -> Self {
+    ///
+    /// `commit_oid_capacity_hint` sizes the internal `commit_id → OidBytes`
+    /// lookup. Pass [`DEFAULT_COMMIT_OID_CAPACITY`](Self::DEFAULT_COMMIT_OID_CAPACITY)
+    /// when no better estimate is available. The hint is clamped to
+    /// [`MAX_COMMIT_OID_MAP_ENTRIES`](Self::MAX_COMMIT_OID_MAP_ENTRIES) so
+    /// callers need not bounds-check.
+    pub(crate) fn new(inner: Arc<CoordinationEventSink>, commit_oid_capacity_hint: usize) -> Self {
+        let capped = commit_oid_capacity_hint.min(Self::MAX_COMMIT_OID_MAP_ENTRIES);
         Self {
             inner,
             finding_count: AtomicU64::new(0),
-            // Most scan passes encounter at most a few dozen commits with
-            // findings, so 64 avoids early reallocations without over-reserving.
-            commit_oid_map: Mutex::new(HashMap::with_capacity(64)),
+            commit_oid_map: Mutex::new(HashMap::with_capacity(capped)),
         }
     }
 
@@ -381,13 +402,16 @@ impl GitEventOutput for FindingsCaptureSink {
                 .commit_oid_map
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            if map.len() < Self::MAX_COMMIT_OID_MAP_ENTRIES {
+            let below_cap = map.len() < Self::MAX_COMMIT_OID_MAP_ENTRIES;
+            if below_cap || map.contains_key(&meta.commit_id) {
                 map.insert(meta.commit_id, meta.commit_oid);
-            } else if map.len() == Self::MAX_COMMIT_OID_MAP_ENTRIES {
-                tracing::warn!(
-                    max = Self::MAX_COMMIT_OID_MAP_ENTRIES,
-                    "commit OID map reached capacity; subsequent entries will be dropped"
-                );
+                // Warn exactly once when a new key pushes us to the ceiling.
+                if below_cap && map.len() == Self::MAX_COMMIT_OID_MAP_ENTRIES {
+                    tracing::warn!(
+                        max = Self::MAX_COMMIT_OID_MAP_ENTRIES,
+                        "commit OID map reached capacity; new keys will be dropped"
+                    );
+                }
             }
         }
         self.inner.emit_git(event);
@@ -444,7 +468,8 @@ mod tests {
             Arc::clone(&recorder) as Arc<dyn CoordinationEventRecorder>,
             Arc::from("test-shard"),
         ));
-        let sink = FindingsCaptureSink::new(inner);
+        let sink =
+            FindingsCaptureSink::new(inner, FindingsCaptureSink::DEFAULT_COMMIT_OID_CAPACITY);
         (sink, recorder)
     }
 
@@ -731,5 +756,102 @@ mod tests {
                 "commit_id {i} must map to its expected OID"
             );
         }
+    }
+
+    #[test]
+    fn findings_capture_sink_commit_oid_map_enforces_capacity_ceiling() {
+        // MAX_COMMIT_OID_MAP_ENTRIES is 8 under #[cfg(test)]. Insert exactly 8
+        // entries to fill the map, then 2 more that must be silently dropped.
+        let (sink, recorder) = make_sink_and_recorder();
+
+        let max = FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES;
+        for i in 0..max as u32 {
+            sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+                commit_id: i,
+                commit_oid: scanner_git::OidBytes::sha1([i as u8 + 1; 20]),
+                timestamp: 1_700_000_000 + u64::from(i),
+                identity: None,
+            }));
+        }
+
+        let map = sink.drain_commit_oid_map();
+        assert_eq!(
+            map.len(),
+            max,
+            "map should accept exactly MAX_COMMIT_OID_MAP_ENTRIES entries"
+        );
+
+        // Re-populate to capacity (drain cleared it), then add 2 beyond the ceiling.
+        for i in 0..max as u32 {
+            sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+                commit_id: i,
+                commit_oid: scanner_git::OidBytes::sha1([i as u8 + 1; 20]),
+                timestamp: 1_700_000_000 + u64::from(i),
+                identity: None,
+            }));
+        }
+        for i in max as u32..max as u32 + 2 {
+            sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+                commit_id: i,
+                commit_oid: scanner_git::OidBytes::sha1([i as u8 + 1; 20]),
+                timestamp: 1_700_000_000 + u64::from(i),
+                identity: None,
+            }));
+        }
+
+        let map = sink.drain_commit_oid_map();
+        assert_eq!(map.len(), max, "entries beyond the ceiling must be dropped");
+        assert!(
+            !map.contains_key(&(max as u32)),
+            "commit_id beyond the ceiling must not appear in the map"
+        );
+        assert!(
+            !map.contains_key(&(max as u32 + 1)),
+            "second commit_id beyond the ceiling must not appear in the map"
+        );
+
+        // All events — including those beyond the ceiling — must still be
+        // forwarded to the inner sink.
+        let forwarded = recorder.git_events.lock().unwrap();
+        let total_events = max + max + 2;
+        assert_eq!(
+            forwarded.len(),
+            total_events,
+            "all events must be forwarded regardless of ceiling"
+        );
+    }
+
+    #[test]
+    fn commit_oid_map_allows_existing_key_update_at_capacity() {
+        // Fill the map to capacity, then update an existing key. The update
+        // does not grow the map, so it should succeed even at the ceiling.
+        let (sink, _recorder) = make_sink_and_recorder();
+        let max = FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES;
+
+        for i in 0..max as u32 {
+            sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+                commit_id: i,
+                commit_oid: scanner_git::OidBytes::sha1([i as u8 + 1; 20]),
+                timestamp: 1_700_000_000 + u64::from(i),
+                identity: None,
+            }));
+        }
+
+        // Map is now at capacity. Update commit_id 0 with a different OID.
+        let updated_oid = scanner_git::OidBytes::sha256([0xFF; 32]);
+        sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+            commit_id: 0,
+            commit_oid: updated_oid,
+            timestamp: 1_700_000_999,
+            identity: None,
+        }));
+
+        let map = sink.drain_commit_oid_map();
+        assert_eq!(map.len(), max, "map size must remain at capacity");
+        assert_eq!(
+            map.get(&0),
+            Some(&updated_oid),
+            "existing key must be updatable even at capacity"
+        );
     }
 }

@@ -2822,8 +2822,11 @@ where
     Ok((report, completion))
 }
 
-/// Bundled metadata for one completed Git repo scan, consumed by the
-/// done-ledger submission helper.
+/// Aggregated persistence inputs for a completed Git repo scan.
+///
+/// Consumers may reject certain field combinations — e.g.,
+/// `detected_count > 0` triggers an error in [`submit_git_repo_done_ledger`]
+/// because durable Git finding translation is not yet available.
 #[derive(Debug)]
 struct GitRepoPersistenceInput<'a> {
     write_context: WriteContext,
@@ -2871,16 +2874,14 @@ where
     let captured_commit_oids = input.commit_oid_map.len();
 
     // --- findings submission ---
-    // TODO(git-findings-persistence): replace this guard and the zero-count
-    // receipt with real findings translation. `input.commit_oid_map` already
-    // carries the stable commit OIDs required to resolve Git finding
-    // identities from the captured event stream.
-    //
-    // This helper only submits the done-ledger row. It does not translate the
-    // captured Git findings into a findings batch, so a nonzero finding count
-    // must still reject the lease rather than checkpointing the repo as clean.
+    // This helper only submits the done-ledger row. It does not translate
+    // captured Git findings into a findings batch, so a nonzero finding
+    // count must reject the lease rather than checkpointing as clean.
     // Synthesize a zero-count receipt to skip an unnecessary sink
     // round-trip for clean shards.
+    //
+    // TODO(git-findings-persistence): replace this guard and the zero-count
+    // receipt with real findings translation using `input.commit_oid_map`.
     if input.detected_count > 0 {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow::anyhow!(
@@ -3041,7 +3042,10 @@ where
     let cancel = CancellationToken::new();
     let lease_uncertainty = LeaseUncertaintySignal::default();
     let lease_watch_done = Arc::new(AtomicBool::new(false));
-    let capture_sink = Arc::new(FindingsCaptureSink::new(Arc::clone(&stage_sink)));
+    let capture_sink = Arc::new(FindingsCaptureSink::new(
+        Arc::clone(&stage_sink),
+        FindingsCaptureSink::DEFAULT_COMMIT_OID_CAPACITY,
+    ));
     let event_sink: Arc<dyn GitEventOutput + Send + Sync> =
         Arc::clone(&capture_sink) as Arc<dyn GitEventOutput + Send + Sync>;
     let (execution, watch_result) = std::thread::scope(|scope| {
@@ -9483,8 +9487,9 @@ mod tests {
     }
 
     /// Integration test composing the full capture-sink → drain → persistence
-    /// pipeline. A clean scan (no findings, no commit metadata) flows through
-    /// `FindingsCaptureSink` into `submit_git_repo_done_ledger` without error.
+    /// pipeline. CommitMeta events emitted through `FindingsCaptureSink` are
+    /// drained into the persistence input and carried through
+    /// `submit_git_repo_done_ledger` without error (zero detected findings).
     #[test]
     fn submit_git_repo_done_ledger_integration_emit_drain_persist() {
         let rec = Arc::new(Recorder::default());
@@ -9492,28 +9497,57 @@ mod tests {
             Arc::clone(&rec) as Arc<dyn CoordinationEventRecorder>,
             Arc::from("integration-shard"),
         ));
-        let capture_sink = FindingsCaptureSink::new(inner_sink);
+        let capture_sink = FindingsCaptureSink::new(
+            inner_sink,
+            FindingsCaptureSink::DEFAULT_COMMIT_OID_CAPACITY,
+        );
 
-        // Simulate a clean scan: no findings, no commit metadata.
-        // The unit tests in coordination_sink cover event emission; this test
-        // verifies the drain-to-persistence composition.
+        // Emit two CommitMeta events to populate the sparse OID map, simulating
+        // a scan where commit metadata was observed but no findings detected
+        // (e.g., all matches were filtered or suppressed by policy).
+        let oid_a = OidBytes::sha1([0xaa; 20]);
+        let oid_b = OidBytes::sha1([0xbb; 20]);
+        capture_sink.emit_git(scanner_git::GitEvent::CommitMeta(
+            scanner_git::CommitMetaEvent {
+                commit_id: 1,
+                commit_oid: oid_a,
+                timestamp: 1_700_000_000,
+                identity: None,
+            },
+        ));
+        capture_sink.emit_git(scanner_git::GitEvent::CommitMeta(
+            scanner_git::CommitMetaEvent {
+                commit_id: 5,
+                commit_oid: oid_b,
+                timestamp: 1_700_000_100,
+                identity: None,
+            },
+        ));
+
+        // No findings were emitted, but the OID map should carry both entries.
         assert_eq!(capture_sink.detected_finding_count(), 0);
         let commit_oid_map = capture_sink.drain_commit_oid_map();
-        assert!(commit_oid_map.is_empty());
+        assert_eq!(
+            commit_oid_map.len(),
+            2,
+            "drain must yield both CommitMeta entries"
+        );
+        assert_eq!(commit_oid_map[&1], oid_a);
+        assert_eq!(commit_oid_map[&5], oid_b);
 
         let input = GitRepoPersistenceInput {
             write_context: write_context(),
             shard_id: "integration-shard",
             repo_id: 123,
             bytes_scanned: 8192,
-            detected_count: capture_sink.detected_finding_count(),
+            detected_count: 0,
             commit_oid_map,
             claim_time: LogicalTime::from_raw(700),
             complete_time: LogicalTime::from_raw(800),
         };
         let ledger = InMemoryDoneLedger::new();
         let (findings_receipt, done_ledger_receipt) = submit_git_repo_done_ledger(&ledger, &input)
-            .expect("clean scan integration path must succeed");
+            .expect("zero-findings scan with commit metadata must succeed");
         assert_eq!(findings_receipt.finding_count(), 0);
         assert_eq!(findings_receipt.occurrence_count(), 0);
         assert_eq!(findings_receipt.observation_count(), 0);
