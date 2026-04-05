@@ -9497,10 +9497,8 @@ mod tests {
             Arc::clone(&rec) as Arc<dyn CoordinationEventRecorder>,
             Arc::from("integration-shard"),
         ));
-        let capture_sink = FindingsCaptureSink::new(
-            inner_sink,
-            FindingsCaptureSink::DEFAULT_COMMIT_OID_CAPACITY,
-        );
+        let capture_sink =
+            FindingsCaptureSink::new(inner_sink, FindingsCaptureSink::DEFAULT_COMMIT_OID_CAPACITY);
 
         // Emit two CommitMeta events to populate the sparse OID map, simulating
         // a scan where commit metadata was observed but no findings detected
