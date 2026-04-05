@@ -913,8 +913,8 @@ mod tests {
 
     #[test]
     fn identical_identity_fields_produce_identical_persistence_ids_across_source_types() {
-        let fs = finding(42, 10, 50, 0xAB);
-        let git = git_finding(42, 10, 50, 0xAB);
+        let fs = finding(7, 10, 50, 0xAB);
+        let git = git_finding(7, 10, 50, 0xAB);
         let fs_translation = translate_item_result(
             write_context(),
             &tenant_secret_key(),
@@ -1520,5 +1520,33 @@ mod tests {
             err,
             ResultTranslationError::InvalidFindingSpan { .. }
         ));
+    }
+
+    #[test]
+    fn translate_git_item_result_rejects_zero_length_span() {
+        let bad = git_finding(1, 30, 30, 0xAA);
+        let err = translate_git_item_result(
+            write_context(),
+            &tenant_secret_key(),
+            42,
+            64,
+            timing(),
+            &[bad],
+            &test_rule_fingerprint,
+        )
+        .expect_err("zero-length git span must fail");
+        assert!(matches!(
+            err,
+            ResultTranslationError::InvalidFindingSpan { .. }
+        ));
+    }
+
+    #[test]
+    fn translate_git_multiple_findings_with_distinct_identities() {
+        let translated =
+            translate_git_scanned(&[git_finding(1, 10, 20, 0xAA), git_finding(2, 30, 40, 0xBB)]);
+        assert_eq!(translated.finding_count(), 2);
+        assert_eq!(translated.occurrence_count(), 2);
+        assert_eq!(translated.observation_count(), 2);
     }
 }
