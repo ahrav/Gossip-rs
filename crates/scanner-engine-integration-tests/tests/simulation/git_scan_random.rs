@@ -80,11 +80,15 @@ fn rand_range_inclusive(rng: &mut SimRng, min: u32, max: u32) -> u32 {
     if min >= max {
         return min;
     }
-    let hi = max.saturating_add(1);
-    if min >= hi {
-        return min;
+    match max.checked_add(1) {
+        Some(hi) => rng.gen_range(min, hi),
+        // max == u32::MAX: the exclusive upper bound overflows u32.
+        // Draw uniformly from [0, width) in u64 arithmetic and shift.
+        None => {
+            let width = u64::from(max) - u64::from(min) + 1;
+            (u64::from(min) + rng.next_u64() % width) as u32
+        }
     }
-    rng.gen_range(min, hi)
 }
 
 fn scenario_config_from_env(deep: bool) -> GitScenarioGenConfig {
