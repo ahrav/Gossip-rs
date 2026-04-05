@@ -189,7 +189,7 @@ pub fn hex_encode_into(bytes: &[u8], buf: &mut [u8], offset: usize) -> usize {
 /// accepts any byte slice up to 32 bytes. Stores the hex in a fixed
 /// `[u8; 64]` buffer with a length discriminant, avoiding heap allocation
 /// entirely. OID-width validation (20 or 32 bytes) is the caller's
-/// responsibility (see [`OidBytes`](crate::OidBytes) in `scanner-git`).
+/// responsibility (see `OidBytes` in `scanner-git`).
 ///
 /// Implements `Display`, `Debug`, `AsRef<str>`, and `Deref<Target = str>`
 /// so it can be used anywhere a `&str` is expected.
