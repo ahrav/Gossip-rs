@@ -1440,12 +1440,12 @@ impl CommitSink for ReceiptCommitSink {
 
         batch.validate()?;
 
-        // The CommitSink surface provides only start/end offsets.
-        // Root-hint fields are unavailable through this bridge, so both
-        // blob_offset_start/end mirror window_start/end. This is safe because
-        // root-hint fields never participate in persistence identity
-        // derivation (see the `Identity derivation` section in
-        // result_translation.rs).
+        // The CommitSink bridge carries blob-absolute start/end offsets.
+        // Window-local coordinates are unavailable through this surface, so
+        // window_start/end mirror blob_offset_start/end. The blob-absolute
+        // offsets are the identity-bearing coordinates consumed by
+        // `PersistenceFinding::blob_offset_start/blob_offset_end` for
+        // `OccurrenceId` derivation.
         item.findings
             .extend(batch.findings.iter().map(|finding| FsFindingRecord {
                 rule_id: finding.rule_id,
