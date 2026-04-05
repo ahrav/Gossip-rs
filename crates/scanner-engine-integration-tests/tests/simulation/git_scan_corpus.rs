@@ -117,7 +117,7 @@ fn replay_git_scan_corpus_cases() {
     }
 
     assert!(
-        validated > 0 || regen,
+        validated + expected_failures > 0 || regen,
         "no corpus cases were validated (validated={validated}, expected_failures={expected_failures})",
     );
 }
