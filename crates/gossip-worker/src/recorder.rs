@@ -24,7 +24,8 @@ use gossip_contracts::identity::domain::COORDINATION_TELEMETRY_V1;
 use gossip_contracts::identity::{domain_hasher, finalize_64};
 use gossip_scanner_runtime::OwnedCoreEvent;
 use gossip_scanner_runtime::coordination_sink::{
-    CommitProgressRecord, CoordinationEventRecorder, StageSignal, StoredGitEvent,
+    CommitProgressRecord, CoordinationEventRecorder, LeaseUncertaintyReason, MirrorErrorClass,
+    StageSignal, StoredGitEvent,
 };
 
 /// Tracing target for all coordination telemetry events. Subscribers can filter
@@ -381,7 +382,7 @@ impl CoordinationTelemetrySink for TracingCoordinationTelemetrySink {
                     shard_id = %shard_id,
                     stage_kind = "mirror_sync",
                     latency_ms,
-                    error_class = %OptionalField::new(error_class),
+                    error_class = %OptionalField::new(error_class.map(|c| c.as_str())),
                     "coordination stage mirror sync",
                 );
             }
@@ -440,7 +441,7 @@ impl CoordinationTelemetrySink for TracingCoordinationTelemetrySink {
                     category = "stage",
                     shard_id = %shard_id,
                     stage_kind = "lease_uncertainty",
-                    reason,
+                    reason = reason.as_str(),
                     "coordination stage lease uncertainty",
                 );
             }
@@ -690,7 +691,7 @@ pub(crate) enum SanitizedCoordinationRecord {
     StageMirrorSyncCompleted {
         shard_id: RedactedDigest,
         latency_ms: u64,
-        error_class: Option<&'static str>,
+        error_class: Option<MirrorErrorClass>,
     },
     StageScanCompleted {
         shard_id: RedactedDigest,
@@ -709,7 +710,7 @@ pub(crate) enum SanitizedCoordinationRecord {
     },
     StageLeaseUncertaintyObserved {
         shard_id: RedactedDigest,
-        reason: &'static str,
+        reason: LeaseUncertaintyReason,
     },
 }
 
@@ -1119,7 +1120,7 @@ mod tests {
                 format!("mirror-stage-shard-{canary}"),
                 StageSignal::MirrorSyncCompleted {
                     latency_ms: 5,
-                    error_class: Some("retryable"),
+                    error_class: Some(MirrorErrorClass::Retryable),
                 },
             ),
             (
@@ -1144,7 +1145,7 @@ mod tests {
             (
                 format!("lease-stage-shard-{canary}"),
                 StageSignal::LeaseUncertaintyObserved {
-                    reason: "deadline_elapsed",
+                    reason: LeaseUncertaintyReason::DeadlineElapsed,
                 },
             ),
         ];
@@ -1475,7 +1476,7 @@ mod tests {
                     .record_stage_signal(
                         "stage-shard",
                         StageSignal::LeaseUncertaintyObserved {
-                            reason: "stale_fence",
+                            reason: LeaseUncertaintyReason::StaleFence,
                         },
                     )
                     .expect("stage telemetry failures must be non-fatal");

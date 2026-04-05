@@ -147,7 +147,7 @@ use crate::{
     commit_sink::{CommitSink, FindingsBatch, ItemMeta},
     coordination_sink::{
         CommitProgressRecord, CoordinationEventRecorder, CoordinationEventSink,
-        FindingsCaptureSink, StageSignal,
+        FindingsCaptureSink, LeaseUncertaintyReason, MirrorErrorClass, StageSignal,
     },
     git_discovery::StaticGitRepoDiscoverySource,
     git_persistence::GitPersistenceBackend,
@@ -805,24 +805,24 @@ fn elapsed_ms(start: Instant) -> u64 {
     duration_ms(start.elapsed())
 }
 
-/// Maps an [`ErrorClass`] to a static metric label.
+/// Maps an [`ErrorClass`] to a [`MirrorErrorClass`] telemetry label.
 ///
 /// The wildcard arm is required because `ErrorClass` is `#[non_exhaustive]`.
 /// New variants should be matched explicitly here; the fallback ensures
 /// forward compatibility but should not be relied upon silently.
-const fn error_class_label(class: ErrorClass) -> &'static str {
+const fn mirror_error_class(class: ErrorClass) -> MirrorErrorClass {
     match class {
-        ErrorClass::Retryable => "retryable",
-        ErrorClass::Permanent => "permanent",
-        _ => "other",
+        ErrorClass::Retryable => MirrorErrorClass::Retryable,
+        ErrorClass::Permanent => MirrorErrorClass::Permanent,
+        _ => MirrorErrorClass::Other,
     }
 }
 
-const fn lease_uncertainty_reason(reason: LeaseUncertainty) -> &'static str {
+const fn lease_uncertainty_reason(reason: LeaseUncertainty) -> LeaseUncertaintyReason {
     match reason {
-        LeaseUncertainty::DeadlineElapsed { .. } => "deadline_elapsed",
-        LeaseUncertainty::AdvanceStaleFence { .. } => "stale_fence",
-        LeaseUncertainty::AdvanceLeaseExpired { .. } => "lease_expired",
+        LeaseUncertainty::DeadlineElapsed { .. } => LeaseUncertaintyReason::DeadlineElapsed,
+        LeaseUncertainty::AdvanceStaleFence { .. } => LeaseUncertaintyReason::StaleFence,
+        LeaseUncertainty::AdvanceLeaseExpired { .. } => LeaseUncertaintyReason::LeaseExpired,
     }
 }
 
@@ -3032,7 +3032,7 @@ where
                 .map_err(|error| {
                     stage_sink.emit_stage_signal(StageSignal::MirrorSyncCompleted {
                         latency_ms: elapsed_ms(mirror_started_at),
-                        error_class: Some(error_class_label(error.class())),
+                        error_class: Some(mirror_error_class(error.class())),
                     });
                     DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
                         anyhow::Error::from(error).context(format!(
@@ -3528,7 +3528,7 @@ mod tests {
         CancellationToken, OwnedCoreEvent,
         commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput},
         commit_sink::{FindingRecord, FindingsBatch, ItemMeta},
-        coordination_sink::{CommitProgressRecord, StageSignal, StoredGitEvent},
+        coordination_sink::{CommitProgressRecord, MirrorErrorClass, StageSignal, StoredGitEvent},
         git_mirror::LocalMirrorManager,
         git_persistence::GitPersistenceOp,
         ordered_content::OrderedContentSkipReason,
@@ -6880,15 +6880,21 @@ mod tests {
         };
         assert_eq!(
             error_class,
-            Some("permanent"),
+            Some(MirrorErrorClass::Permanent),
             "FailingMirrorManager returns permanent error class"
         );
     }
 
     #[test]
-    fn error_class_label_maps_known_variants() {
-        assert_eq!(error_class_label(ErrorClass::Retryable), "retryable");
-        assert_eq!(error_class_label(ErrorClass::Permanent), "permanent");
+    fn mirror_error_class_maps_known_variants() {
+        assert_eq!(
+            mirror_error_class(ErrorClass::Retryable),
+            MirrorErrorClass::Retryable,
+        );
+        assert_eq!(
+            mirror_error_class(ErrorClass::Permanent),
+            MirrorErrorClass::Permanent,
+        );
     }
 
     /// A successful git repo scan of a clean (zero-findings) fixture must

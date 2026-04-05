@@ -55,6 +55,51 @@ pub enum CommitProgressRecord {
     },
 }
 
+/// Closed-set mirror-sync error posture for stage telemetry.
+///
+/// Maps from the connector-level [`ErrorClass`](gossip_contracts::connector::ErrorClass)
+/// (which is `#[non_exhaustive]`) to a fixed set of telemetry labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MirrorErrorClass {
+    Retryable,
+    Permanent,
+    /// Forward-compatibility bucket for unknown `ErrorClass` variants.
+    Other,
+}
+
+impl MirrorErrorClass {
+    /// Returns the static label used in tracing fields and dashboards.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Retryable => "retryable",
+            Self::Permanent => "permanent",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Closed-set lease-uncertainty reason for stage telemetry.
+///
+/// Maps from the runtime-level [`LeaseUncertainty`](super::distributed::LeaseUncertainty)
+/// variants to fixed telemetry labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseUncertaintyReason {
+    DeadlineElapsed,
+    StaleFence,
+    LeaseExpired,
+}
+
+impl LeaseUncertaintyReason {
+    /// Returns the static label used in tracing fields and dashboards.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeadlineElapsed => "deadline_elapsed",
+            Self::StaleFence => "stale_fence",
+            Self::LeaseExpired => "lease_expired",
+        }
+    }
+}
+
 /// Closed set of low-cardinality Git execution stage signals.
 ///
 /// These signals let operators distinguish the claim, mirror, execution,
@@ -69,12 +114,10 @@ pub enum StageSignal {
     /// Mirror acquisition or refresh finished for the claimed repo.
     ///
     /// `latency_ms` is the wall-clock duration of the mirror step.
-    /// `error_class` is a closed-set retry-posture label produced by
-    /// `error_class_label`: `"retryable"` or `"permanent"`.
     /// `None` means the mirror step succeeded.
     MirrorSyncCompleted {
         latency_ms: u64,
-        error_class: Option<&'static str>,
+        error_class: Option<MirrorErrorClass>,
     },
     /// Repo-native scan execution finished.
     ///
@@ -95,9 +138,7 @@ pub enum StageSignal {
     /// `latency_ms` is the wall-clock duration of the shard-advance step.
     CheckpointAdvanced { latency_ms: u64 },
     /// The worker can no longer trust the claimed lease.
-    ///
-    /// `reason` is a closed, low-cardinality discriminant.
-    LeaseUncertaintyObserved { reason: &'static str },
+    LeaseUncertaintyObserved { reason: LeaseUncertaintyReason },
 }
 
 /// Coordinator-facing recorder for distributed scan output.
@@ -367,7 +408,7 @@ mod tests {
 
         sink.emit_stage_signal(StageSignal::MirrorSyncCompleted {
             latency_ms: 17,
-            error_class: Some("retryable"),
+            error_class: Some(MirrorErrorClass::Retryable),
         });
 
         let forwarded = recorder.stage_signals.lock().unwrap();
@@ -377,7 +418,7 @@ mod tests {
             forwarded[0].1,
             StageSignal::MirrorSyncCompleted {
                 latency_ms: 17,
-                error_class: Some("retryable"),
+                error_class: Some(MirrorErrorClass::Retryable),
             }
         );
     }
