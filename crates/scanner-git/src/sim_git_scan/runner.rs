@@ -132,7 +132,7 @@ pub struct FailureReport {
 }
 
 /// Failure classification for deterministic triage.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureKind {
     /// A panic escaped from harness logic.
     Panic,

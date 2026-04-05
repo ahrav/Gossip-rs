@@ -88,6 +88,8 @@ impl GitPersistenceBackend for NoopGitBackend {
         Ok(())
     }
 
+    /// Claims atomicity so the adapter takes the single-phase commit path,
+    /// keeping the test focused on the receipt/checkpoint aggregation layer.
     fn supports_atomic_batches(&self) -> bool {
         true
     }
@@ -227,8 +229,6 @@ fn clean_scan_with_zero_findings_is_receipt_gated_normally() {
     assert_eq!(pending.first_sequence_no(), 0);
     assert_eq!(pending.last_sequence_no(), 0);
     assert_eq!(pending.committed_units(), 1);
-    assert_eq!(pending.first_sequence_no(), 0);
-    assert_eq!(pending.last_sequence_no(), 0);
     assert_eq!(
         pending.checkpoint_cursor(),
         &Cursor::with_last_key(item_key(0x81)),

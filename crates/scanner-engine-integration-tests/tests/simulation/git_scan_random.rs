@@ -139,6 +139,10 @@ fn random_corruption(rng: &mut SimRng) -> GitCorruption {
 
 fn random_read_fault(rng: &mut SimRng) -> GitReadFault {
     let latency_ticks = rng.gen_range(0, 4) as u64;
+    // Arms 0-2 each inject a distinct I/O fault (ErrKind, PartialRead,
+    // EIntrOnce). Arms 3-4 inject data corruption without an I/O fault,
+    // giving corruption-only paths ~40% weight to exercise the
+    // corruption-detection codepaths more heavily.
     match rng.gen_range(0, 5) {
         0 => GitReadFault {
             fault: Some(GitIoFault::ErrKind {
@@ -182,6 +186,9 @@ fn maybe_push_fault_resource(
 }
 
 fn random_fault_plan(rng: &mut SimRng, scenario: &GitScenario) -> GitFaultPlan {
+    // Targets only the resource kinds that the scenario generator produces
+    // (Persist, SeenPersist, CommitGraph, Midx, Pack). GitResourceId::Other
+    // is excluded because the scenario generator does not create those.
     let mut resources = Vec::new();
     maybe_push_fault_resource(&mut resources, rng, GitResourceId::Persist);
     maybe_push_fault_resource(&mut resources, rng, GitResourceId::SeenPersist);
@@ -213,20 +220,6 @@ fn random_fault_plan(rng: &mut SimRng, scenario: &GitScenario) -> GitFaultPlan {
     }
 
     GitFaultPlan { resources }
-}
-
-fn same_failure_kind(expected: &FailureKind, actual: &FailureKind) -> bool {
-    match (expected, actual) {
-        (FailureKind::Panic, FailureKind::Panic)
-        | (FailureKind::Hang, FailureKind::Hang)
-        | (FailureKind::OracleMismatch, FailureKind::OracleMismatch)
-        | (FailureKind::StabilityMismatch, FailureKind::StabilityMismatch) => true,
-        (
-            FailureKind::InvariantViolation { code: left },
-            FailureKind::InvariantViolation { code: right },
-        ) => left == right,
-        _ => false,
-    }
 }
 
 fn assert_same_report(left: &RunReport, right: &RunReport, seed: u64) {
@@ -263,17 +256,18 @@ fn assert_same_report(left: &RunReport, right: &RunReport, seed: u64) {
 }
 
 fn assert_reproducible_failure(left: &FailureReport, right: &FailureReport, seed: u64) {
-    assert!(
-        same_failure_kind(&left.kind, &right.kind),
+    assert_eq!(
+        left.kind, right.kind,
         "seed {seed}: failure kind diverged: {:?} vs {:?}",
-        left.kind,
-        right.kind
+        left.kind, right.kind
     );
     assert_eq!(
         left.message, right.message,
         "seed {seed}: failure message diverged"
     );
     assert_eq!(left.step, right.step, "seed {seed}: failure step diverged");
+    // Only left.kind is tested because the assertion above already proved
+    // left.kind == right.kind; checking one suffices.
     assert!(
         !matches!(
             left.kind,

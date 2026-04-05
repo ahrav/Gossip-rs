@@ -882,6 +882,10 @@ The runtime tests focus on the behavior that exists today:
 - crash-before-ledger fault injection with idempotent retry and checkpoint blocking
 - crash-before-findings-durability with empty-store verification
 - multi-item partial-prefix recovery under mid-stream fault
+- repo-frontier complete-finalize receipt gating with repo-key-authoritative
+  cursor preservation
+- repo-frontier partial-finalize suppression of outer checkpoint progress
+- repo-frontier receipt replay determinism and checkpoint-buffer idempotency
 
 These tests exercise the live local runtime paths for valid filesystem and
 git sources and verify the distributed worker loop (lease construction,

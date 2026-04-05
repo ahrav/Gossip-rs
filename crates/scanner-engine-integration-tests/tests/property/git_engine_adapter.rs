@@ -99,21 +99,14 @@ proptest! {
         blob in prop::collection::vec(any::<u8>(), 0..2048),
         chunk in 64usize..512,
     ) {
-        prop_assert_eq!(
-            {
-                let engine = test_engine();
-                let overlap = engine.required_overlap();
-                scan_blob_chunked(engine, &blob, blob.len().max(overlap + 1))
-                    .expect("reference scan")
-            },
-            {
-                let engine = test_engine();
-                let overlap = engine.required_overlap();
-                // Progress requires at least one byte beyond the overlap budget.
-                let chunk_bytes = chunk.max(overlap.saturating_add(1));
-                scan_blob_chunked(engine, &blob, chunk_bytes)
-                    .expect("chunked scan")
-            }
-        );
+        let engine = test_engine();
+        let overlap = engine.required_overlap();
+        let reference = scan_blob_chunked(engine, &blob, blob.len().max(overlap + 1))
+            .expect("reference scan");
+        // Progress requires at least one byte beyond the overlap budget.
+        let chunk_bytes = chunk.max(overlap.saturating_add(1));
+        let chunked = scan_blob_chunked(engine, &blob, chunk_bytes)
+            .expect("chunked scan");
+        prop_assert_eq!(reference, chunked);
     }
 }
