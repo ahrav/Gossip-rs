@@ -35,9 +35,9 @@ and validation, and Git connector mode uses the direct path.
 | `src/commit_pipeline.rs` | Bounded execution -> commit worker that owns authoritative durable completion, backpressures scan execution through bounded queues, and emits receipt-ready checkpoint input. `CommitPipeline::split()` decomposes the pipeline into a `CommitPipelineSender` (for execution threads) and a `CommitPipelineDrainer` (for concurrent receipt draining) |
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
 | `src/commit_sink.rs` | `CommitSink` trait, `CliNoOpCommitSink` (no-op), and lightweight bridge record types (`ItemMeta`, `FindingRecord`, `FindingsBatch`) for scan-loop lifecycle |
-| `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`) and `CoordinationEventRecorder` trait for distributed scan telemetry |
+| `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`, `StageSignal`) and `CoordinationEventRecorder` trait for distributed scan telemetry |
 | `src/done_ledger_bloom.rs` | Internal done-ledger Bloom filter wrapper: OvidHash-aware membership checks, scope-size gating, and memory-cap enforcement for prefilter construction |
-| `src/distributed.rs` | Distributed worker-loop runtime: filesystem `WorkerIdentity` / `ShardLease`, Git `GitWorkerIdentity` / `GitShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (receipt-driven execution adapter), and the sibling lease loops `run_worker` (filesystem) plus `run_git_repo_worker` (repo-frontier Git). Internal helpers cover receipt-driven checkpoint building, singleton repo-frontier execution, and direct `CoordinationFacade` claim/complete helpers |
+| `src/distributed.rs` | Distributed worker-loop runtime: filesystem `WorkerIdentity` / `ShardLease`, Git `GitWorkerIdentity` / `GitShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (receipt-driven execution adapter), and the sibling lease loops `run_worker` (filesystem) plus `run_git_repo_worker` (repo-frontier Git). Internal helpers cover receipt-driven checkpoint building, singleton repo-frontier execution, low-cardinality Git stage telemetry, and direct `CoordinationFacade` claim/complete helpers |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_discovery.rs` | Static single-target Git repository discovery source for payload-backed repo-frontier shards |
 | `src/git_executor.rs` | Contract-level adapter that implements `GitRepoExecutor` for mirror-backed repo scans by translating `GitSelection` + `GitExecutionLimits` into `scanner-git` config, propagating repo/policy identity into persistence-aware runs, and reusing the shared runtime runner |
@@ -186,6 +186,14 @@ first, or if `complete` rejects a stale or expired lease, the worker
 surfaces `DistributedRuntimeError::LeaseUncertain` and leaves the
 shard for a higher-fence reassignment to resume from durable receipt
 and done-ledger state.
+
+The Git repo-frontier loop also emits low-cardinality stage telemetry through
+`CoordinationEventRecorder::record_stage_signal`. Claim, mirror sync, scan,
+durable receipt, checkpoint, and lease-uncertainty boundaries are recorded
+using only scalar timings, closed-set reason labels, and the recorder's
+redacted shard digest. Successful Git runs accumulate those timings in
+`DistributedRunReport`, and the worker's distributed Git summary log redacts
+the configured mirror root with `ToxicDigest` instead of printing a raw path.
 
 ### Family split
 
