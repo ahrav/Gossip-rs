@@ -23,7 +23,7 @@ impl EngineScratch for DuplicateDropScratch {
 
     fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
         self.findings
-            .retain(|f| f.root_hint_end() >= new_bytes_start);
+            .retain(|f| f.root_hint_end() > new_bytes_start);
     }
 
     fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
@@ -108,7 +108,7 @@ impl EngineScratch for DistinctHashScratch {
 
     fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
         self.findings
-            .retain(|f| f.root_hint_end() >= new_bytes_start);
+            .retain(|f| f.root_hint_end() > new_bytes_start);
     }
 
     fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {

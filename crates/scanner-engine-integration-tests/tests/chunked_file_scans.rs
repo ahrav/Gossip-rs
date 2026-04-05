@@ -130,15 +130,12 @@ fn scan_file_chunked_drops_prefix_duplicates() -> io::Result<()> {
     Ok(())
 }
 
-/// Realistic 1+ MiB blob with a secret past the first-chunk boundary of the
-/// production `DEFAULT_CHUNK_BYTES = 1 << 20`. This test exercises the same
-/// slow-path code as production scans of large files (lockfiles, bundled JS,
-/// minified assets) and asserts that `root_span_hint` remains file-absolute
-/// regardless of how the multi-chunk scanner split the input.
+/// `root_span_hint` must remain file-absolute even when a finding lands past
+/// the first 1 MiB chunk boundary (`DEFAULT_CHUNK_BYTES = 1 << 20`).
 ///
-/// Root-hint offsets feed persistence identity derivation via
-/// `PersistenceFinding::blob_offset_start/blob_offset_end`, so this is the end-to-end
-/// guarantee that OccurrenceId is stable across chunker alignment changes.
+/// These root-hint offsets later feed persistence identity derivation via
+/// `PersistenceFinding::blob_offset_start/blob_offset_end`, so chunk
+/// boundaries must not shift them.
 #[test]
 fn scan_file_chunked_realistic_multi_chunk_root_hint_is_file_absolute() -> io::Result<()> {
     // Use a permissive single-char rule so the secret match is independent

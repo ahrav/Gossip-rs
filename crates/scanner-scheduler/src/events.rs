@@ -26,15 +26,16 @@ pub enum CoreEvent<'a> {
 
 /// Structured finding payload written by scheduler event sinks.
 ///
-/// `start` and `end` carry blob-absolute root-hint coordinates — the full
-/// regex match span (group 0) mapped to root-file coordinates. Both scan
-/// paths populate them from the engine's `FindingRec::root_hint_start` and
-/// `root_hint_end`, which the engine computes via `base_offset +
-/// match_span.start` (root findings) or `base_offset +
-/// RootSpanMapCtx::map_span(decoded_span).start` (transform findings). These
-/// offsets feed both user-facing event output and
-/// persistence identity derivation, so Git and FS scans of the same content
-/// converge on the same `OccurrenceId` regardless of chunker alignment.
+/// `start` and `end` carry blob-absolute root-hint coordinates in
+/// root-file coordinates. For raw (non-transform) findings these typically
+/// coincide with the exact match bounds. On derived paths they remain the
+/// engine's best available root hint and may be broader than the
+/// transformed match span.
+///
+/// Both scan paths populate them from the engine's
+/// `FindingRec::root_hint_start` and `root_hint_end`. Event sinks surface
+/// these offsets directly, and persistence identity derivation consumes
+/// the same coordinates.
 pub struct FindingEvent<'a> {
     /// Source family that emitted this finding.
     pub source: SourceKind,

@@ -135,15 +135,13 @@ impl Default for EngineAdapterConfig {
 /// All identity traits (`PartialEq`, `Eq`, `Hash`, `Ord`, `PartialOrd`)
 /// are derived over the full field tuple.
 ///
-/// `start` and `end` are **blob-absolute** offsets sourced from
-/// `FindingRec.root_hint_start/root_hint_end` — the full regex match span
-/// (group 0) mapped to root-file coordinates. The engine populates
+/// `start` and `end` are **blob-absolute root-hint offsets** sourced from
+/// `FindingRec.root_hint_start/root_hint_end`. The engine populates
 /// `root_hint_*` via `base_offset + match_span.start` (root findings) or
-/// `base_offset + RootSpanMapCtx::map_span(decoded_span).start` (transform findings), so these
-/// offsets are stable across chunker alignment changes and drive
-/// cross-source persistence identity convergence between Git and FS scans
-/// (see `GitFindingForPersistence` in
-/// `gossip_scanner_runtime::coordination_sink`).
+/// `base_offset + RootSpanMapCtx::map_span(decoded_span).start` (transform
+/// findings). These coordinates are stable across chunker alignment changes
+/// and are the identity inputs forwarded into Git persistence via
+/// `GitFindingForPersistence`.
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct FindingKey {
     /// Inclusive blob-absolute start offset of the full match.

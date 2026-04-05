@@ -481,8 +481,9 @@ impl EventOutput for FindingsCaptureSink {
                 Ok(mut guard) => guard.push(record),
                 Err(poison) => {
                     tracing::error!(
-                        "captured_findings mutex poisoned during push; \
-                         finding may be lost"
+                        "captured_findings mutex poisoned; recovered guard and \
+                         committed finding — subsequent lock attempts will also \
+                         require poison recovery"
                     );
                     poison.into_inner().push(record);
                 }

@@ -168,17 +168,15 @@ impl ScanScratch {
         self.findings.clear();
     }
 
-    /// Drop findings whose blob_offset_end is fully within the overlap prefix.
+    /// Drop findings whose blob_offset_end does not extend past the overlap
+    /// prefix. Retains only findings where `blob_offset_end > new_bytes_start`.
     ///
-    /// Called after scanning a chunk to remove findings that were already
-    /// captured by the previous chunk (since they fall in the overlap prefix).
-    ///
-    /// # Arguments
-    ///
-    /// - `new_bytes_start`: Absolute offset where "new" bytes begin (after overlap)
+    /// Matches the real engine's `ScanScratch::drop_prefix_findings` semantics:
+    /// a finding ending exactly at the boundary (`blob_offset_end ==
+    /// new_bytes_start`) is entirely within the prefix and is dropped.
     pub fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
         self.findings
-            .retain(|f| f.blob_offset_end >= new_bytes_start);
+            .retain(|f| f.blob_offset_end > new_bytes_start);
     }
 
     /// Drain all findings into the provided vector (append semantics).

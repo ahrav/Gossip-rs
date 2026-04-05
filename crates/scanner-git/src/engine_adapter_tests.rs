@@ -554,6 +554,10 @@ fn multi_chunk_scan_match_spans_equal_single_chunk_scan() {
     adapter_multi
         .emit_loose(&candidate, b"secret.txt", &blob)
         .expect("multi-chunk scan");
+    assert!(
+        adapter_multi.metrics().chunks_scanned > 1,
+        "chunk_bytes must be small enough (after clamping) to trigger multi-chunk scanning",
+    );
     let findings_multi = sink_multi.take_findings();
 
     assert_eq!(

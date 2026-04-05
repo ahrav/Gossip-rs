@@ -321,9 +321,8 @@ fn encode_core_event(event: CoreEvent<'_>, line: &mut Vec<u8>) {
             // Keep the record shape aligned with scanner-rs golden fixtures.
             //
             // The JSON finding record exposes `start`/`end` — blob-absolute
-            // root-hint offsets covering the full regex match in root-file
-            // coordinates. These same offsets feed persistence identity
-            // derivation downstream.
+            // root-hint offsets in root-file coordinates. These same offsets
+            // feed persistence identity derivation downstream.
             line.push(b'{');
             push_key(line, b"path");
             write_json_bytes(line, finding.object_path);
