@@ -696,7 +696,7 @@ where
             .get(&commit_id)
             .ok_or(ResultTranslationError::MissingGitCommitOid { index, commit_id })?;
         let cache_key = (finding.object_path.as_ref(), commit_id);
-        let &(item, observation_ovid_hash) = match identity_cache.entry(cache_key) {
+        let &(item, observation_ovid_hash) = &*match identity_cache.entry(cache_key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
                 let identity = ItemIdentityKey::try_new(
