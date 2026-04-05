@@ -333,7 +333,104 @@
     "step": 0
   },
   "trace": {
-    "ring": [],
+    "ring": [
+      {
+        "Decision": {
+          "code": 65536
+        }
+      },
+      {
+        "StageEnter": {
+          "stage_id": 1
+        }
+      },
+      {
+        "StageExit": {
+          "stage_id": 1,
+          "items": 1
+        }
+      },
+      {
+        "Decision": {
+          "code": 65536
+        }
+      },
+      {
+        "StageEnter": {
+          "stage_id": 2
+        }
+      },
+      {
+        "StageExit": {
+          "stage_id": 2,
+          "items": 2
+        }
+      },
+      {
+        "Decision": {
+          "code": 65536
+        }
+      },
+      {
+        "StageEnter": {
+          "stage_id": 3
+        }
+      },
+      {
+        "StageExit": {
+          "stage_id": 3,
+          "items": 1
+        }
+      },
+      {
+        "Decision": {
+          "code": 65536
+        }
+      },
+      {
+        "StageEnter": {
+          "stage_id": 4
+        }
+      },
+      {
+        "StageExit": {
+          "stage_id": 4,
+          "items": 1
+        }
+      },
+      {
+        "Decision": {
+          "code": 65536
+        }
+      },
+      {
+        "StageEnter": {
+          "stage_id": 5
+        }
+      },
+      {
+        "StageExit": {
+          "stage_id": 5,
+          "items": 1
+        }
+      },
+      {
+        "Decision": {
+          "code": 65536
+        }
+      },
+      {
+        "StageEnter": {
+          "stage_id": 6
+        }
+      },
+      {
+        "StageExit": {
+          "stage_id": 6,
+          "items": 0
+        }
+      }
+    ],
     "full": null
   }
 }

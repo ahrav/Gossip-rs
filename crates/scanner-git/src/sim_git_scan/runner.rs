@@ -86,6 +86,9 @@ pub struct RunReport {
     pub skipped_hash: [u8; 32],
     /// Hash of trace events (order-sensitive, bounded to the trace ring).
     pub trace_hash: [u8; 32],
+    /// Raw trace events for corpus regeneration and debugging.
+    #[serde(default)]
+    pub trace_dump: Vec<GitTraceEvent>,
 }
 
 /// Semantic subset of `RunReport` used for cross-seed stability checks.
@@ -600,13 +603,13 @@ fn stage_spill_dedupe(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
         let candidates = state
             .candidates
             .as_ref()
-            .ok_or_else(|| failure_inv(27, "candidates missing"))?;
+            .ok_or_else(|| failure_inv(80, "candidates missing"))?;
         let oid_len = to_object_format(state.scenario.repo.object_format).oid_len();
         // The TempDir must outlive the Spiller — the spiller writes run
         // files to spill_dir.path() and cleans them up on finalize/drop.
-        let spill_dir = tempdir().map_err(|err| failure_inv(28, err))?;
+        let spill_dir = tempdir().map_err(|err| failure_inv(81, err))?;
         let mut spiller = Spiller::new(SpillLimits::RESTRICTIVE, oid_len, spill_dir.path())
-            .map_err(|err| failure_inv(44, err))?;
+            .map_err(|err| failure_inv(82, err))?;
 
         for cand in candidates.iter_resolved() {
             spiller
@@ -619,13 +622,13 @@ fn stage_spill_dedupe(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
                     cand.ctx_flags,
                     cand.cand_flags,
                 )
-                .map_err(|err| failure_inv(29, err))?;
+                .map_err(|err| failure_inv(83, err))?;
         }
 
         let mut sink = CollectingUniqueBlobSink::default();
         let stats = spiller
             .finalize(&NeverSeenStore, &state.persist_store, &mut sink)
-            .map_err(|err| failure_inv(42, err))?;
+            .map_err(|err| failure_inv(84, err))?;
         let unique_oids = dedupe_sorted(sink.blobs.into_iter().map(|blob| blob.oid).collect());
         (stats, unique_oids)
     };
@@ -647,7 +650,7 @@ fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
         return Err(failure_inv(30, "candidates missing"));
     };
     let Some(unique_oids) = state.unique_oids.as_ref() else {
-        return Err(failure_inv(43, "spill dedupe output missing"));
+        return Err(failure_inv(85, "spill dedupe output missing"));
     };
     let candidate_oids = collect_unique_candidate_oids(candidates);
     if candidate_oids != *unique_oids {
@@ -908,7 +911,8 @@ fn build_report(state: &RunState<'_>, steps: u64) -> Result<RunReport, FailureRe
 
     let scanned_hash = hash_oids(&state.scanned);
     let skipped_hash = hash_oids(&state.skipped);
-    let trace_hash = hash_trace(&state.trace.dump());
+    let trace_dump = state.trace.dump();
+    let trace_hash = hash_trace(&trace_dump);
     let skipped_count = state.skipped.len();
 
     Ok(RunReport {
@@ -920,6 +924,7 @@ fn build_report(state: &RunState<'_>, steps: u64) -> Result<RunReport, FailureRe
         scanned_hash,
         skipped_hash,
         trace_hash,
+        trace_dump,
     })
 }
 
@@ -1438,7 +1443,7 @@ mod tests {
 
         assert!(matches!(
             failure.kind,
-            FailureKind::InvariantViolation { code: 42 }
+            FailureKind::InvariantViolation { code: 84 }
         ));
         assert!(failure.message.contains("seen-persist"));
     }

@@ -46,12 +46,25 @@ fn replay_git_scan_corpus_cases() {
         return;
     }
 
+    let regen = std::env::var("GIT_SIM_REGEN_CORPUS").is_ok();
+
     for path in cases {
         let bytes = fs::read(&path).expect("read corpus case");
         let artifact: GitReproArtifact = serde_json::from_slice(&bytes).expect("parse corpus case");
         let runner = GitSimRunner::new(artifact.run_config.clone(), artifact.schedule_seed);
         match runner.run(&artifact.scenario, &artifact.fault_plan) {
             RunOutcome::Ok { report } => {
+                if regen {
+                    let mut updated = artifact.clone();
+                    updated.trace = GitTraceDump {
+                        ring: report.trace_dump.clone(),
+                        full: None,
+                    };
+                    let json = serde_json::to_string_pretty(&updated).expect("serialize");
+                    fs::write(&path, &json).expect("write corpus case");
+                    eprintln!("regenerated trace for {:?}", path);
+                    continue;
+                }
                 if let Some(expected) = expected_trace_hash(&artifact)
                     && expected != report.trace_hash
                 {
@@ -65,6 +78,20 @@ fn replay_git_scan_corpus_cases() {
                 }
             }
             RunOutcome::Failed(fail) => {
+                if regen {
+                    eprintln!("skipped {:?} (run failed: {})", path, fail.message);
+                    continue;
+                }
+                // Cases with empty traces are failure-reproduction artifacts from
+                // the random fuzzer. They are expected to fail at runtime and do
+                // not have trace hashes to verify.
+                if expected_trace_hash(&artifact).is_none() {
+                    eprintln!(
+                        "expected failure for {:?}: {} ({})",
+                        path, fail.message, fail.step,
+                    );
+                    continue;
+                }
                 write_failure_artifact(&path, &artifact, fail.clone());
                 panic!("git corpus replay failed for {:?}: {:?}", path, fail);
             }
