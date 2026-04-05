@@ -28,17 +28,17 @@ use std::{
 };
 
 use gossip_contracts::{
-    connector::{GIT_CONNECTOR_TAG, Location, ScanItem, VersionId, git::RepoKey},
+    connector::{git::RepoKey, Location, ScanItem, VersionId, GIT_CONNECTOR_TAG},
     identity::{
-        CanonicalBytes, ConnectorInstanceIdHash, IdentityInputError, ItemIdentityKey, LogicalTime,
-        NormHash, ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey, domain,
-        domain_hasher, finalize_32, key_secret_hash,
+        domain, domain_hasher, finalize_32, key_secret_hash, CanonicalBytes,
+        ConnectorInstanceIdHash, IdentityInputError, ItemIdentityKey, LogicalTime, NormHash,
+        ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey,
     },
     persistence::{
-        DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
-        DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
-        OvidHash, OvidHashInputs, PersistenceFinding, PersistenceInputError, WriteContext,
-        derive_ovid_hash,
+        derive_ovid_hash, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,
+        DoneLedgerRecord, DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord,
+        OccurrenceRecord, OvidHash, OvidHashInputs, PersistenceFinding, PersistenceInputError,
+        WriteContext,
     },
 };
 use scanner_git::OidBytes;
@@ -891,11 +891,11 @@ fn git_observation_location(object_path: &[u8]) -> Option<Arc<Location>> {
 mod tests {
     use gossip_contracts::{
         connector::{
-            GIT_CONNECTOR_TAG, ItemKey, ItemRef, Location, ScanItem, VersionId, git::RepoKey,
+            git::RepoKey, ItemKey, ItemRef, Location, ScanItem, VersionId, GIT_CONNECTOR_TAG,
         },
         identity::{
-            CanonicalBytes, ConnectorInstanceIdHash, ItemIdentityKey, LogicalTime, NormHash,
-            ObjectVersionId, StableItemId, domain, domain_hasher, finalize_32,
+            domain, domain_hasher, finalize_32, CanonicalBytes, ConnectorInstanceIdHash,
+            ItemIdentityKey, LogicalTime, NormHash, ObjectVersionId, StableItemId,
         },
         persistence::{DoneLedgerErrorCode, DoneLedgerStatus, PersistenceFinding},
     };
@@ -905,8 +905,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        FsFindingRef, ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
-        translate_git_item_result, translate_item_result,
+        translate_git_item_result, translate_item_result, FsFindingRef, ItemResult,
+        PersistenceTranslation, ResultTranslationError, ScanTiming,
     };
     use std::collections::HashMap;
 
@@ -1184,14 +1184,20 @@ mod tests {
         );
     }
 
-    /// Single-chunk case where blob_offset_start == 0 and coincides with
-    /// the buffer-local span — verify identity derivation handles offset 0.
+    /// Blob-absolute `blob_offset_start == 0` with a divergent buffer-local
+    /// window span — verifies that persistence identity derives from the
+    /// blob-absolute coordinate, not the window-local one.
     #[test]
     fn persistence_identity_at_zero_offset_boundary() {
-        let rec = fs_finding_with_offsets(7, 0, 10, 0, 10, [0xAB; 32], 7);
+        let rec = fs_finding_with_offsets(7, 0, 10, 99, 109, [0xAB; 32], 7);
         let translated = translate_scanned(&[rec]);
         assert_eq!(translated.occurrence_count(), 1);
         assert_eq!(translated.observation_count(), 1);
+        assert_eq!(
+            translated.occurrences()[0].byte_offset(),
+            0,
+            "persisted byte_offset must come from blob_offset_start, not window_start",
+        );
     }
 
     #[test]
