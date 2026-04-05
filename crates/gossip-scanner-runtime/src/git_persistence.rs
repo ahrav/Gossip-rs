@@ -794,27 +794,27 @@ where
     }
 }
 
+/// Identity inputs used when treating a Git repo as a persistence item.
+///
+/// Git repos have no object-version concept at the done-ledger level, so the
+/// repo itself is the logical item and a fixed zero version keeps the
+/// `(tenant, policy, repo_id)` mapping stable across scans.
+pub(crate) fn git_repo_ovid_inputs(repo_id: u64) -> OvidHashInputs {
+    let mut buf = [0u8; 32];
+    buf[..8].copy_from_slice(&repo_id.to_le_bytes());
+    OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(buf),
+        version: VersionId::Strong(ObjectVersionId::from_bytes([0u8; 32])),
+    }
+}
+
 /// Build a done-ledger record for one completed Git repo-frontier scan.
 ///
-/// Git repos have no object-version concept at the done-ledger level -- the
-/// repo itself is the scanned unit. A fixed zero version produces one
-/// done-ledger entry per (tenant, policy, repo_id) triple.
-///
-/// # OvidHash derivation
-///
-/// Git repo done-ledger entries use a fixed zero `ObjectVersionId` because
-/// repo-frontier shards track mutable refs, not immutable content versions.
-/// The 32-byte `StableItemId` is zero-padded from the u64 `repo_id` per the
-/// fixed-width contract. Domain separation from filesystem `StableItemId`s is
-/// guaranteed by `repo_id` being derived from `TenantId` + normalized path
-/// via `domain_hasher`.
-///
-/// # Provenance timestamps
-///
-/// `claim_time` should be the wall-clock `LogicalTime` captured when the
-/// lease was acquired. `complete_time` should be the wall-clock `LogicalTime`
+/// `claim_time` should be the wall-clock `LogicalTime` captured when the lease
+/// was acquired. `complete_time` should be the wall-clock `LogicalTime`
 /// captured after `execute_repo` returns. Together they bracket the scan
 /// duration for provenance ordering.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_git_repo_done_ledger_record(
     write_context: WriteContext,
     repo_id: u64,
@@ -838,17 +838,7 @@ pub(crate) fn build_git_repo_done_ledger_record(
     // Equal timestamps are valid: a scan can complete within the clock
     // granularity, producing a zero-duration provenance interval.
 
-    // See "OvidHash derivation" in the doc comment above.
-    let ovid = {
-        let mut buf = [0u8; 32];
-        buf[..8].copy_from_slice(&repo_id.to_le_bytes());
-        let stable_item = StableItemId::from_bytes(buf);
-        let version = VersionId::Strong(ObjectVersionId::from_bytes([0u8; 32]));
-        derive_ovid_hash(&OvidHashInputs {
-            stable_item_id: stable_item,
-            version,
-        })
-    };
+    let ovid = derive_ovid_hash(&git_repo_ovid_inputs(repo_id));
     let key = DoneLedgerKey::new(write_context.tenant_id(), write_context.policy_hash(), ovid);
     let status = if findings_count > 0 {
         DoneLedgerStatus::ScannedWithFindings

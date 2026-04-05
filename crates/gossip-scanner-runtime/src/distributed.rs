@@ -107,7 +107,8 @@ use gossip_connectors::FilesystemConnector;
 use gossip_contracts::{
     connector::{
         Budgets, Cursor, ItemKey, ItemRef, Location, PageState, ScanItem, VersionId,
-        git::GitMirrorManager, ordered::OrderedContentSource,
+        git::{GitMirrorManager, RepoKey},
+        ordered::OrderedContentSource,
     },
     coordination::{CursorBoundsCheck, RestoredShardState, ShardSpec, check_cursor_bounds},
     identity::{
@@ -116,8 +117,8 @@ use gossip_contracts::{
         finalize_64,
     },
     persistence::{
-        CheckpointCommitReceipt, CommitHandle, DoneLedger, DoneLedgerCommitReceipt,
-        FindingsCommitReceipt, FindingsSink, WriteContext,
+        CheckpointCommitReceipt, DoneLedger, DoneLedgerCommitReceipt, FindingsCommitReceipt,
+        FindingsSink, WriteContext,
     },
 };
 use gossip_coordination::{
@@ -146,7 +147,8 @@ use crate::{
     },
     commit_sink::{CommitSink, FindingsBatch, ItemMeta},
     coordination_sink::{
-        CommitProgressRecord, CoordinationEventRecorder, CoordinationEventSink, FindingsCaptureSink,
+        CommitProgressRecord, CoordinationEventRecorder, CoordinationEventSink,
+        FindingsCaptureSink, GitFindingForPersistence,
     },
     git_discovery::StaticGitRepoDiscoverySource,
     git_persistence::GitPersistenceBackend,
@@ -156,7 +158,10 @@ use crate::{
         OrderedContentExecutionOutcome, OrderedContentItemExecution, OrderedContentItemOutcome,
         OrderedContentReadStop, OrderedContentRuntime, OrderedContentRuntimeInput,
     },
-    result_translation::{ItemResult, ScanTiming, translate_item_result},
+    result_committer::ResultCommitter,
+    result_translation::{
+        ItemResult, ScanTiming, translate_git_item_result, translate_item_result,
+    },
 };
 
 /// Immutable worker identity threaded through shard claiming and completion.
@@ -1433,7 +1438,7 @@ fn emit_ordered_item_findings(
             end: finding.root_hint_end,
             rule_id: finding.rule_id,
             rule_name: engine.rule_name(finding.rule_id),
-            norm_hash: Some(finding.norm_hash),
+            norm_hash: finding.norm_hash,
             commit_id: None,
             change_kind: None,
             confidence_score: finding.confidence_score,
@@ -2747,14 +2752,16 @@ where
 }
 
 /// Bundled metadata for one completed Git repo scan, consumed by the
-/// done-ledger submission helper.
-#[derive(Debug)]
+/// persistence submission helper.
 struct GitRepoPersistenceInput<'a> {
     write_context: WriteContext,
     shard_id: &'a str,
+    repo_key: &'a RepoKey,
     repo_id: u64,
     bytes_scanned: u64,
-    detected_count: u64,
+    findings: &'a [GitFindingForPersistence],
+    tenant_secret_key: TenantSecretKey,
+    rule_fingerprint: &'a dyn Fn(u32) -> RuleFingerprint,
     claim_time: LogicalTime,
     /// Wall-clock timestamp captured after scan execution *and* persistence
     /// finalize complete. The `(claim_time, complete_time)` interval therefore
@@ -2762,81 +2769,75 @@ struct GitRepoPersistenceInput<'a> {
     complete_time: LogicalTime,
 }
 
-/// Submit a done-ledger entry for one completed Git repo scan.
+/// Submit the findings and done-ledger records for one completed Git repo scan.
 ///
-/// Constructs the done-ledger record from the scan metadata and submits it
-/// through the ledger backend. Returns both receipts (a synthesized
-/// zero-count findings receipt and the real done-ledger receipt) so the
-/// caller can build a durable checkpoint.
+/// The git repo-frontier path reuses the same translation and commit ordering
+/// as filesystem scans:
+///
+/// 1. translate captured findings into `PersistenceTranslation`
+/// 2. durably upsert findings
+/// 3. durably upsert the done-ledger row
 ///
 /// # Partial write window
 ///
-/// If the done-ledger submit fails, the shard checkpoint is not advanced and
-/// the repo stays reclaimable. On re-claim the repo is re-scanned, so
-/// partial done-ledger writes are harmless.
-fn submit_git_repo_done_ledger<D>(
-    done_ledger: &D,
+/// If either persistence submit fails, the shard checkpoint is not advanced and
+/// the repo stays reclaimable. On re-claim the repo is re-scanned, so partial
+/// durable state remains safe under idempotent upsert semantics.
+fn submit_git_repo_persistence<F, D>(
+    persistence: &DistributedPersistence<F, D>,
     input: &GitRepoPersistenceInput<'_>,
 ) -> Result<(FindingsCommitReceipt, DoneLedgerCommitReceipt), DistributedRuntimeError>
 where
+    F: FindingsSink + Clone + Send + Sync + 'static,
     D: DoneLedger + Clone + Send + Sync + 'static,
+    F::Error: std::error::Error + Send + Sync + 'static,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
-    // --- findings submission ---
-    // TODO(git-findings-persistence): replace this guard and the zero-count
-    // receipt with real findings translation — grep for the tag to find the
-    // other two sites that must change atomically.
-    //
-    // Durable Git finding persistence is unsupported. The caller rejects
-    // leases with detected_count > 0, and the hard check below enforces
-    // this invariant in release builds as defense-in-depth.
-    // Synthesize a zero-count receipt to skip an unnecessary sink
-    // round-trip for clean shards.
-    if input.detected_count > 0 {
-        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
-            anyhow::anyhow!(
-                "submit_git_repo_done_ledger called with detected_count={}; \
-                 durable Git finding persistence is unsupported",
-                input.detected_count,
+    let timing = ScanTiming::try_new(input.claim_time, input.complete_time).map_err(|error| {
+        DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(AnyError::new(error).context(
+            format!(
+                "git repo-frontier shard '{}' has invalid persistence timing",
+                input.shard_id,
             ),
-        )));
-    }
-    let findings_receipt = FindingsCommitReceipt::new(0, 0, 0);
-
-    // --- done-ledger submission ---
-    // TODO(git-findings-persistence): derive findings_count from the real
-    // findings receipt via u32::try_from — grep for the tag to find the
-    // other two sites that must change atomically.
-    //
-    // The hard check above guarantees detected_count == 0 on this path.
-    let findings_count: u32 = 0;
-    let record = crate::git_persistence::build_git_repo_done_ledger_record(
+        )))
+    })?;
+    let translation = translate_git_item_result(
         input.write_context,
+        &input.tenant_secret_key,
         input.repo_id,
         input.bytes_scanned,
-        findings_count,
-        input.claim_time,
-        input.complete_time,
+        timing,
+        input.findings,
+        input.rule_fingerprint,
     )
     .map_err(|error| {
-        DistributedRuntimeError::Durability(
-            anyhow::Error::new(error).context("git repo done-ledger record construction"),
-        )
-    })?;
-    let handle = done_ledger.batch_upsert(&[record]).map_err(|error| {
-        DistributedRuntimeError::Durability(anyhow::Error::new(error).context(format!(
-            "git repo-frontier shard '{}' done-ledger submit failed",
-            input.shard_id,
+        DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(AnyError::new(error).context(
+            format!(
+                "git repo-frontier shard '{}' finding translation failed",
+                input.shard_id,
+            ),
         )))
     })?;
-    let done_ledger_receipt = handle.wait().map_err(|error| {
-        DistributedRuntimeError::Durability(anyhow::Error::new(error).context(format!(
-            "git repo-frontier shard '{}' done-ledger wait failed",
+    let completed_unit = CompletedUnit::repo_frontier(
+        0,
+        Cursor::with_last_key(input.repo_key.clone().into_item_key()),
+    );
+    let receipt = ResultCommitter::new(
+        persistence.findings_sink.clone(),
+        persistence.done_ledger.clone(),
+    )
+    .commit_translation(input.write_context, &completed_unit, &translation)
+    .map_err(|error| {
+        DistributedRuntimeError::Durability(AnyError::new(error).context(format!(
+            "git repo-frontier shard '{}' durable persistence commit failed",
             input.shard_id,
         )))
     })?;
 
-    Ok((findings_receipt, done_ledger_receipt))
+    Ok((
+        receipt.durable().findings(),
+        receipt.durable().done_ledger(),
+    ))
 }
 
 /// Execute one Git repo-frontier lease under the durable repo-receipt model.
@@ -3034,39 +3035,27 @@ where
     // clears in-memory watermarks, causing full re-scan on re-claim. A durable
     // GitPersistenceBackend would require splitting finalize into: seen-bitmaps
     // → findings persistence → watermark commit.
+    let captured_findings = capture_sink.take_captured_findings();
     let detected_count = capture_sink.detected_finding_count();
-
-    if detected_count > 0 {
-        // TODO(git-findings-persistence): remove this guard once durable
-        // findings translation is wired in — grep for the tag to find the
-        // other two sites that must change atomically.
-        //
-        // Durable findings translation is not yet available. Persisting an
-        // empty batch while advancing the shard checkpoint would mark the
-        // repo as ScannedClean, silently dropping detected findings from
-        // durable storage. Fail the lease so the repo stays reclaimable
-        // and will be rescanned once findings persistence is implemented.
-        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
-            anyhow::anyhow!(
-                "git repo-frontier shard '{}' detected {detected_count} finding(s), \
-                 but durable Git finding translation is unavailable; \
-                 refusing to checkpoint as clean",
-                lease.shard_id(),
-            ),
-        )));
-    }
+    debug_assert_eq!(
+        detected_count as usize,
+        captured_findings.len(),
+        "finding counter must match captured finding payload count",
+    );
 
     let input = GitRepoPersistenceInput {
         write_context: execution.write_context,
         shard_id: lease.shard_id(),
+        repo_key: lease.payload().repo_key(),
         repo_id: lease.payload().repo_id(),
         bytes_scanned: execution.report.bytes_scanned,
-        detected_count,
+        findings: &captured_findings,
+        tenant_secret_key: identity.tenant_secret_key,
+        rule_fingerprint: &*execution.rule_fingerprint,
         claim_time: lease.claim_wall_clock(),
         complete_time,
     };
-    let (findings_receipt, done_ledger_receipt) =
-        submit_git_repo_done_ledger(&persistence.done_ledger, &input)?;
+    let (findings_receipt, done_ledger_receipt) = submit_git_repo_persistence(persistence, &input)?;
 
     tracing::debug!(
         shard_id = %lease.shard_id(),
@@ -6525,9 +6514,8 @@ mod tests {
         );
     }
 
-    /// Git events are emitted during scan execution before the findings
-    /// durability guard runs, so telemetry remains observable even when the
-    /// lease is later rejected by that guard.
+    /// Git events remain observable when the repo-frontier worker persists
+    /// findings durably.
     #[test]
     fn run_git_repo_worker_records_git_events() {
         let repo = create_git_repo_fixture_with_secrets();
@@ -6535,6 +6523,8 @@ mod tests {
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
         let backend = TestGitBackend::default();
         let test_recorder = Arc::new(Recorder::default());
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
         let identity = git_worker_identity_with_recorder(
             repo.path(),
             Arc::clone(&test_recorder) as Arc<dyn CoordinationEventRecorder>,
@@ -6542,25 +6532,36 @@ mod tests {
         let mut coordinator =
             setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
 
-        // Secret-bearing fixtures trigger the findings durability guard after
-        // scan execution; emitted scan-phase telemetry remains recorded.
         let result = run_git_repo_worker(
             &mut coordinator,
             &mut mirrors,
             identity,
             backend,
-            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
             DistributedRuntimeConfig::default(),
         );
         assert!(
-            result.is_err(),
-            "fixture with secrets should trigger the findings guard"
+            result.is_ok(),
+            "fixture with secrets should persist successfully"
         );
 
         let events = test_recorder.git_events.lock().expect("git events lock");
         assert!(
             !events.is_empty(),
             "git worker should emit at least one git event during the scan"
+        );
+        drop(events);
+        assert!(
+            !findings_sink
+                .findings_snapshot()
+                .expect("findings snapshot")
+                .is_empty(),
+            "git findings should be persisted durably",
+        );
+        assert_eq!(
+            done_ledger.snapshot().expect("done-ledger snapshot")[0].status(),
+            DoneLedgerStatus::ScannedWithFindings,
+            "secret-bearing fixture should produce findings-bearing done-ledger status",
         );
     }
 
@@ -6692,12 +6693,11 @@ mod tests {
         );
     }
 
-    /// When a Git scan detects findings but durable findings translation is
-    /// unavailable, the worker must reject the lease rather than checkpointing
-    /// the repo as clean. This prevents false-clean done-ledger entries from
-    /// suppressing future rescans of repos with active secrets.
+    /// A Git scan with findings must route those findings through the shared
+    /// persistence translation path and advance the shard only after both
+    /// findings and done-ledger writes are durable.
     #[test]
-    fn git_repo_worker_rejects_lease_when_findings_detected_without_durable_translation() {
+    fn git_repo_worker_persists_findings_and_completes_shard() {
         let repo = create_git_repo_fixture_with_secrets();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
@@ -6705,35 +6705,58 @@ mod tests {
         let mut coordinator =
             setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
 
+        let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
-        let err = run_git_repo_worker(
+        let report = run_git_repo_worker(
             &mut coordinator,
             &mut mirrors,
             git_worker_identity(repo.path()),
             backend,
-            DistributedPersistence::new(InMemoryFindingsSink::new(), done_ledger.clone()),
+            DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
             DistributedRuntimeConfig::default(),
         )
-        .expect_err("scan with detected findings must fail when translation is unavailable");
-
-        assert!(
-            matches!(err, DistributedRuntimeError::Runtime(_)),
-            "expected Runtime variant for findings-without-translation guard, got: {err:?}"
-        );
+        .expect("git findings should persist successfully");
+        assert_eq!(report.leases_seen, 1);
+        assert_eq!(report.shards_scanned, 1);
 
         let summaries = shard_summaries(&coordinator);
         assert_eq!(summaries.len(), 1);
-        assert_ne!(
+        assert_eq!(
             summaries[0].status(),
             ShardStatus::Done,
-            "shard must not advance when findings cannot be durably persisted"
+            "shard should advance once findings and done-ledger are durable"
+        );
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(rows.len(), 1, "repo shard should emit one done-ledger row");
+        assert_eq!(
+            rows[0].status(),
+            DoneLedgerStatus::ScannedWithFindings,
+            "finding-bearing repo must not be marked clean",
         );
         assert!(
-            done_ledger
-                .snapshot()
-                .expect("done-ledger snapshot")
+            rows[0].findings_count() > 0,
+            "finding-bearing repo must record a non-zero findings count",
+        );
+        assert!(
+            !findings_sink
+                .findings_snapshot()
+                .expect("findings snapshot")
                 .is_empty(),
-            "done-ledger must remain empty when the findings guard rejects the lease"
+            "shared findings sink should receive translated git findings",
+        );
+        assert!(
+            !findings_sink
+                .occurrences_snapshot()
+                .expect("occurrences snapshot")
+                .is_empty(),
+            "git findings should produce occurrence rows",
+        );
+        assert!(
+            !findings_sink
+                .observations_snapshot()
+                .expect("observations snapshot")
+                .is_empty(),
+            "git findings should produce observation rows",
         );
     }
 
@@ -8994,23 +9017,49 @@ mod tests {
     }
 
     #[test]
-    fn submit_git_repo_done_ledger_rejects_nonzero_detected_count() {
+    fn submit_git_repo_persistence_commits_findings_and_done_ledger() {
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
+        let tmp = tempdir().expect("temp dir for repo key");
+        let repo_key = git_repo_key(tmp.path());
+        let findings = [GitFindingForPersistence {
+            span_start: 10,
+            span_end: 42,
+            norm_hash: gossip_contracts::identity::NormHash::from_digest([0xAB; 32]),
+            rule_id: 7,
+        }];
         let input = GitRepoPersistenceInput {
             write_context: write_context(),
             shard_id: "test-shard",
+            repo_key: &repo_key,
             repo_id: 42,
             bytes_scanned: 1024,
-            detected_count: 5,
+            findings: &findings,
+            tenant_secret_key: tenant_secret_key(),
+            rule_fingerprint: &test_rule_fingerprint,
             claim_time: LogicalTime::from_raw(100),
             complete_time: LogicalTime::from_raw(200),
         };
-        let ledger = InMemoryDoneLedger::new();
-        let err = submit_git_repo_done_ledger(&ledger, &input)
-            .expect_err("nonzero detected_count must be rejected");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("detected_count=5"),
-            "error must report the count: {msg}"
+
+        let (findings_receipt, done_ledger_receipt) =
+            submit_git_repo_persistence(&persistence, &input)
+                .expect("git repo persistence should succeed");
+
+        assert_eq!(findings_receipt.finding_count(), 1);
+        assert_eq!(findings_receipt.occurrence_count(), 1);
+        assert_eq!(findings_receipt.observation_count(), 1);
+        assert_eq!(done_ledger_receipt.record_count(), 1);
+        assert_eq!(
+            done_ledger.snapshot().expect("done-ledger snapshot")[0].status(),
+            DoneLedgerStatus::ScannedWithFindings,
+        );
+        assert_eq!(
+            findings_sink
+                .findings_snapshot()
+                .expect("findings snapshot")
+                .len(),
+            1,
         );
     }
 }

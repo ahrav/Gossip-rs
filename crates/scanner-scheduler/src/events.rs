@@ -38,16 +38,12 @@ pub struct FindingEvent<'a> {
     pub rule_id: u32,
     /// Human-readable rule name resolved from `rule_id`.
     pub rule_name: &'a str,
-    /// Normalized content hash for deduplication. `None` when the finding source
-    /// does not carry a content-derived digest on the event surface; the generic
-    /// scheduler path sets this to `None` while both the distributed filesystem
-    /// runtime and Git-specific paths populate it from their per-finding digest.
+    /// Normalized content hash for deduplication and persistence identity.
     ///
-    /// The `Option<[u8; 32]>` representation adds 33 bytes per event. This is
-    /// acceptable because `FindingEvent` is constructed on WARM paths (per-finding,
-    /// not per-chunk), and moving the hash out-of-band would complicate the event
-    /// flow without measurable benefit.
-    pub norm_hash: Option<[u8; 32]>,
+    /// The digest is always present on the scheduler event surface so runtime
+    /// sinks can derive durable finding identity without a parallel side
+    /// channel.
+    pub norm_hash: [u8; 32],
     /// Commit-graph position for Git findings.
     pub commit_id: Option<u32>,
     /// Git diff classification associated with the finding.
@@ -56,17 +52,12 @@ pub struct FindingEvent<'a> {
     pub confidence_score: i8,
 }
 
-/// Debug-format wrapper that prints `[redacted]` when a secret-derived digest
-/// is present and `None` otherwise. Prevents accidental hash leakage in logs.
-pub struct RedactedNormHash(pub bool);
+/// Debug-format wrapper that prints `[redacted]` for secret-derived digests.
+pub struct RedactedNormHash;
 
 impl fmt::Debug for RedactedNormHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0 {
-            f.write_str("[redacted]")
-        } else {
-            f.write_str("None")
-        }
+        f.write_str("[redacted]")
     }
 }
 
@@ -80,7 +71,7 @@ impl fmt::Debug for FindingEvent<'_> {
             .field("rule_id", &self.rule_id)
             .field("rule_name", &self.rule_name)
             // Secret-derived digests are redacted to keep debug output safe.
-            .field("norm_hash", &RedactedNormHash(self.norm_hash.is_some()))
+            .field("norm_hash", &RedactedNormHash)
             .field("commit_id", &self.commit_id)
             .field("change_kind", &self.change_kind)
             .field("confidence_score", &self.confidence_score)
@@ -395,7 +386,7 @@ mod tests {
             end: 20,
             rule_id: 7,
             rule_name: "rule",
-            norm_hash: Some([0xAB; 32]),
+            norm_hash: [0xAB; 32],
             commit_id: Some(3),
             change_kind: Some("modify"),
             confidence_score: 85,
@@ -417,7 +408,7 @@ mod tests {
             end: 20,
             rule_id: 7,
             rule_name: "rule",
-            norm_hash: Some([0xDE; 32]),
+            norm_hash: [0xDE; 32],
             commit_id: Some(3),
             change_kind: Some("modify"),
             confidence_score: 85,

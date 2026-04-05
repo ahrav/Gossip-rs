@@ -169,11 +169,11 @@ fn test_adapter_with_sink<'a>(engine: &'a Engine, sink: Arc<VecEventSink>) -> En
 
 #[derive(Default)]
 struct CapturingFindingSink {
-    finding_norm_hashes: Mutex<Vec<Option<[u8; 32]>>>,
+    finding_norm_hashes: Mutex<Vec<[u8; 32]>>,
 }
 
 impl CapturingFindingSink {
-    fn take_finding_norm_hashes(&self) -> Vec<Option<[u8; 32]>> {
+    fn take_finding_norm_hashes(&self) -> Vec<[u8; 32]> {
         std::mem::take(
             &mut *self
                 .finding_norm_hashes
@@ -463,7 +463,7 @@ fn git_finding_events_propagate_norm_hash() {
     assert_eq!(captured.len(), 1, "expected exactly one captured finding");
     assert_eq!(
         captured[0],
-        Some(adapter.findings_arena()[0].key.norm_hash),
+        adapter.findings_arena()[0].key.norm_hash,
         "git finding events must forward the finding norm_hash"
     );
 }

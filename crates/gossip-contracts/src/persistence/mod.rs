@@ -12,8 +12,9 @@
 //! - `ovid.rs` defines object-version identity hashing used by the done-ledger.
 //! - `done_ledger.rs` defines done-ledger keys, records, safe error codes, and
 //!   the backend-neutral `DoneLedger` trait.
-//! - `findings.rs` defines stable finding, occurrence, and observation record
-//!   shapes plus the backend-neutral `FindingsSink` trait.
+//! - `findings.rs` defines the `PersistenceFinding` normalization boundary,
+//!   stable finding / occurrence / observation record shapes, and the
+//!   backend-neutral `FindingsSink` trait.
 //! - `page_commit.rs` defines the family-neutral checkpoint boundary types and
 //!   the `PageCommit<S>` typestate machine that enforces findings →
 //!   done-ledger → checkpoint ordering.
@@ -114,6 +115,7 @@ pub use done_ledger::{
 pub use error::PersistenceInputError;
 pub use findings::{
     FindingRecord, FindingsSink, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
+    PersistenceFinding,
 };
 pub use ovid::{OvidHash, OvidHashInputs, derive_ovid_hash};
 pub use page_commit::{

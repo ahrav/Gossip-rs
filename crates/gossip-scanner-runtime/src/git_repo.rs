@@ -33,6 +33,7 @@ use gossip_contracts::connector::git::{
 };
 use gossip_contracts::connector::{Budgets, Cursor, PageBuf, PageState, ToxicDigest};
 use gossip_contracts::coordination::ShardSpec;
+use gossip_contracts::identity::RuleFingerprint;
 use gossip_contracts::persistence::WriteContext;
 use gossip_orchestrator::{GitSelectionLoweringError, GitShardPayload};
 use scanner_git::{
@@ -64,7 +65,6 @@ pub struct GitRepoRuntime;
 /// partial). Produced by [`GitRepoRuntime::execute_repo`] and consumed by
 /// the distributed Git worker loop. The caller builds the checkpoint input
 /// after obtaining durable findings and done-ledger receipts.
-#[derive(Debug)]
 #[must_use]
 pub(crate) struct GitRepoExecutionOutcome<B> {
     /// Aggregate scan metrics (objects, bytes, findings, errors) translated
@@ -77,6 +77,8 @@ pub(crate) struct GitRepoExecutionOutcome<B> {
     /// The write context used during execution, needed for checkpoint
     /// construction.
     pub(crate) write_context: WriteContext,
+    /// Stable rule fingerprint mapper for the engine used during execution.
+    pub(crate) rule_fingerprint: Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>,
     /// Whether the scanner fully traversed the configured start-set
     /// (`Complete`) or stopped early due to resource limits or errors.
     pub(crate) finalize_outcome: FinalizeOutcome,
@@ -144,6 +146,7 @@ impl GitRepoRuntime {
         let runtime_config =
             distributed_git_scan_config(scan_template, mirror, payload, &selection);
         let executor = ScannerGitExecutor::from_runtime_config(&runtime_config, event_sink)?;
+        let rule_fingerprint = executor.rule_fingerprint_fn();
         let persistence = GitPersistenceAdapter::new(
             backend,
             payload.repo_id(),
@@ -171,6 +174,7 @@ impl GitRepoRuntime {
                     report: ScanReport::default(),
                     persistence,
                     write_context,
+                    rule_fingerprint,
                     finalize_outcome: FinalizeOutcome::Partial { skipped_count: 0 },
                 });
             }
@@ -190,6 +194,7 @@ impl GitRepoRuntime {
             report,
             persistence,
             write_context,
+            rule_fingerprint,
             finalize_outcome,
         })
     }

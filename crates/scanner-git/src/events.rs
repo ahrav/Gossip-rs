@@ -307,7 +307,7 @@ mod tests {
             end: 20,
             rule_id: 7,
             rule_name: "rule",
-            norm_hash: Some([0xAB; 32]),
+            norm_hash: [0xAB; 32],
             commit_id: Some(3),
             change_kind: Some("modify"),
             confidence_score: 2,

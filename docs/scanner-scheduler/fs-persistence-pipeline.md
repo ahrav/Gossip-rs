@@ -24,13 +24,15 @@ emits). The consumer side (actual backend storage) is plugged in via the
 | --------------------------------------- | --------------- | --------------------------------------------------------------------------------------------------------------- |
 | `crates/scanner-scheduler/src/store.rs` | FS persistence  | `StoreProducer` trait, finding/batch/loss types, and built-in producer impls |
 | `crates/scanner-git/src/persist.rs`     | Git persistence | Two-phase persist contract for Git blob scan results                                                            |
+| `crates/gossip-contracts/src/persistence/findings.rs` | Shared persistence identity | `PersistenceFinding` trait consumed by runtime translation for both filesystem and Git findings |
 
 The `StoreProducer` trait in `store.rs` defines *how findings flow from
 scan workers into a backend*. Concrete producers receive `FsFindingRecord`
 batches. Identity chain derivation (stable finding IDs, occurrence IDs,
 rule fingerprints) is handled by the receipt-driven runtime path in
 `gossip-scanner-runtime`: `ReceiptCommitSink` rebuilds per-item translation
-inputs, and `translate_item_result` derives the stable identities before the
+inputs, adapts `FsFindingRecord` into the shared `PersistenceFinding`
+surface, and `translate_item_result` derives the stable identities before the
 commit pipeline writes them durably.
 
 ## Data Flow
@@ -102,6 +104,11 @@ absolute byte positions within the scanned object.
 The `norm_hash` is the BLAKE3 digest of the extracted secret bytes after gate
 validation. Two findings with the same `norm_hash` matched the same logical
 secret bytes, regardless of surrounding context.
+
+`FsFindingRecord` remains a scheduler-local carrier. The runtime adapts it into
+`gossip_contracts::persistence::PersistenceFinding` at the translation
+boundary rather than implementing that trait in `scanner-scheduler` directly,
+which preserves crate layering and avoids an orphan-rule violation.
 
 ### FsFindingBatch
 
@@ -414,7 +421,9 @@ The `emit_persistence_batch()` call is inserted at every scan site:
 > if the entire file is clean (no chunk produced findings), exactly one
 > empty-findings call is emitted post-loop so the done-ledger records the
 > file as scanned. `emit_findings` runs on every chunk unconditionally.
-> For archive entries, both run unconditionally per-chunk.
+> For archive entries, both run unconditionally per-chunk. The event path now
+> always carries `norm_hash`, so runtime sinks do not need a second side
+> channel to reconstruct persistence identity.
 
 ## Configuration and Wiring
 

@@ -7,12 +7,13 @@
 //! `ResultCommitter`), while event recording remains best-effort telemetry.
 
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use gossip_contracts::connector::ItemKey;
-use gossip_contracts::persistence::WriteContext;
+use gossip_contracts::identity::NormHash;
+use gossip_contracts::persistence::{PersistenceFinding, WriteContext};
 use scanner_git::{GitEvent, GitEventOutput};
 use scanner_scheduler::events::{CoreEvent, EventOutput};
 
@@ -68,6 +69,51 @@ pub trait CoordinationEventRecorder: Send + Sync + fmt::Debug {
 /// Map a sentinel identity ID to `None`, real IDs to `Some`.
 fn sentinel_to_option(id: u32) -> Option<u32> {
     (id != scanner_git::SENTINEL_ID).then_some(id)
+}
+
+/// Persistence-ready representation of one Git finding observed during scan
+/// execution.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct GitFindingForPersistence {
+    pub(crate) span_start: u64,
+    pub(crate) span_end: u64,
+    pub(crate) norm_hash: NormHash,
+    pub(crate) rule_id: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<GitFindingForPersistence>() <= 56);
+
+impl fmt::Debug for GitFindingForPersistence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitFindingForPersistence")
+            .field("span_start", &self.span_start)
+            .field("span_end", &self.span_end)
+            .field("norm_hash", &"[redacted]")
+            .field("rule_id", &self.rule_id)
+            .finish()
+    }
+}
+
+impl PersistenceFinding for GitFindingForPersistence {
+    #[inline]
+    fn rule_id(&self) -> u32 {
+        self.rule_id
+    }
+
+    #[inline]
+    fn norm_hash(&self) -> NormHash {
+        self.norm_hash
+    }
+
+    #[inline]
+    fn span_start(&self) -> u64 {
+        self.span_start
+    }
+
+    #[inline]
+    fn span_end(&self) -> u64 {
+        self.span_end
+    }
 }
 
 /// Distributed event sink that forwards events to a coordinator recorder.
@@ -161,20 +207,23 @@ impl GitEventOutput for CoordinationEventSink {
     }
 }
 
-/// Wrapper around [`CoordinationEventSink`] that counts `Finding` events
-/// while forwarding all events to the inner sink unchanged.
+/// Wrapper around [`CoordinationEventSink`] that counts and captures `Finding`
+/// events while forwarding all events to the inner sink unchanged.
 ///
-/// The count is retrieved via [`detected_finding_count`](Self::detected_finding_count)
-/// after the scan completes. The caller uses this count to decide whether
-/// the shard checkpoint can safely advance (zero findings) or must be
-/// rejected (nonzero findings without durable persistence).
+/// The count and captured finding payloads are retrieved after the scan
+/// completes. The Git repo-frontier worker uses the captured findings to route
+/// git detections through the same persistence translation path used by
+/// filesystem scans.
 ///
 /// The counter uses `Relaxed` ordering because it is only read after the scan
 /// thread joins (establishing a happens-before via `std::thread::scope`), so
-/// the final value is always visible to the reader.
+/// the final value is always visible to the reader. Captured findings are
+/// stored behind a `Mutex<Vec<_>>` because pack workers emit findings from
+/// multiple threads during git scans.
 pub(crate) struct FindingsCaptureSink {
     inner: Arc<CoordinationEventSink>,
     finding_count: AtomicU64,
+    captured_findings: Mutex<Vec<GitFindingForPersistence>>,
 }
 
 impl FindingsCaptureSink {
@@ -183,6 +232,7 @@ impl FindingsCaptureSink {
         Self {
             inner,
             finding_count: AtomicU64::new(0),
+            captured_findings: Mutex::new(Vec::new()),
         }
     }
 
@@ -194,12 +244,30 @@ impl FindingsCaptureSink {
     pub(crate) fn detected_finding_count(&self) -> u64 {
         self.finding_count.load(Ordering::Relaxed)
     }
+
+    /// Drain the captured findings accumulated during scan execution.
+    pub(crate) fn take_captured_findings(&self) -> Vec<GitFindingForPersistence> {
+        let mut guard = self
+            .captured_findings
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        std::mem::take(&mut *guard)
+    }
 }
 
 impl EventOutput for FindingsCaptureSink {
     fn emit_core(&self, event: CoreEvent<'_>) {
-        if matches!(event, CoreEvent::Finding(_)) {
+        if let CoreEvent::Finding(finding) = &event {
             self.finding_count.fetch_add(1, Ordering::Relaxed);
+            self.captured_findings
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(GitFindingForPersistence {
+                    span_start: finding.start,
+                    span_end: finding.end,
+                    norm_hash: NormHash::from_digest(finding.norm_hash),
+                    rule_id: finding.rule_id,
+                });
         }
         // Forward the borrowed event directly to the inner sink, which
         // performs its own `OwnedCoreEvent::from_core` conversion exactly
@@ -272,7 +340,7 @@ mod tests {
             end: 42,
             rule_id: 7,
             rule_name: "test-rule",
-            norm_hash: Some([0xAA; 32]),
+            norm_hash: [0xAA; 32],
             commit_id: None,
             change_kind: None,
             confidence_score: 85,
@@ -316,7 +384,7 @@ mod tests {
         );
         match &forwarded[0] {
             OwnedCoreEvent::Finding { norm_hash, .. } => {
-                assert_eq!(*norm_hash, Some([0xAA; 32]));
+                assert_eq!(*norm_hash, [0xAA; 32]);
             }
             other => panic!("expected finding event, got: {other:?}"),
         }
@@ -356,6 +424,40 @@ mod tests {
             sink.detected_finding_count(),
             2,
             "should count both findings"
+        );
+    }
+
+    #[test]
+    fn findings_capture_sink_captures_finding_data() {
+        let (sink, _recorder) = make_sink_and_recorder();
+
+        sink.emit_core(finding_event());
+
+        let captured = sink.take_captured_findings();
+        assert_eq!(captured.len(), 1, "finding payload should be captured");
+        assert_eq!(captured[0].rule_id(), 7);
+        assert_eq!(captured[0].span_start(), 10);
+        assert_eq!(captured[0].span_end(), 42);
+        assert_eq!(captured[0].norm_hash(), NormHash::from_digest([0xAA; 32]));
+    }
+
+    #[test]
+    fn git_finding_for_persistence_debug_redacts_norm_hash() {
+        let finding = GitFindingForPersistence {
+            span_start: 1,
+            span_end: 9,
+            norm_hash: NormHash::from_digest([0xFF; 32]),
+            rule_id: 2,
+        };
+
+        let debug = format!("{finding:?}");
+        assert!(
+            debug.contains("[redacted]"),
+            "Debug output must redact norm_hash, got: {debug}"
+        );
+        assert!(
+            !debug.contains("255"),
+            "Debug output must not leak raw hash bytes, got: {debug}"
         );
     }
 

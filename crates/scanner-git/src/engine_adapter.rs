@@ -557,9 +557,7 @@ impl<'a> EngineAdapter<'a> {
                 end: u64::from(f.key.end),
                 rule_id: f.key.rule_id,
                 rule_name: self.engine.rule_name(f.key.rule_id),
-                // Preserve the normalized-secret digest for downstream
-                // persistence identity derivation.
-                norm_hash: Some(f.key.norm_hash),
+                norm_hash: f.key.norm_hash,
                 commit_id: Some(commit_id),
                 change_kind: Some(change_kind),
                 confidence_score: f.confidence_score,
