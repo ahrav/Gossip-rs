@@ -221,10 +221,8 @@ mod tests {
     use super::*;
 
     use std::fs;
-    use std::io::{self, Write};
     use std::path::Path;
     use std::process::Command;
-    use std::sync::{Arc, Mutex};
 
     use gossip_contracts::identity::{
         LogicalTime, OpId, PolicyHash, RunId, ShardId, TenantId, TenantSecretKey, WorkerId,
@@ -251,52 +249,8 @@ mod tests {
     use gossip_worker::production::ProductionStartupSettings;
     use tempfile::tempdir;
     use tracing::Level;
-    use tracing_subscriber::fmt::writer::MakeWriter;
 
-    /// In-memory buffer for capturing tracing output in tests.
-    #[derive(Clone, Default)]
-    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
-
-    struct SharedLogWriter {
-        buffer: Arc<Mutex<Vec<u8>>>,
-    }
-
-    impl Write for SharedLogWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let mut guard = self.buffer.lock().expect("shared log buffer lock");
-            guard.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for SharedLogBuffer {
-        type Writer = SharedLogWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            SharedLogWriter {
-                buffer: Arc::clone(&self.0),
-            }
-        }
-    }
-
-    /// Runs `body` under a temporary tracing subscriber that captures all
-    /// output at or above `level`, returning the captured log text.
-    fn capture_logs(level: Level, body: impl FnOnce()) -> String {
-        let buffer = SharedLogBuffer::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(level)
-            .with_ansi(false)
-            .without_time()
-            .with_writer(buffer.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, body);
-        let bytes = buffer.0.lock().expect("shared log buffer lock").clone();
-        String::from_utf8(bytes).expect("captured logs should be valid UTF-8")
-    }
+    use gossip_worker::recorder::test_support::capture_logs;
 
     fn create_git_repo(path: &Path) {
         run_git(path, &["init", "-q"]);

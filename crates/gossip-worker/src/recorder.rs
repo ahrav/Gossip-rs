@@ -931,8 +931,15 @@ impl SanitizedCoordinationRecord {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+/// Tracing capture utilities for integration and unit tests across the
+/// `gossip-worker` package (both library and binary crate targets).
+///
+/// Not gated behind `#[cfg(test)]` because the binary-crate tests link
+/// against the library as a regular dependency, and `cfg(test)` is only
+/// active for the crate currently under test.  The types here are trivial
+/// and `tracing-subscriber` is already a normal dependency, so there is
+/// no cost to always compiling them.
+pub mod test_support {
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
 
@@ -968,7 +975,7 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn capture_logs(level: Level, body: impl FnOnce()) -> String {
+    pub fn capture_logs(level: Level, body: impl FnOnce()) -> String {
         let buffer = SharedLogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(level)
