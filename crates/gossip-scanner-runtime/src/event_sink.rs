@@ -489,7 +489,7 @@ fn encode_sarif_result(finding: &scanner_scheduler::events::FindingEvent<'_>, li
     line.push(b'}');
 }
 
-fn sanitize_path(path: &[u8]) -> String {
+pub(crate) fn sanitize_path(path: &[u8]) -> String {
     let text = String::from_utf8_lossy(path);
     if !text.chars().any(char::is_control) {
         return text.into_owned();
