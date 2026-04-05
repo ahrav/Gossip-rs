@@ -29,17 +29,17 @@ use std::{
 use ahash::AHashMap;
 
 use gossip_contracts::{
-    connector::{git::RepoKey, Location, ScanItem, VersionId, GIT_CONNECTOR_TAG},
+    connector::{GIT_CONNECTOR_TAG, Location, ScanItem, VersionId, git::RepoKey},
     identity::{
-        domain, domain_hasher, finalize_32, key_secret_hash, CanonicalBytes,
-        ConnectorInstanceIdHash, IdentityInputError, ItemIdentityKey, LogicalTime, NormHash,
-        ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey,
+        CanonicalBytes, ConnectorInstanceIdHash, IdentityInputError, ItemIdentityKey, LogicalTime,
+        NormHash, ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey, domain,
+        domain_hasher, finalize_32, key_secret_hash,
     },
     persistence::{
-        derive_ovid_hash, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,
-        DoneLedgerRecord, DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord,
-        OccurrenceRecord, OvidHash, OvidHashInputs, PersistenceFinding, PersistenceInputError,
-        WriteContext,
+        DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
+        DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
+        OvidHash, OvidHashInputs, PersistenceFinding, PersistenceInputError, WriteContext,
+        derive_ovid_hash,
     },
 };
 use scanner_git::OidBytes;
@@ -892,11 +892,11 @@ fn git_observation_location(object_path: &[u8]) -> Option<Arc<Location>> {
 mod tests {
     use gossip_contracts::{
         connector::{
-            git::RepoKey, ItemKey, ItemRef, Location, ScanItem, VersionId, GIT_CONNECTOR_TAG,
+            GIT_CONNECTOR_TAG, ItemKey, ItemRef, Location, ScanItem, VersionId, git::RepoKey,
         },
         identity::{
-            domain, domain_hasher, finalize_32, CanonicalBytes, ConnectorInstanceIdHash,
-            ItemIdentityKey, LogicalTime, NormHash, ObjectVersionId, StableItemId,
+            CanonicalBytes, ConnectorInstanceIdHash, ItemIdentityKey, LogicalTime, NormHash,
+            ObjectVersionId, StableItemId, domain, domain_hasher, finalize_32,
         },
         persistence::{DoneLedgerErrorCode, DoneLedgerStatus, PersistenceFinding},
     };
@@ -906,10 +906,9 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        translate_git_item_result, translate_item_result, FsFindingRef, ItemResult,
-        PersistenceTranslation, ResultTranslationError, ScanTiming,
+        FsFindingRef, ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
+        translate_git_item_result, translate_item_result,
     };
-    use std::collections::HashMap;
 
     use ahash::AHashMap;
 
@@ -956,8 +955,8 @@ mod tests {
         OidBytes::sha1([0x11; 20])
     }
 
-    fn git_commit_oid_map() -> HashMap<u32, OidBytes> {
-        HashMap::from([(7, git_commit_oid())])
+    fn git_commit_oid_map() -> AHashMap<u32, OidBytes> {
+        AHashMap::from_iter([(7, git_commit_oid())])
     }
 
     fn boxed_path(path: &[u8]) -> Box<[u8]> {
@@ -1752,7 +1751,7 @@ mod tests {
             };
 
             let repo_key = git_repo_key();
-            let commit_oid_map = HashMap::from([(7, commit_oid)]);
+            let commit_oid_map = AHashMap::from_iter([(7, commit_oid)]);
             let item = git_object_scan_item(&repo_key, &object_path, commit_oid);
 
             let fs_t = translate_item_result(
@@ -1921,7 +1920,7 @@ mod tests {
     fn translate_git_item_result_uses_distinct_ovids_for_same_path_different_commits() {
         let commit_oid_a = OidBytes::sha1([0x11; 20]);
         let commit_oid_b = OidBytes::sha1([0x22; 20]);
-        let commit_oid_map = HashMap::from([(7, commit_oid_a), (8, commit_oid_b)]);
+        let commit_oid_map = AHashMap::from_iter([(7, commit_oid_a), (8, commit_oid_b)]);
         let repo_key = git_repo_key();
         let translated = translate_git_item_result(
             write_context(),

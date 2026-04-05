@@ -967,6 +967,44 @@ mod tests {
     }
 
     #[test]
+    fn findings_capture_sink_saturation_fires_cancel_concurrent() {
+        // Spawn MAX+2 threads, each inserting a distinct commit_id. Under
+        // contention, exactly one thread's insert pushes the map to capacity
+        // and triggers saturation; subsequent inserts are gated by the
+        // AtomicBool early-exit guard.
+        let (sink, _recorder, cancel) = make_sink_and_recorder();
+        let max = FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES;
+
+        std::thread::scope(|s| {
+            for i in 0..(max as u32 + 2) {
+                let sink = &sink;
+                s.spawn(move || {
+                    sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+                        commit_id: i,
+                        commit_oid: scanner_git::OidBytes::sha1([i as u8 + 1; 20]),
+                        timestamp: 1_700_000_000 + u64::from(i),
+                        identity: None,
+                    }));
+                });
+            }
+        });
+
+        assert!(
+            cancel.is_cancelled(),
+            "concurrent inserts exceeding capacity must cancel the scan"
+        );
+        assert!(
+            sink.is_oid_map_saturated(),
+            "concurrent inserts exceeding capacity must set the saturation flag"
+        );
+        let map = sink.drain_commit_oid_map();
+        assert!(
+            map.len() <= max,
+            "map must not exceed MAX_COMMIT_OID_MAP_ENTRIES under contention"
+        );
+    }
+
+    #[test]
     fn findings_capture_sink_commit_oid_map_enforces_capacity_ceiling() {
         // MAX_COMMIT_OID_MAP_ENTRIES is 8 under #[cfg(test)]. Insert exactly 8
         // entries to fill the map, then 2 more after saturation fires.

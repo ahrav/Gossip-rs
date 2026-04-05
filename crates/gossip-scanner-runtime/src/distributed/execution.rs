@@ -896,12 +896,23 @@ where
             // exhaustion from generic scan errors. Lease-uncertain errors keep
             // their original classification because they have different
             // operational semantics (alerting, coordinator response).
+            //
+            // Defense-in-depth: fires only when execute_repo returns Err
+            // for a non-abort reason (e.g., I/O error) concurrent with
+            // OID-map saturation. The primary saturation path goes through
+            // the Ok(Partial) check below because execute_repo converts
+            // abort-signalled errors to Ok(FinalizeOutcome::Partial).
             if capture_sink.is_oid_map_saturated()
                 && !matches!(err, DistributedRuntimeError::LeaseUncertain(_))
             {
+                tracing::warn!(
+                    original_error = %err,
+                    "OID-map saturation supersedes scan error; \
+                     original cause preserved in this log entry"
+                );
                 return Err(oid_map_saturation_error(
                     stage_sink.redacted_shard_id(),
-                    "scan cancelled to prevent consistency violation in findings translation",
+                    "scan error superseded by OID-map saturation",
                 ));
             }
             return Err(err);
@@ -914,7 +925,7 @@ where
     if capture_sink.is_oid_map_saturated() {
         return Err(oid_map_saturation_error(
             stage_sink.redacted_shard_id(),
-            "findings cannot be translated",
+            "scan cancelled cooperatively to prevent consistency violation in findings translation",
         ));
     }
     if !matches!(execution.finalize_outcome, FinalizeOutcome::Complete) {
