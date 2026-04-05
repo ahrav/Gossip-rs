@@ -23,35 +23,47 @@ use crate::scanner_rs::sim_git_scan::fault::GitResourceFaults;
 use crate::scanner_rs::sim_git_scan::{
     FailureKind, FailureReport, GitCorruption, GitFaultPlan, GitIoFault, GitReadFault,
     GitReproArtifact, GitResourceId, GitRunConfig, GitScenario, GitScenarioGenConfig, GitSimRunner,
-    GitTraceDump, RunOutcome, RunReport, generate_scenario,
+    GitTraceDump, GitTraceEvent, RunOutcome, RunReport, generate_scenario,
 };
 
 const DEFAULT_SEED_COUNT: u64 = 25;
 const DEFAULT_FAULT_SEED_COUNT: u64 = 8;
 
 fn seed_value_from_env(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(name) {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|e| panic!("{name}={v:?} is not a valid u64: {e}")),
+        Err(_) => default,
+    }
 }
 
 fn env_u32(name: &str, default: u32) -> u32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(name) {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|e| panic!("{name}={v:?} is not a valid u32: {e}")),
+        Err(_) => default,
+    }
 }
 
 fn env_u32_opt(name: &str) -> Option<u32> {
-    std::env::var(name).ok().and_then(|v| v.parse().ok())
+    match std::env::var(name) {
+        Ok(v) => Some(
+            v.parse()
+                .unwrap_or_else(|e| panic!("{name}={v:?} is not a valid u32: {e}")),
+        ),
+        Err(_) => None,
+    }
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(name) {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|e| panic!("{name}={v:?} is not a valid u64: {e}")),
+        Err(_) => default,
+    }
 }
 
 fn env_bool(name: &str, default: bool) -> bool {
@@ -187,10 +199,11 @@ fn maybe_push_fault_resource(
 
 /// Builds a randomized fault plan from the given scenario's resource set.
 ///
-/// Currently only `Persist` and `SeenPersist` faults are reachable because
-/// `generate_scenario` always produces `artifacts: None`. The
-/// `CommitGraph`/`Midx`/`Pack` branches activate when the generator gains
-/// artifact support. A fallback guarantees at least one `Persist` fault.
+/// Only `Persist` and `SeenPersist` faults are exercised because
+/// `generate_scenario` produces `artifacts: None`. The
+/// `CommitGraph`/`Midx`/`Pack` branches are present but dormant until
+/// scenarios include artifact bundles. A fallback guarantees at least one
+/// `Persist` fault.
 fn random_fault_plan(rng: &mut SimRng, scenario: &GitScenario) -> GitFaultPlan {
     let mut resources = Vec::new();
     maybe_push_fault_resource(&mut resources, rng, GitResourceId::Persist);
@@ -226,10 +239,7 @@ fn random_fault_plan(rng: &mut SimRng, scenario: &GitScenario) -> GitFaultPlan {
 }
 
 fn assert_same_report(left: &RunReport, right: &RunReport, seed: u64) {
-    // Structural guard: any new field added to RunReport is automatically
-    // covered by this comparison, preventing silent omission.
-    assert_eq!(left, right, "seed {seed}: reports diverged");
-    // Per-field assertions provide targeted diagnostics when the guard fails.
+    // Per-field assertions for targeted diagnostics on mismatch.
     assert_eq!(left.steps, right.steps, "seed {seed}: step count diverged");
     assert_eq!(
         left.commit_count, right.commit_count,
@@ -260,12 +270,16 @@ fn assert_same_report(left: &RunReport, right: &RunReport, seed: u64) {
         left.trace_dump, right.trace_dump,
         "seed {seed}: trace dump diverged"
     );
+    // Structural guard: catches any field added to RunReport not yet covered
+    // by the per-field assertions above.
+    assert_eq!(
+        left, right,
+        "seed {seed}: reports diverged (uncovered field)"
+    );
 }
 
 fn assert_reproducible_failure(left: &FailureReport, right: &FailureReport, seed: u64) {
-    // Structural guard: any new field added to FailureReport is automatically
-    // covered by this comparison, preventing silent omission.
-    assert_eq!(left, right, "seed {seed}: failure reports diverged");
+    // Per-field assertions for targeted diagnostics on mismatch.
     assert_eq!(
         left.kind, right.kind,
         "seed {seed}: failure kind diverged: {:?} vs {:?}",
@@ -276,8 +290,13 @@ fn assert_reproducible_failure(left: &FailureReport, right: &FailureReport, seed
         "seed {seed}: failure message diverged"
     );
     assert_eq!(left.step, right.step, "seed {seed}: failure step diverged");
-    // Only left.kind is tested because the assertion above already proved
-    // left.kind == right.kind; checking one suffices.
+    // Structural guard: catches any field added to FailureReport not yet
+    // covered by the per-field assertions above.
+    assert_eq!(
+        left, right,
+        "seed {seed}: failure reports diverged (uncovered field)"
+    );
+    // Fault-injected sweeps must not panic, hang, or lose schedule stability.
     assert!(
         !matches!(
             left.kind,
@@ -295,6 +314,12 @@ fn assert_same_outcome(left: &RunOutcome, right: &RunOutcome, seed: u64) {
             assert!(
                 left.commit_count > 0 || left.candidate_count > 0,
                 "seed {seed}: successful fault-injected run produced no scan work"
+            );
+            assert!(
+                left.trace_dump
+                    .iter()
+                    .any(|e| matches!(e, GitTraceEvent::FaultInjected { .. })),
+                "seed {seed}: fault plan had resources but no FaultInjected events appeared in the trace"
             );
         }
         (RunOutcome::Failed(left), RunOutcome::Failed(right)) => {
