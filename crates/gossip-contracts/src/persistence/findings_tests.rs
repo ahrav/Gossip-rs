@@ -619,3 +619,19 @@ proptest::proptest! {
         proptest::prop_assert!(record.validate_identity().is_ok());
     }
 }
+
+#[test]
+fn finding_record_debug_redacts_secret_hash() {
+    let record = make_finding_record(1);
+    let debug = format!("{record:?}");
+    assert!(
+        debug.contains("[redacted]"),
+        "FindingRecord Debug must redact SecretHash, got: {debug}",
+    );
+    // SecretHash bytes must not appear as hex in the output.
+    let secret_hash_bytes = format!("{:?}", record.secret_hash());
+    assert!(
+        secret_hash_bytes.contains("[redacted]"),
+        "SecretHash Debug itself must be redacted, got: {secret_hash_bytes}",
+    );
+}

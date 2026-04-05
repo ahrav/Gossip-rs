@@ -193,6 +193,8 @@ pub(crate) struct GitFindingForPersistence {
     pub(crate) rule_id: u32,
 }
 
+// Layout budget (64-bit): Box<[u8]>=16, Option<u32>=8, 2×u64=16, NormHash=32,
+// u32+pad=8 → 80 bytes. Ceiling allows minor field reordering by the compiler.
 const _: () = assert!(std::mem::size_of::<GitFindingForPersistence>() <= 88);
 
 impl fmt::Debug for GitFindingForPersistence {

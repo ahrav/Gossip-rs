@@ -2921,36 +2921,19 @@ where
             ),
         )))
     })?;
-    let findings_batch = translation.findings_batch();
-    findings_batch
-        .validate_observation_identity()
-        .map_err(|error| {
-            DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
-                AnyError::new(error).context(format!(
-                    "git repo-frontier shard '{}' produced an invalid findings batch",
-                    input.shard_id,
-                )),
-            ))
-        })?;
-    findings_batch
-        .validate_referential_integrity()
-        .map_err(|error| {
-            DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
-                AnyError::new(error).context(format!(
-                    "git repo-frontier shard '{}' produced a broken findings graph",
-                    input.shard_id,
-                )),
-            ))
-        })?;
-    translation.done_ledger().validate().map_err(|error| {
-        DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(AnyError::new(error).context(
-            format!(
-                "git repo-frontier shard '{}' produced an invalid done-ledger row",
-                input.shard_id,
-            ),
-        )))
-    })?;
+    // translate_git_item_result -> build_translation already validates
+    // observation identity, referential integrity, and done-ledger consistency
+    // before returning. No redundant re-validation needed here.
 
+    // We use direct PageCommit instead of ResultCommitter::commit_translation
+    // because its validate_request enforces that every observation's OVID
+    // matches the done-ledger OVID. Git observations carry per-object OVIDs
+    // (derived from object_path + commit_oid), while the done-ledger is
+    // repo-scoped. This structural divergence causes the OVID uniformity
+    // check to reject valid Git translations as false positives.
+
+    // Git repo-frontier shards produce exactly one commit scope per lease
+    // (single-repo-per-shard invariant), so the sequence number is always 1.
     let scope = CommitScope::from_write_context(
         input.write_context,
         NonZeroU64::MIN,
@@ -2961,7 +2944,7 @@ where
     let page = PageCommit::new(scope);
     let findings_handle = persistence
         .findings_sink
-        .upsert_batch(findings_batch)
+        .upsert_batch(translation.findings_batch())
         .map_err(|error| {
             DistributedRuntimeError::Durability(AnyError::new(error).context(format!(
                 "git repo-frontier shard '{}' findings submission failed",

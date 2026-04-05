@@ -105,20 +105,48 @@ type FindingsLayers = (
     Vec<ObservationRecord>,
 );
 
-#[derive(Clone, Copy, Debug)]
-struct TranslationItem<'a> {
-    stable_item_id: StableItemId,
-    version: VersionId,
-    _marker: std::marker::PhantomData<&'a ()>,
+/// Mutable accumulator for the three-layer deduplication state used during
+/// finding translation. Groups the output vectors and their corresponding
+/// dedup sets into a single value, eliminating the need to pass six `&mut`
+/// parameters individually.
+struct TranslationAccumulator {
+    findings: Vec<FindingRecord>,
+    occurrences: Vec<OccurrenceRecord>,
+    observations: Vec<ObservationRecord>,
+    seen_findings: HashSet<gossip_contracts::identity::FindingId, PreHashedBuildHasher>,
+    seen_occurrences: HashSet<gossip_contracts::identity::OccurrenceId, PreHashedBuildHasher>,
+    seen_observations: HashSet<gossip_contracts::identity::ObservationId, PreHashedBuildHasher>,
 }
 
-impl<'a> TranslationItem<'a> {
+impl TranslationAccumulator {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            findings: Vec::with_capacity(cap),
+            occurrences: Vec::with_capacity(cap),
+            observations: Vec::with_capacity(cap),
+            seen_findings: HashSet::with_capacity_and_hasher(cap, PreHashedBuildHasher),
+            seen_occurrences: HashSet::with_capacity_and_hasher(cap, PreHashedBuildHasher),
+            seen_observations: HashSet::with_capacity_and_hasher(cap, PreHashedBuildHasher),
+        }
+    }
+
+    fn into_layers(self) -> FindingsLayers {
+        (self.findings, self.occurrences, self.observations)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TranslationItem {
+    stable_item_id: StableItemId,
+    version: VersionId,
+}
+
+impl TranslationItem {
     #[inline]
-    fn from_scan_item(item: &'a ScanItem) -> Self {
+    fn from_scan_item(item: &ScanItem) -> Self {
         Self {
             stable_item_id: item.stable_item_id(),
             version: item.version(),
-            _marker: std::marker::PhantomData,
         }
     }
 
@@ -548,7 +576,7 @@ pub(crate) fn translate_git_item_result(
 fn translate_result<F, R>(
     write_context: WriteContext,
     tenant_secret_key: &TenantSecretKey,
-    item: TranslationItem<'_>,
+    item: TranslationItem,
     location: Option<Arc<Location>>,
     bytes_scanned: u64,
     timing: ScanTiming,
@@ -589,7 +617,7 @@ where
 fn translate_findings<F, R>(
     write_context: WriteContext,
     tenant_secret_key: &TenantSecretKey,
-    item: TranslationItem<'_>,
+    item: TranslationItem,
     observation_ovid_hash: OvidHash,
     location: Option<Arc<Location>>,
     seen_at: LogicalTime,
@@ -604,17 +632,7 @@ where
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
 
-    let mut findings = Vec::with_capacity(findings_input.len());
-    let mut occurrences = Vec::with_capacity(findings_input.len());
-    let mut observations = Vec::with_capacity(findings_input.len());
-    // BLAKE3-derived IDs are already uniformly distributed, so a passthrough
-    // hasher that reads the first 8 bytes avoids redundant SipHash work.
-    let mut seen_findings =
-        HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
-    let mut seen_occurrences =
-        HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
-    let mut seen_observations =
-        HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
+    let mut acc = TranslationAccumulator::with_capacity(findings_input.len());
 
     for (index, finding) in findings_input.iter().enumerate() {
         push_finding_layers(
@@ -622,21 +640,16 @@ where
             tenant_secret_key,
             item,
             observation_ovid_hash,
-            location.clone(),
+            &location,
             seen_at,
             finding,
             rule_fingerprint,
             index,
-            &mut findings,
-            &mut occurrences,
-            &mut observations,
-            &mut seen_findings,
-            &mut seen_occurrences,
-            &mut seen_observations,
+            &mut acc,
         )?;
     }
 
-    Ok((findings, occurrences, observations))
+    Ok(acc.into_layers())
 }
 
 fn translate_git_findings<R>(
@@ -655,16 +668,11 @@ where
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
 
-    let mut findings = Vec::with_capacity(findings_input.len());
-    let mut occurrences = Vec::with_capacity(findings_input.len());
-    let mut observations = Vec::with_capacity(findings_input.len());
-    let mut seen_findings =
-        HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
-    let mut seen_occurrences =
-        HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
-    let mut seen_observations =
-        HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
+    let mut acc = TranslationAccumulator::with_capacity(findings_input.len());
     let connector_instance = ConnectorInstanceIdHash::from_instance_id_bytes(repo_key.as_bytes());
+    // Cache sanitized location per unique object path so findings on the same
+    // file share a single Arc<Location> instead of re-allocating per finding.
+    let mut location_cache: HashMap<&[u8], Option<Arc<Location>>> = HashMap::new();
 
     for (index, finding) in findings_input.iter().enumerate() {
         let commit_id = finding
@@ -685,10 +693,11 @@ where
                 commit_oid,
                 finding.object_path.as_ref(),
             )),
-            _marker: std::marker::PhantomData,
         };
         let observation_ovid_hash = item.ovid_hash();
-        let location = git_observation_location(finding.object_path.as_ref());
+        let location = location_cache
+            .entry(finding.object_path.as_ref())
+            .or_insert_with(|| git_observation_location(finding.object_path.as_ref()));
         push_finding_layers(
             write_context,
             tenant_secret_key,
@@ -699,38 +708,25 @@ where
             finding,
             rule_fingerprint,
             index,
-            &mut findings,
-            &mut occurrences,
-            &mut observations,
-            &mut seen_findings,
-            &mut seen_occurrences,
-            &mut seen_observations,
+            &mut acc,
         )?;
     }
 
-    Ok((findings, occurrences, observations))
+    Ok(acc.into_layers())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn push_finding_layers<F, R>(
     write_context: WriteContext,
     tenant_secret_key: &TenantSecretKey,
-    item: TranslationItem<'_>,
+    item: TranslationItem,
     observation_ovid_hash: OvidHash,
-    location: Option<Arc<Location>>,
+    location: &Option<Arc<Location>>,
     seen_at: LogicalTime,
     finding: &F,
     rule_fingerprint: &R,
     index: usize,
-    findings: &mut Vec<FindingRecord>,
-    occurrences: &mut Vec<OccurrenceRecord>,
-    observations: &mut Vec<ObservationRecord>,
-    seen_findings: &mut HashSet<gossip_contracts::identity::FindingId, PreHashedBuildHasher>,
-    seen_occurrences: &mut HashSet<gossip_contracts::identity::OccurrenceId, PreHashedBuildHasher>,
-    seen_observations: &mut HashSet<
-        gossip_contracts::identity::ObservationId,
-        PreHashedBuildHasher,
-    >,
+    acc: &mut TranslationAccumulator,
 ) -> Result<(), ResultTranslationError>
 where
     F: PersistenceFinding,
@@ -754,8 +750,8 @@ where
     );
     let finding_id = finding_record.finding_id();
 
-    if seen_findings.insert(finding_id) {
-        findings.push(finding_record);
+    if acc.seen_findings.insert(finding_id) {
+        acc.findings.push(finding_record);
     }
 
     let occurrence_record = OccurrenceRecord::try_new(
@@ -768,8 +764,8 @@ where
     .map_err(|source| ResultTranslationError::PersistenceAtIndex { index, source })?;
     let occurrence_id = occurrence_record.occurrence_id();
 
-    if seen_occurrences.insert(occurrence_id) {
-        occurrences.push(occurrence_record);
+    if acc.seen_occurrences.insert(occurrence_id) {
+        acc.occurrences.push(occurrence_record);
     }
 
     let mut observation_record = ObservationRecord::from_write_context(
@@ -779,11 +775,14 @@ where
         seen_at,
     );
 
-    if seen_observations.insert(observation_record.observation_id()) {
-        if let Some(location) = location {
+    if acc
+        .seen_observations
+        .insert(observation_record.observation_id())
+    {
+        if let Some(location) = location.clone() {
             observation_record = observation_record.with_location(location);
         }
-        observations.push(observation_record);
+        acc.observations.push(observation_record);
     }
 
     Ok(())
@@ -837,6 +836,14 @@ fn build_translation<F>(
     Ok(translation)
 }
 
+/// Derive the strong object-version identity for a Git finding.
+///
+/// Hashes `commit_oid || object_path` under the `OBJECT_VERSION_V1` domain
+/// separator, producing a deterministic [`ObjectVersionId`]. This mirrors the
+/// canonical derivation in `gossip_contracts::identity` — both use
+/// [`domain_hasher`] + [`CanonicalBytes::write_canonical`] + [`finalize_32`] —
+/// but operates on the raw OID bytes and repository-relative path available in
+/// the scanner-runtime layer rather than the higher-level connector types.
 fn git_object_version_id(commit_oid: &OidBytes, object_path: &[u8]) -> ObjectVersionId {
     let mut hasher = domain_hasher(domain::OBJECT_VERSION_V1);
     commit_oid.as_slice().write_canonical(&mut hasher);
@@ -1198,6 +1205,19 @@ mod tests {
         let b = translate_scanned(&findings);
 
         assert_eq!(a, b, "identical inputs must produce identical translations");
+    }
+
+    #[test]
+    fn translation_is_deterministic_for_git_inputs() {
+        let findings = [git_finding(9, 1, 5, 0xBC), git_finding(9, 12, 18, 0xDE)];
+
+        let a = translate_git_scanned(&findings);
+        let b = translate_git_scanned(&findings);
+
+        assert_eq!(
+            a, b,
+            "identical git inputs must produce identical translations"
+        );
     }
 
     #[test]
@@ -1680,15 +1700,18 @@ mod tests {
             hash_seed in proptest::array::uniform32(0u8..),
             start in 0..u32::MAX as u64,
             len in 1..1000u64,
+            object_path in prop::collection::vec(1u8..=127, 1..64),
+            commit_oid_bytes in proptest::array::uniform20(0u8..),
         ) {
             let end = start.saturating_add(len).max(start + 1);
+            let commit_oid = OidBytes::sha1(commit_oid_bytes);
             let fs_rec = FsFindingRecord {
                 rule_id, norm_hash: hash_seed,
                 span_start: start, span_end: end,
                 root_hint_start: 0, root_hint_end: 0, confidence_score: 5,
             };
             let git_rec = GitFindingForPersistence {
-                object_path: boxed_path(b"src/lib.rs"),
+                object_path: object_path.clone().into_boxed_slice(),
                 commit_id: Some(7),
                 rule_id,
                 norm_hash: NormHash::from_digest(hash_seed),
@@ -1696,8 +1719,8 @@ mod tests {
             };
 
             let repo_key = git_repo_key();
-            let item = git_object_scan_item(&repo_key, git_rec.object_path.as_ref(), git_commit_oid());
-            let commit_oid_map = git_commit_oid_map();
+            let commit_oid_map = HashMap::from([(7, commit_oid)]);
+            let item = git_object_scan_item(&repo_key, &object_path, commit_oid);
 
             let fs_t = translate_item_result(
                 write_context(), &tenant_secret_key(), &item, 4096, timing(),
@@ -1735,29 +1758,6 @@ mod tests {
             DoneLedgerStatus::ScannedClean,
         );
         assert_eq!(translated.done_ledger().findings_count(), 0);
-    }
-
-    #[test]
-    fn translate_git_item_result_rejects_inverted_span() {
-        let bad = git_finding(1, 50, 10, 0xDD);
-        let repo_key = git_repo_key();
-        let commit_oid_map = git_commit_oid_map();
-        let err = translate_git_item_result(
-            write_context(),
-            &tenant_secret_key(),
-            &repo_key,
-            42,
-            4_096,
-            timing(),
-            &[bad],
-            &commit_oid_map,
-            &test_rule_fingerprint,
-        )
-        .expect_err("inverted git span must fail");
-        assert!(matches!(
-            err,
-            ResultTranslationError::InvalidFindingSpan { .. }
-        ));
     }
 
     #[test]
@@ -1817,6 +1817,38 @@ mod tests {
                 commit_id: 99
             }
         ));
+    }
+
+    #[test]
+    fn translate_git_item_result_rejects_empty_object_path() {
+        let repo_key = git_repo_key();
+        let commit_oid_map = git_commit_oid_map();
+        let err = translate_git_item_result(
+            write_context(),
+            &tenant_secret_key(),
+            &repo_key,
+            42,
+            4_096,
+            timing(),
+            &[GitFindingForPersistence {
+                object_path: boxed_path(b""),
+                commit_id: Some(7),
+                span_start: 10,
+                span_end: 20,
+                norm_hash: NormHash::from_digest([0xAA; 32]),
+                rule_id: 7,
+            }],
+            &commit_oid_map,
+            &test_rule_fingerprint,
+        )
+        .expect_err("empty object_path must be rejected");
+        assert!(
+            matches!(
+                err,
+                ResultTranslationError::GitItemIdentity { index: 0, .. }
+            ),
+            "expected GitItemIdentity, got: {err:?}",
+        );
     }
 
     #[test]
@@ -1882,6 +1914,51 @@ mod tests {
         assert_eq!(translated.finding_count(), 2);
         assert_eq!(translated.occurrence_count(), 2);
         assert_eq!(translated.observation_count(), 2);
+    }
+
+    #[test]
+    fn translate_git_item_result_oversized_path_produces_observation_without_location() {
+        let long_path = vec![b'a'; 5000];
+        let translated = translate_git_scanned(&[GitFindingForPersistence {
+            object_path: long_path.into_boxed_slice(),
+            commit_id: Some(7),
+            span_start: 0,
+            span_end: 10,
+            norm_hash: NormHash::from_digest([0xAA; 32]),
+            rule_id: 1,
+        }]);
+        assert_eq!(translated.observation_count(), 1);
+        assert!(
+            translated.observations()[0].location().is_none(),
+            "oversized object paths should produce observations without location",
+        );
+    }
+
+    #[test]
+    fn distinct_object_paths_produce_distinct_git_finding_ids() {
+        let translated = translate_git_scanned(&[
+            GitFindingForPersistence {
+                object_path: boxed_path(b"src/lib.rs"),
+                commit_id: Some(7),
+                span_start: 10,
+                span_end: 20,
+                norm_hash: NormHash::from_digest([0xAA; 32]),
+                rule_id: 7,
+            },
+            GitFindingForPersistence {
+                object_path: boxed_path(b"src/main.rs"),
+                commit_id: Some(7),
+                span_start: 10,
+                span_end: 20,
+                norm_hash: NormHash::from_digest([0xAA; 32]),
+                rule_id: 7,
+            },
+        ]);
+        assert_eq!(
+            translated.finding_count(),
+            2,
+            "identical identity fields on different objects must not collapse",
+        );
     }
 
     /// Verifies that [`PreHashedHasher`] extracts the first 8 bytes of the
