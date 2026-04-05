@@ -67,9 +67,10 @@ use super::{
 ///
 /// # Invariants
 ///
-/// - `span_end() > span_start()`
+/// - `span_end() > span_start()` — zero-length spans (`span_end == span_start`)
+///   are not supported.
 /// - `norm_hash()` returns the canonical redacted [`NormHash`] newtype
-pub trait PersistenceFinding: Send {
+pub trait PersistenceFinding: Send + Sync {
     /// Engine rule identifier that matched.
     fn rule_id(&self) -> u32;
 
@@ -85,10 +86,17 @@ pub trait PersistenceFinding: Send {
     /// Length of the matched byte span.
     #[inline]
     fn span_len(&self) -> u64 {
+        debug_assert!(
+            self.span_end() >= self.span_start(),
+            "span_end ({}) < span_start ({}): broken span invariant",
+            self.span_end(),
+            self.span_start(),
+        );
         self.span_end() - self.span_start()
     }
 }
 
+// Compile-time object-safety assertion; primary dispatch is static (`&[impl PersistenceFinding]`).
 const _: fn(&dyn PersistenceFinding) = |_| {};
 
 /// Stable finding record (layer 1 of 3).

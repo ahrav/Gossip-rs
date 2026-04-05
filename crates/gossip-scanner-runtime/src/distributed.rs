@@ -2769,6 +2769,23 @@ struct GitRepoPersistenceInput<'a> {
     complete_time: LogicalTime,
 }
 
+impl std::fmt::Debug for GitRepoPersistenceInput<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitRepoPersistenceInput")
+            .field("write_context", &self.write_context)
+            .field("shard_id", &self.shard_id)
+            .field("repo_key", &self.repo_key)
+            .field("repo_id", &self.repo_id)
+            .field("bytes_scanned", &self.bytes_scanned)
+            .field("findings_count", &self.findings.len())
+            .field("tenant_secret_key", &"[redacted]")
+            .field("rule_fingerprint", &"<fn>")
+            .field("claim_time", &self.claim_time)
+            .field("complete_time", &self.complete_time)
+            .finish()
+    }
+}
+
 /// Submit the findings and done-ledger records for one completed Git repo scan.
 ///
 /// The git repo-frontier path reuses the same translation and commit ordering
@@ -3037,7 +3054,7 @@ where
     // → findings persistence → watermark commit.
     let captured_findings = capture_sink.take_captured_findings();
     let detected_count = capture_sink.detected_finding_count();
-    debug_assert_eq!(
+    assert_eq!(
         detected_count as usize,
         captured_findings.len(),
         "finding counter must match captured finding payload count",

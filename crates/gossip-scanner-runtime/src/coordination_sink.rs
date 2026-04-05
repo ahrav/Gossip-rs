@@ -14,6 +14,7 @@ use anyhow::Result;
 use gossip_contracts::connector::ItemKey;
 use gossip_contracts::identity::NormHash;
 use gossip_contracts::persistence::{PersistenceFinding, WriteContext};
+use gossip_stdx::HexOid;
 use scanner_git::{GitEvent, GitEventOutput};
 use scanner_scheduler::events::{CoreEvent, EventOutput};
 
@@ -25,7 +26,7 @@ pub enum StoredGitEvent {
     /// Metadata for a single commit (OID, timestamp, identity dictionary IDs).
     CommitMeta {
         commit_id: u32,
-        oid_hex: String,
+        oid_hex: HexOid,
         timestamp: u64,
         author_name_id: Option<u32>,
         author_email_id: Option<u32>,
@@ -176,7 +177,7 @@ impl GitEventOutput for CoordinationEventSink {
         let owned = match event {
             GitEvent::CommitMeta(meta) => StoredGitEvent::CommitMeta {
                 commit_id: meta.commit_id,
-                oid_hex: gossip_stdx::hex_encode(meta.commit_oid.as_slice()),
+                oid_hex: HexOid::from_oid_bytes(meta.commit_oid.as_slice()),
                 timestamp: meta.timestamp,
                 author_name_id: meta
                     .identity
@@ -223,6 +224,11 @@ impl GitEventOutput for CoordinationEventSink {
 pub(crate) struct FindingsCaptureSink {
     inner: Arc<CoordinationEventSink>,
     finding_count: AtomicU64,
+    /// Captured finding data for persistence. Guarded by Mutex because
+    /// pack workers emit findings from multiple threads. Per-finding lock
+    /// acquisition is acceptable: most repos have zero or few findings.
+    /// For high-finding-density repos, consider per-adapter local collection
+    /// merged post-join.
     captured_findings: Mutex<Vec<GitFindingForPersistence>>,
 }
 
@@ -232,7 +238,10 @@ impl FindingsCaptureSink {
         Self {
             inner,
             finding_count: AtomicU64::new(0),
-            captured_findings: Mutex::new(Vec::new()),
+            // Small initial capacity avoids the first three reallocation cycles
+            // (0 -> 1 -> 2 -> 4 -> 8) under the lock. Most repos produce zero
+            // findings, but when findings do occur they tend to cluster.
+            captured_findings: Mutex::new(Vec::with_capacity(8)),
         }
     }
 
@@ -259,15 +268,20 @@ impl EventOutput for FindingsCaptureSink {
     fn emit_core(&self, event: CoreEvent<'_>) {
         if let CoreEvent::Finding(finding) = &event {
             self.finding_count.fetch_add(1, Ordering::Relaxed);
+            // Build the persistence struct outside the lock. `from_digest`
+            // is a byte copy, but keeping construction out of the critical
+            // section means any future work (validation, hashing) added to
+            // the constructor won't widen the lock window.
+            let record = GitFindingForPersistence {
+                span_start: finding.start,
+                span_end: finding.end,
+                norm_hash: NormHash::from_digest(finding.norm_hash),
+                rule_id: finding.rule_id,
+            };
             self.captured_findings
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .push(GitFindingForPersistence {
-                    span_start: finding.start,
-                    span_end: finding.end,
-                    norm_hash: NormHash::from_digest(finding.norm_hash),
-                    rule_id: finding.rule_id,
-                });
+                .push(record);
         }
         // Forward the borrowed event directly to the inner sink, which
         // performs its own `OwnedCoreEvent::from_core` conversion exactly

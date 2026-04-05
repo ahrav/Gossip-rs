@@ -42,11 +42,17 @@ use gossip_contracts::{
     connector::Cursor,
     connector::VersionId,
     connector::git::RepoKey,
-    identity::{LogicalTime, ObjectVersionId, StableItemId},
+    identity::{ObjectVersionId, StableItemId},
     persistence::{
-        CommitScope, DoneLedgerCommitReceipt, DoneLedgerKey, DoneLedgerProvenance,
-        DoneLedgerRecord, DoneLedgerStatus, FindingsCommitReceipt, OvidHashInputs, PageCommit,
-        PageCommitValidationError, PersistenceInputError, WriteContext, derive_ovid_hash,
+        CommitScope, DoneLedgerCommitReceipt, FindingsCommitReceipt, OvidHashInputs, PageCommit,
+        PageCommitValidationError, PersistenceInputError, WriteContext,
+    },
+};
+#[cfg(test)]
+use gossip_contracts::{
+    identity::LogicalTime,
+    persistence::{
+        DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord, DoneLedgerStatus, derive_ovid_hash,
     },
 };
 use scanner_git::{
@@ -357,13 +363,15 @@ where
 /// invisible to `batch_check_seen` and only folded into the committed scope
 /// on a complete finalize.
 ///
-/// # Write-ahead caching
+/// # Take-mutate-restore caching
 ///
-/// The merge is performed on a local clone of the cached bitmap. The cache
-/// is updated only after the backend write succeeds, so a failed
-/// `apply_batch` cannot leave stale (never-durably-staged) OIDs in memory.
-/// This prevents `commit_finalize` from folding phantom OIDs into the
-/// committed scope.
+/// The bitmap is moved out of the cache (`Option::take`), merged in place,
+/// serialized, and restored only after the backend write succeeds. A failed
+/// `apply_batch` leaves the cache empty; the next call reloads from the
+/// backend, which always holds the last successfully written state. This
+/// avoids cloning the full bitmap on every batch (O(total) per call)
+/// while preserving the invariant that `commit_finalize` never folds
+/// phantom OIDs into the committed scope.
 ///
 /// # Amortized cost
 ///
@@ -387,15 +395,15 @@ where
         let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())?;
         let staging_key = self.seen_staging_key();
 
-        // Load or create the staging bitmap on first spill, then cache it
-        // across subsequent calls. This avoids O(total_staged) re-reads per
-        // spill batch, reducing aggregate cost from O(N²/B) to O(N).
-        //
-        // The merge is performed on a local clone so that a failed
-        // apply_batch does not leave stale OIDs in the cache.
+        // Take ownership of the cached staging bitmap instead of cloning.
+        // This turns the per-batch cost from O(total_bitmap) (clone) to
+        // O(delta) (in-place merge). On backend write failure the cache
+        // is empty; the next call reloads from the backend via the
+        // `None` branch, which always holds the last successfully
+        // written state.
         let mut guard = self.staging_seen.borrow_mut();
-        let base = match guard.as_ref() {
-            Some(bitmap) => bitmap.clone(),
+        let mut merged = match guard.take() {
+            Some(bitmap) => bitmap,
             None => match self.backend.get(&staging_key) {
                 Ok(Some(existing)) => RoaringSeenBitmap::deserialize(&existing).map_err(|err| {
                     SpillError::Io(io::Error::other(format!("corrupt staging bitmap: {err}")))
@@ -408,7 +416,6 @@ where
                 }
             },
         };
-        let mut merged = base;
         merged.merge_delta(&delta)?;
         let bytes = merged.serialize()?;
 
@@ -814,7 +821,7 @@ pub(crate) fn git_repo_ovid_inputs(repo_id: u64) -> OvidHashInputs {
 /// was acquired. `complete_time` should be the wall-clock `LogicalTime`
 /// captured after `execute_repo` returns. Together they bracket the scan
 /// duration for provenance ordering.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn build_git_repo_done_ledger_record(
     write_context: WriteContext,
     repo_id: u64,

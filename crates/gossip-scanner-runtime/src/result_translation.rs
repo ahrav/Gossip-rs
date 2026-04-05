@@ -20,7 +20,11 @@
 //! implementors. Root-hint fields remain scanner-local metadata and never
 //! participate in persistence identity derivation.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    hash::{BuildHasher, Hasher},
+    sync::Arc,
+};
 
 use gossip_contracts::{
     connector::{Location, ScanItem, VersionId},
@@ -37,8 +41,58 @@ use gossip_contracts::{
 };
 use scanner_scheduler::store::FsFindingRecord;
 
-use crate::coordination_sink::GitFindingForPersistence;
 use crate::git_persistence::git_repo_ovid_inputs;
+
+// ---------------------------------------------------------------------------
+// Passthrough hasher for BLAKE3-derived 32-byte identity types.
+//
+// FindingId, OccurrenceId, and ObservationId are BLAKE3 digests — already
+// uniformly distributed. Re-hashing through SipHash wastes ~20ns per
+// insert/lookup. This hasher reads the first 8 bytes of the derived
+// `Hash` output as a u64 and returns that directly.
+// ---------------------------------------------------------------------------
+
+/// Hasher that captures the first 8 bytes written and returns them as a u64.
+///
+/// Correct only for types whose `Hash` impl writes at least 8 bytes of
+/// uniformly distributed data as the first operation (true for all
+/// `define_id_32!` types, which derive `Hash` on a `[u8; 32]` inner field).
+struct PreHashedHasher(u64);
+
+impl Hasher for PreHashedHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // The derived Hash for [u8; 32] writes a length prefix (usize) then
+        // the 32 bytes. We want the first 8 bytes of the *payload*, so we
+        // only capture the final write that carries the actual digest bytes.
+        // For a [u8; 32] the derived Hash writes: write_usize(32) then
+        // write(&self.0). We always overwrite, so the last write wins — and
+        // for these types the last write is the 32-byte payload.
+        if bytes.len() >= 8 {
+            // SAFETY: bytes.len() >= 8 checked above.
+            self.0 = u64::from_ne_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]);
+        }
+    }
+}
+
+/// `BuildHasher` producing [`PreHashedHasher`] instances.
+struct PreHashedBuildHasher;
+
+impl BuildHasher for PreHashedBuildHasher {
+    type Hasher = PreHashedHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> PreHashedHasher {
+        PreHashedHasher(0)
+    }
+}
 
 type FindingsLayers = (
     Vec<FindingRecord>,
@@ -78,9 +132,9 @@ impl<'a> TranslationItem<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct FsFindingForPersistence<'a>(&'a FsFindingRecord);
+struct FsFindingRef<'a>(&'a FsFindingRecord);
 
-impl PersistenceFinding for FsFindingForPersistence<'_> {
+impl PersistenceFinding for FsFindingRef<'_> {
     #[inline]
     fn rule_id(&self) -> u32 {
         self.0.rule_id
@@ -99,6 +153,29 @@ impl PersistenceFinding for FsFindingForPersistence<'_> {
     #[inline]
     fn span_end(&self) -> u64 {
         self.0.span_end
+    }
+}
+
+/// Uninhabited finding type for non-Scanned translation paths where no
+/// findings exist. Satisfies the generic bound on `translate_result`
+/// without coupling to any concrete finding type.
+enum NeverFinding {}
+
+impl PersistenceFinding for NeverFinding {
+    fn rule_id(&self) -> u32 {
+        match *self {}
+    }
+
+    fn norm_hash(&self) -> NormHash {
+        match *self {}
+    }
+
+    fn span_start(&self) -> u64 {
+        match *self {}
+    }
+
+    fn span_end(&self) -> u64 {
+        match *self {}
     }
 }
 
@@ -353,7 +430,8 @@ pub fn translate_item_result(
     let item = TranslationItem::from_scan_item(item);
     match result {
         ItemResult::Scanned { findings } => {
-            let findings: Vec<_> = findings.iter().map(FsFindingForPersistence).collect();
+            // Per-item allocation; bounded by finding count (typically < 100).
+            let findings: Vec<_> = findings.iter().map(FsFindingRef).collect();
             translate_result(
                 write_context,
                 tenant_secret_key,
@@ -366,7 +444,7 @@ pub fn translate_item_result(
                 rule_fingerprint,
             )
         }
-        ItemResult::FailedRetryable { error_code } => translate_result::<GitFindingForPersistence>(
+        ItemResult::FailedRetryable { error_code } => translate_result::<NeverFinding, _>(
             write_context,
             tenant_secret_key,
             item,
@@ -375,7 +453,7 @@ pub fn translate_item_result(
             ItemResult::FailedRetryable { error_code },
             rule_fingerprint,
         ),
-        ItemResult::FailedPermanent { error_code } => translate_result::<GitFindingForPersistence>(
+        ItemResult::FailedPermanent { error_code } => translate_result::<NeverFinding, _>(
             write_context,
             tenant_secret_key,
             item,
@@ -384,7 +462,7 @@ pub fn translate_item_result(
             ItemResult::FailedPermanent { error_code },
             rule_fingerprint,
         ),
-        ItemResult::Skipped { error_code } => translate_result::<GitFindingForPersistence>(
+        ItemResult::Skipped { error_code } => translate_result::<NeverFinding, _>(
             write_context,
             tenant_secret_key,
             item,
@@ -397,6 +475,11 @@ pub fn translate_item_result(
 }
 
 /// Translate one completed Git repo scan into deterministic persistence rows.
+///
+/// Always produces a `Scanned` result because the Git path rejects errors
+/// before reaching translation — failed or skipped repos never call this
+/// function. The FS path handles all four `ItemResult` variants via
+/// `translate_item_result`.
 ///
 /// Git repo-frontier scans treat the repository itself as the logical item and
 /// therefore use a fixed synthetic version identity derived from `repo_id`.
@@ -428,17 +511,18 @@ where
     )
 }
 
-fn translate_result<F>(
+fn translate_result<F, R>(
     write_context: WriteContext,
     tenant_secret_key: &TenantSecretKey,
     item: TranslationItem<'_>,
     bytes_scanned: u64,
     timing: ScanTiming,
     result: ItemResult<'_, F>,
-    rule_fingerprint: &dyn Fn(u32) -> RuleFingerprint,
+    rule_fingerprint: &R,
 ) -> Result<PersistenceTranslation, ResultTranslationError>
 where
     F: PersistenceFinding,
+    R: Fn(u32) -> RuleFingerprint + ?Sized,
 {
     let ovid_hash = item.ovid_hash();
     let done_ledger_key = DoneLedgerKey::new(
@@ -497,15 +581,19 @@ where
     Ok(translation)
 }
 
-fn translate_findings(
+fn translate_findings<F, R>(
     write_context: WriteContext,
     tenant_secret_key: &TenantSecretKey,
     item: TranslationItem<'_>,
     ovid_hash: OvidHash,
     seen_at: LogicalTime,
-    findings_input: &[impl PersistenceFinding],
-    rule_fingerprint: &dyn Fn(u32) -> RuleFingerprint,
-) -> Result<FindingsLayers, ResultTranslationError> {
+    findings_input: &[F],
+    rule_fingerprint: &R,
+) -> Result<FindingsLayers, ResultTranslationError>
+where
+    F: PersistenceFinding,
+    R: Fn(u32) -> RuleFingerprint + ?Sized,
+{
     if findings_input.is_empty() {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
@@ -513,9 +601,14 @@ fn translate_findings(
     let mut findings = Vec::with_capacity(findings_input.len());
     let mut occurrences = Vec::with_capacity(findings_input.len());
     let mut observations = Vec::with_capacity(findings_input.len());
-    let mut seen_findings = HashSet::with_capacity(findings_input.len());
-    let mut seen_occurrences = HashSet::with_capacity(findings_input.len());
-    let mut seen_observations = HashSet::with_capacity(findings_input.len());
+    // BLAKE3-derived IDs are already uniformly distributed, so a passthrough
+    // hasher that reads the first 8 bytes avoids redundant SipHash work.
+    let mut seen_findings =
+        HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
+    let mut seen_occurrences =
+        HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
+    let mut seen_observations =
+        HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
     // Wrap in Arc once so repeated observations share the same allocation
     // instead of cloning the underlying String fields per iteration.
     let location: Option<Arc<_>> = item.location.map(|l| Arc::new(l.clone()));
@@ -532,6 +625,7 @@ fn translate_findings(
             });
         }
 
+        // --- Phase 1: derive finding identity (needed for dedup check) ---
         let norm_hash = finding.norm_hash();
         let secret_hash = key_secret_hash(tenant_secret_key, &norm_hash);
         let finding_record = FindingRecord::new(
@@ -540,27 +634,31 @@ fn translate_findings(
             rule_fingerprint(finding.rule_id()),
             secret_hash,
         );
+        let finding_id = finding_record.finding_id();
+
+        if seen_findings.insert(finding_id) {
+            findings.push(finding_record);
+        }
+
+        // --- Phase 2: derive occurrence identity only after finding dedup ---
         let occurrence_record = OccurrenceRecord::try_new(
             write_context.tenant_id(),
-            finding_record.finding_id(),
+            finding_id,
             item.object_version_id(),
             finding.span_start(),
             finding.span_len(),
         )
         .map_err(|e| ResultTranslationError::PersistenceAtIndex { index, source: e })?;
-        let mut observation_record = ObservationRecord::from_write_context(
-            write_context,
-            occurrence_record.occurrence_id(),
-            ovid_hash,
-            seen_at,
-        );
+        let occurrence_id = occurrence_record.occurrence_id();
 
-        if seen_findings.insert(finding_record.finding_id()) {
-            findings.push(finding_record);
-        }
-        if seen_occurrences.insert(occurrence_record.occurrence_id()) {
+        if seen_occurrences.insert(occurrence_id) {
             occurrences.push(occurrence_record);
         }
+
+        // --- Phase 3: derive observation identity only after occurrence dedup ---
+        let mut observation_record =
+            ObservationRecord::from_write_context(write_context, occurrence_id, ovid_hash, seen_at);
+
         if seen_observations.insert(observation_record.observation_id()) {
             if let Some(location) = location.clone() {
                 observation_record = observation_record.with_location(location);

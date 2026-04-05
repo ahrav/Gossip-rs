@@ -69,6 +69,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+use std::fmt;
+
 /// Provides a lock-free atomic bitset with test-and-set for concurrent dedup.
 pub mod atomic_bitset;
 /// Provides composite concurrent dedup tracker for git object traversal.
@@ -154,4 +156,119 @@ pub fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+/// Lookup table shared by hex encoding functions.
+const HEX_LUT: &[u8; 16] = b"0123456789abcdef";
+
+/// Encode a byte slice as lowercase hex into a caller-provided buffer.
+///
+/// Returns the number of bytes written (`bytes.len() * 2`). The caller must
+/// ensure `buf` has at least `bytes.len() * 2` bytes available starting at
+/// `offset`. Panics otherwise.
+#[inline]
+pub fn hex_encode_into(bytes: &[u8], buf: &mut [u8], offset: usize) -> usize {
+    let hex_len = bytes.len() * 2;
+    assert!(
+        buf.len() >= offset + hex_len,
+        "hex_encode_into: buffer too small ({} < {})",
+        buf.len(),
+        offset + hex_len,
+    );
+    let dest = &mut buf[offset..offset + hex_len];
+    for (i, &byte) in bytes.iter().enumerate() {
+        dest[i * 2] = HEX_LUT[(byte >> 4) as usize];
+        dest[i * 2 + 1] = HEX_LUT[(byte & 0x0f) as usize];
+    }
+    hex_len
+}
+
+/// Stack-allocated lowercase hex representation of a Git object ID.
+///
+/// Git OIDs are 20 bytes (SHA-1) or 32 bytes (SHA-256), producing hex
+/// strings of 40 or 64 characters respectively. `HexOid` stores the hex
+/// in a fixed `[u8; 64]` buffer with a length discriminant, avoiding heap
+/// allocation entirely.
+///
+/// Implements `Display`, `Debug`, `AsRef<str>`, and `Deref<Target = str>`
+/// so it can be used anywhere a `&str` is expected.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HexOid {
+    buf: [u8; Self::MAX_HEX_LEN],
+    len: u8,
+}
+
+impl HexOid {
+    /// Maximum hex output length: SHA-256 OID = 32 bytes = 64 hex chars.
+    pub const MAX_HEX_LEN: usize = 64;
+
+    /// Encode raw OID bytes into a stack-resident hex string.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `oid_bytes.len() > 32` (i.e. hex output would exceed 64).
+    #[must_use]
+    pub fn from_oid_bytes(oid_bytes: &[u8]) -> Self {
+        let hex_len = oid_bytes.len() * 2;
+        assert!(
+            hex_len <= Self::MAX_HEX_LEN,
+            "OID too large for HexOid: {} bytes",
+            oid_bytes.len(),
+        );
+        let mut buf = [0u8; Self::MAX_HEX_LEN];
+        hex_encode_into(oid_bytes, &mut buf, 0);
+        Self {
+            buf,
+            len: hex_len as u8,
+        }
+    }
+
+    /// View the hex content as a `&str`.
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // SAFETY: hex_encode_into only writes ASCII hex digits (0-9, a-f),
+        // which are valid UTF-8.
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len as usize]) }
+    }
+}
+
+impl std::ops::Deref for HexOid {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for HexOid {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for HexOid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Debug for HexOid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HexOid(\"{}\")", self.as_str())
+    }
+}
+
+impl PartialEq<str> for HexOid {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for HexOid {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
 }

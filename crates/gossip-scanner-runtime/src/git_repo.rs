@@ -84,6 +84,18 @@ pub(crate) struct GitRepoExecutionOutcome<B> {
     pub(crate) finalize_outcome: FinalizeOutcome,
 }
 
+impl<B: std::fmt::Debug> std::fmt::Debug for GitRepoExecutionOutcome<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitRepoExecutionOutcome")
+            .field("report", &self.report)
+            .field("persistence", &self.persistence)
+            .field("write_context", &self.write_context)
+            .field("rule_fingerprint", &"<fn>")
+            .field("finalize_outcome", &self.finalize_outcome)
+            .finish()
+    }
+}
+
 impl GitRepoRuntime {
     /// Execute one Git discovery step for the current shard suffix.
     ///
