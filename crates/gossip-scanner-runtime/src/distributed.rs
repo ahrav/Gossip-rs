@@ -6718,6 +6718,56 @@ mod tests {
         );
     }
 
+    /// A findings-sink submission failure during git repo persistence must
+    /// surface as `DistributedRuntimeError::Durability` and must not advance
+    /// the shard cursor. Because findings are submitted before the done-ledger,
+    /// the done-ledger must remain empty.
+    #[test]
+    fn git_repo_worker_propagates_findings_sink_failure() {
+        let repo = create_git_repo_fixture_with_secrets();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        findings_sink
+            .fail_next_submissions(1)
+            .expect("inject findings-sink submission failure");
+
+        let err = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend,
+            DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("findings-sink failure should propagate as an error");
+
+        assert!(
+            matches!(err, DistributedRuntimeError::Durability(_)),
+            "expected Durability variant, got: {err:?}"
+        );
+
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_ne!(
+            summaries[0].status(),
+            ShardStatus::Done,
+            "shard must not advance when findings-sink submission fails"
+        );
+        assert!(
+            done_ledger
+                .snapshot()
+                .expect("done-ledger snapshot")
+                .is_empty(),
+            "done-ledger must remain empty when findings fail before submission"
+        );
+    }
+
     /// A Git scan with findings must route those findings through the shared
     /// persistence translation path and advance the shard only after both
     /// findings and done-ledger writes are durable.

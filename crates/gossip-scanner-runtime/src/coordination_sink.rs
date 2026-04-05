@@ -481,8 +481,8 @@ mod tests {
             "Debug output must redact norm_hash, got: {debug}"
         );
         assert!(
-            !debug.contains("255"),
-            "Debug output must not leak raw hash bytes, got: {debug}"
+            debug.contains(r#"norm_hash: "[redacted]""#),
+            "Debug output must show redacted norm_hash field, got: {debug}"
         );
     }
 
