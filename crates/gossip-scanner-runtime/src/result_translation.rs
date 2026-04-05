@@ -1488,4 +1488,37 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn translate_git_item_result_empty_findings_produces_scanned_clean() {
+        let translated = translate_git_scanned(&[]);
+
+        assert!(translated.findings().is_empty());
+        assert!(translated.occurrences().is_empty());
+        assert!(translated.observations().is_empty());
+        assert_eq!(
+            translated.done_ledger().status(),
+            DoneLedgerStatus::ScannedClean,
+        );
+        assert_eq!(translated.done_ledger().findings_count(), 0);
+    }
+
+    #[test]
+    fn translate_git_item_result_rejects_inverted_span() {
+        let bad = git_finding(1, 50, 10, 0xDD);
+        let err = translate_git_item_result(
+            write_context(),
+            &tenant_secret_key(),
+            42,
+            4_096,
+            timing(),
+            &[bad],
+            &test_rule_fingerprint,
+        )
+        .expect_err("inverted git span must fail");
+        assert!(matches!(
+            err,
+            ResultTranslationError::InvalidFindingSpan { .. }
+        ));
+    }
 }

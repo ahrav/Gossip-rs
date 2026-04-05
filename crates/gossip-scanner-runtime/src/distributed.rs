@@ -9137,4 +9137,31 @@ mod tests {
             1,
         );
     }
+
+    #[test]
+    fn submit_git_repo_persistence_rejects_reversed_timestamps() {
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence = DistributedPersistence::new(findings_sink, done_ledger);
+        let tmp = tempdir().expect("temp dir for repo key");
+        let repo_key = git_repo_key(tmp.path());
+        let input = GitRepoPersistenceInput {
+            write_context: write_context(),
+            shard_id: "test-shard",
+            repo_key: &repo_key,
+            repo_id: 42,
+            bytes_scanned: 1024,
+            findings: &[],
+            tenant_secret_key: tenant_secret_key(),
+            rule_fingerprint: &test_rule_fingerprint,
+            claim_time: LogicalTime::from_raw(200),
+            complete_time: LogicalTime::from_raw(100),
+        };
+        let err = submit_git_repo_persistence(&persistence, &input)
+            .expect_err("reversed timestamps must be rejected");
+        assert!(
+            matches!(err, DistributedRuntimeError::Runtime(_)),
+            "expected Runtime variant for timing rejection, got: {err:?}"
+        );
+    }
 }
