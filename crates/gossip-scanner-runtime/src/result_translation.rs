@@ -30,14 +30,14 @@ use std::{
 use gossip_contracts::{
     connector::{Location, ScanItem, VersionId},
     identity::{
-        key_secret_hash, LogicalTime, NormHash, ObjectVersionId, RuleFingerprint, StableItemId,
-        TenantSecretKey,
+        LogicalTime, NormHash, ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey,
+        key_secret_hash,
     },
     persistence::{
-        derive_ovid_hash, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,
-        DoneLedgerRecord, DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord,
-        OccurrenceRecord, OvidHash, OvidHashInputs, PersistenceFinding, PersistenceInputError,
-        WriteContext,
+        DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
+        DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
+        OvidHash, OvidHashInputs, PersistenceFinding, PersistenceInputError, WriteContext,
+        derive_ovid_hash,
     },
 };
 use scanner_scheduler::store::FsFindingRecord;
@@ -688,8 +688,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        translate_git_item_result, translate_item_result, FsFindingRef, ItemResult,
-        PersistenceTranslation, ResultTranslationError, ScanTiming,
+        FsFindingRef, ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
+        translate_git_item_result, translate_item_result,
     };
     use crate::coordination_sink::GitFindingForPersistence;
     use crate::git_persistence::git_repo_ovid_inputs;
