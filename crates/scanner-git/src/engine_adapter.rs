@@ -171,8 +171,14 @@ impl fmt::Debug for FindingKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScoredFinding {
     pub key: FindingKey,
+    /// Exact match start offset within the scanned buffer.
+    pub match_start: u32,
+    /// Exact match end offset within the scanned buffer.
+    pub match_end: u32,
     pub confidence_score: i8,
 }
+
+const _: () = assert!(std::mem::size_of::<ScoredFinding>() <= 64);
 
 impl Ord for ScoredFinding {
     /// Primary: identity key ascending. Secondary: confidence descending.
@@ -567,6 +573,8 @@ impl<'a> EngineAdapter<'a> {
                 object_path: path,
                 start: u64::from(f.key.start),
                 end: u64::from(f.key.end),
+                match_start: u64::from(f.match_start),
+                match_end: u64::from(f.match_end),
                 rule_id: f.key.rule_id,
                 rule_name: self.engine.rule_name(f.key.rule_id),
                 norm_hash: f.key.norm_hash,
@@ -1007,6 +1015,8 @@ fn scan_chunk(
                 rule_id: rec.rule_id,
                 norm_hash: *hash,
             },
+            match_start: rec.span_start,
+            match_end: rec.span_end,
             confidence_score: rec.confidence_score,
         });
     }

@@ -33,20 +33,27 @@ pub struct FindingEvent<'a> {
     /// Byte offset marking the start of the finding region (inclusive).
     ///
     /// Both scan paths populate this from root-hint offsets (`root_hint_start`),
-    /// which delimit the broader context region containing the match. The FS
-    /// path reads `root_hint_start` directly from the engine finding record;
-    /// the Git path reads it via `FindingKey.start`, which is itself derived
-    /// from `root_hint_start` at scan time.
-    ///
-    /// Persistence identity derivation uses the finding record's `span_start`
-    /// and `span_end` fields (the exact match location) rather than these
-    /// root-hint event fields.
+    /// which delimit the broader context region containing the match in root
+    /// file coordinates. These fields are useful for user-facing event output
+    /// and debugging, but they do not participate in persistence identity.
     pub start: u64,
     /// Byte offset marking the end of the finding region (exclusive).
     ///
     /// Same source semantics as [`start`](Self::start): populated from
     /// `root_hint_end` in both scan paths. Not used for persistence identity.
     pub end: u64,
+    /// Exact match start offset (inclusive).
+    ///
+    /// The FS path populates this from `span_start`, and the Git path
+    /// populates it from the exact match span captured alongside the finding
+    /// key during adapter deduplication. Persistence identity derivation uses
+    /// this field together with [`match_end`](Self::match_end).
+    pub match_start: u64,
+    /// Exact match end offset (exclusive).
+    ///
+    /// Same source semantics as [`match_start`](Self::match_start): populated
+    /// from the engine's exact match span, not the root-hint context window.
+    pub match_end: u64,
     /// Numeric identifier of the matching detection rule.
     pub rule_id: u32,
     /// Human-readable rule name resolved from `rule_id`.
@@ -81,6 +88,8 @@ impl fmt::Debug for FindingEvent<'_> {
             .field("object_path", &self.object_path)
             .field("start", &self.start)
             .field("end", &self.end)
+            .field("match_start", &self.match_start)
+            .field("match_end", &self.match_end)
             .field("rule_id", &self.rule_id)
             .field("rule_name", &self.rule_name)
             // Secret-derived digests are redacted to keep debug output safe.
@@ -397,6 +406,8 @@ mod tests {
             object_path: b"dir/file.txt",
             start: 10,
             end: 20,
+            match_start: 12,
+            match_end: 18,
             rule_id: 7,
             rule_name: "rule",
             norm_hash: [0xAB; 32],
@@ -419,6 +430,8 @@ mod tests {
             object_path: b"dir/file.txt",
             start: 10,
             end: 20,
+            match_start: 12,
+            match_end: 18,
             rule_id: 7,
             rule_name: "rule",
             norm_hash: [0xDE; 32],

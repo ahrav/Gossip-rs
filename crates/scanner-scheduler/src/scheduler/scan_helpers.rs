@@ -142,6 +142,8 @@ pub(super) fn emit_findings<E: ScanEngine, F: FindingWithHashRecord>(
                 object_path: path,
                 start: rec.root_hint_start(),
                 end: rec.root_hint_end(),
+                match_start: rec.span_start(),
+                match_end: rec.span_end(),
                 rule_id: rec.rule_id(),
                 rule_name: engine.rule_name(rec.rule_id()),
                 norm_hash: *rec.norm_hash(),

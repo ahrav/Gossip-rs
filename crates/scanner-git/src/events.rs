@@ -305,6 +305,8 @@ mod tests {
             object_path: b"secret.txt",
             start: 10,
             end: 20,
+            match_start: 12,
+            match_end: 18,
             rule_id: 7,
             rule_name: "rule",
             norm_hash: [0xAB; 32],

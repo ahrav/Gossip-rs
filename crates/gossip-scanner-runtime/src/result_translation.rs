@@ -762,6 +762,25 @@ mod tests {
         }
     }
 
+    fn fs_finding_with_root_hint(
+        rule_id: u32,
+        root_hint_start: u64,
+        root_hint_end: u64,
+        span_start: u64,
+        span_end: u64,
+        hash_seed: u8,
+    ) -> FsFindingRecord {
+        FsFindingRecord {
+            rule_id,
+            root_hint_start,
+            root_hint_end,
+            span_start,
+            span_end,
+            norm_hash: [hash_seed; 32],
+            confidence_score: 7,
+        }
+    }
+
     fn translate_git_scanned(findings: &[GitFindingForPersistence]) -> PersistenceTranslation {
         translate_git_item_result(
             write_context(),
@@ -937,6 +956,39 @@ mod tests {
             fs_translation.occurrences()[0].occurrence_id(),
             git_translation.occurrences()[0].occurrence_id(),
             "matching span identity must derive the same OccurrenceId",
+        );
+        assert_eq!(
+            fs_translation.observations()[0].observation_id(),
+            git_translation.observations()[0].observation_id(),
+            "matching persistence identity must derive the same ObservationId",
+        );
+    }
+
+    #[test]
+    fn divergent_root_hint_and_exact_match_spans_still_converge_across_source_types() {
+        let fs = fs_finding_with_root_hint(7, 100, 124, 10, 22, 0xAB);
+        let git = git_finding(7, 10, 22, 0xAB);
+        let fs_translation = translate_item_result(
+            write_context(),
+            &tenant_secret_key(),
+            &git_identity_scan_item(42),
+            4_096,
+            timing(),
+            ItemResult::Scanned { findings: &[fs] },
+            &test_rule_fingerprint,
+        )
+        .expect("filesystem translation should succeed");
+        let git_translation = translate_git_scanned(&[git]);
+
+        assert_eq!(
+            fs_translation.findings()[0].finding_id(),
+            git_translation.findings()[0].finding_id(),
+            "matching rule/hash identity must derive the same FindingId",
+        );
+        assert_eq!(
+            fs_translation.occurrences()[0].occurrence_id(),
+            git_translation.occurrences()[0].occurrence_id(),
+            "Git occurrence identity must use exact match spans, not root hints",
         );
         assert_eq!(
             fs_translation.observations()[0].observation_id(),
@@ -1443,14 +1495,29 @@ mod tests {
         fn proptest_translate_findings_identity_equivalence(
             rule_id in 1..100u32,
             hash_seed in proptest::array::uniform32(0u8..),
-            start in 0..u32::MAX as u64,
+            start in 0..1_000_000u64,
             len in 1..1000u64,
+            root_hint_prefix in 1..1000u64,
+            root_hint_suffix in 0..1000u64,
         ) {
             let end = start.saturating_add(len).max(start + 1);
+            let root_hint_start = start.saturating_add(root_hint_prefix);
+            let root_hint_end = root_hint_start
+                .saturating_add(len)
+                .saturating_add(root_hint_suffix)
+                .max(root_hint_start.saturating_add(1));
+            let fs_rec = fs_finding_with_root_hint(
+                rule_id,
+                root_hint_start,
+                root_hint_end,
+                start,
+                end,
+                hash_seed[0],
+            );
             let fs_rec = FsFindingRecord {
-                rule_id, norm_hash: hash_seed,
-                span_start: start, span_end: end,
-                root_hint_start: 0, root_hint_end: 0, confidence_score: 5,
+                norm_hash: hash_seed,
+                confidence_score: 5,
+                ..fs_rec
             };
             let git_rec = GitFindingForPersistence {
                 rule_id,

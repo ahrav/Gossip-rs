@@ -645,6 +645,8 @@ mod tests {
                 rule_id,
                 norm_hash: [0xAA; 32],
             },
+            match_start: start,
+            match_end: end,
             confidence_score: 0,
         }
     }
@@ -657,6 +659,8 @@ mod tests {
                 rule_id,
                 norm_hash: [hash_byte; 32],
             },
+            match_start: start,
+            match_end: end,
             confidence_score: 0,
         }
     }

@@ -169,27 +169,37 @@ fn test_adapter_with_sink<'a>(engine: &'a Engine, sink: Arc<VecEventSink>) -> En
 
 #[derive(Default)]
 struct CapturingFindingSink {
-    finding_norm_hashes: Mutex<Vec<[u8; 32]>>,
+    findings: Mutex<Vec<CapturedFindingEvent>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CapturedFindingEvent {
+    start: u64,
+    end: u64,
+    match_start: u64,
+    match_end: u64,
+    norm_hash: [u8; 32],
 }
 
 impl CapturingFindingSink {
-    fn take_finding_norm_hashes(&self) -> Vec<[u8; 32]> {
-        std::mem::take(
-            &mut *self
-                .finding_norm_hashes
-                .lock()
-                .expect("capturing sink mutex poisoned"),
-        )
+    fn take_findings(&self) -> Vec<CapturedFindingEvent> {
+        std::mem::take(&mut *self.findings.lock().expect("capturing sink mutex poisoned"))
     }
 }
 
 impl EventSink for CapturingFindingSink {
     fn emit(&self, event: ScanEvent<'_>) {
         if let ScanEvent::Finding(finding) = event {
-            self.finding_norm_hashes
+            self.findings
                 .lock()
                 .expect("capturing sink mutex poisoned")
-                .push(finding.norm_hash);
+                .push(CapturedFindingEvent {
+                    start: finding.start,
+                    end: finding.end,
+                    match_start: finding.match_start,
+                    match_end: finding.match_end,
+                    norm_hash: finding.norm_hash,
+                });
         }
     }
 
@@ -459,12 +469,51 @@ fn git_finding_events_propagate_norm_hash() {
         .emit_loose(&candidate, b"secret.txt", blob)
         .expect("scan");
 
-    let captured = sink.take_finding_norm_hashes();
+    let captured = sink.take_findings();
     assert_eq!(captured.len(), 1, "expected exactly one captured finding");
     assert_eq!(
-        captured[0],
+        captured[0].norm_hash,
         adapter.findings_arena()[0].key.norm_hash,
         "git finding events must forward the finding norm_hash"
+    );
+}
+
+#[test]
+fn git_finding_events_preserve_exact_match_spans_when_root_hints_diverge() {
+    let engine = test_engine_with_tok_rule();
+    let sink = Arc::new(CapturingFindingSink::default());
+    let mut adapter = test_adapter_with_capturing_sink(&engine, Arc::clone(&sink));
+
+    let candidate = make_candidate_with_ctx(1, ChangeKind::Add);
+    let blob = b"prefix VE9LX0FCQ0RFRkdI suffix";
+    adapter
+        .emit_loose(&candidate, b"secret.txt", blob)
+        .expect("scan transformed finding");
+
+    let captured = sink.take_findings();
+    assert_eq!(captured.len(), 1, "expected exactly one captured finding");
+
+    let finding = captured[0];
+    assert_ne!(
+        (finding.start, finding.end),
+        (finding.match_start, finding.match_end),
+        "transform-derived finding should preserve a distinct exact match span",
+    );
+    assert_eq!(
+        (finding.start as u32, finding.end as u32),
+        (
+            adapter.findings_arena()[0].key.start,
+            adapter.findings_arena()[0].key.end,
+        ),
+        "event root hints must still match the dedupe key",
+    );
+    assert_eq!(
+        (finding.match_start as u32, finding.match_end as u32),
+        (
+            adapter.findings_arena()[0].match_start,
+            adapter.findings_arena()[0].match_end,
+        ),
+        "event exact spans must match the adapter's stored match coordinates",
     );
 }
 
@@ -478,6 +527,8 @@ fn sort_and_dedupe_findings_prefers_higher_confidence() {
                 rule_id: 7,
                 norm_hash: [0x11; 32],
             },
+            match_start: 10,
+            match_end: 20,
             confidence_score: 1,
         },
         ScoredFinding {
@@ -487,6 +538,8 @@ fn sort_and_dedupe_findings_prefers_higher_confidence() {
                 rule_id: 7,
                 norm_hash: [0x11; 32],
             },
+            match_start: 10,
+            match_end: 20,
             confidence_score: 5,
         },
         ScoredFinding {
@@ -496,6 +549,8 @@ fn sort_and_dedupe_findings_prefers_higher_confidence() {
                 rule_id: 7,
                 norm_hash: [0x22; 32],
             },
+            match_start: 30,
+            match_end: 40,
             confidence_score: 0,
         },
     ];
@@ -523,6 +578,8 @@ fn sort_and_dedupe_findings_prefers_higher_confidence_reverse_input() {
                 rule_id: 7,
                 norm_hash: [0x11; 32],
             },
+            match_start: 10,
+            match_end: 20,
             confidence_score: 5,
         },
         ScoredFinding {
@@ -532,6 +589,8 @@ fn sort_and_dedupe_findings_prefers_higher_confidence_reverse_input() {
                 rule_id: 7,
                 norm_hash: [0x11; 32],
             },
+            match_start: 10,
+            match_end: 20,
             confidence_score: 1,
         },
     ];
@@ -628,6 +687,8 @@ fn sort_and_dedupe_single_element() {
             rule_id: 1,
             norm_hash: [0xaa; 32],
         },
+        match_start: 5,
+        match_end: 15,
         confidence_score: 3,
     };
     let mut findings = vec![original];
@@ -646,6 +707,8 @@ fn sort_and_dedupe_negative_confidence_keeps_higher() {
                 rule_id: 2,
                 norm_hash: [0xbb; 32],
             },
+            match_start: 0,
+            match_end: 10,
             confidence_score: -10,
         },
         ScoredFinding {
@@ -655,6 +718,8 @@ fn sort_and_dedupe_negative_confidence_keeps_higher() {
                 rule_id: 2,
                 norm_hash: [0xbb; 32],
             },
+            match_start: 0,
+            match_end: 10,
             confidence_score: -5,
         },
     ];
@@ -680,6 +745,8 @@ fn sort_and_dedupe_three_duplicates_keeps_highest() {
                 rule_id: 4,
                 norm_hash: [0xcc; 32],
             },
+            match_start: 0,
+            match_end: 8,
             confidence_score: 2,
         },
         ScoredFinding {
@@ -689,6 +756,8 @@ fn sort_and_dedupe_three_duplicates_keeps_highest() {
                 rule_id: 4,
                 norm_hash: [0xcc; 32],
             },
+            match_start: 0,
+            match_end: 8,
             confidence_score: 7,
         },
         ScoredFinding {
@@ -698,6 +767,8 @@ fn sort_and_dedupe_three_duplicates_keeps_highest() {
                 rule_id: 4,
                 norm_hash: [0xcc; 32],
             },
+            match_start: 0,
+            match_end: 8,
             confidence_score: 3,
         },
     ];
@@ -719,6 +790,8 @@ fn sort_and_dedupe_all_identical_including_confidence() {
             rule_id: 9,
             norm_hash: [0xdd; 32],
         },
+        match_start: 1,
+        match_end: 2,
         confidence_score: 4,
     };
     let mut findings = vec![f, f, f];
@@ -742,6 +815,8 @@ fn sort_and_dedupe_mixed_duplicates_and_unique() {
                 rule_id: 1,
                 norm_hash: [0x11; 32],
             },
+            match_start: 10,
+            match_end: 20,
             confidence_score: 2,
         },
         ScoredFinding {
@@ -751,6 +826,8 @@ fn sort_and_dedupe_mixed_duplicates_and_unique() {
                 rule_id: 1,
                 norm_hash: [0x11; 32],
             },
+            match_start: 10,
+            match_end: 20,
             confidence_score: 8,
         },
         // Group B: unique finding.
@@ -761,6 +838,8 @@ fn sort_and_dedupe_mixed_duplicates_and_unique() {
                 rule_id: 2,
                 norm_hash: [0x22; 32],
             },
+            match_start: 30,
+            match_end: 40,
             confidence_score: 0,
         },
         // Group C: three duplicates.
@@ -771,6 +850,8 @@ fn sort_and_dedupe_mixed_duplicates_and_unique() {
                 rule_id: 3,
                 norm_hash: [0x33; 32],
             },
+            match_start: 50,
+            match_end: 60,
             confidence_score: 1,
         },
         ScoredFinding {
@@ -780,6 +861,8 @@ fn sort_and_dedupe_mixed_duplicates_and_unique() {
                 rule_id: 3,
                 norm_hash: [0x33; 32],
             },
+            match_start: 50,
+            match_end: 60,
             confidence_score: 6,
         },
         ScoredFinding {
@@ -789,6 +872,8 @@ fn sort_and_dedupe_mixed_duplicates_and_unique() {
                 rule_id: 3,
                 norm_hash: [0x33; 32],
             },
+            match_start: 50,
+            match_end: 60,
             confidence_score: 3,
         },
     ];

@@ -171,12 +171,11 @@ fn sentinel_to_option(id: u32) -> Option<u32> {
 /// Persistence-ready representation of one Git finding observed during scan
 /// execution.
 ///
-/// `span_start` and `span_end` are blob-level byte offsets captured from
-/// `FindingEvent::start/end`. For Git findings these correspond to
-/// `FindingKey::start/end` (root-hint coordinates within the blob). The FS
-/// path uses decoded-buffer match spans for the same trait methods, so
-/// cross-source identity convergence is guaranteed only for non-transformed
-/// findings (the common case).
+/// `span_start` and `span_end` are exact match offsets captured from
+/// `FindingEvent::match_start/match_end`. Root-hint event coordinates remain
+/// available on `FindingEvent::start/end` for logs and UI surfaces, but
+/// persistence identity must use the exact match span so Git and FS scans of
+/// the same content converge on the same occurrence identity.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct GitFindingForPersistence {
     pub(crate) span_start: u64,
@@ -466,8 +465,8 @@ impl EventOutput for FindingsCaptureSink {
             // section means any future work (validation, hashing) added to
             // the constructor won't widen the lock window.
             let record = GitFindingForPersistence {
-                span_start: finding.start,
-                span_end: finding.end,
+                span_start: finding.match_start,
+                span_end: finding.match_end,
                 norm_hash: NormHash::from_digest(finding.norm_hash),
                 rule_id: finding.rule_id,
             };
@@ -579,8 +578,10 @@ mod tests {
         CoreEvent::Finding(FindingEvent {
             source: SourceKind::Fs,
             object_path: b"/tmp/secret.txt",
-            start: 10,
-            end: 42,
+            start: 100,
+            end: 142,
+            match_start: 10,
+            match_end: 42,
             rule_id: 7,
             rule_name: "test-rule",
             norm_hash: [0xAA; 32],
@@ -651,8 +652,14 @@ mod tests {
             "inner sink should also receive the finding"
         );
         match &forwarded[0] {
-            OwnedCoreEvent::Finding { norm_hash, .. } => {
+            OwnedCoreEvent::Finding {
+                norm_hash,
+                match_start,
+                match_end,
+                ..
+            } => {
                 assert_eq!(*norm_hash, [0xAA; 32]);
+                assert_eq!((*match_start, *match_end), (10, 42));
             }
             other => panic!("expected finding event, got: {other:?}"),
         }
