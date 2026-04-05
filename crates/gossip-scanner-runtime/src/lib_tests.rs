@@ -1090,7 +1090,7 @@ fn owned_core_event_finding_with_norm_hash_round_trips() {
         end: 42,
         rule_id: 7,
         rule_name: "test-rule",
-        norm_hash: Some([0xAB; 32]),
+        norm_hash: [0xAB; 32],
         commit_id: Some(3),
         change_kind: Some("modify"),
         confidence_score: 85,
@@ -1100,8 +1100,7 @@ fn owned_core_event_finding_with_norm_hash_round_trips() {
     match &owned {
         OwnedCoreEvent::Finding { norm_hash, .. } => {
             assert_eq!(
-                *norm_hash,
-                Some([0xAB; 32]),
+                *norm_hash, [0xAB; 32],
                 "from_core must preserve norm_hash in memory"
             );
         }
@@ -1128,7 +1127,7 @@ fn owned_core_event_finding_with_norm_hash_round_trips() {
 }
 
 #[test]
-fn owned_core_event_finding_without_norm_hash_round_trips() {
+fn owned_core_event_finding_round_trips_with_distinct_norm_hash() {
     let original = CoreEvent::Finding(FindingEvent {
         source: SourceKind::Fs,
         object_path: b"/tmp/secret.txt",
@@ -1136,7 +1135,7 @@ fn owned_core_event_finding_without_norm_hash_round_trips() {
         end: 42,
         rule_id: 7,
         rule_name: "test-rule",
-        norm_hash: None,
+        norm_hash: [0xCD; 32],
         commit_id: Some(3),
         change_kind: Some("modify"),
         confidence_score: 85,
@@ -1146,8 +1145,8 @@ fn owned_core_event_finding_without_norm_hash_round_trips() {
     match &owned {
         OwnedCoreEvent::Finding { norm_hash, .. } => {
             assert_eq!(
-                *norm_hash, None,
-                "from_core must preserve None norm_hash in memory"
+                *norm_hash, [0xCD; 32],
+                "from_core must preserve norm_hash in memory"
             );
         }
         other => panic!("expected Finding, got {other:?}"),
@@ -1181,7 +1180,7 @@ fn owned_core_event_finding_partial_eq_includes_norm_hash() {
         end: 42,
         rule_id: 7,
         rule_name: "test-rule".to_owned(),
-        norm_hash: Some([0xAA; 32]),
+        norm_hash: [0xAA; 32],
         commit_id: Some(3),
         change_kind: Some("modify".to_owned()),
         confidence_score: 85,
@@ -1193,7 +1192,7 @@ fn owned_core_event_finding_partial_eq_includes_norm_hash() {
         end: 42,
         rule_id: 7,
         rule_name: "test-rule".to_owned(),
-        norm_hash: Some([0xBB; 32]),
+        norm_hash: [0xBB; 32],
         commit_id: Some(3),
         change_kind: Some("modify".to_owned()),
         confidence_score: 85,
@@ -1211,7 +1210,7 @@ fn owned_core_event_debug_redacts_norm_hash() {
         end: 42,
         rule_id: 7,
         rule_name: "test-rule".to_owned(),
-        norm_hash: Some([0xDE; 32]),
+        norm_hash: [0xDE; 32],
         commit_id: Some(3),
         change_kind: Some("modify".to_owned()),
         confidence_score: 85,

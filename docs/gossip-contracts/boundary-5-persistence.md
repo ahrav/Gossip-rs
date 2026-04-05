@@ -59,6 +59,7 @@ Non-negotiables (project-wide):
 
 | Trait | Purpose | Key methods |
 |-------|---------|-------------|
+| `PersistenceFinding` | Unified finding-identity surface consumed by persistence translation, regardless of source family | `rule_id(&self) -> u32`, `norm_hash(&self) -> NormHash`, `span_start(&self) -> u64`, `span_end(&self) -> u64`, `span_len(&self) -> u64` |
 | `DoneLedger` | Dedupe index: "was this object-version scanned under this policy?" | `batch_get(&self, TenantId, PolicyHash, &[OvidHash]) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error>`, `list_done_hashes(&self, TenantId, PolicyHash) -> Result<Vec<OvidHash>, Self::Error>`, `batch_upsert(&self, &[DoneLedgerRecord]) -> Result<Self::CommitHandle, Self::Error>` |
 | `FindingsSink` | Triage/query plane: findings + occurrences + observations persistence | `upsert_batch(&self, FindingsUpsertBatch<'_>) -> Result<Self::CommitHandle, Self::Error>` |
 | `CommitHandle` | Durable acknowledgement handle; `wait()` consumes self and returns a receipt | `wait(self) -> Result<Self::Receipt, Self::Error>` |
@@ -97,6 +98,13 @@ Non-negotiables (project-wide):
 | `OccurrenceRecord` | Layer 2 — version-specific: pins a finding to an `ObjectVersionId` with `(byte_offset, byte_length)` span. `byte_length` guaranteed non-zero via `NonZeroU64`. Content-addressed `OccurrenceId`. |
 | `ObservationRecord` | Layer 3 — policy- and run-scoped: records that an occurrence was seen under a specific `(policy_hash, run_id, shard_id, fence_epoch)` with associated `ovid_hash`. Optional display-safe `Location` metadata stored as `Option<Arc<Location>>` so that multiple observations sharing the same location avoid cloning the underlying `String` fields. `with_location(Arc<Location>)` attaches location; `location()` returns `Option<&Location>` (deref through Arc); `location_arc()` returns `Option<&Arc<Location>>` for cheap `Arc::clone` during merge loops. Content-addressed `ObservationId`. Runtime code can build one directly from `WriteContext`, and `write_context()` round-trips the stored routing/fencing fields back into the shared scope value. |
 | `FindingsUpsertBatch<'a>` | Borrowed zero-copy batch view over all three layers. Provides `validate_referential_integrity()` for intra-batch consistency checks. |
+
+Source-specific finding carriers do not flow into persistence directly. The
+translation boundary consumes `PersistenceFinding`, which exposes only the
+identity-relevant fields (`rule_id`, redacted `NormHash`, `span_start`,
+`span_end`). Filesystem and Git paths are free to keep extra metadata such as
+root hints, object paths, commit IDs, or confidence scores on their local
+telemetry paths without affecting stable persistence identity.
 
 **Commit receipts** (`commit.rs`):
 

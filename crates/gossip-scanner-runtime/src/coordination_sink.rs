@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use gossip_contracts::connector::{ItemKey, ToxicDigest};
-use gossip_contracts::persistence::WriteContext;
+use gossip_contracts::identity::NormHash;
+use gossip_contracts::persistence::{PersistenceFinding, WriteContext};
+use gossip_stdx::HexOid;
 use scanner_git::{GitEvent, GitEventOutput, OidBytes};
 use scanner_scheduler::events::{CoreEvent, EventOutput};
 
@@ -27,7 +29,7 @@ pub enum StoredGitEvent {
     /// Metadata for a single commit (OID, timestamp, identity dictionary IDs).
     CommitMeta {
         commit_id: u32,
-        oid_hex: String,
+        oid_hex: HexOid,
         timestamp: u64,
         author_name_id: Option<u32>,
         author_email_id: Option<u32>,
@@ -166,6 +168,58 @@ fn sentinel_to_option(id: u32) -> Option<u32> {
     (id != scanner_git::SENTINEL_ID).then_some(id)
 }
 
+/// Persistence-ready representation of one Git finding observed during scan
+/// execution.
+///
+/// `span_start` and `span_end` are blob-level byte offsets captured from
+/// `FindingEvent::start/end`. For Git findings these correspond to
+/// `FindingKey::start/end` (root-hint coordinates within the blob). The FS
+/// path uses decoded-buffer match spans for the same trait methods, so
+/// cross-source identity convergence is guaranteed only for non-transformed
+/// findings (the common case).
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct GitFindingForPersistence {
+    pub(crate) span_start: u64,
+    pub(crate) span_end: u64,
+    pub(crate) norm_hash: NormHash,
+    pub(crate) rule_id: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<GitFindingForPersistence>() <= 56);
+
+impl fmt::Debug for GitFindingForPersistence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitFindingForPersistence")
+            .field("span_start", &self.span_start)
+            .field("span_end", &self.span_end)
+            .field("norm_hash", &"[redacted]")
+            .field("rule_id", &self.rule_id)
+            .finish()
+    }
+}
+
+impl PersistenceFinding for GitFindingForPersistence {
+    #[inline]
+    fn rule_id(&self) -> u32 {
+        self.rule_id
+    }
+
+    #[inline]
+    fn norm_hash(&self) -> NormHash {
+        self.norm_hash
+    }
+
+    #[inline]
+    fn span_start(&self) -> u64 {
+        self.span_start
+    }
+
+    #[inline]
+    fn span_end(&self) -> u64 {
+        self.span_end
+    }
+}
+
 /// Distributed event sink that forwards events to a coordinator recorder.
 ///
 /// Recorder errors are non-fatal. The first failure for each event kind
@@ -252,7 +306,7 @@ impl GitEventOutput for CoordinationEventSink {
         let owned = match event {
             GitEvent::CommitMeta(meta) => StoredGitEvent::CommitMeta {
                 commit_id: meta.commit_id,
-                oid_hex: gossip_stdx::hex_encode(meta.commit_oid.as_slice()),
+                oid_hex: HexOid::from_oid_bytes(meta.commit_oid.as_slice()),
                 timestamp: meta.timestamp,
                 author_name_id: meta
                     .identity
@@ -283,24 +337,33 @@ impl GitEventOutput for CoordinationEventSink {
     }
 }
 
-/// Wrapper around [`CoordinationEventSink`] that counts `Finding` events,
-/// captures Git commit OIDs, and forwards all events to the inner sink
+/// Wrapper around [`CoordinationEventSink`] that counts and captures `Finding`
+/// events, captures Git commit OIDs, and forwards all events to the inner sink
 /// unchanged.
 ///
-/// The caller drains both capture paths after the scan thread joins:
-/// [`detected_finding_count`](Self::detected_finding_count) reports how many
-/// findings were emitted, and [`drain_commit_oid_map`](Self::drain_commit_oid_map)
-/// returns the sparse `commit_id -> OidBytes` lookup populated from
-/// `GitEvent::CommitMeta`. Git findings translation uses that lookup to
-/// resolve per-scan ordinals into stable commit identities.
+/// The count and captured finding payloads are retrieved after the scan
+/// completes. The Git repo-frontier worker uses the captured findings to route
+/// git detections through the same persistence translation path used by
+/// filesystem scans.
 ///
-/// Both capture paths are additive: every event is still forwarded exactly once
-/// to the inner sink. The counter uses `Relaxed` ordering because it is only
+/// The counter uses `Relaxed` ordering because it is only
 /// read after the scan thread joins (establishing a happens-before via
 /// `std::thread::scope`), so the final value is always visible to the reader.
+/// Captured findings are stored behind a `Mutex<Vec<_>>` because pack workers
+/// emit findings from multiple threads during git scans.
+/// The lock is held only for a single `Vec::push` per finding (~nanoseconds),
+/// so contention is negligible for typical sparse-findings repositories. For
+/// finding-dense repos under high pack-worker parallelism, per-worker local
+/// collection merged post-join would eliminate contention entirely.
 pub(crate) struct FindingsCaptureSink {
     inner: Arc<CoordinationEventSink>,
     finding_count: AtomicU64,
+    /// Captured finding data for persistence. Guarded by Mutex because
+    /// pack workers emit findings from multiple threads. Per-finding lock
+    /// acquisition is acceptable: most repos have zero or few findings.
+    /// For high-finding-density repos, consider per-adapter local collection
+    /// merged post-join.
+    captured_findings: Mutex<Vec<GitFindingForPersistence>>,
     /// Sparse mapping from finding `commit_id` ordinals to stable commit OIDs.
     ///
     /// Populated from `GitEvent::CommitMeta` and drained after the scan joins.
@@ -346,6 +409,10 @@ impl FindingsCaptureSink {
         Self {
             inner,
             finding_count: AtomicU64::new(0),
+            // Small initial capacity avoids the first three reallocation cycles
+            // (0 -> 1 -> 2 -> 4 -> 8) under the lock. Most repos produce zero
+            // findings, but when findings do occur they tend to cluster.
+            captured_findings: Mutex::new(Vec::with_capacity(8)),
             commit_oid_map: Mutex::new(HashMap::with_capacity(capped)),
         }
     }
@@ -357,6 +424,21 @@ impl FindingsCaptureSink {
     /// join provides the necessary happens-before synchronization.
     pub(crate) fn detected_finding_count(&self) -> u64 {
         self.finding_count.load(Ordering::Relaxed)
+    }
+
+    /// Drain the captured findings accumulated during scan execution.
+    pub(crate) fn take_captured_findings(&self) -> Vec<GitFindingForPersistence> {
+        let mut guard = match self.captured_findings.lock() {
+            Ok(guard) => guard,
+            Err(poison) => {
+                tracing::error!(
+                    "captured_findings mutex poisoned; a scan worker panicked \
+                     while holding the lock — recovered findings may be incomplete"
+                );
+                poison.into_inner()
+            }
+        };
+        std::mem::take(&mut *guard)
     }
 
     /// Drain the captured sparse mapping from commit ordinals to stable OIDs.
@@ -377,8 +459,28 @@ impl FindingsCaptureSink {
 
 impl EventOutput for FindingsCaptureSink {
     fn emit_core(&self, event: CoreEvent<'_>) {
-        if matches!(event, CoreEvent::Finding(_)) {
+        if let CoreEvent::Finding(finding) = &event {
             self.finding_count.fetch_add(1, Ordering::Relaxed);
+            // Build the persistence struct outside the lock. `from_digest`
+            // is a byte copy, but keeping construction out of the critical
+            // section means any future work (validation, hashing) added to
+            // the constructor won't widen the lock window.
+            let record = GitFindingForPersistence {
+                span_start: finding.start,
+                span_end: finding.end,
+                norm_hash: NormHash::from_digest(finding.norm_hash),
+                rule_id: finding.rule_id,
+            };
+            match self.captured_findings.lock() {
+                Ok(mut guard) => guard.push(record),
+                Err(poison) => {
+                    tracing::error!(
+                        "captured_findings mutex poisoned during push; \
+                         finding may be lost"
+                    );
+                    poison.into_inner().push(record);
+                }
+            }
         }
         // Forward the borrowed event directly to the inner sink, which
         // performs its own `OwnedCoreEvent::from_core` conversion exactly
@@ -481,7 +583,7 @@ mod tests {
             end: 42,
             rule_id: 7,
             rule_name: "test-rule",
-            norm_hash: Some([0xAA; 32]),
+            norm_hash: [0xAA; 32],
             commit_id: None,
             change_kind: None,
             confidence_score: 85,
@@ -550,7 +652,7 @@ mod tests {
         );
         match &forwarded[0] {
             OwnedCoreEvent::Finding { norm_hash, .. } => {
-                assert_eq!(*norm_hash, Some([0xAA; 32]));
+                assert_eq!(*norm_hash, [0xAA; 32]);
             }
             other => panic!("expected finding event, got: {other:?}"),
         }
@@ -590,6 +692,40 @@ mod tests {
             sink.detected_finding_count(),
             2,
             "should count both findings"
+        );
+    }
+
+    #[test]
+    fn findings_capture_sink_captures_finding_data() {
+        let (sink, _recorder) = make_sink_and_recorder();
+
+        sink.emit_core(finding_event());
+
+        let captured = sink.take_captured_findings();
+        assert_eq!(captured.len(), 1, "finding payload should be captured");
+        assert_eq!(captured[0].rule_id(), 7);
+        assert_eq!(captured[0].span_start(), 10);
+        assert_eq!(captured[0].span_end(), 42);
+        assert_eq!(captured[0].norm_hash(), NormHash::from_digest([0xAA; 32]));
+    }
+
+    #[test]
+    fn git_finding_for_persistence_debug_redacts_norm_hash() {
+        let finding = GitFindingForPersistence {
+            span_start: 1,
+            span_end: 9,
+            norm_hash: NormHash::from_digest([0xFF; 32]),
+            rule_id: 2,
+        };
+
+        let debug = format!("{finding:?}");
+        assert!(
+            debug.contains("[redacted]"),
+            "Debug output must redact norm_hash, got: {debug}"
+        );
+        assert!(
+            debug.contains(r#"norm_hash: "[redacted]""#),
+            "Debug output must show redacted norm_hash field, got: {debug}"
         );
     }
 

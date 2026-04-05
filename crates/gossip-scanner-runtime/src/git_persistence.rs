@@ -38,15 +38,16 @@ use std::cell::{Cell, RefCell};
 use std::io;
 use std::num::NonZeroU64;
 
+#[cfg(test)]
+use gossip_contracts::persistence::derive_ovid_hash;
 use gossip_contracts::{
     connector::Cursor,
     connector::VersionId,
     connector::git::RepoKey,
-    identity::{LogicalTime, ObjectVersionId, StableItemId},
+    identity::{ObjectVersionId, StableItemId},
     persistence::{
-        CommitScope, DoneLedgerCommitReceipt, DoneLedgerKey, DoneLedgerProvenance,
-        DoneLedgerRecord, DoneLedgerStatus, FindingsCommitReceipt, OvidHashInputs, PageCommit,
-        PageCommitValidationError, PersistenceInputError, WriteContext, derive_ovid_hash,
+        CommitScope, DoneLedgerCommitReceipt, FindingsCommitReceipt, OvidHashInputs, PageCommit,
+        PageCommitValidationError, PersistenceInputError, WriteContext,
     },
 };
 use scanner_git::{
@@ -357,13 +358,15 @@ where
 /// invisible to `batch_check_seen` and only folded into the committed scope
 /// on a complete finalize.
 ///
-/// # Write-ahead caching
+/// # Take-mutate-restore caching
 ///
-/// The merge is performed on a local clone of the cached bitmap. The cache
-/// is updated only after the backend write succeeds, so a failed
-/// `apply_batch` cannot leave stale (never-durably-staged) OIDs in memory.
-/// This prevents `commit_finalize` from folding phantom OIDs into the
-/// committed scope.
+/// The bitmap is moved out of the cache (`Option::take`), merged in place,
+/// serialized, and restored only after the backend write succeeds. A failed
+/// `apply_batch` leaves the cache empty; the next call reloads from the
+/// backend, which always holds the last successfully written state. This
+/// avoids cloning the full bitmap on every batch (O(total) per call)
+/// while preserving the invariant that `commit_finalize` never folds
+/// phantom OIDs into the committed scope.
 ///
 /// # Amortized cost
 ///
@@ -387,15 +390,15 @@ where
         let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())?;
         let staging_key = self.seen_staging_key();
 
-        // Load or create the staging bitmap on first spill, then cache it
-        // across subsequent calls. This avoids O(total_staged) re-reads per
-        // spill batch, reducing aggregate cost from O(N²/B) to O(N).
-        //
-        // The merge is performed on a local clone so that a failed
-        // apply_batch does not leave stale OIDs in the cache.
+        // Take ownership of the cached staging bitmap instead of cloning.
+        // This turns the per-batch cost from O(total_bitmap) (clone) to
+        // O(delta) (in-place merge). On backend write failure the cache
+        // is empty; the next call reloads from the backend via the
+        // `None` branch, which always holds the last successfully
+        // written state.
         let mut guard = self.staging_seen.borrow_mut();
-        let base = match guard.as_ref() {
-            Some(bitmap) => bitmap.clone(),
+        let mut merged = match guard.take() {
+            Some(bitmap) => bitmap,
             None => match self.backend.get(&staging_key) {
                 Ok(Some(existing)) => RoaringSeenBitmap::deserialize(&existing).map_err(|err| {
                     SpillError::Io(io::Error::other(format!("corrupt staging bitmap: {err}")))
@@ -408,7 +411,6 @@ where
                 }
             },
         };
-        let mut merged = base;
         merged.merge_delta(&delta)?;
         let bytes = merged.serialize()?;
 
@@ -794,76 +796,18 @@ where
     }
 }
 
-/// Build a done-ledger record for one completed Git repo-frontier scan.
+/// Identity inputs used when treating a Git repo as a persistence item.
 ///
-/// Git repos have no object-version concept at the done-ledger level -- the
-/// repo itself is the scanned unit. A fixed zero version produces one
-/// done-ledger entry per (tenant, policy, repo_id) triple.
-///
-/// # OvidHash derivation
-///
-/// Git repo done-ledger entries use a fixed zero `ObjectVersionId` because
-/// repo-frontier shards track mutable refs, not immutable content versions.
-/// The 32-byte `StableItemId` is zero-padded from the u64 `repo_id` per the
-/// fixed-width contract. Domain separation from filesystem `StableItemId`s is
-/// guaranteed by `repo_id` being derived from `TenantId` + normalized path
-/// via `domain_hasher`.
-///
-/// # Provenance timestamps
-///
-/// `claim_time` should be the wall-clock `LogicalTime` captured when the
-/// lease was acquired. `complete_time` should be the wall-clock `LogicalTime`
-/// captured after `execute_repo` returns. Together they bracket the scan
-/// duration for provenance ordering.
-pub(crate) fn build_git_repo_done_ledger_record(
-    write_context: WriteContext,
-    repo_id: u64,
-    bytes_scanned: u64,
-    findings_count: u32,
-    claim_time: LogicalTime,
-    complete_time: LogicalTime,
-) -> Result<DoneLedgerRecord, GitRepoDurabilityError> {
-    // Reject reversed provenance timestamps early. DoneLedgerProvenance::new
-    // only debug_asserts this, and DoneLedgerBackend::apply validates it at
-    // persistence time. Catching it here surfaces the error before any
-    // done-ledger write is attempted.
-    if claim_time.as_raw() > complete_time.as_raw() {
-        return Err(GitRepoDurabilityError::InvalidDoneLedgerRecord(
-            PersistenceInputError::ProvenanceOrdering {
-                started_at: claim_time.as_raw(),
-                finished_at: complete_time.as_raw(),
-            },
-        ));
+/// Git repos have no object-version concept at the done-ledger level, so the
+/// repo itself is the logical item and a fixed zero version keeps the
+/// `(tenant, policy, repo_id)` mapping stable across scans.
+pub(crate) fn git_repo_ovid_inputs(repo_id: u64) -> OvidHashInputs {
+    let mut buf = [0u8; 32];
+    buf[..8].copy_from_slice(&repo_id.to_le_bytes());
+    OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(buf),
+        version: VersionId::Strong(ObjectVersionId::from_bytes([0u8; 32])),
     }
-    // Equal timestamps are valid: a scan can complete within the clock
-    // granularity, producing a zero-duration provenance interval.
-
-    // See "OvidHash derivation" in the doc comment above.
-    let ovid = {
-        let mut buf = [0u8; 32];
-        buf[..8].copy_from_slice(&repo_id.to_le_bytes());
-        let stable_item = StableItemId::from_bytes(buf);
-        let version = VersionId::Strong(ObjectVersionId::from_bytes([0u8; 32]));
-        derive_ovid_hash(&OvidHashInputs {
-            stable_item_id: stable_item,
-            version,
-        })
-    };
-    let key = DoneLedgerKey::new(write_context.tenant_id(), write_context.policy_hash(), ovid);
-    let status = if findings_count > 0 {
-        DoneLedgerStatus::ScannedWithFindings
-    } else {
-        DoneLedgerStatus::ScannedClean
-    };
-    let provenance =
-        DoneLedgerProvenance::from_write_context(write_context, claim_time, complete_time);
-    let record =
-        DoneLedgerRecord::try_new(key, status, bytes_scanned, findings_count, provenance, None)
-            .map_err(GitRepoDurabilityError::InvalidDoneLedgerRecord)?;
-    record
-        .validate()
-        .map_err(GitRepoDurabilityError::InvalidDoneLedgerRecord)?;
-    Ok(record)
 }
 
 /// In-memory [`GitPersistenceBackend`] for integration and unit tests.
@@ -1799,106 +1743,19 @@ mod tests {
         );
     }
 
-    // ---- build_git_repo_done_ledger_record tests ----
+    // ---- git_repo_ovid_inputs tests ----
 
     #[test]
-    fn build_git_repo_done_ledger_record_scanned_clean() {
-        let wc = write_context();
-        let record = build_git_repo_done_ledger_record(
-            wc,
-            42,
-            1024,
-            0,
-            LogicalTime::from_raw(100),
-            LogicalTime::from_raw(200),
-        )
-        .expect("should build a valid record");
-
-        assert_eq!(record.status(), DoneLedgerStatus::ScannedClean);
-        assert_eq!(record.findings_count(), 0);
+    fn git_repo_ovid_inputs_different_repo_ids_produce_different_ovid() {
+        let a = derive_ovid_hash(&git_repo_ovid_inputs(1));
+        let b = derive_ovid_hash(&git_repo_ovid_inputs(2));
+        assert_ne!(a, b, "distinct repo IDs must derive distinct OVIDs");
     }
 
     #[test]
-    fn build_git_repo_done_ledger_record_scanned_with_findings() {
-        let wc = write_context();
-        let record = build_git_repo_done_ledger_record(
-            wc,
-            42,
-            2048,
-            5,
-            LogicalTime::from_raw(100),
-            LogicalTime::from_raw(200),
-        )
-        .expect("should build a valid record");
-
-        assert_eq!(record.status(), DoneLedgerStatus::ScannedWithFindings);
-        assert_eq!(record.findings_count(), 5);
-    }
-
-    #[test]
-    fn build_git_repo_done_ledger_record_different_repo_ids_produce_different_ovid() {
-        let claim = LogicalTime::from_raw(100);
-        let complete = LogicalTime::from_raw(200);
-
-        let record_a = build_git_repo_done_ledger_record(write_context(), 1, 0, 0, claim, complete)
-            .expect("record a");
-        let record_b = build_git_repo_done_ledger_record(write_context(), 2, 0, 0, claim, complete)
-            .expect("record b");
-
-        assert_ne!(
-            record_a.key(),
-            record_b.key(),
-            "distinct repo_ids must produce distinct done-ledger keys"
-        );
-    }
-
-    #[test]
-    fn build_git_repo_done_ledger_record_is_deterministic() {
-        let claim = LogicalTime::from_raw(300);
-        let complete = LogicalTime::from_raw(400);
-
-        let record_1 =
-            build_git_repo_done_ledger_record(write_context(), 99, 512, 3, claim, complete)
-                .expect("first call");
-        let record_2 =
-            build_git_repo_done_ledger_record(write_context(), 99, 512, 3, claim, complete)
-                .expect("second call");
-
-        assert_eq!(
-            record_1, record_2,
-            "identical inputs must produce identical records"
-        );
-    }
-
-    #[test]
-    fn build_git_repo_done_ledger_record_rejects_reversed_timestamps() {
-        let wc = write_context();
-        let err = build_git_repo_done_ledger_record(
-            wc,
-            42,
-            1024,
-            0,
-            LogicalTime::from_raw(500),
-            LogicalTime::from_raw(100),
-        )
-        .expect_err("reversed timestamps must be rejected");
-
-        assert!(
-            matches!(
-                err,
-                GitRepoDurabilityError::InvalidDoneLedgerRecord(
-                    PersistenceInputError::ProvenanceOrdering { .. }
-                )
-            ),
-            "expected InvalidDoneLedgerRecord(ProvenanceOrdering), got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn build_git_repo_done_ledger_record_accepts_equal_timestamps() {
-        let t = LogicalTime::from_raw(100);
-        let record = build_git_repo_done_ledger_record(write_context(), 42, 0, 0, t, t)
-            .expect("equal timestamps (zero-duration scan) must be accepted");
-        assert_eq!(record.status(), DoneLedgerStatus::ScannedClean);
+    fn git_repo_ovid_inputs_is_deterministic() {
+        let a = derive_ovid_hash(&git_repo_ovid_inputs(42));
+        let b = derive_ovid_hash(&git_repo_ovid_inputs(42));
+        assert_eq!(a, b, "same repo ID must derive the same OVID");
     }
 }

@@ -1651,9 +1651,8 @@ pub enum OwnedCoreEvent {
         /// engine's `rule_name()` return type would require a cross-crate
         /// signature change across `scanner_engine` and `scanner_scheduler`.
         rule_name: String,
-        /// BLAKE3 digest of the normalized secret content when the source path
-        /// carries it on the event surface.
-        norm_hash: Option<[u8; 32]>,
+        /// BLAKE3 digest of the normalized secret content.
+        norm_hash: [u8; 32],
         commit_id: Option<u32>,
         change_kind: Option<String>,
         confidence_score: i8,
@@ -1690,7 +1689,7 @@ impl fmt::Debug for OwnedCoreEvent {
                 end,
                 rule_id,
                 rule_name,
-                norm_hash,
+                norm_hash: _norm_hash,
                 commit_id,
                 change_kind,
                 confidence_score,
@@ -1703,7 +1702,7 @@ impl fmt::Debug for OwnedCoreEvent {
                 .field("rule_id", rule_id)
                 .field("rule_name", rule_name)
                 // Secret-derived digests are redacted to keep debug output safe.
-                .field("norm_hash", &RedactedNormHash(norm_hash.is_some()))
+                .field("norm_hash", &RedactedNormHash)
                 .field("commit_id", commit_id)
                 .field("change_kind", change_kind)
                 .field("confidence_score", confidence_score)

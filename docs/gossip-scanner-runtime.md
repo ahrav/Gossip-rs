@@ -35,7 +35,7 @@ and validation, and Git connector mode uses the direct path.
 | `src/commit_pipeline.rs` | Bounded execution -> commit worker that owns authoritative durable completion, backpressures scan execution through bounded queues, and emits receipt-ready checkpoint input. `CommitPipeline::split()` decomposes the pipeline into a `CommitPipelineSender` (for execution threads) and a `CommitPipelineDrainer` (for concurrent receipt draining) |
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
 | `src/commit_sink.rs` | `CommitSink` trait, `CliNoOpCommitSink` (no-op), and lightweight bridge record types (`ItemMeta`, `FindingRecord`, `FindingsBatch`) for scan-loop lifecycle |
-| `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`, `StageSignal`) and `CoordinationEventRecorder` trait for distributed scan telemetry |
+| `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`, `StageSignal`), `CoordinationEventRecorder` trait, and `FindingsCaptureSink`/`GitFindingForPersistence` adapters for repo-frontier Git finding capture before durable translation |
 | `src/done_ledger_bloom.rs` | Internal done-ledger Bloom filter wrapper: OvidHash-aware membership checks, scope-size gating, and memory-cap enforcement for prefilter construction |
 | `src/distributed.rs` | Distributed worker-loop runtime: filesystem `WorkerIdentity` / `ShardLease`, Git `GitWorkerIdentity` / `GitShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (receipt-driven execution adapter), and the sibling lease loops `run_worker` (filesystem) plus `run_git_repo_worker` (repo-frontier Git). Internal helpers cover receipt-driven checkpoint building, singleton repo-frontier execution, low-cardinality Git stage telemetry, and direct `CoordinationFacade` claim/complete helpers |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
@@ -137,10 +137,13 @@ through owned channel forwarding, invoke `run_git_scan`, and convert the
 git report into the local `ScanReport` plus optional debug output.
 When the caller owns durable Git state, `git_persistence::GitPersistenceAdapter`
 implements `scanner-git`'s ref-watermark, seen-blob, and finalize seams and
-plugs into `git_repo::run_runtime_git_scan_with_stores`. A complete finalize
-can then be mapped onto the existing repo-frontier `UnitCommitReceipt` and
-`CheckpointAggregatorInput` path without inventing a Git-only outer receipt
-stack.
+plugs into `git_repo::run_runtime_git_scan_with_stores`. Distributed
+repo-frontier execution wraps the event sink with `FindingsCaptureSink`, lifts
+Git `FindingEvent` values into `GitFindingForPersistence`, translates them
+through the same `PersistenceFinding`-based path used by ordered-content items,
+and only then synthesizes the outer repo-frontier `UnitCommitReceipt` and
+`CheckpointAggregatorInput`. This keeps Git findings on the same
+findings-first, done-ledger-second durable ordering as filesystem scans.
 
 The distributed module exports the concrete worker-loop types and helpers:
 `WorkerIdentity`, `ShardLease`, `DistributedPersistence`,
@@ -598,17 +601,30 @@ The module owns:
 - `PersistenceTranslation` (crate-visible constructor; only `translate_item_result` can build one)
 - `ResultTranslationError`
 - `translate_item_result`
+- `translate_git_item_result`
 
 The translation is deterministic for its inputs. Stable item
 identity, version claim, write scope, tenant secret key, a rule-fingerprint
 resolver callback, and scan findings fully determine the resulting OVID,
 finding IDs, occurrence IDs, observation IDs, and done-ledger key.
 
+`translate_findings` is generic over `gossip_contracts::persistence::PersistenceFinding`.
+Filesystem `FsFindingRecord` values are adapted into that trait at the runtime
+boundary, while repo-frontier Git scans feed `GitFindingForPersistence`
+directly. This keeps source-specific metadata out of persistence derivation
+without forcing the scheduler crate to depend on `gossip-contracts`.
+
 `translate_item_result` accepts a `&dyn Fn(u32) -> RuleFingerprint` callback
 that resolves positional `rule_id` values to stable, name-derived
 `RuleFingerprint` values. This decouples translation from compilation
 order: the same rule always maps to the same fingerprint regardless of its
 position in the rule list.
+
+Matching `(rule_id, norm_hash, span_start, span_end)` values are not sufficient
+to guarantee identical persistence IDs across source families. `FindingId`
+still includes `StableItemId`, and `OccurrenceId` still includes
+`ObjectVersionId`, so cross-source equality requires the logical item identity
+and version inputs to match as well.
 
 Input order is preserved while each persistence layer is deduplicated by its
 own identity:
@@ -832,9 +848,12 @@ with a deterministic `OpId`.
 3. syncs a worker-local mirror for the target locator,
 4. executes the mirror-backed Git scan through `GitRepoRuntime::execute_repo`,
    using `GitPersistenceAdapter` as the scanner-git seen/watermark/finalize
-   store,
-5. derives the outer repo-frontier checkpoint cursor from the durable complete
-   finalize receipt, and
+   store and `FindingsCaptureSink` to retain persistence-ready finding payloads,
+5. if `execute_repo` finishes with `FinalizeOutcome::Complete`, translates the
+   captured findings plus repo identity through `translate_git_item_result`,
+   commits findings and done-ledger rows through `ResultCommitter`, and uses
+   the resulting durable receipts to build the repo-frontier checkpoint input;
+   partial finalize aborts the lease before this stage, and
 6. re-runs singleton discovery against that checkpoint cursor to decide whether
    the shard is terminally complete or should checkpoint for later replay.
 
@@ -865,7 +884,8 @@ The runtime tests focus on the behavior that exists today:
 - distributed worker-loop lease accounting, claim retry, and receipt-derived
   completion
 - singleton repo-frontier Git worker execution, including cursor-covered
-  exhausted-empty completion and durable finalize-backed shard advancement
+  exhausted-empty completion, captured-finding persistence, and durable
+  finalize-backed shard advancement
 - `gossip_coordination::InMemoryCoordinator` snapshots for completed shards
   and run progress
 - CLI parsing and summary formatting

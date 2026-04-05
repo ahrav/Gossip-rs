@@ -6,7 +6,7 @@
 //! remote scanner, and archive processors can reuse them without coupling
 //! to the local-filesystem scheduler.
 
-use super::engine_trait::{FindingRecord, FindingWithHashRecord, ScanEngine};
+use super::engine_trait::{FindingWithHashRecord, ScanEngine};
 use super::metrics::WorkerMetricsLocal;
 
 use std::cmp::Ordering as CmpOrdering;
@@ -125,7 +125,7 @@ pub(super) fn account_effective_dropped_findings(
 ///
 /// [`EventOutput`]: crate::events::EventOutput
 #[inline]
-pub(super) fn emit_findings<E: ScanEngine, F: FindingRecord>(
+pub(super) fn emit_findings<E: ScanEngine, F: FindingWithHashRecord>(
     engine: &E,
     event_sink: &dyn crate::events::EventOutput,
     path: &[u8],
@@ -144,9 +144,7 @@ pub(super) fn emit_findings<E: ScanEngine, F: FindingRecord>(
                 end: rec.root_hint_end(),
                 rule_id: rec.rule_id(),
                 rule_name: engine.rule_name(rec.rule_id()),
-                // Generic scheduler finding records do not carry norm_hash on the
-                // event surface; persistence captures it separately when available.
-                norm_hash: None,
+                norm_hash: *rec.norm_hash(),
                 commit_id: None,
                 change_kind: None,
                 confidence_score: rec.confidence_score(),
