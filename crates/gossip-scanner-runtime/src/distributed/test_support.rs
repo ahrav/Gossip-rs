@@ -317,8 +317,8 @@ impl OrderedContentSource for MultiStepScriptedSource {
             .expect("MultiStepScriptedSource: unexpected extra fill_page call")
     }
 
-    /// Returns a fixed empty byte slice; the scripted page loop only
-    /// exercises enumeration and commit ordering, not content reads.
+    /// Returns a fixed benign payload (`b"clean"`); the scripted page loop
+    /// exercises enumeration and commit ordering, not content-specific findings.
     fn open(
         &mut self,
         _item_ref: &ItemRef,
