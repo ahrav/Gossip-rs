@@ -68,7 +68,7 @@ impl From<FinalizeOutcome> for SimFinalizeOutcome {
 }
 
 /// Summary report for a successful run.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunReport {
     /// Total steps executed.
     pub steps: u64,
@@ -121,7 +121,7 @@ impl From<&RunReport> for RunOutput {
 }
 
 /// Structured failure report captured in artifacts.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureReport {
     /// Failure classification.
     pub kind: FailureKind,
@@ -132,7 +132,7 @@ pub struct FailureReport {
 }
 
 /// Failure classification for deterministic triage.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureKind {
     /// A panic escaped from harness logic.
     Panic,

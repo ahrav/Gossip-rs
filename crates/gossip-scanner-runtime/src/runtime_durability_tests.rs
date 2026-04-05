@@ -1,21 +1,36 @@
 //! Runtime durability integration tests for translation, commit, and
 //! receipt-driven checkpoint aggregation.
+//!
+//! Covered invariant families:
+//! 1. Ordered-content writes advance checkpoint progress only after a durable
+//!    receipt is explicitly recorded.
+//! 2. Clean scans and pipeline-drain boundaries preserve the same
+//!    receipt-before-checkpoint rule as finding-producing scans.
+//! 3. Crash and replay paths stay idempotent across findings, done-ledger, and
+//!    stale-fence recovery windows.
+//! 4. Repo-frontier durable receipts use repo-key-authoritative cursors and do
+//!    not let partial finalize outcomes fabricate outer progress.
 
 use std::{
+    convert::Infallible,
     sync::mpsc::{self, RecvTimeoutError},
     thread,
     time::Duration,
 };
 
 use gossip_contracts::{
-    connector::Cursor,
+    connector::{Cursor, git::RepoKey},
     identity::LogicalTime,
-    persistence::{CheckpointCommitReceipt, CommitAdvanceError, DoneLedgerStatus},
+    persistence::{
+        CheckpointCommitReceipt, CommitAdvanceError, DoneLedgerCommitReceipt, DoneLedgerStatus,
+        FindingsCommitReceipt,
+    },
 };
 use gossip_persistence_inmemory::{
     CompletionOrder, InMemoryDoneLedger, InMemoryFindingsSink, InMemoryPersistenceError,
     InMemoryStoreKind,
 };
+use scanner_git::FinalizeOutcome;
 
 use crate::{
     CancellationToken,
@@ -24,6 +39,7 @@ use crate::{
     },
     commit_model::CheckpointAggregatorInput,
     commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput, QueuedCommit},
+    git_persistence::{GitPersistenceAdapter, GitPersistenceBackend, GitPersistenceOp},
     result_committer::{ResultCommitError, ResultCommitter},
     test_fixtures::{
         clean_scanned_translation, completed_unit, item_key, scanned_translation, wait_until,
@@ -56,6 +72,35 @@ fn assert_single_done_row(
         .expect("exactly one done-ledger record");
     assert_eq!(row.status(), expected_status);
     assert_eq!(row.findings_count(), expected_findings_count);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NoopGitBackend;
+
+impl GitPersistenceBackend for NoopGitBackend {
+    type Error = Infallible;
+
+    fn get(&self, _key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(None)
+    }
+
+    fn apply_batch(&self, _ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Claims atomicity so the adapter takes the single-phase commit path,
+    /// keeping the test focused on the receipt/checkpoint aggregation layer.
+    fn supports_atomic_batches(&self) -> bool {
+        true
+    }
+}
+
+fn repo_frontier_adapter() -> GitPersistenceAdapter<NoopGitBackend> {
+    GitPersistenceAdapter::new(NoopGitBackend, 17, [0xA7; 32])
+}
+
+fn repo_frontier_key() -> RepoKey {
+    RepoKey::for_local_path(b"/var/lib/gossip/repos/acme/repo.git").expect("repo key")
 }
 
 #[test]
@@ -184,8 +229,6 @@ fn clean_scan_with_zero_findings_is_receipt_gated_normally() {
     assert_eq!(pending.first_sequence_no(), 0);
     assert_eq!(pending.last_sequence_no(), 0);
     assert_eq!(pending.committed_units(), 1);
-    assert_eq!(pending.first_sequence_no(), 0);
-    assert_eq!(pending.last_sequence_no(), 0);
     assert_eq!(
         pending.checkpoint_cursor(),
         &Cursor::with_last_key(item_key(0x81)),
@@ -208,6 +251,192 @@ fn clean_scan_with_zero_findings_is_receipt_gated_normally() {
             .expect("checkpoint preparation should succeed")
             .is_none(),
         "no pending receipts should remain after acknowledging the clean-scan checkpoint"
+    );
+}
+
+#[test]
+fn repo_frontier_complete_finalize_is_receipt_gated_and_uses_repo_key_cursor() {
+    let context = write_context_with_epoch(550);
+    let repo_key = repo_frontier_key();
+    let adapter = repo_frontier_adapter();
+    let mut aggregator = PrefixCheckpointAggregator::new(context, 0, 4);
+
+    // If outer progress ever keys off "scan returned Ok" instead of the
+    // durable repo receipt, this would incorrectly fabricate a checkpoint.
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .is_none(),
+        "repo-frontier progress must remain receipt-gated until finalize is durably recorded"
+    );
+
+    let input = adapter
+        .repo_frontier_checkpoint_input(
+            context,
+            0,
+            &repo_key,
+            FinalizeOutcome::Complete,
+            FindingsCommitReceipt::new(0, 0, 0),
+            DoneLedgerCommitReceipt::new(1, 1, 0),
+        )
+        .expect("complete finalize should build checkpoint input")
+        .expect("complete finalize should yield checkpoint input");
+
+    assert_eq!(
+        aggregator
+            .record_receipt(input)
+            .expect("repo-frontier receipt should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+
+    let pending = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("one repo-frontier receipt should yield one checkpointable prefix");
+    assert_eq!(pending.first_sequence_no(), 0);
+    assert_eq!(pending.last_sequence_no(), 0);
+    assert_eq!(pending.committed_units(), 1);
+    assert_eq!(
+        pending.checkpoint_cursor(),
+        &Cursor::with_last_key(repo_key.clone().into_item_key()),
+        "repo-frontier checkpoint cursor must stay authoritative to the durable repo key"
+    );
+
+    let checkpoint_scope = pending.scope().clone();
+    aggregator
+        .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            checkpoint_scope,
+            LogicalTime::from_raw(9_551),
+        ))
+        .expect("acknowledging the repo-frontier checkpoint should succeed");
+    assert_eq!(aggregator.next_sequence_no(), 1);
+    assert_eq!(aggregator.checkpointed_units(), 1);
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
+}
+
+#[test]
+fn repo_frontier_partial_finalize_produces_no_receipt_or_checkpoint_input() {
+    let context = write_context_with_epoch(551);
+    let repo_key = repo_frontier_key();
+    let adapter = repo_frontier_adapter();
+    let mut aggregator = PrefixCheckpointAggregator::new(context, 0, 4);
+
+    // Partial finalize keeps watermark progress non-authoritative, so the outer
+    // repo frontier must not observe any checkpointable receipt at all.
+    assert!(
+        adapter
+            .repo_frontier_receipt(
+                context,
+                0,
+                &repo_key,
+                FinalizeOutcome::Partial { skipped_count: 2 },
+                FindingsCommitReceipt::new(0, 0, 0),
+                DoneLedgerCommitReceipt::new(1, 1, 0),
+            )
+            .expect("partial finalize receipt construction should succeed")
+            .is_none(),
+        "partial finalize must not synthesize a durable repo-frontier receipt"
+    );
+    assert!(
+        adapter
+            .repo_frontier_checkpoint_input(
+                context,
+                0,
+                &repo_key,
+                FinalizeOutcome::Partial { skipped_count: 2 },
+                FindingsCommitReceipt::new(0, 0, 0),
+                DoneLedgerCommitReceipt::new(1, 1, 0),
+            )
+            .expect("partial checkpoint-input construction should succeed")
+            .is_none(),
+        "partial finalize must not manufacture outer checkpoint progress"
+    );
+
+    // Aggregator state must be unperturbed by the partial finalize path.
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
+    assert_eq!(aggregator.next_sequence_no(), 0);
+    assert_eq!(aggregator.checkpointed_units(), 0);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .is_none(),
+        "aggregator must have no checkpointable prefix after partial finalize"
+    );
+}
+
+#[test]
+fn repo_frontier_replay_receipt_is_deterministic_and_buffers_once() {
+    let context = write_context_with_epoch(552);
+    let repo_key = repo_frontier_key();
+    let adapter = repo_frontier_adapter();
+    let mut aggregator = PrefixCheckpointAggregator::new(context, 3, 4);
+
+    let first = adapter
+        .repo_frontier_receipt(
+            context,
+            3,
+            &repo_key,
+            FinalizeOutcome::Complete,
+            FindingsCommitReceipt::new(0, 0, 0),
+            DoneLedgerCommitReceipt::new(1, 1, 0),
+        )
+        .expect("first receipt construction should succeed")
+        .expect("complete finalize should yield a receipt");
+    let replay = adapter
+        .repo_frontier_receipt(
+            context,
+            3,
+            &repo_key,
+            FinalizeOutcome::Complete,
+            FindingsCommitReceipt::new(0, 0, 0),
+            DoneLedgerCommitReceipt::new(1, 1, 0),
+        )
+        .expect("replay receipt construction should succeed")
+        .expect("replay should converge to the same durable receipt");
+    assert_eq!(
+        first, replay,
+        "replaying the same repo-frontier finalize must converge to the same durable receipt"
+    );
+
+    let first_input =
+        CheckpointAggregatorInput::new(first.completed_unit().checkpoint_boundary_kind(), first)
+            .expect("repo-frontier receipt kind should match the stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(first_input)
+            .expect("first repo-frontier receipt should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+
+    // If replay ever changed receipt identity, this second record would either
+    // buffer twice or advance to a different cursor instead of collapsing.
+    let replay_input =
+        CheckpointAggregatorInput::new(replay.completed_unit().checkpoint_boundary_kind(), replay)
+            .expect("replayed repo-frontier receipt kind should still match the stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(replay_input)
+            .expect("replayed repo-frontier receipt should be accepted"),
+        ReceiptRecordOutcome::DuplicateBuffered
+    );
+    assert_eq!(
+        aggregator.buffered_receipt_count(),
+        1,
+        "replayed repo-frontier receipts must not inflate the checkpoint buffer"
+    );
+
+    let pending = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("one unique repo-frontier receipt should remain checkpointable");
+    assert_eq!(pending.first_sequence_no(), 3);
+    assert_eq!(pending.last_sequence_no(), 3);
+    assert_eq!(
+        pending.checkpoint_cursor(),
+        &Cursor::with_last_key(repo_key.into_item_key()),
+        "replayed repo-frontier receipts must preserve the authoritative repo-key cursor"
     );
 }
 

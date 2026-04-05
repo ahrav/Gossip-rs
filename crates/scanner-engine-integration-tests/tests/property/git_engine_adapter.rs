@@ -1,4 +1,10 @@
 //! Property tests for Git engine adapter chunking invariance.
+//!
+//! The adapter must report the same findings whether it scans a blob in one
+//! full slice or via overlapping chunks. The randomized proptest below gives
+//! shrinkable counterexamples, while the hand-written edge cases pin the
+//! boundary conditions that tend to regress first: empty blobs, tiny blobs,
+//! and anchors split across a chunk boundary.
 
 use std::sync::OnceLock;
 
@@ -57,6 +63,38 @@ fn test_engine() -> &'static Engine {
     })
 }
 
+fn assert_chunking_matches_reference(label: &str, engine: &Engine, blob: &[u8], chunk: usize) {
+    let overlap = engine.required_overlap();
+    let chunk_bytes = chunk.max(overlap.saturating_add(1));
+    let reference =
+        scan_blob_chunked(engine, blob, blob.len().max(overlap + 1)).expect("reference scan");
+    let chunked = scan_blob_chunked(engine, blob, chunk_bytes).expect("chunked scan");
+    assert_eq!(
+        reference, chunked,
+        "{label}: chunked scan must match the full-blob reference scan"
+    );
+}
+
+#[test]
+fn chunking_invariance_edge_cases_match_full_scan() {
+    let engine = test_engine();
+    let overlap = engine.required_overlap();
+    let mut boundary_split = vec![b'X'; overlap];
+    boundary_split.extend_from_slice(b"TOK_ABCD");
+
+    for (label, blob, chunk) in [
+        ("empty_blob", Vec::new(), 1),
+        ("single_byte_blob", vec![b'X'], 1),
+        ("anchor_split_across_boundary", boundary_split, overlap + 1),
+        ("blob_at_overlap_size", vec![b'X'; overlap], overlap + 1),
+        ("minimal_two_chunk", vec![b'X'; overlap + 1], overlap + 1),
+    ] {
+        // These cases pin the fast path, the smallest non-empty blob, and a
+        // boundary-straddling anchor so chunk overlap cannot silently drop it.
+        assert_chunking_matches_reference(label, engine, &blob, chunk);
+    }
+}
+
 proptest! {
     #[test]
     fn chunking_invariance_randomized_set_equal_to_full_scan(
@@ -65,10 +103,10 @@ proptest! {
     ) {
         let engine = test_engine();
         let overlap = engine.required_overlap();
-        // Ensure chunk size always exceeds overlap so progress is guaranteed.
-        let chunk_bytes = chunk.max(overlap.saturating_add(1));
         let reference = scan_blob_chunked(engine, &blob, blob.len().max(overlap + 1))
             .expect("reference scan");
+        // Progress requires at least one byte beyond the overlap budget.
+        let chunk_bytes = chunk.max(overlap.saturating_add(1));
         let chunked = scan_blob_chunked(engine, &blob, chunk_bytes)
             .expect("chunked scan");
         prop_assert_eq!(reference, chunked);

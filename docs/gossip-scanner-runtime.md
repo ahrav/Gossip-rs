@@ -51,7 +51,7 @@ and validation, and Git connector mode uses the direct path.
 | `src/lib_tests.rs` | Validation and local scan execution tests for the runtime core |
 | `src/cli_tests.rs` | CLI parsing and summary-rendering tests |
 | `src/test_fixtures.rs` | Shared test fixtures (write contexts, timings, findings builders, rule fingerprints, and git repository setup helpers) used by runtime test modules |
-| `src/runtime_durability_tests.rs` | Integration tests that stitch together translation, findings -> done-ledger durability, and receipt-driven checkpoint aggregation to prove explicit-receipt gating, contiguous-prefix advancement, and reassignment-safe retry invariants |
+| `src/runtime_durability_tests.rs` | Integration tests that stitch together translation, findings -> done-ledger durability, and receipt-driven checkpoint aggregation to prove explicit-receipt gating, contiguous-prefix advancement, repo-frontier receipt/cursor gating, and reassignment-safe retry invariants |
 | `Cargo.toml` | Runtime crate dependencies and feature flags |
 
 ---
@@ -902,6 +902,10 @@ The runtime tests focus on the behavior that exists today:
 - crash-before-ledger fault injection with idempotent retry and checkpoint blocking
 - crash-before-findings-durability with empty-store verification
 - multi-item partial-prefix recovery under mid-stream fault
+- repo-frontier complete-finalize receipt gating with repo-key-authoritative
+  cursor preservation
+- repo-frontier partial-finalize suppression of outer checkpoint progress
+- repo-frontier receipt replay determinism and checkpoint-buffer idempotency
 
 These tests exercise the live local runtime paths for valid filesystem and
 git sources and verify the distributed worker loop (lease construction,

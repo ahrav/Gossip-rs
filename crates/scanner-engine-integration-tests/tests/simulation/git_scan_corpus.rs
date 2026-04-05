@@ -70,14 +70,15 @@ fn replay_git_scan_corpus_cases() {
                 // Empty-trace cases are expected to fail. If they succeed,
                 // a regression has silently turned a failure case into a
                 // passing one.
-                if expected_trace_hash(&artifact).is_none() {
+                let expected_hash = expected_trace_hash(&artifact);
+                if expected_hash.is_none() {
                     panic!(
                         "git corpus replay unexpectedly succeeded for {:?} \
                          (empty-trace case should fail)",
                         path,
                     );
                 }
-                if let Some(expected) = expected_trace_hash(&artifact)
+                if let Some(expected) = expected_hash
                     && expected != report.trace_hash
                 {
                     let failure = FailureReport {
@@ -122,24 +123,14 @@ fn replay_git_scan_corpus_cases() {
     );
 }
 
-/// Compares two failure reports by failure kind.
+/// Compares two failure reports by failure kind only.
 ///
 /// The message field is not compared because minor wording changes across
 /// runner versions should not break corpus replay. The step counter is
 /// also excluded because schedule-sensitive runs may diverge in step count
 /// while producing the same logical failure.
 fn same_failure_kind(expected: &FailureReport, actual: &FailureReport) -> bool {
-    match (&expected.kind, &actual.kind) {
-        (FailureKind::Panic, FailureKind::Panic)
-        | (FailureKind::Hang, FailureKind::Hang)
-        | (FailureKind::OracleMismatch, FailureKind::OracleMismatch)
-        | (FailureKind::StabilityMismatch, FailureKind::StabilityMismatch) => true,
-        (
-            FailureKind::InvariantViolation { code: a },
-            FailureKind::InvariantViolation { code: b },
-        ) => a == b,
-        _ => false,
-    }
+    expected.kind == actual.kind
 }
 
 fn expected_trace_hash(artifact: &GitReproArtifact) -> Option<[u8; 32]> {
@@ -202,8 +193,9 @@ fn write_failure_artifact(path: &Path, artifact: &GitReproArtifact, failure: Fai
     }
 
     let stem = path
-        .file_stem()
+        .file_name()
         .and_then(|s| s.to_str())
+        .and_then(|name| name.strip_suffix(".case.json"))
         .unwrap_or("git_scan_case");
     let out_path = format!("{out_dir}/git_scan_{stem}.case.json");
 
