@@ -2811,10 +2811,14 @@ where
             ),
         )));
     }
-    debug_assert_eq!(
-        captured_commit_oids, 0,
-        "clean git repo scans should not carry commit metadata into done-ledger submission"
-    );
+    if captured_commit_oids > 0 {
+        tracing::debug!(
+            captured_commit_oids,
+            repo_id = input.repo_id,
+            "clean git repo scan carried commit metadata into done-ledger submission; \
+             commit OIDs may have been emitted for filtered/suppressed findings"
+        );
+    }
     let findings_receipt = FindingsCommitReceipt::new(0, 0, 0);
 
     // --- done-ledger submission ---
@@ -3064,10 +3068,12 @@ where
         // clean while dropping durable findings state.
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow::anyhow!(
-                "git repo-frontier shard '{}' detected {detected_count} finding(s), \
+                "git repo-frontier shard '{}' detected {detected_count} finding(s) \
+                 with {} captured commit OID(s), \
                  but durable Git finding translation is unavailable; \
                  refusing to checkpoint as clean",
                 lease.shard_id(),
+                commit_oid_map.len(),
             ),
         )));
     }
@@ -9033,6 +9039,108 @@ mod tests {
         assert!(
             msg.contains("captured_commit_oids=1"),
             "error must report the captured commit metadata count: {msg}"
+        );
+    }
+
+    #[test]
+    fn submit_git_repo_done_ledger_accepts_clean_scan() {
+        let input = GitRepoPersistenceInput {
+            write_context: write_context(),
+            shard_id: "test-shard",
+            repo_id: 99,
+            bytes_scanned: 4096,
+            detected_count: 0,
+            commit_oid_map: HashMap::new(),
+            claim_time: LogicalTime::from_raw(300),
+            complete_time: LogicalTime::from_raw(400),
+        };
+        let ledger = InMemoryDoneLedger::new();
+        let (findings_receipt, done_ledger_receipt) = submit_git_repo_done_ledger(&ledger, &input)
+            .expect("clean scan with no findings must succeed");
+        assert_eq!(
+            findings_receipt.finding_count(),
+            0,
+            "synthesized findings receipt must report zero findings"
+        );
+        assert_eq!(
+            findings_receipt.occurrence_count(),
+            0,
+            "synthesized findings receipt must report zero occurrences"
+        );
+        assert_eq!(
+            findings_receipt.observation_count(),
+            0,
+            "synthesized findings receipt must report zero observations"
+        );
+        assert!(
+            done_ledger_receipt.record_count() > 0,
+            "done-ledger receipt must indicate at least one record written"
+        );
+    }
+
+    #[test]
+    fn submit_git_repo_done_ledger_accepts_clean_scan_with_stale_commit_metadata() {
+        let input = GitRepoPersistenceInput {
+            write_context: write_context(),
+            shard_id: "test-shard",
+            repo_id: 77,
+            bytes_scanned: 2048,
+            detected_count: 0,
+            commit_oid_map: HashMap::from([
+                (1, scanner_git::OidBytes::sha1([0xAA; 20])),
+                (5, scanner_git::OidBytes::sha256([0xBB; 32])),
+            ]),
+            claim_time: LogicalTime::from_raw(500),
+            complete_time: LogicalTime::from_raw(600),
+        };
+        let ledger = InMemoryDoneLedger::new();
+        let (findings_receipt, _done_ledger_receipt) = submit_git_repo_done_ledger(&ledger, &input)
+            .expect("clean scan with stale commit metadata must still succeed");
+        assert_eq!(
+            findings_receipt.finding_count(),
+            0,
+            "findings receipt must still report zero findings"
+        );
+    }
+
+    /// Integration test composing the full capture-sink → drain → persistence
+    /// pipeline. A clean scan (no findings, no commit metadata) flows through
+    /// `FindingsCaptureSink` into `submit_git_repo_done_ledger` without error.
+    #[test]
+    fn submit_git_repo_done_ledger_integration_emit_drain_persist() {
+        let rec = Arc::new(Recorder::default());
+        let inner_sink = Arc::new(CoordinationEventSink::new(
+            Arc::clone(&rec) as Arc<dyn CoordinationEventRecorder>,
+            Arc::from("integration-shard"),
+        ));
+        let capture_sink = FindingsCaptureSink::new(inner_sink);
+
+        // Simulate a clean scan: no findings, no commit metadata.
+        // The unit tests in coordination_sink cover event emission; this test
+        // verifies the drain-to-persistence composition.
+        assert_eq!(capture_sink.detected_finding_count(), 0);
+        let commit_oid_map = capture_sink.drain_commit_oid_map();
+        assert!(commit_oid_map.is_empty());
+
+        let input = GitRepoPersistenceInput {
+            write_context: write_context(),
+            shard_id: "integration-shard",
+            repo_id: 123,
+            bytes_scanned: 8192,
+            detected_count: capture_sink.detected_finding_count(),
+            commit_oid_map,
+            claim_time: LogicalTime::from_raw(700),
+            complete_time: LogicalTime::from_raw(800),
+        };
+        let ledger = InMemoryDoneLedger::new();
+        let (findings_receipt, done_ledger_receipt) = submit_git_repo_done_ledger(&ledger, &input)
+            .expect("clean scan integration path must succeed");
+        assert_eq!(findings_receipt.finding_count(), 0);
+        assert_eq!(findings_receipt.occurrence_count(), 0);
+        assert_eq!(findings_receipt.observation_count(), 0);
+        assert!(
+            done_ledger_receipt.record_count() > 0,
+            "done-ledger must record at least one row"
         );
     }
 }
