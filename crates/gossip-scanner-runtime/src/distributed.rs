@@ -2892,13 +2892,23 @@ where
             ),
         )));
     }
+    // On the production path, CommitMeta events are only emitted by
+    // `EngineAdapter::stream_findings` when `findings_buf` is non-empty,
+    // and the same call emits at least one Finding (incrementing
+    // `detected_finding_count`). Both events traverse the same channel
+    // and are replayed by a non-panicking forwarder, so partial delivery
+    // is structurally impossible. Captured OIDs without findings therefore
+    // signals a broken event bridge — fail closed rather than writing a
+    // ScannedClean done-ledger row that would mask the regression.
     if captured_commit_oids > 0 {
-        tracing::debug!(
-            captured_commit_oids,
-            repo_id = input.repo_id,
-            "clean git repo scan carried commit metadata into done-ledger submission; \
-             commit OIDs may have been emitted for filtered/suppressed findings"
-        );
+        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+            anyhow::anyhow!(
+                "submit_git_repo_done_ledger: captured_commit_oids={captured_commit_oids} \
+                 but detected_count=0; the CommitMeta/Finding event bridge is inconsistent \
+                 (repo_id={})",
+                input.repo_id,
+            ),
+        )));
     }
     let findings_receipt = FindingsCommitReceipt::new(0, 0, 0);
 
