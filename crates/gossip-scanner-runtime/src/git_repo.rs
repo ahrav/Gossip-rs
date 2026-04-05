@@ -21,6 +21,7 @@
 //! treats every OID as unseen. Incremental behavior is reserved for the
 //! distributed runtime path.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,8 +85,8 @@ pub(crate) struct GitRepoExecutionOutcome<B> {
     pub(crate) finalize_outcome: FinalizeOutcome,
 }
 
-impl<B: std::fmt::Debug> std::fmt::Debug for GitRepoExecutionOutcome<B> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<B: fmt::Debug> fmt::Debug for GitRepoExecutionOutcome<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GitRepoExecutionOutcome")
             .field("report", &self.report)
             .field("persistence", &self.persistence)

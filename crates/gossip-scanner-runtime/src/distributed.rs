@@ -96,6 +96,7 @@
 //! [`CommitPipeline`]: crate::commit_pipeline::CommitPipeline
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2769,16 +2770,16 @@ struct GitRepoPersistenceInput<'a> {
     complete_time: LogicalTime,
 }
 
-impl std::fmt::Debug for GitRepoPersistenceInput<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for GitRepoPersistenceInput<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GitRepoPersistenceInput")
             .field("write_context", &self.write_context)
             .field("shard_id", &self.shard_id)
             .field("repo_key", &self.repo_key)
             .field("repo_id", &self.repo_id)
             .field("bytes_scanned", &self.bytes_scanned)
-            .field("findings_count", &self.findings.len())
-            .field("tenant_secret_key", &"[redacted]")
+            .field("findings", &self.findings)
+            .field("tenant_secret_key", &self.tenant_secret_key)
             .field("rule_fingerprint", &"<fn>")
             .field("claim_time", &self.claim_time)
             .field("complete_time", &self.complete_time)
@@ -2835,6 +2836,9 @@ where
             ),
         )))
     })?;
+    // CompletedUnit satisfies the ResultCommitter::commit_translation signature.
+    // Only the durable receipts are used — the unit itself is discarded. The real
+    // checkpoint input is built separately by repo_frontier_checkpoint_input.
     let completed_unit = CompletedUnit::repo_frontier(
         0,
         Cursor::with_last_key(input.repo_key.clone().into_item_key()),
@@ -3054,11 +3058,15 @@ where
     // → findings persistence → watermark commit.
     let captured_findings = capture_sink.take_captured_findings();
     let detected_count = capture_sink.detected_finding_count();
-    assert_eq!(
-        detected_count as usize,
-        captured_findings.len(),
-        "finding counter must match captured finding payload count",
-    );
+    if detected_count as usize != captured_findings.len() {
+        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+            anyhow::anyhow!(
+                "finding counter ({detected_count}) diverged from captured payload count ({}); \
+                 data integrity compromised",
+                captured_findings.len(),
+            ),
+        )));
+    }
 
     let input = GitRepoPersistenceInput {
         write_context: execution.write_context,

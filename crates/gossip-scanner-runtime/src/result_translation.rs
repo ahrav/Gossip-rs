@@ -444,6 +444,10 @@ pub fn translate_item_result(
                 rule_fingerprint,
             )
         }
+        // Type witness only — no findings exist for non-Scanned variants. Any
+        // PersistenceFinding implementor works; NeverFinding is uninhabited and
+        // exists solely to satisfy the generic bound without implying a concrete
+        // finding source.
         ItemResult::FailedRetryable { error_code } => translate_result::<NeverFinding, _>(
             write_context,
             tenant_secret_key,
@@ -679,8 +683,10 @@ mod tests {
     };
     use scanner_scheduler::store::FsFindingRecord;
 
+    use proptest::prelude::*;
+
     use super::{
-        ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
+        FsFindingRef, ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
         translate_git_item_result, translate_item_result,
     };
     use crate::coordination_sink::GitFindingForPersistence;
@@ -875,6 +881,17 @@ mod tests {
     }
 
     #[test]
+    fn persistence_finding_trait_fs_impl_round_trip() {
+        let rec = finding(42, 10, 50, 0xAB);
+        let wrapper = FsFindingRef(&rec);
+        assert_eq!(wrapper.rule_id(), 42);
+        assert_eq!(wrapper.norm_hash(), NormHash::from_digest([0xAB; 32]));
+        assert_eq!(wrapper.span_start(), 10);
+        assert_eq!(wrapper.span_end(), 50);
+        assert_eq!(wrapper.span_len(), 40);
+    }
+
+    #[test]
     fn translate_git_item_result_produces_valid_three_layer_batch() {
         let translated = translate_git_scanned(&[git_finding(3, 10, 24, 0xAB)]);
         assert_eq!(translated.finding_count(), 1);
@@ -1010,6 +1027,37 @@ mod tests {
     }
 
     #[test]
+    fn translate_git_item_result_rejects_inverted_spans() {
+        let finding = GitFindingForPersistence {
+            rule_id: 1,
+            norm_hash: NormHash::from_digest([0xAA; 32]),
+            span_start: 50,
+            span_end: 10,
+        };
+        let err = translate_git_item_result(
+            write_context(),
+            &tenant_secret_key(),
+            42,
+            4096,
+            timing(),
+            &[finding],
+            &test_rule_fingerprint,
+        )
+        .expect_err("inverted spans must be rejected");
+        assert!(
+            matches!(
+                err,
+                ResultTranslationError::InvalidFindingSpan {
+                    start: 50,
+                    end: 10,
+                    ..
+                }
+            ),
+            "expected InvalidFindingSpan, got: {err:?}",
+        );
+    }
+
+    #[test]
     fn failed_translation_emits_done_ledger_only() {
         let error_code = DoneLedgerErrorCode::try_new("TIMEOUT").expect("error code");
 
@@ -1055,6 +1103,20 @@ mod tests {
         assert_eq!(translated.occurrence_count(), 1);
         assert_eq!(translated.observation_count(), 1);
         assert_eq!(translated.done_ledger().findings_count(), 1);
+    }
+
+    #[test]
+    fn duplicate_git_findings_collapse_by_identity() {
+        let f1 = git_finding(7, 10, 50, 0xAB);
+        let f2 = git_finding(7, 10, 50, 0xAB);
+        let translated = translate_git_scanned(&[f1, f2]);
+        assert_eq!(
+            translated.finding_count(),
+            1,
+            "duplicate git findings must collapse"
+        );
+        assert_eq!(translated.occurrence_count(), 1);
+        assert_eq!(translated.observation_count(), 1);
     }
 
     /// Non-collapse twin: findings that differ in an identity-contributing field
@@ -1330,5 +1392,100 @@ mod tests {
         assert!(ScanTiming::try_new(later, earlier).is_err());
         // Equal times are accepted (zero-duration scan).
         assert!(ScanTiming::try_new(later, later).is_ok());
+    }
+
+    /// Verifies that `ResultTranslationError` variants never expose norm_hash
+    /// bytes in their Display or Debug representations.
+    #[test]
+    fn no_finding_data_in_error_context_strings() {
+        let hash_bytes = [0xDE; 32];
+        let bad_finding = GitFindingForPersistence {
+            rule_id: 7,
+            norm_hash: NormHash::from_digest(hash_bytes),
+            span_start: 50,
+            span_end: 10, // inverted span triggers InvalidFindingSpan
+        };
+        let err = translate_git_item_result(
+            write_context(),
+            &tenant_secret_key(),
+            42,
+            4096,
+            timing(),
+            &[bad_finding],
+            &test_rule_fingerprint,
+        )
+        .expect_err("inverted span must fail");
+
+        let display = format!("{err}");
+        let debug = format!("{err:?}");
+        // 0xDE = 222 decimal; must not appear in error output.
+        assert!(
+            !display.contains("222"),
+            "Display must not leak hash bytes: {display}",
+        );
+        assert!(
+            !debug.contains("222"),
+            "Debug must not leak hash bytes: {debug}",
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            .. ProptestConfig::default()
+        })]
+
+        /// For any valid identity quadruple (rule_id, norm_hash, span_start,
+        /// span_end), the FS and Git translation paths must produce identical
+        /// FindingId, OccurrenceId, and ObservationId values.
+        #[test]
+        fn proptest_translate_findings_identity_equivalence(
+            rule_id in 1..100u32,
+            hash_seed in proptest::array::uniform32(0u8..),
+            start in 0..u32::MAX as u64,
+            len in 1..1000u64,
+        ) {
+            let end = start.saturating_add(len).max(start + 1);
+            let fs_rec = FsFindingRecord {
+                rule_id, norm_hash: hash_seed,
+                span_start: start, span_end: end,
+                root_hint_start: 0, root_hint_end: 0, confidence_score: 5,
+            };
+            let git_rec = GitFindingForPersistence {
+                rule_id,
+                norm_hash: NormHash::from_digest(hash_seed),
+                span_start: start, span_end: end,
+            };
+
+            let identity = git_repo_ovid_inputs(42);
+            let item = ScanItem::new(
+                ItemKey::try_from_slice(b"tenant/repo/git").expect("item key"),
+                ItemRef::try_from_vec(b"ref".to_vec()).expect("item ref"),
+                identity.stable_item_id,
+                identity.version,
+            );
+
+            let fs_t = translate_item_result(
+                write_context(), &tenant_secret_key(), &item, 4096, timing(),
+                ItemResult::Scanned { findings: &[fs_rec] }, &test_rule_fingerprint,
+            ).expect("fs translation");
+            let git_t = translate_git_item_result(
+                write_context(), &tenant_secret_key(), 42, 4096, timing(),
+                &[git_rec], &test_rule_fingerprint,
+            ).expect("git translation");
+
+            prop_assert_eq!(
+                fs_t.findings()[0].finding_id(),
+                git_t.findings()[0].finding_id(),
+            );
+            prop_assert_eq!(
+                fs_t.occurrences()[0].occurrence_id(),
+                git_t.occurrences()[0].occurrence_id(),
+            );
+            prop_assert_eq!(
+                fs_t.observations()[0].observation_id(),
+                git_t.observations()[0].observation_id(),
+            );
+        }
     }
 }

@@ -74,6 +74,13 @@ fn sentinel_to_option(id: u32) -> Option<u32> {
 
 /// Persistence-ready representation of one Git finding observed during scan
 /// execution.
+///
+/// `span_start` and `span_end` are blob-level byte offsets captured from
+/// `FindingEvent::start/end`. For Git findings these correspond to
+/// `FindingKey::start/end` (root-hint coordinates within the blob). The FS
+/// path uses decoded-buffer match spans for the same trait methods, so
+/// cross-source identity convergence is guaranteed only for non-transformed
+/// findings (the common case).
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct GitFindingForPersistence {
     pub(crate) span_start: u64,
@@ -221,6 +228,10 @@ impl GitEventOutput for CoordinationEventSink {
 /// the final value is always visible to the reader. Captured findings are
 /// stored behind a `Mutex<Vec<_>>` because pack workers emit findings from
 /// multiple threads during git scans.
+/// The lock is held only for a single `Vec::push` per finding (~nanoseconds),
+/// so contention is negligible for typical sparse-findings repositories. For
+/// finding-dense repos under high pack-worker parallelism, per-worker local
+/// collection merged post-join would eliminate contention entirely.
 pub(crate) struct FindingsCaptureSink {
     inner: Arc<CoordinationEventSink>,
     finding_count: AtomicU64,

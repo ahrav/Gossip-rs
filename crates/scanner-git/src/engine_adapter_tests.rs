@@ -1293,3 +1293,23 @@ fn mismatched_bitset_and_graph_panics_in_debug() {
         },
     );
 }
+
+/// Debug output must redact `norm_hash` to prevent leaking secret-derived bytes.
+#[test]
+fn finding_key_debug_redacts_norm_hash() {
+    let key = FindingKey {
+        start: 0,
+        end: 10,
+        rule_id: 1,
+        norm_hash: [0xFF; 32],
+    };
+    let debug = format!("{key:?}");
+    assert!(
+        debug.contains("[redacted]"),
+        "Debug must redact norm_hash, got: {debug}"
+    );
+    assert!(
+        !debug.contains("255"),
+        "Debug must not leak raw hash bytes, got: {debug}"
+    );
+}
