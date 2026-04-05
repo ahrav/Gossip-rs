@@ -570,7 +570,7 @@ impl GitEventOutput for FindingsCaptureSink {
             {
                 // Publish saturation before cancelling so later events
                 // can take the mutex-free fast path immediately.
-                self.oid_map_saturated.store(true, Ordering::Release);
+                self.oid_map_saturated.store(true, Ordering::Relaxed);
                 self.cancel.cancel();
                 tracing::warn!(
                     max = Self::MAX_COMMIT_OID_MAP_ENTRIES,
@@ -1084,6 +1084,84 @@ mod tests {
         assert!(
             !sink.is_oid_map_saturated(),
             "below-capacity inserts must not set the saturation flag"
+        );
+    }
+
+    #[test]
+    fn commit_oid_map_update_existing_key_near_capacity() {
+        // Verify that updating an existing key at MAX-1 occupancy does not
+        // spuriously trigger saturation, and that a subsequent new-key insert
+        // at the actual boundary fires cancellation correctly.
+        let (sink, _recorder, cancel) = make_sink_and_recorder();
+        let max = FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES;
+
+        // Fill the map to MAX-1 entries (IDs 0..max-1).
+        for i in 0..(max as u32 - 1) {
+            sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+                commit_id: i,
+                commit_oid: scanner_git::OidBytes::sha1([i as u8 + 1; 20]),
+                timestamp: 1_700_000_000 + u64::from(i),
+                identity: None,
+            }));
+        }
+
+        assert!(
+            !cancel.is_cancelled(),
+            "below-capacity inserts must not cancel the scan"
+        );
+        assert!(
+            !sink.is_oid_map_saturated(),
+            "below-capacity inserts must not set the saturation flag"
+        );
+
+        // Re-insert ID 0 with a different OID. This exercises the
+        // Entry::Occupied path when pre_len == MAX-1; the map size must
+        // stay at MAX-1 because no new key was added.
+        let updated_oid = scanner_git::OidBytes::sha256([0xFF; 32]);
+        sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+            commit_id: 0,
+            commit_oid: updated_oid,
+            timestamp: 1_700_000_099,
+            identity: None,
+        }));
+
+        assert!(
+            !cancel.is_cancelled(),
+            "updating an existing key must not cancel the scan"
+        );
+        assert!(
+            !sink.is_oid_map_saturated(),
+            "updating an existing key must not set the saturation flag"
+        );
+
+        // Insert the final new key (ID = max-1) to push the map to exactly
+        // MAX entries. This crosses the capacity boundary and fires saturation.
+        sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+            commit_id: max as u32 - 1,
+            commit_oid: scanner_git::OidBytes::sha1([max as u8; 20]),
+            timestamp: 1_700_000_100,
+            identity: None,
+        }));
+
+        assert!(
+            cancel.is_cancelled(),
+            "reaching capacity must cancel the scan"
+        );
+        assert!(
+            sink.is_oid_map_saturated(),
+            "reaching capacity must set the saturation flag"
+        );
+
+        let map = sink.drain_commit_oid_map();
+        assert_eq!(
+            map.len(),
+            max,
+            "map must contain exactly MAX_COMMIT_OID_MAP_ENTRIES entries"
+        );
+        assert_eq!(
+            map.get(&0),
+            Some(&updated_oid),
+            "ID 0 must reflect the updated OID, not the original"
         );
     }
 

@@ -899,9 +899,10 @@ where
             //
             // Defense-in-depth: fires only when execute_repo returns Err
             // for a non-abort reason (e.g., I/O error) concurrent with
-            // OID-map saturation. The primary saturation path goes through
-            // the Ok(Partial) check below because execute_repo converts
-            // abort-signalled errors to Ok(FinalizeOutcome::Partial).
+            // OID-map saturation. The primary saturation path exits through
+            // the is_oid_map_saturated() check after the match because
+            // execute_repo converts abort-signalled errors to
+            // Ok(FinalizeOutcome::Partial).
             if capture_sink.is_oid_map_saturated()
                 && !matches!(err, DistributedRuntimeError::LeaseUncertain(_))
             {
@@ -910,18 +911,23 @@ where
                     "OID-map saturation supersedes scan error; \
                      original cause preserved in this log entry"
                 );
-                return Err(oid_map_saturation_error(
-                    stage_sink.redacted_shard_id(),
-                    "scan error superseded by OID-map saturation",
-                ));
+                return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+                    anyhow!(
+                        "git repo-frontier shard '{}': commit OID map saturated \
+                     at {} entries; scan error superseded by OID-map saturation \
+                     (original: {err})",
+                        stage_sink.redacted_shard_id(),
+                        FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES,
+                    ),
+                )));
             }
             return Err(err);
         }
     };
     let complete_time = wall_clock_now();
     // Single check covers both the common case (cancellation propagated as
-    // partial finalize) and the last-commit race where the scan completed
-    // before observing the cancellation flag.
+    // partial finalize) and the race where execute_repo completed its last
+    // commit before polling the abort flag set by OID-map saturation.
     if capture_sink.is_oid_map_saturated() {
         return Err(oid_map_saturation_error(
             stage_sink.redacted_shard_id(),

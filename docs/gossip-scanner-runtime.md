@@ -868,8 +868,8 @@ with a deterministic `OpId`.
    using `GitPersistenceAdapter` as the scanner-git seen/watermark/finalize
    store and `FindingsCaptureSink` to retain persistence-ready finding payloads
    plus the sparse commit-ordinal-to-OID map; if the map saturates,
-   `FindingsCaptureSink` cancels the shared scan token and the lease fails
-   before translation,
+   `FindingsCaptureSink` cancels the shared scan token and the worker returns
+   an error before translation,
 5. if `execute_repo` finishes with `FinalizeOutcome::Complete`, translates the
    captured findings into per-object persistence rows through
    `translate_git_item_result`, then durably records findings and the repo-level
