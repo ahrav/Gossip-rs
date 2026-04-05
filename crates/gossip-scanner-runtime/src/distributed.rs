@@ -95,7 +95,7 @@
 //! [`CoordinationFacade`]: gossip_coordination::CoordinationFacade
 //! [`CommitPipeline`]: crate::commit_pipeline::CommitPipeline
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -128,7 +128,7 @@ use gossip_frontier::decode_connector_extra;
 use gossip_orchestrator::{
     FilesystemPathKind, FilesystemShardPayload, FilesystemSourceMode, GitShardPayload,
 };
-use scanner_git::{FinalizeOutcome, GitEventOutput};
+use scanner_git::{FinalizeOutcome, GitEventOutput, OidBytes};
 use scanner_scheduler::store::FsFindingRecord;
 use scanner_scheduler::{
     events::{CoreEvent, EventOutput, FindingEvent, SummaryEvent},
@@ -2822,8 +2822,11 @@ where
     Ok((report, completion))
 }
 
-/// Bundled metadata for one completed Git repo scan, consumed by the
-/// done-ledger submission helper.
+/// Aggregated persistence inputs for a completed Git repo scan.
+///
+/// Consumers may reject certain field combinations — e.g.,
+/// `detected_count > 0` triggers an error in [`submit_git_repo_done_ledger`]
+/// because durable Git finding translation is not yet available.
 #[derive(Debug)]
 struct GitRepoPersistenceInput<'a> {
     write_context: WriteContext,
@@ -2831,6 +2834,12 @@ struct GitRepoPersistenceInput<'a> {
     repo_id: u64,
     bytes_scanned: u64,
     detected_count: u64,
+    /// Sparse mapping from finding `commit_id` ordinals to stable commit OIDs.
+    ///
+    /// The scan captures this from `CommitMeta` events so Git findings
+    /// translation can derive stable occurrence identities without re-reading
+    /// commit metadata after the worker thread joins.
+    commit_oid_map: HashMap<u32, OidBytes>,
     claim_time: LogicalTime,
     /// Wall-clock timestamp captured after scan execution *and* persistence
     /// finalize complete. The `(claim_time, complete_time)` interval therefore
@@ -2862,22 +2871,42 @@ where
     D: DoneLedger + Clone + Send + Sync + 'static,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
+    let captured_commit_oids = input.commit_oid_map.len();
+
     // --- findings submission ---
-    // TODO(git-findings-persistence): replace this guard and the zero-count
-    // receipt with real findings translation — grep for the tag to find the
-    // other two sites that must change atomically.
-    //
-    // Durable Git finding persistence is unsupported. The caller rejects
-    // leases with detected_count > 0, and the hard check below enforces
-    // this invariant in release builds as defense-in-depth.
+    // This helper only submits the done-ledger row. It does not translate
+    // captured Git findings into a findings batch, so a nonzero finding
+    // count must reject the lease rather than checkpointing as clean.
     // Synthesize a zero-count receipt to skip an unnecessary sink
     // round-trip for clean shards.
+    //
+    // TODO(git-findings-persistence): replace this guard and the zero-count
+    // receipt with real findings translation using `input.commit_oid_map`.
     if input.detected_count > 0 {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow::anyhow!(
                 "submit_git_repo_done_ledger called with detected_count={}; \
+                 captured_commit_oids={captured_commit_oids}; \
                  durable Git finding persistence is unsupported",
                 input.detected_count,
+            ),
+        )));
+    }
+    // On the production path, CommitMeta events are only emitted by
+    // `EngineAdapter::stream_findings` when `findings_buf` is non-empty,
+    // and the same call emits at least one Finding (incrementing
+    // `detected_finding_count`). Both events traverse the same channel
+    // and are replayed by a non-panicking forwarder, so partial delivery
+    // is structurally impossible. Captured OIDs without findings therefore
+    // signals a broken event bridge — fail closed rather than writing a
+    // ScannedClean done-ledger row that would mask the regression.
+    if captured_commit_oids > 0 {
+        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+            anyhow::anyhow!(
+                "submit_git_repo_done_ledger: captured_commit_oids={captured_commit_oids} \
+                 but detected_count=0; the CommitMeta/Finding event bridge is inconsistent \
+                 (repo_id={})",
+                input.repo_id,
             ),
         )));
     }
@@ -2885,8 +2914,8 @@ where
 
     // --- done-ledger submission ---
     // TODO(git-findings-persistence): derive findings_count from the real
-    // findings receipt via u32::try_from — grep for the tag to find the
-    // other two sites that must change atomically.
+    // findings receipt via u32::try_from once Git findings translation
+    // populates the findings sink from the captured event stream.
     //
     // The hard check above guarantees detected_count == 0 on this path.
     let findings_count: u32 = 0;
@@ -3023,7 +3052,10 @@ where
     let cancel = CancellationToken::new();
     let lease_uncertainty = LeaseUncertaintySignal::default();
     let lease_watch_done = Arc::new(AtomicBool::new(false));
-    let capture_sink = Arc::new(FindingsCaptureSink::new(Arc::clone(&stage_sink)));
+    let capture_sink = Arc::new(FindingsCaptureSink::new(
+        Arc::clone(&stage_sink),
+        FindingsCaptureSink::DEFAULT_COMMIT_OID_CAPACITY,
+    ));
     let event_sink: Arc<dyn GitEventOutput + Send + Sync> =
         Arc::clone(&capture_sink) as Arc<dyn GitEventOutput + Send + Sync>;
     let (execution, watch_result) = std::thread::scope(|scope| {
@@ -3134,6 +3166,10 @@ where
     // GitPersistenceBackend would require splitting finalize into: seen-bitmaps
     // → findings persistence → watermark commit.
     let detected_count = capture_sink.detected_finding_count();
+    // Drain the sparse ordinal-to-OID lookup after the scan thread joins so
+    // Git findings persistence can resolve stable commit versions from the
+    // captured event stream without replaying commit metadata.
+    let commit_oid_map = capture_sink.drain_commit_oid_map();
 
     if detected_count > 0 {
         // Durable findings translation is not yet available. Persisting an
@@ -3143,10 +3179,12 @@ where
         // and will be rescanned once findings persistence is implemented.
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow::anyhow!(
-                "git repo-frontier shard '{}' detected {detected_count} finding(s), \
+                "git repo-frontier shard '{}' detected {detected_count} finding(s) \
+                 with {} captured commit OID(s), \
                  but durable Git finding translation is unavailable; \
                  refusing to checkpoint as clean",
                 stage_sink.redacted_shard_id(),
+                commit_oid_map.len(),
             ),
         )));
     }
@@ -3157,6 +3195,7 @@ where
         repo_id: lease.payload().repo_id(),
         bytes_scanned: execution.report.bytes_scanned,
         detected_count,
+        commit_oid_map,
         claim_time: lease.claim_wall_clock(),
         complete_time,
     };
@@ -9378,6 +9417,7 @@ mod tests {
             repo_id: 42,
             bytes_scanned: 1024,
             detected_count: 5,
+            commit_oid_map: HashMap::from([(7, scanner_git::OidBytes::sha1([0xAB; 20]))]),
             claim_time: LogicalTime::from_raw(100),
             complete_time: LogicalTime::from_raw(200),
         };
@@ -9388,6 +9428,142 @@ mod tests {
         assert!(
             msg.contains("detected_count=5"),
             "error must report the count: {msg}"
+        );
+        assert!(
+            msg.contains("captured_commit_oids=1"),
+            "error must report the captured commit metadata count: {msg}"
+        );
+    }
+
+    #[test]
+    fn submit_git_repo_done_ledger_accepts_clean_scan() {
+        let input = GitRepoPersistenceInput {
+            write_context: write_context(),
+            shard_id: "test-shard",
+            repo_id: 99,
+            bytes_scanned: 4096,
+            detected_count: 0,
+            commit_oid_map: HashMap::new(),
+            claim_time: LogicalTime::from_raw(300),
+            complete_time: LogicalTime::from_raw(400),
+        };
+        let ledger = InMemoryDoneLedger::new();
+        let (findings_receipt, done_ledger_receipt) = submit_git_repo_done_ledger(&ledger, &input)
+            .expect("clean scan with no findings must succeed");
+        assert_eq!(
+            findings_receipt.finding_count(),
+            0,
+            "synthesized findings receipt must report zero findings"
+        );
+        assert_eq!(
+            findings_receipt.occurrence_count(),
+            0,
+            "synthesized findings receipt must report zero occurrences"
+        );
+        assert_eq!(
+            findings_receipt.observation_count(),
+            0,
+            "synthesized findings receipt must report zero observations"
+        );
+        assert!(
+            done_ledger_receipt.record_count() > 0,
+            "done-ledger receipt must indicate at least one record written"
+        );
+    }
+
+    #[test]
+    fn submit_git_repo_done_ledger_rejects_nonzero_commit_oids_with_zero_findings() {
+        let input = GitRepoPersistenceInput {
+            write_context: write_context(),
+            shard_id: "test-shard",
+            repo_id: 77,
+            bytes_scanned: 2048,
+            detected_count: 0,
+            commit_oid_map: HashMap::from([
+                (1, scanner_git::OidBytes::sha1([0xAA; 20])),
+                (5, scanner_git::OidBytes::sha256([0xBB; 32])),
+            ]),
+            claim_time: LogicalTime::from_raw(500),
+            complete_time: LogicalTime::from_raw(600),
+        };
+        let ledger = InMemoryDoneLedger::new();
+        let err = submit_git_repo_done_ledger(&ledger, &input)
+            .expect_err("captured OIDs without findings indicates a broken event bridge");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("captured_commit_oids=2"),
+            "error must report the captured count: {msg}"
+        );
+        assert!(
+            msg.contains("detected_count=0"),
+            "error must report the zero finding count: {msg}"
+        );
+    }
+
+    /// Integration test composing the full capture-sink → drain → persistence
+    /// pipeline. CommitMeta events without corresponding findings trigger the
+    /// broken-event-bridge guard in `submit_git_repo_done_ledger`.
+    #[test]
+    fn submit_git_repo_done_ledger_integration_rejects_oids_without_findings() {
+        let rec = Arc::new(Recorder::default());
+        let inner_sink = Arc::new(CoordinationEventSink::new(
+            Arc::clone(&rec) as Arc<dyn CoordinationEventRecorder>,
+            Arc::from("integration-shard"),
+        ));
+        let capture_sink =
+            FindingsCaptureSink::new(inner_sink, FindingsCaptureSink::DEFAULT_COMMIT_OID_CAPACITY);
+
+        // Emit two CommitMeta events without any Finding events. On the
+        // production path this combination is structurally impossible
+        // (EngineAdapter::stream_findings only emits CommitMeta when
+        // findings_buf is non-empty), so the persistence function must
+        // reject it as a broken event bridge.
+        let oid_a = OidBytes::sha1([0xaa; 20]);
+        let oid_b = OidBytes::sha1([0xbb; 20]);
+        capture_sink.emit_git(scanner_git::GitEvent::CommitMeta(
+            scanner_git::CommitMetaEvent {
+                commit_id: 1,
+                commit_oid: oid_a,
+                timestamp: 1_700_000_000,
+                identity: None,
+            },
+        ));
+        capture_sink.emit_git(scanner_git::GitEvent::CommitMeta(
+            scanner_git::CommitMetaEvent {
+                commit_id: 5,
+                commit_oid: oid_b,
+                timestamp: 1_700_000_100,
+                identity: None,
+            },
+        ));
+
+        assert_eq!(capture_sink.detected_finding_count(), 0);
+        let commit_oid_map = capture_sink.drain_commit_oid_map();
+        assert_eq!(
+            commit_oid_map.len(),
+            2,
+            "drain must yield both CommitMeta entries"
+        );
+        assert_eq!(commit_oid_map[&1], oid_a);
+        assert_eq!(commit_oid_map[&5], oid_b);
+
+        let input = GitRepoPersistenceInput {
+            write_context: write_context(),
+            shard_id: "integration-shard",
+            repo_id: 123,
+            bytes_scanned: 8192,
+            detected_count: 0,
+            commit_oid_map,
+            claim_time: LogicalTime::from_raw(700),
+            complete_time: LogicalTime::from_raw(800),
+        };
+        let ledger = InMemoryDoneLedger::new();
+        let err = submit_git_repo_done_ledger(&ledger, &input)
+            .expect_err("captured OIDs without findings must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("captured_commit_oids=2"),
+            "error must report captured count: {msg}"
         );
     }
 }
