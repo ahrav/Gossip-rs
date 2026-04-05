@@ -20,6 +20,7 @@ members = [
     "crates/gossip-worker",
     "crates/scanner-rs-cli",
     "tools/dev-seed",
+    "crates/fleet-orchestrator",
 ]
 
 [workspace.package]

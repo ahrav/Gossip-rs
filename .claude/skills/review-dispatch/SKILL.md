@@ -57,6 +57,27 @@ If the diff is empty, tell the user there's nothing to review and stop.
 When reviewing a PR, include the PR number and title in the review header so
 findings can be linked back to the PR.
 
+## Known Patterns Injection
+
+Before launching specialist agents, read `.claude/review-rules.yaml`. For each
+rule with `status: active`, append the following to the Common Preamble:
+
+```
+## Known Patterns from Previous Reviews
+
+The following patterns have been identified as recurring issues in this codebase.
+Check specifically for these during your review, in addition to your full scope:
+
+{for each active rule:}
+- **{rule.what}** ({rule.category}/{rule.subcategory})
+  Scope: {rule.scope_dirs}
+  Why: {rule.why}
+  BAD: {rule.bad_example}
+  GOOD: {rule.good_example}
+```
+
+If `.claude/review-rules.yaml` does not exist or has no active rules, skip this.
+
 ## Phase 1 — Specialist Reviews (6 Parallel Agents)
 
 Launch **all 6 agents in a single message** using the Task tool with
@@ -410,3 +431,18 @@ Minimum: at least 2 specialists must run. The ranker always runs.
 - For unsafe code changes, the Safety specialist is essential — don't skip it.
 - If the diff is very large (>1000 lines), consider reviewing in logical chunks
   rather than all at once to keep agent context focused.
+
+## Findings Log
+
+After producing the final report, append each finding to
+`.claude/review-findings.jsonl` (one JSON object per line). Only log findings
+with confidence >= 0.60.
+
+```json
+{"id":"rf-YYYYMMDD-NNN","timestamp":"ISO8601","source":"review-dispatch","dimension":"...","category":"...","subcategory":"...","file":"...","line":0,"directory":"...","severity":"P0-P3","title":"...","description":"...","suggestion":"...","confidence":0.0,"importance":0,"classification":"MUST FIX|SHOULD FIX|CONSIDER|NIT","resolution":{"status":"pending","action":null,"was_true_positive":null}}
+```
+
+Assign `category` and `subcategory` from the taxonomy in
+`.claude/review-rules.yaml`, or use the finding's `dimension` as category if no
+exact match exists. Generate a unique `id` per finding using the date and a
+sequential counter (e.g., `rf-20260404-001`).

@@ -412,3 +412,24 @@ After all waves complete, present:
 - `/test-strategy` — choose appropriate test type (unit, property, fuzz, Kani)
 - `/test-consolidate` — referenced in bug resolution steps to avoid test duplication
 - `/doc-verify` — runs as Phase 5 to catch documentation drift from fixes
+
+## Findings Log Integration
+
+After completing all execution waves, update `.claude/review-findings.jsonl`:
+
+1. For each finding that was executed, update its `resolution` field:
+   - `status`: "fixed", "wontfix", or "false_positive"
+   - `action`: brief description of what was done
+   - `was_true_positive`: true if the finding was a real issue, false if not
+
+2. Generate a **Pattern Coverage Report** comparing current findings against
+   known patterns in `.claude/review-rules.yaml`:
+
+   | Known Pattern | Rule ID | Found | Count |
+   |--------------|---------|-------|-------|
+   | {rule.what} | {rule.id} | Yes/No | N |
+
+   Also list new finding categories not yet in rules (monitoring candidates).
+
+If `.claude/review-findings.jsonl` does not exist, create it. If
+`.claude/review-rules.yaml` does not exist, skip the coverage report.

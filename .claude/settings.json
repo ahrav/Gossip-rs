@@ -41,6 +41,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/review-pattern-check.sh"
+          }
+        ]
+      }
     ]
   }
 }
