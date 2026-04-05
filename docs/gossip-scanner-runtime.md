@@ -37,7 +37,11 @@ and validation, and Git connector mode uses the direct path.
 | `src/commit_sink.rs` | `CommitSink` trait, `CliNoOpCommitSink` (no-op), and lightweight bridge record types (`ItemMeta`, `FindingRecord`, `FindingsBatch`) for scan-loop lifecycle |
 | `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`, `StageSignal`), `CoordinationEventRecorder` trait, and `FindingsCaptureSink`/`GitFindingForPersistence` adapters for repo-frontier Git finding capture before durable translation |
 | `src/done_ledger_bloom.rs` | Internal done-ledger Bloom filter wrapper: OvidHash-aware membership checks, scope-size gating, and memory-cap enforcement for prefilter construction |
-| `src/distributed.rs` | Distributed worker-loop runtime: filesystem `WorkerIdentity` / `ShardLease`, Git `GitWorkerIdentity` / `GitShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (receipt-driven execution adapter), and the sibling lease loops `run_worker` (filesystem) plus `run_git_repo_worker` (repo-frontier Git). Internal helpers cover receipt-driven checkpoint building, singleton repo-frontier execution, low-cardinality Git stage telemetry, and direct `CoordinationFacade` claim/complete helpers |
+| `src/distributed.rs` | Module root: re-exports public API and documents the distributed worker-loop architecture |
+| `src/distributed/types.rs` | Worker identity (`WorkerIdentity`, `GitWorkerIdentity`), lease types (`ShardLease`, `GitShardLease`, `LeaseView`), config (`DistributedRuntimeConfig`), report, and error types |
+| `src/distributed/execution.rs` | Lease execution functions (`run_filesystem_lease`, `run_git_repo_lease`) and worker entry points (`run_worker`, `run_git_repo_worker`) |
+| `src/distributed/commit_bridge.rs` | `ReceiptCommitSink` adapter, receipt-driven checkpoint building, `drain_commit_stage` |
+| `src/distributed/lease_ops.rs` | Lease lifecycle: `advance_shard`, `ArmedLeaseDeadline`, `watch_lease_deadline`, `LeaseUncertaintySignal` |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_discovery.rs` | Static single-target Git repository discovery source for payload-backed repo-frontier shards |
 | `src/git_executor.rs` | Contract-level adapter that implements `GitRepoExecutor` for mirror-backed repo scans by translating `GitSelection` + `GitExecutionLimits` into `scanner-git` config, propagating repo/policy identity into persistence-aware runs, and reusing the shared runtime runner |
@@ -784,17 +788,22 @@ where
 ```
 
 ```rust
-pub fn run_git_repo_worker<C, M, B>(
+pub fn run_git_repo_worker<C, M, B, F, D>(
     coordinator: &mut C,
     mirrors: &mut M,
     identity: GitWorkerIdentity,
     git_persistence_backend: B,
+    persistence: DistributedPersistence<F, D>,
     config: DistributedRuntimeConfig,
 ) -> Result<DistributedRunReport, DistributedRuntimeError>
 where
     C: CoordinationFacade,
     M: GitMirrorManager,
     B: GitPersistenceBackend + Clone,
+    F: FindingsSink + Clone + Send + Sync + 'static,
+    D: DoneLedger + Clone + Send + Sync + 'static,
+    F::Error: std::error::Error + Send + Sync + 'static,
+    D::Error: std::error::Error + Send + Sync + 'static,
 {
     ...
 }
@@ -935,7 +944,7 @@ and coordination-backend observations).
 | Bounded execution -> commit worker and outcome queues | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` |
 | Coordination recorder payloads | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
 | Done-ledger Bloom prefilter helper | `crates/gossip-scanner-runtime/src/done_ledger_bloom.rs` |
-| Distributed worker-loop foundation types | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| Distributed worker-loop runtime (`src/distributed/` submodules) | `crates/gossip-scanner-runtime/src/distributed.rs` (module root), `src/distributed/types.rs`, `src/distributed/execution.rs`, `src/distributed/commit_bridge.rs`, `src/distributed/lease_ops.rs` |
 | Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | Static Git repo discovery source | `crates/gossip-scanner-runtime/src/git_discovery.rs` |
 | Git-repo local scan runtime | `crates/gossip-scanner-runtime/src/git_repo.rs` |

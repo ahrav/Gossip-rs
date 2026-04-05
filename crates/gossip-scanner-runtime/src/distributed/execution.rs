@@ -363,10 +363,14 @@ where
         .with_budgets(config.budgets)
         .with_persist_findings(true);
 
-    assert_eq!(
-        scan_config.workers, 1,
-        "receipt-driven execution requires single-threaded scanning"
-    );
+    if scan_config.workers != 1 {
+        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+            anyhow::anyhow!(
+                "receipt-driven execution requires single-threaded scanning, got workers={}",
+                scan_config.workers,
+            ),
+        )));
+    }
 
     let armed_lease_deadline = ArmedLeaseDeadline::arm_from(
         lease.lease().deadline(),

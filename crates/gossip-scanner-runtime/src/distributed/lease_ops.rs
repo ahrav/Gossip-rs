@@ -634,7 +634,14 @@ where
     C: CoordinationFacade,
     L: LeaseView,
 {
-    assert_eq!(lease.lease().tenant(), tenant);
+    if lease.lease().tenant() != tenant {
+        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+            anyhow::anyhow!(
+                "advance_shard tenant mismatch: worker tenant {tenant:?}, lease tenant {:?}",
+                lease.lease().tenant(),
+            ),
+        )));
+    }
 
     let (cursor, op_kind, operation_name) = match outcome {
         ShardCompletionOutcome::Checkpoint { checkpoint } => {

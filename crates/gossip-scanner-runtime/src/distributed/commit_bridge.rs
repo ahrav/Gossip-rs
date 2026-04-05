@@ -371,10 +371,25 @@ impl ReceiptCommitSink {
             scan_item = scan_item.with_size_hint(size_hint);
         }
 
-        if let Ok(display) = std::str::from_utf8(scan_item.item_key().as_bytes())
-            && let Ok(location) = Location::try_new(display.to_owned(), None)
-        {
-            scan_item = scan_item.with_location(location);
+        match std::str::from_utf8(scan_item.item_key().as_bytes()) {
+            Ok(display) => match Location::try_new(display.to_owned(), None) {
+                Ok(location) => {
+                    scan_item = scan_item.with_location(location);
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        item_key_len = scan_item.item_key().as_bytes().len(),
+                        "item location rejected by Location::try_new; \
+                         observation will lack display path"
+                    );
+                }
+            },
+            Err(_) => {
+                tracing::debug!(
+                    item_key_len = scan_item.item_key().as_bytes().len(),
+                    "item key is not valid UTF-8; observation will lack display path"
+                );
+            }
         }
 
         let translation = translate_item_result(
@@ -459,7 +474,7 @@ impl CommitSink for ReceiptCommitSink {
         // Root-hint fields are unavailable through this bridge, so both
         // root_hint_start/end mirror span_start/end. This is safe because
         // root-hint fields never participate in persistence identity
-        // derivation (see the `Identity derivation` section in
+        // derivation (see the module-level doc in
         // result_translation.rs).
         item.findings
             .extend(batch.findings.iter().map(|finding| FsFindingRecord {

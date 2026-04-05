@@ -3,8 +3,8 @@
 //! Contains test doubles, helper constructors, and fixture builders used by
 //! both `unit_tests` and `integration_tests` sibling modules.
 
-// Many items are only consumed by sibling test modules that are still
-// being populated. Suppress unused-import and dead-code noise until then.
+// Items are consumed by sibling test modules (`unit_tests`, `integration_tests`)
+// via `super::*`, which the compiler cannot trace across module boundaries.
 #![allow(unused_imports)]
 #![allow(dead_code)]
 

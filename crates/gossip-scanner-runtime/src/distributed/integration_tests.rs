@@ -2532,6 +2532,66 @@ fn run_git_repo_worker_mirror_failure_does_not_advance_shard_or_persist() {
     );
 }
 
+/// The repo-frontier worker validates that the atomic finding counter
+/// matches the captured finding payload count before persisting. This
+/// guards against data integrity issues where the counter and payload
+/// diverge (e.g., from a concurrent mutation bug in the capture sink).
+///
+/// This test exercises the positive path: a secret-bearing repo produces
+/// findings, and the done-ledger `findings_count` must equal the number
+/// of durably persisted finding rows. If the counter-vs-payload guard
+/// rejected the scan, the worker would return an error instead of
+/// completing successfully.
+#[test]
+fn run_git_repo_worker_finding_counter_matches_persisted_payload_count() {
+    let repo = create_git_repo_fixture_with_secrets();
+    let mirror_root = tempdir().expect("mirror root");
+    let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+    let backend = TestGitBackend::default();
+    let mut coordinator =
+        setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let report = run_git_repo_worker(
+        &mut coordinator,
+        &mut mirrors,
+        git_worker_identity(repo.path()),
+        backend,
+        DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
+        DistributedRuntimeConfig::default(),
+    )
+    .expect("finding counter must match payload count for the worker to succeed");
+
+    assert_eq!(report.leases_seen, 1);
+    assert_eq!(report.shards_scanned, 1);
+
+    let persisted = findings_sink
+        .findings_snapshot()
+        .expect("findings snapshot");
+    assert!(
+        !persisted.is_empty(),
+        "secret-bearing fixture must produce at least one finding"
+    );
+
+    let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+    assert_eq!(
+        rows.len(),
+        1,
+        "singleton repo shard produces one done-ledger row"
+    );
+    assert_eq!(
+        rows[0].findings_count(),
+        persisted.len() as u32,
+        "done-ledger findings_count must equal the number of durably persisted findings"
+    );
+    assert_eq!(
+        rows[0].status(),
+        DoneLedgerStatus::ScannedWithFindings,
+        "non-zero findings must produce ScannedWithFindings status"
+    );
+}
+
 /// A `FinalizeOutcome::Partial` from the scanner (caused by skipped
 /// candidates) must be rejected by the repo-frontier worker because
 /// outer progress requires a fully durable repo receipt.

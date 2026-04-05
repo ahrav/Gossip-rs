@@ -27,7 +27,8 @@ use super::*;
 
 use super::commit_bridge::{
     CommitStageDrainResult, InFlightItem, ReceiptCommitSink, checkpoint_logical_time,
-    emit_ordered_summary, resolve_filesystem_lease_results, wait_for_submitted_commits,
+    drain_commit_stage, emit_ordered_summary, resolve_filesystem_lease_results,
+    wait_for_submitted_commits,
 };
 use super::execution::{GitRepoPersistenceInput, submit_git_repo_persistence};
 use super::lease_ops::{
@@ -49,6 +50,7 @@ use gossip_contracts::{
     coordination::{RestoredShardState, ShardSpec},
     identity::{
         FenceEpoch, LogicalTime, NormHash, ObjectVersionId, OpId, ShardId, ShardKey, StableItemId,
+        TenantId,
     },
     persistence::{DoneLedgerCommitReceipt, DoneLedgerStatus, FindingsCommitReceipt},
 };
@@ -59,7 +61,7 @@ use gossip_coordination::{
 };
 use gossip_frontier::{ShardSpecScratch, range_shard_ref};
 use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
-use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
+use gossip_persistence_inmemory::{CompletionOrder, InMemoryDoneLedger, InMemoryFindingsSink};
 use scanner_git::{FinalizeOutcome, OidBytes};
 use scanner_scheduler::{source_kind::SourceKind, store::FsFindingRecord};
 use tempfile::tempdir;
@@ -67,10 +69,14 @@ use tempfile::tempdir;
 use crate::{
     CancellationToken, OwnedCoreEvent, ScanBudgets, ScanReport, ScanRuntimeError,
     checkpoint_aggregator::PrefixCheckpointAggregator,
-    commit_pipeline::CommitStageOutput,
+    commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput, QueuedCommit},
     commit_sink::{CommitSink, FindingRecord, FindingsBatch, ItemMeta},
     coordination_sink::{CommitProgressRecord, GitFindingForPersistence, MirrorErrorClass},
     ordered_content::{OrderedContentReadStop, OrderedContentSkipReason},
+    test_fixtures::{
+        completed_unit as fixture_completed_unit,
+        scanned_translation as fixture_scanned_translation, wait_until,
+    },
 };
 
 // ============================================================================
@@ -2614,4 +2620,105 @@ fn advance_shard_checkpoint_keeps_shard_active() {
         summaries[0].last_key(),
         checkpoint.last_key().map(|key| key.as_bytes())
     );
+}
+
+#[test]
+fn advance_shard_rejects_tenant_mismatch() {
+    let dir = tempdir().expect("tempdir");
+    let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+    let identity = worker_identity(Path::new("/fallback"));
+    let lease = claim_lease(&mut coordinator, &identity);
+
+    // Use a different tenant than the one embedded in the lease.
+    let wrong_tenant = TenantId::from_bytes([0xFF; 32]);
+    assert_ne!(wrong_tenant, identity.tenant);
+
+    let err = advance_shard(
+        &mut coordinator,
+        wrong_tenant,
+        &lease,
+        &ShardCompletionOutcome::ExhaustedEmpty,
+    )
+    .expect_err("advance_shard with mismatched tenant must fail");
+
+    assert!(
+        matches!(err, DistributedRuntimeError::Runtime(_)),
+        "expected Runtime error variant, got: {err:?}"
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("tenant mismatch"),
+        "error message should mention tenant mismatch, got: {msg}"
+    );
+}
+
+// ============================================================================
+// drain_commit_stage tests
+// ============================================================================
+
+#[test]
+fn drain_commit_stage_returns_error_on_durable_commit_failure() {
+    let wc = write_context();
+    let findings_sink = InMemoryFindingsSink::with_auto_complete(false);
+    let done_ledger = InMemoryDoneLedger::new();
+    let cancel = CancellationToken::new();
+
+    let pipeline = CommitPipeline::start(
+        findings_sink.clone(),
+        done_ledger,
+        CommitPipelineConfig {
+            execution_queue_capacity: 4,
+            outcome_queue_capacity: 4,
+        },
+        cancel,
+    )
+    .expect("pipeline should start");
+
+    let (sender, drainer) = pipeline.split();
+
+    // Submit two items: item 1 will succeed, item 2 will fail at durable commit.
+    let work_1 = QueuedCommit::new(
+        wc,
+        fixture_completed_unit(1, 0xA1),
+        fixture_scanned_translation(wc, 0xA1, 1),
+    );
+    let work_2 = QueuedCommit::new(
+        wc,
+        fixture_completed_unit(2, 0xA2),
+        fixture_scanned_translation(wc, 0xA2, 2),
+    );
+
+    sender.submit(work_1).expect("submit item 1");
+    sender.submit(work_2).expect("submit item 2");
+    drop(sender);
+
+    std::thread::scope(|scope| {
+        let drain_handle = scope.spawn(move || drain_commit_stage(drainer, wc, 4));
+
+        // Wait for the first findings write to arrive, then release it normally.
+        wait_until(|| findings_sink.pending_count().expect("pending count") >= 1);
+        findings_sink
+            .release_next(CompletionOrder::OldestFirst)
+            .expect("release first findings write");
+
+        // After the first item's findings commit succeeds, inject a failure so
+        // the second item's findings durable commit fails.
+        wait_until(|| findings_sink.pending_count().expect("pending count") >= 1);
+        findings_sink
+            .fail_next_commits(1)
+            .expect("inject commit failure");
+        findings_sink
+            .release_next(CompletionOrder::OldestFirst)
+            .expect("release second findings write");
+
+        let drain_result = drain_handle.join().expect("drain thread should not panic");
+
+        let err = drain_result
+            .expect_err("drain_commit_stage should return an error when a commit stage item fails");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("durable commit failed"),
+            "error should mention durable commit failure, got: {msg}"
+        );
+    });
 }
