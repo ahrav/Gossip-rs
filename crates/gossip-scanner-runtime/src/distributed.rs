@@ -9472,7 +9472,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_git_repo_done_ledger_accepts_clean_scan_with_stale_commit_metadata() {
+    fn submit_git_repo_done_ledger_rejects_nonzero_commit_oids_with_zero_findings() {
         let input = GitRepoPersistenceInput {
             write_context: write_context(),
             shard_id: "test-shard",
@@ -9487,21 +9487,24 @@ mod tests {
             complete_time: LogicalTime::from_raw(600),
         };
         let ledger = InMemoryDoneLedger::new();
-        let (findings_receipt, _done_ledger_receipt) = submit_git_repo_done_ledger(&ledger, &input)
-            .expect("clean scan with stale commit metadata must still succeed");
-        assert_eq!(
-            findings_receipt.finding_count(),
-            0,
-            "findings receipt must still report zero findings"
+        let err = submit_git_repo_done_ledger(&ledger, &input)
+            .expect_err("captured OIDs without findings indicates a broken event bridge");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("captured_commit_oids=2"),
+            "error must report the captured count: {msg}"
+        );
+        assert!(
+            msg.contains("detected_count=0"),
+            "error must report the zero finding count: {msg}"
         );
     }
 
     /// Integration test composing the full capture-sink → drain → persistence
-    /// pipeline. CommitMeta events emitted through `FindingsCaptureSink` are
-    /// drained into the persistence input and carried through
-    /// `submit_git_repo_done_ledger` without error (zero detected findings).
+    /// pipeline. CommitMeta events without corresponding findings trigger the
+    /// broken-event-bridge guard in `submit_git_repo_done_ledger`.
     #[test]
-    fn submit_git_repo_done_ledger_integration_emit_drain_persist() {
+    fn submit_git_repo_done_ledger_integration_rejects_oids_without_findings() {
         let rec = Arc::new(Recorder::default());
         let inner_sink = Arc::new(CoordinationEventSink::new(
             Arc::clone(&rec) as Arc<dyn CoordinationEventRecorder>,
@@ -9510,9 +9513,11 @@ mod tests {
         let capture_sink =
             FindingsCaptureSink::new(inner_sink, FindingsCaptureSink::DEFAULT_COMMIT_OID_CAPACITY);
 
-        // Emit two CommitMeta events to populate the sparse OID map, simulating
-        // a scan where commit metadata was observed but no findings detected
-        // (e.g., all matches were filtered or suppressed by policy).
+        // Emit two CommitMeta events without any Finding events. On the
+        // production path this combination is structurally impossible
+        // (EngineAdapter::stream_findings only emits CommitMeta when
+        // findings_buf is non-empty), so the persistence function must
+        // reject it as a broken event bridge.
         let oid_a = OidBytes::sha1([0xaa; 20]);
         let oid_b = OidBytes::sha1([0xbb; 20]);
         capture_sink.emit_git(scanner_git::GitEvent::CommitMeta(
@@ -9532,7 +9537,6 @@ mod tests {
             },
         ));
 
-        // No findings were emitted, but the OID map should carry both entries.
         assert_eq!(capture_sink.detected_finding_count(), 0);
         let commit_oid_map = capture_sink.drain_commit_oid_map();
         assert_eq!(
@@ -9554,14 +9558,12 @@ mod tests {
             complete_time: LogicalTime::from_raw(800),
         };
         let ledger = InMemoryDoneLedger::new();
-        let (findings_receipt, done_ledger_receipt) = submit_git_repo_done_ledger(&ledger, &input)
-            .expect("zero-findings scan with commit metadata must succeed");
-        assert_eq!(findings_receipt.finding_count(), 0);
-        assert_eq!(findings_receipt.occurrence_count(), 0);
-        assert_eq!(findings_receipt.observation_count(), 0);
+        let err = submit_git_repo_done_ledger(&ledger, &input)
+            .expect_err("captured OIDs without findings must be rejected");
+        let msg = format!("{err}");
         assert!(
-            done_ledger_receipt.record_count() > 0,
-            "done-ledger must record at least one row"
+            msg.contains("captured_commit_oids=2"),
+            "error must report captured count: {msg}"
         );
     }
 }
