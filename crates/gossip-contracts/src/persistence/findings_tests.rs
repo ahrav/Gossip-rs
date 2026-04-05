@@ -303,7 +303,7 @@ fn derive_observation_id_is_field_order_sensitive() {
 
 fn make_finding_record(tenant_seed: u8) -> FindingRecord {
     use crate::identity::{
-        NormHash, RuleFingerprint, StableItemId, TenantId, TenantSecretKey, key_secret_hash,
+        key_secret_hash, NormHash, RuleFingerprint, StableItemId, TenantId, TenantSecretKey,
     };
 
     let tenant_id = TenantId::from_bytes([tenant_seed; 32]);
@@ -411,8 +411,8 @@ fn observation_record_verify_id_with_wrong_id() {
 #[test]
 fn validate_accepts_referentially_consistent_batch() {
     use crate::identity::{
-        NormHash, ObjectVersionId, RuleFingerprint, StableItemId, TenantId, TenantSecretKey,
-        key_secret_hash,
+        key_secret_hash, NormHash, ObjectVersionId, RuleFingerprint, StableItemId, TenantId,
+        TenantSecretKey,
     };
 
     let tenant_id = TenantId::from_bytes([0x01; 32]);
@@ -495,7 +495,7 @@ fn validate_accepts_empty_batch() {
 #[test]
 fn validate_rejects_mixed_tenants_in_findings() {
     use crate::identity::{
-        NormHash, RuleFingerprint, StableItemId, TenantSecretKey, key_secret_hash,
+        key_secret_hash, NormHash, RuleFingerprint, StableItemId, TenantSecretKey,
     };
 
     let sid = StableItemId::from_bytes([0x02; 32]);
@@ -518,7 +518,7 @@ fn validate_rejects_mixed_tenants_in_findings() {
 #[test]
 fn validate_rejects_mixed_tenants_across_layers() {
     use crate::identity::{
-        NormHash, ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey, key_secret_hash,
+        key_secret_hash, NormHash, ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey,
     };
 
     let sid = StableItemId::from_bytes([0x02; 32]);

@@ -37,17 +37,17 @@ use std::{collections::HashSet, error::Error, num::NonZeroU64, sync::Arc};
 use crate::{
     connector::Location,
     identity::{
-        FenceEpoch, FindingId, FindingIdInputs, LogicalTime, NormHash, ObjectVersionId,
-        ObservationId, ObservationIdInputs, OccurrenceId, OccurrenceIdInputs, PolicyHash,
-        RuleFingerprint, RunId, SecretHash, ShardId, StableItemId, TenantId, derive_finding_id,
-        derive_observation_id, derive_occurrence_id,
+        derive_finding_id, derive_observation_id, derive_occurrence_id, FenceEpoch, FindingId,
+        FindingIdInputs, LogicalTime, NormHash, ObjectVersionId, ObservationId,
+        ObservationIdInputs, OccurrenceId, OccurrenceIdInputs, PolicyHash, RuleFingerprint, RunId,
+        SecretHash, ShardId, StableItemId, TenantId,
     },
 };
 
 use super::{
-    PersistenceInputError, WriteContext,
     commit::{CommitHandle, FindingsCommitReceipt},
     ovid::OvidHash,
+    PersistenceInputError, WriteContext,
 };
 
 /// Unified identity surface for findings destined for persistence.
@@ -58,8 +58,8 @@ use super::{
 ///
 /// - `rule_id`
 /// - `norm_hash`
-/// - `span_start`
-/// - `span_end`
+/// - `blob_offset_start`
+/// - `blob_offset_end`
 ///
 /// Object paths, commit metadata, and confidence scores stay on the discovery
 /// or telemetry path unless they become part of persistence identity in the
@@ -67,15 +67,16 @@ use super::{
 ///
 /// # Coordinate Space
 ///
-/// `span_start` and `span_end` **must be blob-absolute** — expressed in
-/// root-file (blob) coordinates, not in the engine's per-chunk scan buffer.
-/// `OccurrenceId` derivation hashes these values; if they vary with chunker
-/// alignment, the same secret in the same blob produces different identities
-/// depending on how the scanner happened to split the input.
+/// `blob_offset_start` and `blob_offset_end` are **blob-absolute** offsets
+/// expressed in root-file (blob) coordinates, not in the engine's per-chunk
+/// scan buffer. `OccurrenceId` derivation hashes these values; if they vary
+/// with chunker alignment, the same secret in the same blob produces
+/// different identities depending on how the scanner happened to split the
+/// input.
 ///
-/// Implementors sourced from the engine's `FindingRec` **must not** return
-/// `FindingRec.span_start/span_end` directly — those are current-buffer
-/// offsets and are not blob-absolute in the multi-chunk scan path. Use
+/// Implementors sourced from the engine's `FindingRec` **must not** use
+/// `FindingRec.span_start/span_end` — those are current-buffer offsets and
+/// are not blob-absolute in the multi-chunk scan path. Use
 /// `FindingRec.root_hint_start/root_hint_end` (or an equivalently mapped
 /// value) instead, because the engine populates those with blob-absolute
 /// coordinates via `base_offset + match_span.start` (root findings) or
@@ -83,11 +84,10 @@ use super::{
 ///
 /// # Invariants
 ///
-/// - `span_end() >= span_start()` — zero-length spans are permitted (the
-///   translation layer rejects them when inappropriate for identity
-///   derivation, but the trait itself allows them).
+/// - `blob_offset_end() >= blob_offset_start()` — zero-length spans are
+///   permitted (the translation layer rejects them when inappropriate for
+///   identity derivation, but the trait itself allows them).
 /// - `norm_hash()` returns the canonical redacted [`NormHash`] newtype.
-/// - Both offsets are blob-absolute as described above.
 pub trait PersistenceFinding: Send + Sync {
     /// Engine rule identifier that matched.
     fn rule_id(&self) -> u32;
@@ -96,18 +96,19 @@ pub trait PersistenceFinding: Send + Sync {
     fn norm_hash(&self) -> NormHash;
 
     /// Inclusive blob-absolute byte offset where the match starts.
-    fn span_start(&self) -> u64;
+    fn blob_offset_start(&self) -> u64;
 
     /// Exclusive blob-absolute byte offset where the match ends.
-    fn span_end(&self) -> u64;
+    fn blob_offset_end(&self) -> u64;
 
-    /// Length of the matched byte span.
+    /// Length of the matched byte span in blob-absolute coordinates.
     ///
-    /// Panics if `span_end() < span_start()` (invariant violation).
-    fn span_len(&self) -> u64 {
-        self.span_end()
-            .checked_sub(self.span_start())
-            .expect("span_end must be >= span_start")
+    /// Panics if `blob_offset_end() < blob_offset_start()` (invariant
+    /// violation).
+    fn blob_offset_len(&self) -> u64 {
+        self.blob_offset_end()
+            .checked_sub(self.blob_offset_start())
+            .expect("blob_offset_end must be >= blob_offset_start")
     }
 }
 

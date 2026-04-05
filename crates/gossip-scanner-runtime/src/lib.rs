@@ -1554,8 +1554,8 @@ fn forward_commit_batch(
             .iter()
             .map(|finding| commit_sink::FindingRecord {
                 rule_id: finding.rule_id,
-                start: finding.span_start,
-                end: finding.span_end,
+                start: finding.window_start,
+                end: finding.window_end,
                 norm_hash: finding.norm_hash,
                 confidence_score: finding.confidence_score,
             })

@@ -1442,17 +1442,17 @@ impl CommitSink for ReceiptCommitSink {
 
         // The CommitSink surface provides only start/end offsets.
         // Root-hint fields are unavailable through this bridge, so both
-        // root_hint_start/end mirror span_start/end. This is safe because
+        // blob_offset_start/end mirror window_start/end. This is safe because
         // root-hint fields never participate in persistence identity
         // derivation (see the `Identity derivation` section in
         // result_translation.rs).
         item.findings
             .extend(batch.findings.iter().map(|finding| FsFindingRecord {
                 rule_id: finding.rule_id,
-                root_hint_start: finding.start,
-                root_hint_end: finding.end,
-                span_start: finding.start,
-                span_end: finding.end,
+                blob_offset_start: finding.start,
+                blob_offset_end: finding.end,
+                window_start: finding.start,
+                window_end: finding.end,
                 norm_hash: finding.norm_hash,
                 confidence_score: finding.confidence_score,
             }));
@@ -1512,8 +1512,8 @@ fn emit_ordered_item_findings(
         out.emit_core(CoreEvent::Finding(FindingEvent {
             source: SourceKind::Fs,
             object_path: execution.item().item_key().as_bytes(),
-            start: finding.root_hint_start,
-            end: finding.root_hint_end,
+            start: finding.blob_offset_start,
+            end: finding.blob_offset_end,
             rule_id: finding.rule_id,
             rule_name: engine.rule_name(finding.rule_id),
             norm_hash: finding.norm_hash,
@@ -4849,10 +4849,10 @@ mod tests {
             item.findings,
             vec![FsFindingRecord {
                 rule_id: 7,
-                root_hint_start: 10,
-                root_hint_end: 20,
-                span_start: 10,
-                span_end: 20,
+                blob_offset_start: 10,
+                blob_offset_end: 20,
+                window_start: 10,
+                window_end: 20,
                 norm_hash: [0x55; 32],
                 confidence_score: 6,
             }]
@@ -5002,8 +5002,8 @@ mod tests {
         assert_eq!(item.findings.len(), 2, "both batches should accumulate");
         assert_eq!(item.findings[0].rule_id, 7);
         assert_eq!(item.findings[1].rule_id, 8);
-        assert_eq!(item.findings[1].span_start, 30);
-        assert_eq!(item.findings[1].span_end, 40);
+        assert_eq!(item.findings[1].window_start, 30);
+        assert_eq!(item.findings[1].window_end, 40);
         drop(guard);
 
         pipeline.shutdown().expect("worker should join");
@@ -5128,10 +5128,10 @@ mod tests {
         };
         let findings = vec![FsFindingRecord {
             rule_id: 7,
-            root_hint_start: 10,
-            root_hint_end: 20,
-            span_start: 10,
-            span_end: 20,
+            blob_offset_start: 10,
+            blob_offset_end: 20,
+            window_start: 10,
+            window_end: 20,
             norm_hash: [0x55; 32],
             confidence_score: 6,
         }];
@@ -9492,8 +9492,8 @@ mod tests {
         let tmp = tempdir().expect("temp dir for repo key");
         let repo_key = git_repo_key(tmp.path());
         let findings = [GitFindingForPersistence {
-            span_start: 10,
-            span_end: 42,
+            blob_offset_start: 10,
+            blob_offset_end: 42,
             norm_hash: gossip_contracts::identity::NormHash::from_digest([0xAB; 32]),
             rule_id: 7,
         }];

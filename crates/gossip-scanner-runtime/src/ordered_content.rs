@@ -67,34 +67,34 @@
 
 use std::io::{self, Read};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::anyhow;
 use gossip_contracts::{
     connector::{
-        Budgets, Cursor, EnumerateError, ErrorClass, PageBuf, PageState, ReadError, ScanItem,
-        ordered::OrderedContentSource, validate_page_sequence,
+        ordered::OrderedContentSource, validate_page_sequence, Budgets, Cursor, EnumerateError,
+        ErrorClass, PageBuf, PageState, ReadError, ScanItem,
     },
     coordination::{CursorSemantics, RestoredShardState, ShardSpec},
     persistence::{
-        DoneLedger, DoneLedgerErrorCode, DoneLedgerStatus, OvidHashInputs,
-        RECOMMENDED_MAX_BATCH_SIZE, WriteContext, derive_ovid_hash,
+        derive_ovid_hash, DoneLedger, DoneLedgerErrorCode, DoneLedgerStatus, OvidHashInputs,
+        WriteContext, RECOMMENDED_MAX_BATCH_SIZE,
     },
 };
-use scanner_engine::content_policy::{CHECK_LEN, ContentVerdict, classify_content};
+use scanner_engine::content_policy::{classify_content, ContentVerdict, CHECK_LEN};
 use scanner_scheduler::events::EventOutput;
-use scanner_scheduler::scheduler::parallel_scan::{ParallelScanConfig, parallel_scan_dir};
+use scanner_scheduler::scheduler::parallel_scan::{parallel_scan_dir, ParallelScanConfig};
 use scanner_scheduler::{
-    EngineScratch, FileId, FindingWithHashRecord, FsFindingRecord, RealEngineScratch, ScanEngine,
-    WorkerMetricsLocal, carry_overlap_prefix, scan_chunk_postprocess,
+    carry_overlap_prefix, scan_chunk_postprocess, EngineScratch, FileId, FindingWithHashRecord,
+    FsFindingRecord, RealEngineScratch, ScanEngine, WorkerMetricsLocal,
 };
 
 use crate::{
-    AssignmentOutcome, COMMIT_CHANNEL_CAP, CancellationToken, ChannelEventOutput,
-    ChannelStoreProducer, EVENT_CHANNEL_CAP, FsScanConfig, ScanBudgets, ScanReport,
-    ScanRuntimeError, build_runtime_engine, forward_commits, forward_core_events, join_scoped,
+    build_runtime_engine, forward_commits, forward_core_events, join_scoped, AssignmentOutcome,
+    CancellationToken, ChannelEventOutput, ChannelStoreProducer, FsScanConfig, ScanBudgets,
+    ScanReport, ScanRuntimeError, COMMIT_CHANNEL_CAP, EVENT_CHANNEL_CAP,
 };
 
 /// Inputs required to acquire and validate one ordered connector page.
@@ -1283,10 +1283,10 @@ fn build_item_report(
 fn append_findings<F: FindingWithHashRecord>(src: &[F], dst: &mut Vec<FsFindingRecord>) {
     dst.extend(src.iter().map(|finding| FsFindingRecord {
         rule_id: finding.rule_id(),
-        root_hint_start: finding.root_hint_start(),
-        root_hint_end: finding.root_hint_end(),
-        span_start: finding.span_start(),
-        span_end: finding.span_end(),
+        blob_offset_start: finding.root_hint_start(),
+        blob_offset_end: finding.root_hint_end(),
+        window_start: finding.span_start(),
+        window_end: finding.span_end(),
         norm_hash: *finding.norm_hash(),
         confidence_score: finding.confidence_score(),
     }));
@@ -1777,7 +1777,7 @@ mod tests {
 
     use gossip_contracts::{
         connector::{
-            ItemKey, ItemRef, ReadError, TokenBytes, VersionId, ordered::OrderedContentCapabilities,
+            ordered::OrderedContentCapabilities, ItemKey, ItemRef, ReadError, TokenBytes, VersionId,
         },
         identity::{LogicalTime, ObjectVersionId, StableItemId},
         persistence::{

@@ -171,18 +171,18 @@ fn sentinel_to_option(id: u32) -> Option<u32> {
 /// Persistence-ready representation of one Git finding observed during scan
 /// execution.
 ///
-/// `span_start` and `span_end` are blob-absolute root-hint offsets captured
-/// from `FindingEvent::start/end`. These map to the full regex match span
-/// (group 0) in root-file coordinates and participate in `OccurrenceId`
-/// derivation. The engine produces blob-absolute root-hint offsets for both
-/// root and transform findings — for root findings via `base_offset +
+/// `blob_offset_start` and `blob_offset_end` are blob-absolute offsets
+/// captured from `FindingEvent::start/end`. These map to the full regex match
+/// span (group 0) in root-file coordinates and participate in `OccurrenceId`
+/// derivation. The engine produces blob-absolute offsets for both root and
+/// transform findings — for root findings via `base_offset +
 /// match_span.start`, for transform findings via
 /// `RootSpanMapCtx::map_span(decoded_span)` — so Git and FS scans of the
 /// same content converge on the same occurrence identity.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct GitFindingForPersistence {
-    pub(crate) span_start: u64,
-    pub(crate) span_end: u64,
+    pub(crate) blob_offset_start: u64,
+    pub(crate) blob_offset_end: u64,
     pub(crate) norm_hash: NormHash,
     pub(crate) rule_id: u32,
 }
@@ -196,8 +196,8 @@ const _: () = assert!(std::mem::size_of::<GitFindingForPersistence>() <= 56);
 impl fmt::Debug for GitFindingForPersistence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GitFindingForPersistence")
-            .field("span_start", &self.span_start)
-            .field("span_end", &self.span_end)
+            .field("blob_offset_start", &self.blob_offset_start)
+            .field("blob_offset_end", &self.blob_offset_end)
             .field("norm_hash", &"[redacted]")
             .field("rule_id", &self.rule_id)
             .finish()
@@ -216,13 +216,13 @@ impl PersistenceFinding for GitFindingForPersistence {
     }
 
     #[inline]
-    fn span_start(&self) -> u64 {
-        self.span_start
+    fn blob_offset_start(&self) -> u64 {
+        self.blob_offset_start
     }
 
     #[inline]
-    fn span_end(&self) -> u64 {
-        self.span_end
+    fn blob_offset_end(&self) -> u64 {
+        self.blob_offset_end
     }
 }
 
@@ -472,8 +472,8 @@ impl EventOutput for FindingsCaptureSink {
             // section means any future work (validation, hashing) added to
             // the constructor won't widen the lock window.
             let record = GitFindingForPersistence {
-                span_start: finding.start,
-                span_end: finding.end,
+                blob_offset_start: finding.start,
+                blob_offset_end: finding.end,
                 norm_hash: NormHash::from_digest(finding.norm_hash),
                 rule_id: finding.rule_id,
             };
@@ -710,19 +710,19 @@ mod tests {
         let captured = sink.take_captured_findings();
         assert_eq!(captured.len(), 1, "finding payload should be captured");
         assert_eq!(captured[0].rule_id(), 7);
-        // `GitFindingForPersistence.span_start/span_end` carry the blob-absolute
+        // `GitFindingForPersistence.blob_offset_start/blob_offset_end` carry the blob-absolute
         // root-hint offsets from `FindingEvent.start/end` — these feed
         // persistence identity derivation.
-        assert_eq!(captured[0].span_start(), 100);
-        assert_eq!(captured[0].span_end(), 142);
+        assert_eq!(captured[0].blob_offset_start(), 100);
+        assert_eq!(captured[0].blob_offset_end(), 142);
         assert_eq!(captured[0].norm_hash(), NormHash::from_digest([0xAA; 32]));
     }
 
     #[test]
     fn git_finding_for_persistence_debug_redacts_norm_hash() {
         let finding = GitFindingForPersistence {
-            span_start: 1,
-            span_end: 9,
+            blob_offset_start: 1,
+            blob_offset_end: 9,
             norm_hash: NormHash::from_digest([0xFF; 32]),
             rule_id: 2,
         };

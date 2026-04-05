@@ -29,14 +29,14 @@ use std::{
 use gossip_contracts::{
     connector::{Location, ScanItem, VersionId},
     identity::{
-        LogicalTime, NormHash, ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey,
-        key_secret_hash,
+        key_secret_hash, LogicalTime, NormHash, ObjectVersionId, RuleFingerprint, StableItemId,
+        TenantSecretKey,
     },
     persistence::{
-        DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
-        DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
-        OvidHash, OvidHashInputs, PersistenceFinding, PersistenceInputError, WriteContext,
-        derive_ovid_hash,
+        derive_ovid_hash, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,
+        DoneLedgerRecord, DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord,
+        OccurrenceRecord, OvidHash, OvidHashInputs, PersistenceFinding, PersistenceInputError,
+        WriteContext,
     },
 };
 use scanner_scheduler::store::FsFindingRecord;
@@ -146,26 +146,14 @@ impl PersistenceFinding for FsFindingRef<'_> {
         NormHash::from_digest(self.0.norm_hash)
     }
 
-    /// Returns the blob-absolute root-hint start. `FsFindingRecord` carries
-    /// two offset pairs: `span_start/span_end` from the engine's current
-    /// scan buffer (window-local, chunker-dependent) and
-    /// `root_hint_start/end` mapped to root-file coordinates (blob-absolute).
-    /// The `PersistenceFinding::span_start` trait method is the identity
-    /// coordinate and must be blob-absolute, so this impl deliberately
-    /// returns `root_hint_start` — the clippy `misnamed_getters` lint fires
-    /// because the method name and field name appear to mismatch, but the
-    /// naming is load-bearing: renaming either the trait method or the
-    /// `FsFindingRecord` field would cross a crate boundary.
     #[inline]
-    #[allow(clippy::misnamed_getters)]
-    fn span_start(&self) -> u64 {
-        self.0.root_hint_start
+    fn blob_offset_start(&self) -> u64 {
+        self.0.blob_offset_start
     }
 
     #[inline]
-    #[allow(clippy::misnamed_getters)]
-    fn span_end(&self) -> u64 {
-        self.0.root_hint_end
+    fn blob_offset_end(&self) -> u64 {
+        self.0.blob_offset_end
     }
 }
 
@@ -183,11 +171,11 @@ impl PersistenceFinding for NeverFinding {
         match *self {}
     }
 
-    fn span_start(&self) -> u64 {
+    fn blob_offset_start(&self) -> u64 {
         match *self {}
     }
 
-    fn span_end(&self) -> u64 {
+    fn blob_offset_end(&self) -> u64 {
         match *self {}
     }
 }
@@ -634,11 +622,11 @@ where
         // confidence_score is intentionally omitted: the persistence schema does not
         // carry confidence.
 
-        if finding.span_end() <= finding.span_start() {
+        if finding.blob_offset_end() <= finding.blob_offset_start() {
             return Err(ResultTranslationError::InvalidFindingSpan {
                 index,
-                start: finding.span_start(),
-                end: finding.span_end(),
+                start: finding.blob_offset_start(),
+                end: finding.blob_offset_end(),
             });
         }
 
@@ -662,8 +650,8 @@ where
             write_context.tenant_id(),
             finding_id,
             item.object_version_id(),
-            finding.span_start(),
-            finding.span_len(),
+            finding.blob_offset_start(),
+            finding.blob_offset_len(),
         )
         .map_err(|e| ResultTranslationError::PersistenceAtIndex { index, source: e })?;
         let occurrence_id = occurrence_record.occurrence_id();
@@ -699,8 +687,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        FsFindingRef, ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
-        translate_git_item_result, translate_item_result,
+        translate_git_item_result, translate_item_result, FsFindingRef, ItemResult,
+        PersistenceTranslation, ResultTranslationError, ScanTiming,
     };
     use crate::coordination_sink::GitFindingForPersistence;
     use crate::git_persistence::git_repo_ovid_inputs;
@@ -762,13 +750,13 @@ mod tests {
 
     fn git_finding(
         rule_id: u32,
-        span_start: u64,
-        span_end: u64,
+        blob_offset_start: u64,
+        blob_offset_end: u64,
         hash_seed: u8,
     ) -> GitFindingForPersistence {
         GitFindingForPersistence {
-            span_start,
-            span_end,
+            blob_offset_start,
+            blob_offset_end,
             norm_hash: NormHash::from_digest([hash_seed; 32]),
             rule_id,
         }
@@ -776,19 +764,19 @@ mod tests {
 
     fn fs_finding_with_root_hint(
         rule_id: u32,
-        root_hint_start: u64,
-        root_hint_end: u64,
-        span_start: u64,
-        span_end: u64,
+        blob_offset_start: u64,
+        blob_offset_end: u64,
+        window_start: u64,
+        window_end: u64,
         norm_hash: [u8; 32],
         confidence_score: i8,
     ) -> FsFindingRecord {
         FsFindingRecord {
             rule_id,
-            root_hint_start,
-            root_hint_end,
-            span_start,
-            span_end,
+            blob_offset_start,
+            blob_offset_end,
+            window_start,
+            window_end,
             norm_hash,
             confidence_score,
         }
@@ -908,9 +896,9 @@ mod tests {
         let finding = git_finding(7, 0, 100, 0xCD);
         assert_eq!(finding.rule_id(), 7);
         assert_eq!(finding.norm_hash(), NormHash::from_digest([0xCD; 32]));
-        assert_eq!(finding.span_start(), 0);
-        assert_eq!(finding.span_end(), 100);
-        assert_eq!(finding.span_len(), 100);
+        assert_eq!(finding.blob_offset_start(), 0);
+        assert_eq!(finding.blob_offset_end(), 100);
+        assert_eq!(finding.blob_offset_len(), 100);
     }
 
     #[test]
@@ -919,9 +907,9 @@ mod tests {
         let wrapper = FsFindingRef(&rec);
         assert_eq!(wrapper.rule_id(), 42);
         assert_eq!(wrapper.norm_hash(), NormHash::from_digest([0xAB; 32]));
-        assert_eq!(wrapper.span_start(), 10);
-        assert_eq!(wrapper.span_end(), 50);
-        assert_eq!(wrapper.span_len(), 40);
+        assert_eq!(wrapper.blob_offset_start(), 10);
+        assert_eq!(wrapper.blob_offset_end(), 50);
+        assert_eq!(wrapper.blob_offset_len(), 40);
     }
 
     #[test]
@@ -982,10 +970,10 @@ mod tests {
         // Persistence identity derives from blob-absolute root-hint coordinates
         // (the full regex match span in root-file coordinates), not from the
         // engine's buffer-local span. Two findings with identical rule, hash,
-        // and root_hint must produce the same OccurrenceId regardless of
-        // whatever buffer-local `span_start/span_end` each scan path recorded.
+        // and blob_offset must produce the same OccurrenceId regardless of
+        // whatever buffer-local `window_start/window_end` each scan path recorded.
         let fs = fs_finding_with_root_hint(7, 100, 124, 10, 22, [0xAB; 32], 7);
-        // Git's GitFindingForPersistence.span_start/span_end carry the
+        // Git's GitFindingForPersistence.blob_offset_start/blob_offset_end carry the
         // blob-absolute root-hint offsets (see coordination_sink.rs doc).
         let git = git_finding(7, 100, 124, 0xAB);
         let fs_translation = translate_item_result(
@@ -1075,8 +1063,8 @@ mod tests {
                     end,
                 } => {
                     assert_eq!(got_index, 0);
-                    assert_eq!(start, bad.span_start);
-                    assert_eq!(end, bad.span_end);
+                    assert_eq!(start, bad.blob_offset_start);
+                    assert_eq!(end, bad.blob_offset_end);
                 }
                 other => panic!("case {index} expected InvalidFindingSpan, got {other:?}"),
             }
@@ -1104,8 +1092,8 @@ mod tests {
         let finding = GitFindingForPersistence {
             rule_id: 1,
             norm_hash: NormHash::from_digest([0xAA; 32]),
-            span_start: 50,
-            span_end: 10,
+            blob_offset_start: 50,
+            blob_offset_end: 10,
         };
         let err = translate_git_item_result(
             write_context(),
@@ -1396,23 +1384,23 @@ mod tests {
     }
 
     /// Module-level invariant: persistence identity derives from blob-absolute
-    /// `root_hint_start/root_hint_end`. The engine's buffer-local
-    /// `span_start/span_end` is chunker-dependent and must not participate in
+    /// `blob_offset_start/blob_offset_end`. The engine's buffer-local
+    /// `window_start/window_end` is chunker-dependent and must not participate in
     /// identity derivation.
     #[test]
     fn root_hint_fields_determine_persistence_identity() {
         // Same root_hint, divergent span — identities must match.
         let mut a = finding(7, 10, 22, 0xAA);
         let mut b = finding(7, 10, 22, 0xAA);
-        a.root_hint_start = 100;
-        a.root_hint_end = 124;
-        b.root_hint_start = 100;
-        b.root_hint_end = 124;
+        a.blob_offset_start = 100;
+        a.blob_offset_end = 124;
+        b.blob_offset_start = 100;
+        b.blob_offset_end = 124;
         // Diverge the buffer-local span fields only.
-        a.span_start = 10;
-        a.span_end = 22;
-        b.span_start = 40;
-        b.span_end = 52;
+        a.window_start = 10;
+        a.window_end = 22;
+        b.window_start = 40;
+        b.window_end = 52;
 
         let translated_a = translate_scanned(&[a]);
         let translated_b = translate_scanned(&[b]);
@@ -1435,10 +1423,10 @@ mod tests {
         // buffer-local span fields happen to match.
         let mut a = finding(7, 10, 22, 0xAA);
         let mut b = finding(7, 10, 22, 0xAA);
-        a.root_hint_start = 100;
-        a.root_hint_end = 124;
-        b.root_hint_start = 200;
-        b.root_hint_end = 224;
+        a.blob_offset_start = 100;
+        a.blob_offset_end = 124;
+        b.blob_offset_start = 200;
+        b.blob_offset_end = 224;
 
         let translated_a = translate_scanned(&[a]);
         let translated_b = translate_scanned(&[b]);
@@ -1500,8 +1488,8 @@ mod tests {
         let bad_finding = GitFindingForPersistence {
             rule_id: 7,
             norm_hash: NormHash::from_digest(hash_bytes),
-            span_start: 50,
-            span_end: 10, // inverted span triggers InvalidFindingSpan
+            blob_offset_start: 50,
+            blob_offset_end: 10, // inverted span triggers InvalidFindingSpan
         };
         let err = translate_git_item_result(
             write_context(),
@@ -1533,10 +1521,10 @@ mod tests {
             .. ProptestConfig::default()
         })]
 
-        /// For any valid identity quadruple (rule_id, norm_hash, root_hint_start,
-        /// root_hint_end), the FS and Git translation paths must produce identical
+        /// For any valid identity quadruple (rule_id, norm_hash, blob_offset_start,
+        /// blob_offset_end), the FS and Git translation paths must produce identical
         /// FindingId, OccurrenceId, and ObservationId values. The FS path has a
-        /// distinct buffer-local `span_start/span_end` that must NOT affect the
+        /// distinct buffer-local `window_start/window_end` that must NOT affect the
         /// derived identity — scanner-side divergence in buffer coordinates
         /// must be invisible to persistence identity.
         #[test]
@@ -1562,13 +1550,13 @@ mod tests {
                 hash_seed,
                 5,
             );
-            // Git's GitFindingForPersistence.span_start/span_end carry the
+            // Git's GitFindingForPersistence.blob_offset_start/blob_offset_end carry the
             // blob-absolute root-hint offsets.
             let git_rec = GitFindingForPersistence {
                 rule_id,
                 norm_hash: NormHash::from_digest(hash_seed),
-                span_start: root_hint_start,
-                span_end: root_hint_end,
+                blob_offset_start: root_hint_start,
+                blob_offset_end: root_hint_end,
             };
 
             let identity = git_repo_ovid_inputs(42);

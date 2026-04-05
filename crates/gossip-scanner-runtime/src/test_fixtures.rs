@@ -10,8 +10,8 @@ use std::process::Command;
 use gossip_contracts::{
     connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
     identity::{
-        FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, RunId, ShardId,
-        StableItemId, TenantId, TenantSecretKey, derive_rule_fingerprint,
+        derive_rule_fingerprint, FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash,
+        RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey,
     },
     persistence::WriteContext,
 };
@@ -21,7 +21,7 @@ use scanner_scheduler::store::FsFindingRecord;
 #[cfg(test)]
 use crate::{
     commit_model::CompletedUnit,
-    result_translation::{ItemResult, PersistenceTranslation, ScanTiming, translate_item_result},
+    result_translation::{translate_item_result, ItemResult, PersistenceTranslation, ScanTiming},
 };
 
 #[cfg(test)]
@@ -137,16 +137,16 @@ pub(crate) fn wait_until(mut predicate: impl FnMut() -> bool) {
 #[cfg(test)]
 pub(crate) fn finding(
     rule_id: u32,
-    span_start: u64,
-    span_end: u64,
+    window_start: u64,
+    window_end: u64,
     hash_seed: u8,
 ) -> FsFindingRecord {
     FsFindingRecord {
         rule_id,
-        root_hint_start: span_start,
-        root_hint_end: span_end,
-        span_start,
-        span_end,
+        blob_offset_start: window_start,
+        blob_offset_end: window_end,
+        window_start,
+        window_end,
         norm_hash: [hash_seed; 32],
         confidence_score: 7,
     }
