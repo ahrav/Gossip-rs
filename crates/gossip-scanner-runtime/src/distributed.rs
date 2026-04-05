@@ -3045,7 +3045,10 @@ where
     let cancel = CancellationToken::new();
     let lease_uncertainty = LeaseUncertaintySignal::default();
     let lease_watch_done = Arc::new(AtomicBool::new(false));
-    let capture_sink = Arc::new(FindingsCaptureSink::new(Arc::clone(&stage_sink)));
+    let capture_sink = Arc::new(FindingsCaptureSink::new(
+        Arc::clone(&stage_sink),
+        FindingsCaptureSink::DEFAULT_COMMIT_OID_CAPACITY,
+    ));
     let event_sink: Arc<dyn GitEventOutput + Send + Sync> =
         Arc::clone(&capture_sink) as Arc<dyn GitEventOutput + Send + Sync>;
     let (execution, watch_result) = std::thread::scope(|scope| {
