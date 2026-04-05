@@ -9,6 +9,8 @@
 //!   cargo test --features scheduler-sim --test simulation  # scheduler only
 //!   cargo test -p scanner-engine-integration-tests --features sim-harness,rocksdb --test simulation
 //!                                                     # scanner + git
+//!     (`rocksdb` is needed because `git_scan_shallow_limits` uses
+//!      `InMemoryPersistenceStore::with_seen_scope`, gated on that feature)
 //!   cargo test --features real-rules-harness --test simulation  # real rules
 //!   cargo test -p scanner-engine-integration-tests --features scheduler-sim,sim-harness,rocksdb --test simulation
 //!                                                     # both

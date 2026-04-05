@@ -109,6 +109,11 @@ cargo test -p scanner-engine-integration-tests --features sim-harness,rocksdb --
 cargo test -p scanner-engine-integration-tests --features sim-harness,rocksdb --test simulation git_scan_corpus
 ```
 
+The `rocksdb` feature is required because `git_scan_shallow_limits` tests in the
+same binary depend on `InMemoryPersistenceStore::with_seen_scope`, which is gated
+on `#[cfg(feature = "rocksdb")]`. The `sim-harness` feature itself does not
+depend on `rocksdb`.
+
 Corpus cases live in `crates/scanner-engine-integration-tests/tests/corpus/git_scan/*.case.json`. Replay failures emit
 artifacts to `crates/scanner-engine-integration-tests/tests/failures/` for triage and minimization.
 
@@ -129,6 +134,9 @@ run at least:
 ```bash
 cargo test -p scanner-engine-integration-tests --features sim-harness,rocksdb --test simulation
 ```
+
+The `rocksdb` feature is included because the `git_scan_shallow_limits` module
+requires it for compilation (see note in the Running Tests section above).
 
 Soak or nightly tiers can increase `SIM_GIT_SCAN_SEED_COUNT` or enable
 `SIM_GIT_SCAN_DEEP=1` for broader coverage.

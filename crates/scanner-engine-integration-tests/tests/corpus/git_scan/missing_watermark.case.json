@@ -422,9 +422,13 @@
     "resources": []
   },
   "failure": {
-    "kind": "OracleMismatch",
-    "message": "corpus",
-    "step": 0
+    "kind": {
+      "InvariantViolation": {
+        "code": 1
+      }
+    },
+    "message": "missing watermark commit object",
+    "step": 1
   },
   "trace": {
     "ring": [],
