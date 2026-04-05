@@ -37,7 +37,11 @@ and validation, and Git connector mode uses the direct path.
 | `src/commit_sink.rs` | `CommitSink` trait, `CliNoOpCommitSink` (no-op), and lightweight bridge record types (`ItemMeta`, `FindingRecord`, `FindingsBatch`) for scan-loop lifecycle |
 | `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`, `StageSignal`), `CoordinationEventRecorder` trait, and `FindingsCaptureSink`/`GitFindingForPersistence` adapters for repo-frontier Git finding capture before durable translation |
 | `src/done_ledger_bloom.rs` | Internal done-ledger Bloom filter wrapper: OvidHash-aware membership checks, scope-size gating, and memory-cap enforcement for prefilter construction |
-| `src/distributed.rs` | Distributed worker-loop runtime: filesystem `WorkerIdentity` / `ShardLease`, Git `GitWorkerIdentity` / `GitShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (receipt-driven execution adapter), and the sibling lease loops `run_worker` (filesystem) plus `run_git_repo_worker` (repo-frontier Git). Internal helpers cover receipt-driven checkpoint building, singleton repo-frontier execution, low-cardinality Git stage telemetry, and direct `CoordinationFacade` claim/complete helpers |
+| `src/distributed.rs` | Module root: re-exports public API and documents the distributed worker-loop architecture |
+| `src/distributed/types.rs` | Worker identity (`WorkerIdentity`, `GitWorkerIdentity`), lease types (`ShardLease`, `GitShardLease`, `LeaseView`), config (`DistributedRuntimeConfig`), report, and error types |
+| `src/distributed/execution.rs` | Lease execution functions (`run_filesystem_lease`, `run_git_repo_lease`) and worker entry points (`run_worker`, `run_git_repo_worker`) |
+| `src/distributed/commit_bridge.rs` | `ReceiptCommitSink` adapter, receipt-driven checkpoint building, `drain_commit_stage` |
+| `src/distributed/lease_ops.rs` | Lease lifecycle: `advance_shard`, `ArmedLeaseDeadline`, `watch_lease_deadline`, `LeaseUncertaintySignal` |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_discovery.rs` | Static single-target Git repository discovery source for payload-backed repo-frontier shards |
 | `src/git_executor.rs` | Contract-level adapter that implements `GitRepoExecutor` for mirror-backed repo scans by translating `GitSelection` + `GitExecutionLimits` into `scanner-git` config, propagating repo/policy identity into persistence-aware runs, and reusing the shared runtime runner |
@@ -139,11 +143,16 @@ When the caller owns durable Git state, `git_persistence::GitPersistenceAdapter`
 implements `scanner-git`'s ref-watermark, seen-blob, and finalize seams and
 plugs into `git_repo::run_runtime_git_scan_with_stores`. Distributed
 repo-frontier execution wraps the event sink with `FindingsCaptureSink`, lifts
-Git `FindingEvent` values into `GitFindingForPersistence`, translates them
-through the same `PersistenceFinding`-based path used by ordered-content items,
-and only then synthesizes the outer repo-frontier `UnitCommitReceipt` and
-`CheckpointAggregatorInput`. This keeps Git findings on the same
-findings-first, done-ledger-second durable ordering as filesystem scans.
+Git `FindingEvent` values into `GitFindingForPersistence` while building a
+sparse commit-ordinal-to-OID map from `GitEvent::CommitMeta` events.
+`translate_git_item_result` then derives stable item identity from
+`(connector_instance, object_path)` and strong version identity from
+`(commit_oid, object_path)` for each finding while
+keeping the done-ledger row repo-scoped via `repo_id`. Persistence uses
+an explicit `PageCommit` sequence so Git observations may carry per-object
+OVIDs while shard completion remains repo-scoped. This keeps Git findings
+on the same findings-first, done-ledger-second durable ordering as
+filesystem scans.
 
 The distributed module exports the concrete worker-loop types and helpers:
 `WorkerIdentity`, `ShardLease`, `DistributedPersistence`,
@@ -608,11 +617,14 @@ identity, version claim, write scope, tenant secret key, a rule-fingerprint
 resolver callback, and scan findings fully determine the resulting OVID,
 finding IDs, occurrence IDs, observation IDs, and done-ledger key.
 
-`translate_findings` is generic over `gossip_contracts::persistence::PersistenceFinding`.
-Filesystem `FsFindingRecord` values are adapted into that trait at the runtime
-boundary, while repo-frontier Git scans feed `GitFindingForPersistence`
-directly. This keeps source-specific metadata out of persistence derivation
-without forcing the scheduler crate to depend on `gossip-contracts`.
+`translate_findings` is generic over `gossip_contracts::persistence::PersistenceFinding`
+and handles filesystem items via `FsFindingRef`. Repo-frontier Git scans use a
+dedicated `translate_git_findings` that derives per-object stable identity (via
+`ItemIdentityKey`) and strong version identity (via commit OID + object path)
+for each finding before calling the shared `push_finding_layers` helper. Both
+paths share the same finding/occurrence/observation derivation logic, keeping
+source-specific metadata out of persistence identity without forcing the
+scheduler crate to depend on `gossip-contracts`.
 
 `translate_item_result` accepts a `&dyn Fn(u32) -> RuleFingerprint` callback
 that resolves positional `rule_id` values to stable, name-derived
@@ -777,17 +789,22 @@ where
 ```
 
 ```rust
-pub fn run_git_repo_worker<C, M, B>(
+pub fn run_git_repo_worker<C, M, B, F, D>(
     coordinator: &mut C,
     mirrors: &mut M,
     identity: GitWorkerIdentity,
     git_persistence_backend: B,
+    persistence: DistributedPersistence<F, D>,
     config: DistributedRuntimeConfig,
 ) -> Result<DistributedRunReport, DistributedRuntimeError>
 where
     C: CoordinationFacade,
     M: GitMirrorManager,
     B: GitPersistenceBackend + Clone,
+    F: FindingsSink + Clone + Send + Sync + 'static,
+    D: DoneLedger + Clone + Send + Sync + 'static,
+    F::Error: std::error::Error + Send + Sync + 'static,
+    D::Error: std::error::Error + Send + Sync + 'static,
 {
     ...
 }
@@ -848,12 +865,14 @@ with a deterministic `OpId`.
 3. syncs a worker-local mirror for the target locator,
 4. executes the mirror-backed Git scan through `GitRepoRuntime::execute_repo`,
    using `GitPersistenceAdapter` as the scanner-git seen/watermark/finalize
-   store and `FindingsCaptureSink` to retain persistence-ready finding payloads,
+   store and `FindingsCaptureSink` to retain persistence-ready finding payloads
+   plus the sparse commit-ordinal-to-OID map,
 5. if `execute_repo` finishes with `FinalizeOutcome::Complete`, translates the
-   captured findings plus repo identity through `translate_git_item_result`,
-   commits findings and done-ledger rows through `ResultCommitter`, and uses
-   the resulting durable receipts to build the repo-frontier checkpoint input;
-   partial finalize aborts the lease before this stage, and
+   captured findings into per-object persistence rows through
+   `translate_git_item_result`, then durably records findings and the repo-level
+   done-ledger row with an explicit `PageCommit` so Git observations may use
+   per-object OVIDs while shard completion remains repo-scoped; partial finalize
+   aborts the lease before this stage, and
 6. re-runs singleton discovery against that checkpoint cursor to decide whether
    the shard is terminally complete or should checkpoint for later replay.
 
@@ -926,7 +945,7 @@ and coordination-backend observations).
 | Bounded execution -> commit worker and outcome queues | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` |
 | Coordination recorder payloads | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
 | Done-ledger Bloom prefilter helper | `crates/gossip-scanner-runtime/src/done_ledger_bloom.rs` |
-| Distributed worker-loop foundation types | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| Distributed worker-loop runtime (`src/distributed/` submodules) | `crates/gossip-scanner-runtime/src/distributed.rs` (module root), `src/distributed/types.rs`, `src/distributed/execution.rs`, `src/distributed/commit_bridge.rs`, `src/distributed/lease_ops.rs` |
 | Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | Static Git repo discovery source | `crates/gossip-scanner-runtime/src/git_discovery.rs` |
 | Git-repo local scan runtime | `crates/gossip-scanner-runtime/src/git_repo.rs` |
