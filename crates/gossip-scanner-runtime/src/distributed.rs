@@ -3180,8 +3180,8 @@ where
         complete_time,
     };
     let receipt_started_at = Instant::now();
-    let (findings_receipt, done_ledger_receipt) =
-        submit_git_repo_persistence(persistence, &input).inspect_err(|_| {
+    let (findings_receipt, done_ledger_receipt) = submit_git_repo_persistence(persistence, &input)
+        .inspect_err(|_| {
             stage_sink.emit_stage_signal(StageSignal::DurableReceiptCompleted {
                 latency_ms: elapsed_ms(receipt_started_at),
                 receipts: 0,
