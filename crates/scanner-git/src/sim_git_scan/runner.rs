@@ -1270,10 +1270,76 @@ mod tests {
         GitTreeEntryKind, GitTreeEntrySpec, GitTreeSpec,
     };
     use crate::sim_git_scan::PersistPhase;
+    use crate::ChangeKind;
 
     fn oid(val: u8) -> GitOid {
         GitOid {
             bytes: vec![val; 20],
+        }
+    }
+
+    /// Two independent root commits whose trees both reference the same blob OID.
+    ///
+    /// TreeDiff emits one candidate per root commit (diffed against empty tree),
+    /// producing two candidates with identical OID `oid(30)`. SpillDedupe must
+    /// deduplicate them down to a single unique OID.
+    fn duplicate_oid_scenario() -> GitScenario {
+        GitScenario {
+            schema_version: super::super::scenario::GIT_SCENARIO_SCHEMA_VERSION,
+            repo: GitRepoModel {
+                object_format: GitObjectFormat::Sha1,
+                refs: vec![
+                    GitRefSpec {
+                        name: b"refs/heads/a".to_vec(),
+                        tip: oid(1),
+                        watermark: None,
+                    },
+                    GitRefSpec {
+                        name: b"refs/heads/b".to_vec(),
+                        tip: oid(2),
+                        watermark: None,
+                    },
+                ],
+                commits: vec![
+                    GitCommitSpec {
+                        oid: oid(1),
+                        parents: Vec::new(),
+                        tree: oid(10),
+                        generation: 1,
+                    },
+                    GitCommitSpec {
+                        oid: oid(2),
+                        parents: Vec::new(),
+                        tree: oid(11),
+                        generation: 1,
+                    },
+                ],
+                trees: vec![
+                    GitTreeSpec {
+                        oid: oid(10),
+                        entries: vec![GitTreeEntrySpec {
+                            name: b"f.txt".to_vec(),
+                            mode: 0o100644,
+                            oid: oid(30),
+                            kind: GitTreeEntryKind::Blob,
+                        }],
+                    },
+                    GitTreeSpec {
+                        oid: oid(11),
+                        entries: vec![GitTreeEntrySpec {
+                            name: b"g.txt".to_vec(),
+                            mode: 0o100644,
+                            oid: oid(30),
+                            kind: GitTreeEntryKind::Blob,
+                        }],
+                    },
+                ],
+                blobs: vec![GitBlobSpec {
+                    oid: oid(30),
+                    bytes: b"shared".to_vec(),
+                }],
+            },
+            artifacts: None,
         }
     }
 
@@ -1496,6 +1562,78 @@ mod tests {
     }
 
     #[test]
+    fn spill_dedupe_deduplicates_shared_blob_across_refs() {
+        let scenario = duplicate_oid_scenario();
+        let mut state = RunState::new(&scenario, 64, GitFaultPlan::default());
+
+        assert_eq!(stage_repo_open(&mut state).unwrap(), 2);
+        assert_eq!(stage_commit_walk(&mut state).unwrap(), 2);
+        assert_eq!(stage_tree_diff(&mut state).unwrap(), 2);
+        assert_eq!(stage_spill_dedupe(&mut state).unwrap(), 1);
+
+        assert_eq!(
+            state.unique_oids.as_deref(),
+            Some(&[OidBytes::sha1([30; 20])][..])
+        );
+
+        let seen_ops: Vec<_> = state
+            .persist_store
+            .log()
+            .into_iter()
+            .filter(|op| op.phase == PersistPhase::SeenDelta)
+            .collect();
+        assert_eq!(seen_ops.len(), 1);
+        assert_eq!(seen_ops[0].key, vec![30; 20]);
+
+        let spill_stats = state.spill_stats.as_ref().expect("spill stats");
+        assert_eq!(spill_stats.spill_runs, 0);
+    }
+
+    #[test]
+    fn spiller_persists_seen_deltas_through_disk_spill() {
+        let limits = SpillLimits {
+            max_spill_bytes: 512 * 1024 * 1024,
+            seen_batch_max_oids: 256,
+            seen_batch_max_path_bytes: 64 * 1024,
+            max_chunk_candidates: 1,
+            max_chunk_path_bytes: 1024 * 1024,
+            max_spill_runs: 16,
+            max_path_len: 4 * 1024,
+        };
+        let spill_dir = tempdir().unwrap();
+        let mut spiller = Spiller::new(limits, 20, spill_dir.path()).unwrap();
+
+        let oids = [
+            OidBytes::sha1([1; 20]),
+            OidBytes::sha1([2; 20]),
+            OidBytes::sha1([3; 20]),
+        ];
+        let paths: [&[u8]; 3] = [b"a.txt", b"b.txt", b"c.txt"];
+        for (i, (oid, path)) in oids.iter().zip(paths.iter()).enumerate() {
+            spiller
+                .push(*oid, path, i as u32, 0, ChangeKind::Add, 0, 0)
+                .unwrap();
+        }
+
+        let persist_store = SimPersistStore::default();
+        let mut sink = CollectingUniqueBlobSink::default();
+        let stats = spiller
+            .finalize(&NeverSeenStore, &persist_store, &mut sink)
+            .unwrap();
+
+        assert!(stats.spill_runs > 0, "expected at least one spill run");
+        assert!(stats.spill_bytes > 0, "expected nonzero spill bytes");
+        assert_eq!(sink.blobs.len(), 3);
+
+        let seen_ops: Vec<_> = persist_store
+            .log()
+            .into_iter()
+            .filter(|op| op.phase == PersistPhase::SeenDelta)
+            .collect();
+        assert_eq!(seen_ops.len(), 3);
+    }
+
+    #[test]
     fn run_halts_when_step_budget_exceeded() {
         let scenario = simple_scenario();
         let cfg = GitRunConfig {
@@ -1668,6 +1806,44 @@ mod tests {
         )
         .expect_err("expected pack read error");
         assert!(matches!(err, PackExecError::PackRead(_)));
+    }
+
+    #[test]
+    fn validate_outputs_rejects_mismatched_oid_partition() {
+        let scenario = simple_scenario();
+        let mut state = RunState::new(&scenario, 64, GitFaultPlan::default());
+
+        stage_repo_open(&mut state).unwrap();
+        stage_commit_walk(&mut state).unwrap();
+        stage_tree_diff(&mut state).unwrap();
+        stage_spill_dedupe(&mut state).unwrap();
+        stage_pack_exec(&mut state).unwrap();
+        stage_finalize(&mut state).unwrap();
+
+        // Corrupt unique_oids so the conservation oracle fires.
+        state.unique_oids = Some(vec![OidBytes::sha1([99; 20])]);
+
+        let err = validate_outputs(&state).expect_err("expected oracle mismatch");
+        assert!(matches!(err.kind, FailureKind::OracleMismatch));
+        assert!(err.message.contains("scanned/skipped partition"));
+    }
+
+    #[test]
+    fn pack_exec_rejects_mismatched_spill_oids() {
+        let scenario = simple_scenario();
+        let mut state = RunState::new(&scenario, 64, GitFaultPlan::default());
+
+        stage_repo_open(&mut state).unwrap();
+        stage_commit_walk(&mut state).unwrap();
+        stage_tree_diff(&mut state).unwrap();
+        stage_spill_dedupe(&mut state).unwrap();
+
+        // Corrupt unique_oids so the pack-exec precondition oracle fires.
+        state.unique_oids = Some(vec![OidBytes::sha1([99; 20])]);
+
+        let err = stage_pack_exec(&mut state).expect_err("expected oracle mismatch");
+        assert!(matches!(err.kind, FailureKind::OracleMismatch));
+        assert!(err.message.contains("spill dedupe unique OIDs differ"));
     }
 
     fn build_minimal_midx() -> Vec<u8> {
