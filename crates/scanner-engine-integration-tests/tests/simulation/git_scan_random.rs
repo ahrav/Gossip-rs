@@ -11,10 +11,12 @@
 //!   `SIM_GIT_RUN_TRACE_CAP` override runner config.
 //! - `GIT_SIM_WRITE_FAIL=1` writes failing artifacts to `tests/failures/`.
 //!
-//! The sweeps are deterministic for a given `(scenario_seed, schedule_seed,
-//! fault_plan, environment)` tuple. The plain sweep keeps the happy path green;
-//! the fault-injected sweep checks that the same tuple reproduces the same
-//! success or failure shape across repeated runs while `stability_runs >= 2`.
+//! Both sweeps are deterministic for a given `(scenario_seed, schedule_seed,
+//! fault_plan, environment)` tuple. The plain sweep exercises the nominal
+//! execution path without injected faults. The fault-injected sweep injects
+//! randomized resource faults and asserts that repeated runs with the same
+//! tuple produce the same outcome shape (success or failure) when
+//! `stability_runs >= 2`.
 
 use std::fs;
 
@@ -392,6 +394,27 @@ fn bounded_random_git_sims_with_fault_injection_are_reproducible() {
         // resource faults do not introduce hidden nondeterminism in the harness.
         let first = runner.run(&scenario, &fault_plan);
         let second = runner.run(&scenario, &fault_plan);
+
+        // Write a repro artifact before asserting so the full tuple is
+        // preserved for debugging when outcome shapes diverge.
+        if std::env::var_os("GIT_SIM_WRITE_FAIL").is_some() {
+            let fail = match (&first, &second) {
+                (RunOutcome::Failed(f), RunOutcome::Ok { .. })
+                | (RunOutcome::Ok { .. }, RunOutcome::Failed(f)) => Some(f),
+                _ => None,
+            };
+            if let Some(fail) = fail {
+                write_failure_artifact(
+                    seed,
+                    schedule_seed,
+                    runner.config(),
+                    &scenario,
+                    &fault_plan,
+                    fail,
+                );
+            }
+        }
+
         assert_same_outcome(&first, &second, seed);
     }
 }
