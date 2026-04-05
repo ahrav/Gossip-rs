@@ -55,6 +55,50 @@ pub enum CommitProgressRecord {
     },
 }
 
+/// Closed set of low-cardinality Git execution stage signals.
+///
+/// These signals let operators distinguish the claim, mirror, execution,
+/// durable-receipt, checkpoint, and lease-loss boundaries for one repo-frontier
+/// shard without emitting raw repository-identifying data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageSignal {
+    /// The worker claimed a shard lease.
+    ///
+    /// `latency_ms` is the elapsed wall time spent waiting on claim.
+    ShardClaimed { latency_ms: u64 },
+    /// Mirror acquisition or refresh finished for the claimed repo.
+    ///
+    /// `latency_ms` is the wall-clock duration of the mirror step.
+    /// `error_class` is a closed-set retry posture when mirror sync failed;
+    /// `None` means the mirror step succeeded.
+    MirrorSyncCompleted {
+        latency_ms: u64,
+        error_class: Option<&'static str>,
+    },
+    /// Repo-native scan execution finished.
+    ///
+    /// `latency_ms` is the wall-clock duration of the execution step.
+    /// `items_scanned` and `bytes_scanned` are passthrough aggregate counters.
+    ScanCompleted {
+        latency_ms: u64,
+        items_scanned: u64,
+        bytes_scanned: u64,
+    },
+    /// Durable findings + done-ledger receipt submission finished.
+    ///
+    /// `latency_ms` is the wall-clock duration of the receipt step.
+    /// `receipts` is the number of authoritative receipt families confirmed.
+    DurableReceiptCompleted { latency_ms: u64, receipts: u64 },
+    /// The outer coordinator checkpoint/complete call finished.
+    ///
+    /// `latency_ms` is the wall-clock duration of the shard-advance step.
+    CheckpointAdvanced { latency_ms: u64 },
+    /// The worker can no longer trust the claimed lease.
+    ///
+    /// `reason` is a closed, low-cardinality discriminant.
+    LeaseUncertaintyObserved { reason: &'static str },
+}
+
 /// Coordinator-facing recorder for distributed scan output.
 pub trait CoordinationEventRecorder: Send + Sync + fmt::Debug {
     /// Persists a scanner core event (finding, progress, summary, diagnostic).
@@ -63,6 +107,11 @@ pub trait CoordinationEventRecorder: Send + Sync + fmt::Debug {
     fn record_git_event(&self, shard_id: &str, event: StoredGitEvent) -> Result<()>;
     /// Persists a commit lifecycle progress marker (begin/finish).
     fn record_commit_progress(&self, shard_id: &str, event: CommitProgressRecord) -> Result<()>;
+    /// Persists a low-cardinality Git stage signal.
+    ///
+    /// Recorder failures remain non-fatal for callers; stage telemetry follows
+    /// the same best-effort contract as core, git, and progress events.
+    fn record_stage_signal(&self, shard_id: &str, signal: StageSignal) -> Result<()>;
 }
 
 /// Map a sentinel identity ID to `None`, real IDs to `Some`.
@@ -73,13 +122,14 @@ fn sentinel_to_option(id: u32) -> Option<u32> {
 /// Distributed event sink that forwards events to a coordinator recorder.
 ///
 /// Recorder errors are non-fatal. The first failure for each event kind
-/// (core / git) is logged; subsequent failures are suppressed to avoid
+/// (core / git / stage) is logged; subsequent failures are suppressed to avoid
 /// flooding logs during sustained recorder outages.
 pub struct CoordinationEventSink {
     shard_id: Arc<str>,
     recorder: Arc<dyn CoordinationEventRecorder>,
     core_error_logged: AtomicBool,
     git_error_logged: AtomicBool,
+    stage_error_logged: AtomicBool,
 }
 
 impl CoordinationEventSink {
@@ -91,6 +141,7 @@ impl CoordinationEventSink {
             recorder,
             core_error_logged: AtomicBool::new(false),
             git_error_logged: AtomicBool::new(false),
+            stage_error_logged: AtomicBool::new(false),
         }
     }
 
@@ -105,6 +156,17 @@ impl CoordinationEventSink {
                 shard_id = %self.shard_id,
                 %error,
                 "{message}",
+            );
+        }
+    }
+
+    /// Emit one best-effort stage signal for the current shard.
+    pub(crate) fn emit_stage_signal(&self, signal: StageSignal) {
+        if let Err(error) = self.recorder.record_stage_signal(&self.shard_id, signal) {
+            self.warn_recorder_failure(
+                &self.stage_error_logged,
+                error,
+                "recorder failed to persist stage signal; subsequent failures suppressed",
             );
         }
     }
@@ -232,6 +294,7 @@ mod tests {
     struct TestRecorder {
         core_events: Mutex<Vec<OwnedCoreEvent>>,
         git_events: Mutex<Vec<StoredGitEvent>>,
+        stage_signals: Mutex<Vec<(String, StageSignal)>>,
     }
 
     impl CoordinationEventRecorder for TestRecorder {
@@ -250,6 +313,14 @@ mod tests {
             _shard_id: &str,
             _event: CommitProgressRecord,
         ) -> Result<()> {
+            Ok(())
+        }
+
+        fn record_stage_signal(&self, shard_id: &str, signal: StageSignal) -> Result<()> {
+            self.stage_signals
+                .lock()
+                .unwrap()
+                .push((shard_id.to_owned(), signal));
             Ok(())
         }
     }
@@ -277,6 +348,31 @@ mod tests {
             change_kind: None,
             confidence_score: 85,
         })
+    }
+
+    #[test]
+    fn sink_forwards_stage_signals_to_recorder() {
+        let recorder = Arc::new(TestRecorder::default());
+        let sink = CoordinationEventSink::new(
+            Arc::clone(&recorder) as Arc<dyn CoordinationEventRecorder>,
+            Arc::from("stage-shard"),
+        );
+
+        sink.emit_stage_signal(StageSignal::MirrorSyncCompleted {
+            latency_ms: 17,
+            error_class: Some("retryable"),
+        });
+
+        let forwarded = recorder.stage_signals.lock().unwrap();
+        assert_eq!(forwarded.len(), 1, "stage signal should be forwarded");
+        assert_eq!(forwarded[0].0, "stage-shard");
+        assert_eq!(
+            forwarded[0].1,
+            StageSignal::MirrorSyncCompleted {
+                latency_ms: 17,
+                error_class: Some("retryable"),
+            }
+        );
     }
 
     fn progress_event() -> CoreEvent<'static> {

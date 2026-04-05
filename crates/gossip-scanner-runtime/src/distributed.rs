@@ -106,7 +106,7 @@ use anyhow::{Context as _, Error as AnyError, Result, anyhow};
 use gossip_connectors::FilesystemConnector;
 use gossip_contracts::{
     connector::{
-        Budgets, Cursor, ItemKey, ItemRef, Location, PageState, ScanItem, VersionId,
+        Budgets, Cursor, ErrorClass, ItemKey, ItemRef, Location, PageState, ScanItem, VersionId,
         git::GitMirrorManager, ordered::OrderedContentSource,
     },
     coordination::{CursorBoundsCheck, RestoredShardState, ShardSpec, check_cursor_bounds},
@@ -146,7 +146,8 @@ use crate::{
     },
     commit_sink::{CommitSink, FindingsBatch, ItemMeta},
     coordination_sink::{
-        CommitProgressRecord, CoordinationEventRecorder, CoordinationEventSink, FindingsCaptureSink,
+        CommitProgressRecord, CoordinationEventRecorder, CoordinationEventSink,
+        FindingsCaptureSink, StageSignal,
     },
     git_discovery::StaticGitRepoDiscoverySource,
     git_persistence::GitPersistenceBackend,
@@ -759,6 +760,16 @@ pub struct DistributedRunReport {
     pub leases_seen: u64,
     /// Number of shards that were scanned.
     pub shards_scanned: u64,
+    /// Aggregate claim latency in milliseconds across the invocation.
+    pub total_claim_ms: u64,
+    /// Aggregate Git mirror-sync latency in milliseconds.
+    pub total_mirror_sync_ms: u64,
+    /// Aggregate Git execution latency in milliseconds.
+    pub total_scan_ms: u64,
+    /// Aggregate durable receipt latency in milliseconds.
+    pub total_durable_receipt_ms: u64,
+    /// Aggregate shard-advance latency in milliseconds.
+    pub total_checkpoint_ms: u64,
 }
 
 impl DistributedRunReport {
@@ -771,6 +782,44 @@ impl DistributedRunReport {
             self.leases_seen,
         );
     }
+}
+
+/// Per-lease Git stage timings aggregated into [`DistributedRunReport`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GitRunStageMetrics {
+    mirror_sync_ms: u64,
+    scan_ms: u64,
+    durable_receipt_ms: u64,
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    duration_ms(start.elapsed())
+}
+
+const fn error_class_label(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Retryable => "retryable",
+        ErrorClass::Permanent => "permanent",
+        _ => "other",
+    }
+}
+
+const fn lease_uncertainty_reason(reason: LeaseUncertainty) -> &'static str {
+    match reason {
+        LeaseUncertainty::DeadlineElapsed { .. } => "deadline_elapsed",
+        LeaseUncertainty::AdvanceStaleFence { .. } => "stale_fence",
+        LeaseUncertainty::AdvanceLeaseExpired { .. } => "lease_expired",
+    }
+}
+
+fn emit_lease_uncertainty(stage_sink: &CoordinationEventSink, reason: LeaseUncertainty) {
+    stage_sink.emit_stage_signal(StageSignal::LeaseUncertaintyObserved {
+        reason: lease_uncertainty_reason(reason),
+    });
 }
 
 /// Explicit reason the worker can no longer trust a claimed lease.
@@ -2845,14 +2894,14 @@ where
 /// (already complete) or exactly one in-scope repo target. A durable complete
 /// finalize produces the repo-frontier checkpoint cursor for shard advance.
 fn run_git_repo_lease<M, B, F, D>(
-    recorder: Arc<dyn CoordinationEventRecorder>,
+    stage_sink: Arc<CoordinationEventSink>,
     identity: &GitWorkerIdentity,
     mirrors: &mut M,
     git_persistence_backend: &B,
     persistence: &DistributedPersistence<F, D>,
     lease: &GitShardLease,
     config: DistributedRuntimeConfig,
-) -> Result<(ScanReport, ShardCompletionOutcome), DistributedRuntimeError>
+) -> Result<(ScanReport, ShardCompletionOutcome, GitRunStageMetrics), DistributedRuntimeError>
 where
     M: GitMirrorManager,
     B: GitPersistenceBackend + Clone,
@@ -2920,6 +2969,7 @@ where
         return Ok((
             ScanReport::default(),
             ShardCompletionOutcome::ExhaustedEmpty,
+            GitRunStageMetrics::default(),
         ));
     };
     // Defense-in-depth: unreachable with StaticGitRepoDiscoverySource because
@@ -2945,11 +2995,7 @@ where
     let cancel = CancellationToken::new();
     let lease_uncertainty = LeaseUncertaintySignal::default();
     let lease_watch_done = Arc::new(AtomicBool::new(false));
-    let inner_sink = Arc::new(CoordinationEventSink::new(
-        recorder,
-        Arc::clone(lease.shard_id_arc()),
-    ));
-    let capture_sink = Arc::new(FindingsCaptureSink::new(inner_sink));
+    let capture_sink = Arc::new(FindingsCaptureSink::new(Arc::clone(&stage_sink)));
     let event_sink: Arc<dyn GitEventOutput + Send + Sync> =
         Arc::clone(&capture_sink) as Arc<dyn GitEventOutput + Send + Sync>;
     let (execution, watch_result) = std::thread::scope(|scope| {
@@ -2961,13 +3007,19 @@ where
         });
 
         let execution = (|| -> Result<_, DistributedRuntimeError> {
+            let mut stage_metrics = GitRunStageMetrics::default();
             if let Some(reason) = armed_lease_deadline.expiry_reason() {
                 return Err(DistributedRuntimeError::LeaseUncertain(reason));
             }
 
+            let mirror_started_at = Instant::now();
             let mirror = mirrors
                 .sync_mirror(lease.payload().repo_target().locator())
                 .map_err(|error| {
+                    stage_sink.emit_stage_signal(StageSignal::MirrorSyncCompleted {
+                        latency_ms: elapsed_ms(mirror_started_at),
+                        error_class: Some(error_class_label(error.class())),
+                    });
                     DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
                         anyhow::Error::from(error).context(format!(
                             "git mirror sync failed for shard '{}' and repo key {:?}",
@@ -2976,12 +3028,18 @@ where
                         )),
                     ))
                 })?;
+            stage_metrics.mirror_sync_ms = elapsed_ms(mirror_started_at);
+            stage_sink.emit_stage_signal(StageSignal::MirrorSyncCompleted {
+                latency_ms: stage_metrics.mirror_sync_ms,
+                error_class: None,
+            });
 
             if let Some(reason) = armed_lease_deadline.expiry_reason() {
                 return Err(DistributedRuntimeError::LeaseUncertain(reason));
             }
 
-            GitRepoRuntime::execute_repo(
+            let scan_started_at = Instant::now();
+            let execution = GitRepoRuntime::execute_repo(
                 &identity.scan_template,
                 lease.payload(),
                 &mirror,
@@ -2990,7 +3048,14 @@ where
                 Arc::clone(&event_sink),
                 git_persistence_backend.clone(),
             )
-            .map_err(DistributedRuntimeError::Runtime)
+            .map_err(DistributedRuntimeError::Runtime)?;
+            stage_metrics.scan_ms = elapsed_ms(scan_started_at);
+            stage_sink.emit_stage_signal(StageSignal::ScanCompleted {
+                latency_ms: stage_metrics.scan_ms,
+                items_scanned: execution.report.items_scanned,
+                bytes_scanned: execution.report.bytes_scanned,
+            });
+            Ok((execution, stage_metrics))
         })();
 
         // Seal the uncertainty signal after durable execution so a late
@@ -3018,7 +3083,7 @@ where
         return Err(DistributedRuntimeError::LeaseUncertain(reason));
     }
 
-    let execution = execution?;
+    let (execution, mut stage_metrics) = execution?;
     let complete_time = wall_clock_now();
     if !matches!(execution.finalize_outcome, FinalizeOutcome::Complete) {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
@@ -3037,10 +3102,6 @@ where
     let detected_count = capture_sink.detected_finding_count();
 
     if detected_count > 0 {
-        // TODO(git-findings-persistence): remove this guard once durable
-        // findings translation is wired in — grep for the tag to find the
-        // other two sites that must change atomically.
-        //
         // Durable findings translation is not yet available. Persisting an
         // empty batch while advancing the shard checkpoint would mark the
         // repo as ScannedClean, silently dropping detected findings from
@@ -3065,8 +3126,14 @@ where
         claim_time: lease.claim_wall_clock(),
         complete_time,
     };
+    let receipt_started_at = Instant::now();
     let (findings_receipt, done_ledger_receipt) =
         submit_git_repo_done_ledger(&persistence.done_ledger, &input)?;
+    stage_metrics.durable_receipt_ms = elapsed_ms(receipt_started_at);
+    stage_sink.emit_stage_signal(StageSignal::DurableReceiptCompleted {
+        latency_ms: stage_metrics.durable_receipt_ms,
+        receipts: 2,
+    });
 
     tracing::debug!(
         shard_id = %lease.shard_id(),
@@ -3148,7 +3215,7 @@ where
     };
 
     ensure_post_drain_lease_trust(&lease_uncertainty)?;
-    Ok((execution.report, completion))
+    Ok((execution.report, completion, stage_metrics))
 }
 
 /// Run the distributed worker loop until the coordinator has no more leases.
@@ -3285,6 +3352,7 @@ where
     let mut report = DistributedRunReport::default();
 
     loop {
+        let claim_started_at = Instant::now();
         let lease = match claim_next_git_lease(coordinator, &identity, &mut scratch) {
             Ok(Some(lease)) => lease,
             Ok(None) => break,
@@ -3299,9 +3367,19 @@ where
             }
         };
         report.leases_seen = report.leases_seen.saturating_add(1);
+        let claim_ms = elapsed_ms(claim_started_at);
+        report.total_claim_ms = report.total_claim_ms.saturating_add(claim_ms);
 
-        let (scan_report, completion) = match run_git_repo_lease(
+        let stage_sink = Arc::new(CoordinationEventSink::new(
             Arc::clone(&identity.recorder),
+            Arc::clone(lease.shard_id_arc()),
+        ));
+        stage_sink.emit_stage_signal(StageSignal::ShardClaimed {
+            latency_ms: claim_ms,
+        });
+
+        let (scan_report, completion, stage_metrics) = match run_git_repo_lease(
+            Arc::clone(&stage_sink),
             &identity,
             mirrors,
             &git_persistence_backend,
@@ -3311,6 +3389,9 @@ where
         ) {
             Ok(result) => result,
             Err(error) => {
+                if let DistributedRuntimeError::LeaseUncertain(reason) = &error {
+                    emit_lease_uncertainty(stage_sink.as_ref(), *reason);
+                }
                 tracing::warn!(
                     error = %error,
                     leases_seen = report.leases_seen,
@@ -3321,6 +3402,13 @@ where
                 return Err(error);
             }
         };
+        report.total_mirror_sync_ms = report
+            .total_mirror_sync_ms
+            .saturating_add(stage_metrics.mirror_sync_ms);
+        report.total_scan_ms = report.total_scan_ms.saturating_add(stage_metrics.scan_ms);
+        report.total_durable_receipt_ms = report
+            .total_durable_receipt_ms
+            .saturating_add(stage_metrics.durable_receipt_ms);
 
         tracing::debug!(
             shard_id = %lease.shard_id(),
@@ -3330,7 +3418,11 @@ where
             "git repo shard scan complete",
         );
 
+        let checkpoint_started_at = Instant::now();
         if let Err(error) = advance_shard(coordinator, identity.tenant, &lease, &completion) {
+            if let DistributedRuntimeError::LeaseUncertain(reason) = &error {
+                emit_lease_uncertainty(stage_sink.as_ref(), *reason);
+            }
             tracing::warn!(
                 error = %error,
                 leases_seen = report.leases_seen,
@@ -3340,6 +3432,11 @@ where
             );
             return Err(error);
         }
+        let checkpoint_ms = elapsed_ms(checkpoint_started_at);
+        report.total_checkpoint_ms = report.total_checkpoint_ms.saturating_add(checkpoint_ms);
+        stage_sink.emit_stage_signal(StageSignal::CheckpointAdvanced {
+            latency_ms: checkpoint_ms,
+        });
 
         report.shards_scanned = report.shards_scanned.saturating_add(1);
     }
@@ -3405,7 +3502,7 @@ mod tests {
         CancellationToken, OwnedCoreEvent,
         commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput},
         commit_sink::{FindingRecord, FindingsBatch, ItemMeta},
-        coordination_sink::{CommitProgressRecord, StoredGitEvent},
+        coordination_sink::{CommitProgressRecord, StageSignal, StoredGitEvent},
         git_mirror::LocalMirrorManager,
         git_persistence::GitPersistenceOp,
         ordered_content::OrderedContentSkipReason,
@@ -3507,6 +3604,7 @@ mod tests {
     struct Recorder {
         git_events: Mutex<Vec<StoredGitEvent>>,
         progress: Mutex<Vec<CommitProgressRecord>>,
+        stage_signals: Mutex<Vec<StageSignal>>,
     }
 
     impl CoordinationEventRecorder for Recorder {
@@ -3525,6 +3623,14 @@ mod tests {
             event: CommitProgressRecord,
         ) -> Result<()> {
             self.progress.lock().expect("progress lock").push(event);
+            Ok(())
+        }
+
+        fn record_stage_signal(&self, _shard_id: &str, signal: StageSignal) -> Result<()> {
+            self.stage_signals
+                .lock()
+                .expect("stage signals lock")
+                .push(signal);
             Ok(())
         }
     }
@@ -4032,6 +4138,11 @@ mod tests {
         let report = DistributedRunReport::default();
         assert_eq!(report.leases_seen, 0);
         assert_eq!(report.shards_scanned, 0);
+        assert_eq!(report.total_claim_ms, 0);
+        assert_eq!(report.total_mirror_sync_ms, 0);
+        assert_eq!(report.total_scan_ms, 0);
+        assert_eq!(report.total_durable_receipt_ms, 0);
+        assert_eq!(report.total_checkpoint_ms, 0);
         assert!(report.shards_scanned <= report.leases_seen);
 
         // Non-trivial case: demonstrates the invariant holds for realistic
@@ -4040,6 +4151,11 @@ mod tests {
         let nonzero = DistributedRunReport {
             leases_seen: 10,
             shards_scanned: 7,
+            total_claim_ms: 11,
+            total_mirror_sync_ms: 13,
+            total_scan_ms: 17,
+            total_durable_receipt_ms: 19,
+            total_checkpoint_ms: 23,
         };
         assert!(nonzero.shards_scanned <= nonzero.leases_seen);
     }
@@ -6562,6 +6678,58 @@ mod tests {
             !events.is_empty(),
             "git worker should emit at least one git event during the scan"
         );
+    }
+
+    #[test]
+    fn run_git_repo_worker_emits_stage_signals_for_successful_scan() {
+        let repo = create_clean_git_repo_fixture();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        let test_recorder = Arc::new(Recorder::default());
+        let identity = git_worker_identity_with_recorder(
+            repo.path(),
+            Arc::clone(&test_recorder) as Arc<dyn CoordinationEventRecorder>,
+        );
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+        let report = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            identity,
+            backend,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("git repo worker should succeed");
+
+        assert_eq!(report.leases_seen, 1);
+        assert_eq!(report.shards_scanned, 1);
+
+        let signals = test_recorder
+            .stage_signals
+            .lock()
+            .expect("stage signals lock");
+        assert_eq!(
+            signals.len(),
+            5,
+            "successful path should emit five stage signals"
+        );
+        assert!(matches!(signals[0], StageSignal::ShardClaimed { .. }));
+        assert!(matches!(
+            signals[1],
+            StageSignal::MirrorSyncCompleted {
+                error_class: None,
+                ..
+            }
+        ));
+        assert!(matches!(signals[2], StageSignal::ScanCompleted { .. }));
+        assert!(matches!(
+            signals[3],
+            StageSignal::DurableReceiptCompleted { receipts: 2, .. }
+        ));
+        assert!(matches!(signals[4], StageSignal::CheckpointAdvanced { .. }));
     }
 
     /// A successful git repo scan of a clean (zero-findings) fixture must

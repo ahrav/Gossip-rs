@@ -24,7 +24,7 @@ use gossip_contracts::identity::domain::COORDINATION_TELEMETRY_V1;
 use gossip_contracts::identity::{domain_hasher, finalize_64};
 use gossip_scanner_runtime::OwnedCoreEvent;
 use gossip_scanner_runtime::coordination_sink::{
-    CommitProgressRecord, CoordinationEventRecorder, StoredGitEvent,
+    CommitProgressRecord, CoordinationEventRecorder, StageSignal, StoredGitEvent,
 };
 
 /// Tracing target for all coordination telemetry events. Subscribers can filter
@@ -54,6 +54,7 @@ pub struct ProductionCoordinationEventRecorder {
     core_error_logged: AtomicBool,
     git_error_logged: AtomicBool,
     progress_error_logged: AtomicBool,
+    stage_error_logged: AtomicBool,
 }
 
 impl fmt::Debug for ProductionCoordinationEventRecorder {
@@ -71,6 +72,10 @@ impl fmt::Debug for ProductionCoordinationEventRecorder {
             .field(
                 "progress_error_logged",
                 &self.progress_error_logged.load(Ordering::Relaxed),
+            )
+            .field(
+                "stage_error_logged",
+                &self.stage_error_logged.load(Ordering::Relaxed),
             )
             .finish()
     }
@@ -96,6 +101,7 @@ impl ProductionCoordinationEventRecorder {
             core_error_logged: AtomicBool::new(false),
             git_error_logged: AtomicBool::new(false),
             progress_error_logged: AtomicBool::new(false),
+            stage_error_logged: AtomicBool::new(false),
         }
     }
 
@@ -148,6 +154,14 @@ impl CoordinationEventRecorder for ProductionCoordinationEventRecorder {
         self.emit_best_effort(
             RecorderCategory::Progress,
             SanitizedCoordinationRecord::from_commit_progress(shard_id, event),
+        );
+        Ok(())
+    }
+
+    fn record_stage_signal(&self, shard_id: &str, signal: StageSignal) -> Result<()> {
+        self.emit_best_effort(
+            RecorderCategory::Stage,
+            SanitizedCoordinationRecord::from_stage_signal(shard_id, signal),
         );
         Ok(())
     }
@@ -341,6 +355,95 @@ impl CoordinationTelemetrySink for TracingCoordinationTelemetrySink {
                     "coordination commit finish",
                 );
             }
+            SanitizedCoordinationRecord::StageShardClaimed {
+                shard_id,
+                latency_ms,
+            } => {
+                tracing::debug!(
+                    target: TELEMETRY_TARGET,
+                    event_name = "coordination_stage_shard_claimed",
+                    category = "stage",
+                    shard_id = %shard_id,
+                    stage_kind = "shard_claimed",
+                    latency_ms,
+                    "coordination stage shard claimed",
+                );
+            }
+            SanitizedCoordinationRecord::StageMirrorSyncCompleted {
+                shard_id,
+                latency_ms,
+                error_class,
+            } => {
+                tracing::debug!(
+                    target: TELEMETRY_TARGET,
+                    event_name = "coordination_stage_mirror_sync",
+                    category = "stage",
+                    shard_id = %shard_id,
+                    stage_kind = "mirror_sync",
+                    latency_ms,
+                    error_class = %OptionalField::new(error_class),
+                    "coordination stage mirror sync",
+                );
+            }
+            SanitizedCoordinationRecord::StageScanCompleted {
+                shard_id,
+                latency_ms,
+                items_scanned,
+                bytes_scanned,
+            } => {
+                tracing::debug!(
+                    target: TELEMETRY_TARGET,
+                    event_name = "coordination_stage_scan",
+                    category = "stage",
+                    shard_id = %shard_id,
+                    stage_kind = "scan",
+                    latency_ms,
+                    items_scanned,
+                    bytes_scanned,
+                    "coordination stage scan",
+                );
+            }
+            SanitizedCoordinationRecord::StageDurableReceiptCompleted {
+                shard_id,
+                latency_ms,
+                receipts,
+            } => {
+                tracing::debug!(
+                    target: TELEMETRY_TARGET,
+                    event_name = "coordination_stage_durable_receipt",
+                    category = "stage",
+                    shard_id = %shard_id,
+                    stage_kind = "durable_receipt",
+                    latency_ms,
+                    receipts,
+                    "coordination stage durable receipt",
+                );
+            }
+            SanitizedCoordinationRecord::StageCheckpointAdvanced {
+                shard_id,
+                latency_ms,
+            } => {
+                tracing::debug!(
+                    target: TELEMETRY_TARGET,
+                    event_name = "coordination_stage_checkpoint",
+                    category = "stage",
+                    shard_id = %shard_id,
+                    stage_kind = "checkpoint",
+                    latency_ms,
+                    "coordination stage checkpoint",
+                );
+            }
+            SanitizedCoordinationRecord::StageLeaseUncertaintyObserved { shard_id, reason } => {
+                tracing::warn!(
+                    target: TELEMETRY_TARGET,
+                    event_name = "coordination_stage_lease_uncertainty",
+                    category = "stage",
+                    shard_id = %shard_id,
+                    stage_kind = "lease_uncertainty",
+                    reason,
+                    "coordination stage lease uncertainty",
+                );
+            }
         }
 
         Ok(())
@@ -385,16 +488,17 @@ fn emit_diagnostic(
     }
 }
 
-/// Discriminant for the three independent error-suppression channels.
+/// Discriminant for the independent error-suppression channels.
 ///
 /// Each category tracks its own "first failure logged" flag so that a broken
-/// git sink does not suppress the first-failure warning for core events (or
-/// vice versa).
+/// git sink does not suppress the first-failure warning for core or stage
+/// events (or vice versa).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecorderCategory {
     Core,
     Git,
     Progress,
+    Stage,
 }
 
 impl RecorderCategory {
@@ -403,6 +507,7 @@ impl RecorderCategory {
             Self::Core => "core",
             Self::Git => "git",
             Self::Progress => "progress",
+            Self::Stage => "stage",
         }
     }
 
@@ -413,6 +518,7 @@ impl RecorderCategory {
             Self::Core => &recorder.core_error_logged,
             Self::Git => &recorder.git_error_logged,
             Self::Progress => &recorder.progress_error_logged,
+            Self::Stage => &recorder.stage_error_logged,
         }
     }
 }
@@ -503,8 +609,9 @@ impl<T: fmt::Display> fmt::Display for OptionalField<T> {
 /// (`u64` counters, `f64` throughput), `&'static str` labels, and integer IDs
 /// pass through unchanged because they carry no customer-attributable content.
 ///
-/// Variants mirror the three event families of [`CoordinationEventRecorder`]:
-/// core scanner events, git metadata, and commit lifecycle progress.
+/// Variants mirror the event families of [`CoordinationEventRecorder`]: core
+/// scanner events, git metadata, commit lifecycle progress, and low-cardinality
+/// Git stage signals.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SanitizedCoordinationRecord {
     CoreFinding {
@@ -575,6 +682,34 @@ pub(crate) enum SanitizedCoordinationRecord {
         lease_shard_id: u64,
         fence_epoch: u64,
         item_key: RedactedDigest,
+    },
+    StageShardClaimed {
+        shard_id: RedactedDigest,
+        latency_ms: u64,
+    },
+    StageMirrorSyncCompleted {
+        shard_id: RedactedDigest,
+        latency_ms: u64,
+        error_class: Option<&'static str>,
+    },
+    StageScanCompleted {
+        shard_id: RedactedDigest,
+        latency_ms: u64,
+        items_scanned: u64,
+        bytes_scanned: u64,
+    },
+    StageDurableReceiptCompleted {
+        shard_id: RedactedDigest,
+        latency_ms: u64,
+        receipts: u64,
+    },
+    StageCheckpointAdvanced {
+        shard_id: RedactedDigest,
+        latency_ms: u64,
+    },
+    StageLeaseUncertaintyObserved {
+        shard_id: RedactedDigest,
+        reason: &'static str,
     },
 }
 
@@ -728,6 +863,52 @@ impl SanitizedCoordinationRecord {
         }
     }
 
+    /// Converts a stage signal into a sanitized record, redacting only the
+    /// shard identifier while passing through low-cardinality labels and
+    /// numeric metrics unchanged.
+    fn from_stage_signal(shard_id: &str, signal: StageSignal) -> Self {
+        let shard_id = RedactedDigest::text("shard_id", shard_id);
+        match signal {
+            StageSignal::ShardClaimed { latency_ms } => Self::StageShardClaimed {
+                shard_id,
+                latency_ms,
+            },
+            StageSignal::MirrorSyncCompleted {
+                latency_ms,
+                error_class,
+            } => Self::StageMirrorSyncCompleted {
+                shard_id,
+                latency_ms,
+                error_class,
+            },
+            StageSignal::ScanCompleted {
+                latency_ms,
+                items_scanned,
+                bytes_scanned,
+            } => Self::StageScanCompleted {
+                shard_id,
+                latency_ms,
+                items_scanned,
+                bytes_scanned,
+            },
+            StageSignal::DurableReceiptCompleted {
+                latency_ms,
+                receipts,
+            } => Self::StageDurableReceiptCompleted {
+                shard_id,
+                latency_ms,
+                receipts,
+            },
+            StageSignal::CheckpointAdvanced { latency_ms } => Self::StageCheckpointAdvanced {
+                shard_id,
+                latency_ms,
+            },
+            StageSignal::LeaseUncertaintyObserved { reason } => {
+                Self::StageLeaseUncertaintyObserved { shard_id, reason }
+            }
+        }
+    }
+
     /// Extracts the (already redacted) shard ID for error-suppression log context.
     fn shard_id(&self) -> RedactedDigest {
         match self {
@@ -738,7 +919,13 @@ impl SanitizedCoordinationRecord {
             | Self::GitCommitMeta { shard_id, .. }
             | Self::GitIdentityDictionary { shard_id, .. }
             | Self::CommitBegin { shard_id, .. }
-            | Self::CommitFinish { shard_id, .. } => *shard_id,
+            | Self::CommitFinish { shard_id, .. }
+            | Self::StageShardClaimed { shard_id, .. }
+            | Self::StageMirrorSyncCompleted { shard_id, .. }
+            | Self::StageScanCompleted { shard_id, .. }
+            | Self::StageDurableReceiptCompleted { shard_id, .. }
+            | Self::StageCheckpointAdvanced { shard_id, .. }
+            | Self::StageLeaseUncertaintyObserved { shard_id, .. } => *shard_id,
         }
     }
 }
@@ -834,6 +1021,7 @@ mod tests {
         Vec<(String, OwnedCoreEvent)>,
         Vec<(String, StoredGitEvent)>,
         Vec<(String, CommitProgressRecord)>,
+        Vec<(String, StageSignal)>,
     ) {
         let canary_item_key =
             ItemKey::try_from_slice(canary.as_bytes()).expect("canary item key should be valid");
@@ -922,11 +1110,49 @@ mod tests {
                 },
             ),
         ];
-        (core, git, progress)
+        let stage = vec![
+            (
+                format!("claimed-stage-shard-{canary}"),
+                StageSignal::ShardClaimed { latency_ms: 3 },
+            ),
+            (
+                format!("mirror-stage-shard-{canary}"),
+                StageSignal::MirrorSyncCompleted {
+                    latency_ms: 5,
+                    error_class: Some("retryable"),
+                },
+            ),
+            (
+                format!("scan-stage-shard-{canary}"),
+                StageSignal::ScanCompleted {
+                    latency_ms: 7,
+                    items_scanned: 11,
+                    bytes_scanned: 13,
+                },
+            ),
+            (
+                format!("receipt-stage-shard-{canary}"),
+                StageSignal::DurableReceiptCompleted {
+                    latency_ms: 17,
+                    receipts: 2,
+                },
+            ),
+            (
+                format!("checkpoint-stage-shard-{canary}"),
+                StageSignal::CheckpointAdvanced { latency_ms: 19 },
+            ),
+            (
+                format!("lease-stage-shard-{canary}"),
+                StageSignal::LeaseUncertaintyObserved {
+                    reason: "deadline_elapsed",
+                },
+            ),
+        ];
+        (core, git, progress, stage)
     }
 
     fn full_coverage_records(canary: &str) -> Vec<SanitizedCoordinationRecord> {
-        let (core, git, progress) = canary_raw_events(canary);
+        let (core, git, progress, stage) = canary_raw_events(canary);
         let mut records: Vec<SanitizedCoordinationRecord> = Vec::new();
         for (shard_id, event) in core {
             records.push(SanitizedCoordinationRecord::from_core_event(
@@ -941,6 +1167,11 @@ mod tests {
         for (shard_id, event) in progress {
             records.push(SanitizedCoordinationRecord::from_commit_progress(
                 &shard_id, event,
+            ));
+        }
+        for (shard_id, signal) in stage {
+            records.push(SanitizedCoordinationRecord::from_stage_signal(
+                &shard_id, signal,
             ));
         }
         records
@@ -1080,7 +1311,29 @@ mod tests {
                     assert_digest_string_is_redacted(&policy_hash.to_string(), &canary);
                     assert_digest_string_is_redacted(&item_key.to_string(), &canary);
                 }
+                SanitizedCoordinationRecord::StageShardClaimed { shard_id, .. }
+                | SanitizedCoordinationRecord::StageMirrorSyncCompleted { shard_id, .. }
+                | SanitizedCoordinationRecord::StageScanCompleted { shard_id, .. }
+                | SanitizedCoordinationRecord::StageDurableReceiptCompleted { shard_id, .. }
+                | SanitizedCoordinationRecord::StageCheckpointAdvanced { shard_id, .. }
+                | SanitizedCoordinationRecord::StageLeaseUncertaintyObserved { shard_id, .. } => {
+                    assert_digest_string_is_redacted(&shard_id.to_string(), &canary);
+                }
             }
+        }
+    }
+
+    #[test]
+    fn sanitized_stage_signal_records_redact_shard_id() {
+        let canary = secret_canary();
+        let (_, _, _, stage) = canary_raw_events(&canary);
+
+        for (shard_id, signal) in stage {
+            let record = SanitizedCoordinationRecord::from_stage_signal(&shard_id, signal);
+            let debug = format!("{record:?}");
+            assert!(!debug.contains(&canary));
+            assert!(debug.contains("len="));
+            assert!(debug.contains("hash="));
         }
     }
 
@@ -1117,7 +1370,7 @@ mod tests {
     fn tracing_sink_never_logs_raw_canary_bytes() {
         let recorder = ProductionCoordinationEventRecorder::default();
         let canary = secret_canary();
-        let (core, git, progress) = canary_raw_events(&canary);
+        let (core, git, progress, stage) = canary_raw_events(&canary);
         let logs = capture_logs(Level::TRACE, || {
             for (shard_id, event) in core {
                 recorder
@@ -1134,6 +1387,11 @@ mod tests {
                     .record_commit_progress(&shard_id, event)
                     .expect("progress telemetry should be best-effort");
             }
+            for (shard_id, signal) in stage {
+                recorder
+                    .record_stage_signal(&shard_id, signal)
+                    .expect("stage telemetry should be best-effort");
+            }
         });
 
         for event_name in [
@@ -1145,6 +1403,12 @@ mod tests {
             "coordination_git_identity_dictionary",
             "coordination_commit_begin",
             "coordination_commit_finish",
+            "coordination_stage_shard_claimed",
+            "coordination_stage_mirror_sync",
+            "coordination_stage_scan",
+            "coordination_stage_durable_receipt",
+            "coordination_stage_checkpoint",
+            "coordination_stage_lease_uncertainty",
         ] {
             assert!(logs.contains(event_name), "missing {event_name} from logs");
         }
@@ -1169,6 +1433,7 @@ mod tests {
         let core_shard = RedactedDigest::text("shard_id", "core-shard").to_string();
         let git_shard = RedactedDigest::text("shard_id", "git-shard").to_string();
         let progress_shard = RedactedDigest::text("shard_id", "progress-shard").to_string();
+        let stage_shard = RedactedDigest::text("shard_id", "stage-shard").to_string();
 
         let logs = capture_logs(Level::WARN, || {
             for _ in 0..4 {
@@ -1205,15 +1470,26 @@ mod tests {
                     )
                     .expect("progress telemetry failures must be non-fatal");
             }
+            for _ in 0..4 {
+                recorder
+                    .record_stage_signal(
+                        "stage-shard",
+                        StageSignal::LeaseUncertaintyObserved {
+                            reason: "stale_fence",
+                        },
+                    )
+                    .expect("stage telemetry failures must be non-fatal");
+            }
         });
 
         assert_eq!(
             logs.matches("coordination_recorder_sink_failure").count(),
-            3
+            4
         );
         assert_eq!(logs.matches(&core_shard).count(), 1);
         assert_eq!(logs.matches(&git_shard).count(), 1);
         assert_eq!(logs.matches(&progress_shard).count(), 1);
+        assert_eq!(logs.matches(&stage_shard).count(), 1);
         assert!(logs.contains("hash="));
         assert!(!logs.contains(&canary));
     }
@@ -1270,12 +1546,27 @@ mod tests {
                     },
                 )
                 .expect("commit begin with None size_hint should succeed");
+
+            recorder
+                .record_stage_signal(
+                    "none-stage-shard",
+                    StageSignal::MirrorSyncCompleted {
+                        latency_ms: 100,
+                        error_class: None,
+                    },
+                )
+                .expect("mirror sync with None error_class should succeed");
         });
 
         // Verify specific structured fields render as "none" — tying the
         // assertion to the exact OptionalField usage rather than a bare
         // substring that could match unrelated log output.
-        for field in ["commit_id=none", "change_kind=none", "size_hint=none"] {
+        for field in [
+            "commit_id=none",
+            "change_kind=none",
+            "size_hint=none",
+            "error_class=none",
+        ] {
             assert!(
                 logs.contains(field),
                 "OptionalField::None should render as \"{field}\" in tracing output, \
