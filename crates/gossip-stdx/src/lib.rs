@@ -272,3 +272,80 @@ impl PartialEq<&str> for HexOid {
         self.as_str() == *other
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_oid_sha1_20_bytes() {
+        let oid = HexOid::from_oid_bytes(&[0u8; 20]);
+        assert_eq!(oid.as_str().len(), 40);
+        assert_eq!(oid.as_str(), "0000000000000000000000000000000000000000");
+    }
+
+    #[test]
+    fn hex_oid_sha256_32_bytes() {
+        let oid = HexOid::from_oid_bytes(&[0xffu8; 32]);
+        assert_eq!(oid.as_str().len(), 64);
+        assert_eq!(
+            oid.as_str(),
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+    }
+
+    #[test]
+    fn hex_oid_empty_input() {
+        let oid = HexOid::from_oid_bytes(&[]);
+        assert_eq!(oid.as_str(), "");
+        assert_eq!(oid.as_str().len(), 0);
+    }
+
+    #[test]
+    fn hex_oid_known_value() {
+        let oid = HexOid::from_oid_bytes(&[0xCA, 0xFE]);
+        assert_eq!(oid.as_str(), "cafe");
+    }
+
+    #[test]
+    fn hex_oid_display_and_debug() {
+        let oid = HexOid::from_oid_bytes(&[0xAB, 0xCD]);
+        assert_eq!(format!("{oid}"), "abcd");
+        assert_eq!(format!("{oid:?}"), "HexOid(\"abcd\")");
+    }
+
+    #[test]
+    fn hex_oid_partial_eq_str() {
+        let oid = HexOid::from_oid_bytes(&[0xCA, 0xFE]);
+        assert_eq!(oid, *"cafe");
+        assert_eq!(oid, "cafe");
+    }
+
+    #[test]
+    fn hex_oid_deref_to_str() {
+        let oid = HexOid::from_oid_bytes(&[0xDE, 0xAD]);
+        let s: &str = &oid;
+        assert_eq!(s, "dead");
+    }
+
+    #[test]
+    #[should_panic(expected = "OID too large")]
+    fn hex_oid_oversized_panics() {
+        let _ = HexOid::from_oid_bytes(&[0u8; 33]);
+    }
+
+    #[test]
+    fn hex_encode_into_correctness() {
+        let mut buf = [0u8; 8];
+        let written = hex_encode_into(&[0xAB, 0xCD, 0xEF, 0x01], &mut buf, 0);
+        assert_eq!(written, 8);
+        assert_eq!(&buf, b"abcdef01");
+    }
+
+    #[test]
+    #[should_panic(expected = "buffer too small")]
+    fn hex_encode_into_buffer_too_small_panics() {
+        let mut buf = [0u8; 3];
+        hex_encode_into(&[0xAB, 0xCD], &mut buf, 0);
+    }
+}

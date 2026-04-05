@@ -386,10 +386,16 @@ impl FindingsCaptureSink {
 
     /// Drain the captured findings accumulated during scan execution.
     pub(crate) fn take_captured_findings(&self) -> Vec<GitFindingForPersistence> {
-        let mut guard = self
-            .captured_findings
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut guard = match self.captured_findings.lock() {
+            Ok(guard) => guard,
+            Err(poison) => {
+                tracing::error!(
+                    "captured_findings mutex poisoned; a scan worker panicked \
+                     while holding the lock — recovered findings may be incomplete"
+                );
+                poison.into_inner()
+            }
+        };
         std::mem::take(&mut *guard)
     }
 }
@@ -408,10 +414,16 @@ impl EventOutput for FindingsCaptureSink {
                 norm_hash: NormHash::from_digest(finding.norm_hash),
                 rule_id: finding.rule_id,
             };
-            self.captured_findings
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .push(record);
+            match self.captured_findings.lock() {
+                Ok(mut guard) => guard.push(record),
+                Err(poison) => {
+                    tracing::error!(
+                        "captured_findings mutex poisoned during push; \
+                         finding may be lost"
+                    );
+                    poison.into_inner().push(record);
+                }
+            }
         }
         // Forward the borrowed event directly to the inner sink, which
         // performs its own `OwnedCoreEvent::from_core` conversion exactly

@@ -3160,8 +3160,10 @@ where
     if detected_count != captured_findings.len() as u64 {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow::anyhow!(
-                "finding counter ({detected_count}) diverged from captured payload count ({}); \
+                "git repo-frontier shard '{}': finding counter ({detected_count}) \
+                 diverged from captured payload count ({}); \
                  data integrity compromised",
+                lease.shard_id(),
                 captured_findings.len(),
             ),
         )));
