@@ -3163,7 +3163,7 @@ where
                 "git repo-frontier shard '{}': finding counter ({detected_count}) \
                  diverged from captured payload count ({}); \
                  data integrity compromised",
-                lease.shard_id(),
+                stage_sink.redacted_shard_id(),
                 captured_findings.len(),
             ),
         )));
