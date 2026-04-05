@@ -11,6 +11,8 @@
 //! The helpers here do not verify pack checksums; they operate on already
 //! loaded pack bytes and return precise errors for size and parsing issues.
 
+use crate::pack_inflate_libdeflate;
+
 use super::pack_inflate::{
     inflate_exact, inflate_exact_with, inflate_limited, inflate_limited_with, EntryHeader,
     EntryKind, PackFile,
@@ -110,9 +112,13 @@ pub fn entry_header_at(
 /// that offset.
 ///
 /// Non-delta entries (`EntryKind::NonDelta`) are inflated with an exact-size
-/// contract of `header.size` bytes. Delta entries (`EntryKind::OfsDelta` and
-/// `EntryKind::RefDelta`) are inflated as raw delta streams with a hard cap of
-/// `limits.max_delta_bytes`.
+/// contract of `header.size` bytes. Small non-delta entries route through the
+/// thread-local libdeflate backend; larger non-delta entries continue to use
+/// the caller-provided `Decompress`. Delta entries (`EntryKind::OfsDelta` and
+/// `EntryKind::RefDelta`) are inflated as raw delta streams with a hard cap
+/// of `limits.max_delta_bytes`.
+/// The caller-provided `Decompress` is bypassed entirely when the libdeflate
+/// fast path is selected.
 ///
 /// This function does not enforce `limits.max_object_bytes` for non-delta
 /// entries and does not parse delta varints/result sizes; those checks happen
@@ -138,6 +144,9 @@ pub fn entry_header_at(
 /// # Panics
 /// Panics if `header.data_start` is out of bounds for `pack` (bounds check in
 /// `PackFile::slice_from`).
+/// May panic if called reentrantly on the same thread while inflating a small
+/// non-delta entry because the libdeflate fast path uses thread-local scratch
+/// guarded by `RefCell`.
 pub fn inflate_entry_payload_with(
     de: &mut Decompress,
     pack: &PackFile<'_>,
@@ -145,6 +154,14 @@ pub fn inflate_entry_payload_with(
     out: &mut Vec<u8>,
     limits: &PackDecodeLimits,
 ) -> Result<usize, PackDecodeError> {
+    if pack_inflate_libdeflate::use_libdeflate_for_header(header) {
+        return pack_inflate_libdeflate::inflate_nondelta_exact(
+            pack.slice_from(header.data_start),
+            header.size as usize,
+            out,
+        );
+    }
+
     match header.kind {
         EntryKind::NonDelta { .. } => {
             let expected = header.size as usize;
@@ -169,7 +186,8 @@ pub fn inflate_entry_payload_with(
 ///
 /// Header and behavior contracts are identical to
 /// [`inflate_entry_payload_with`]:
-/// - Non-delta entries inflate exactly `header.size` bytes.
+/// - Non-delta entries inflate exactly `header.size` bytes and route small
+///   payloads through the thread-local libdeflate backend.
 /// - Delta entries inflate a raw delta stream capped by
 ///   `limits.max_delta_bytes`.
 ///
@@ -187,13 +205,22 @@ pub fn inflate_entry_payload_with(
 /// - Panics if `header.data_start` is out of bounds for `pack` (bounds check in
 ///   `PackFile::slice_from`).
 /// - May panic if called reentrantly on the same thread because the
-///   thread-local inflate scratch uses `RefCell` borrowing.
+///   thread-local inflate scratch and thread-local libdeflate scratch both use
+///   `RefCell` borrowing.
 pub fn inflate_entry_payload(
     pack: &PackFile<'_>,
     header: &EntryHeader,
     out: &mut Vec<u8>,
     limits: &PackDecodeLimits,
 ) -> Result<usize, PackDecodeError> {
+    if pack_inflate_libdeflate::use_libdeflate_for_header(header) {
+        return pack_inflate_libdeflate::inflate_nondelta_exact(
+            pack.slice_from(header.data_start),
+            header.size as usize,
+            out,
+        );
+    }
+
     match header.kind {
         EntryKind::NonDelta { .. } => {
             let expected = header.size as usize;
@@ -214,9 +241,46 @@ pub fn inflate_entry_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delta_test_helpers::{
+        encode_entry_header, make_add_delta, zlib_compress, SyntheticPackBuilder,
+    };
+    use crate::pack_inflate_libdeflate::LIBDEFLATE_THRESHOLD_BYTES;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    fn test_limits(max_object_bytes: usize) -> PackDecodeLimits {
+        PackDecodeLimits::new(64, max_object_bytes, max_object_bytes)
+    }
+
+    fn build_pack(entries: &[Vec<u8>]) -> (Vec<u8>, Vec<u64>) {
+        let mut pack = Vec::new();
+        let mut offsets = Vec::with_capacity(entries.len());
+
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+
+        for entry in entries {
+            offsets.push(pack.len() as u64);
+            pack.extend_from_slice(entry);
+        }
+
+        pack.extend_from_slice(&[0u8; 20]);
+        (pack, offsets)
+    }
+
+    fn single_entry_pack(entry: Vec<u8>) -> (Vec<u8>, u64) {
+        let (pack, offsets) = build_pack(&[entry]);
+        (pack, offsets[0])
+    }
+
+    fn non_delta_entry(declared_size: usize, compressed: &[u8]) -> Vec<u8> {
+        let mut entry = encode_entry_header(3, declared_size);
+        entry.extend_from_slice(compressed);
+        entry
+    }
 
     #[test]
     fn inflate_limited_errors_on_overrun() {
@@ -228,5 +292,176 @@ mod tests {
         let mut out = Vec::with_capacity(4);
         let err = inflate_limited(&compressed, &mut out, 4).unwrap_err();
         assert_eq!(err, InflateError::LimitExceeded);
+    }
+
+    #[test]
+    fn empty_nondelta_payload_inflates_via_libdeflate() {
+        let compressed = zlib_compress(&[]);
+        let (pack_bytes, offset) = single_entry_pack(non_delta_entry(0, &compressed));
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+        let mut out = Vec::new();
+
+        assert!(pack_inflate_libdeflate::use_libdeflate_for_header(&header));
+        let consumed =
+            inflate_entry_payload(&pack, &header, &mut out, &limits).expect("inflate entry");
+
+        assert_eq!(consumed, compressed.len());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn exact_size_nondelta_roundtrip_returns_compressed_bytes_consumed() {
+        let payload = b"exact size roundtrip via libdeflate".to_vec();
+        let compressed = zlib_compress(&payload);
+        let (pack_bytes, offset) = single_entry_pack(non_delta_entry(payload.len(), &compressed));
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+        let mut out = Vec::new();
+        let mut de = Decompress::new(true);
+
+        let consumed =
+            inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits).unwrap();
+
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn short_output_nondelta_returns_truncated_input() {
+        let payload = b"short output".to_vec();
+        let compressed = zlib_compress(&payload);
+        let (pack_bytes, offset) =
+            single_entry_pack(non_delta_entry(payload.len() + 1, &compressed));
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+        let mut out = Vec::new();
+        let mut de = Decompress::new(true);
+
+        let err = inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits)
+            .expect_err("expected truncated exact-size decode");
+
+        assert_eq!(err, PackDecodeError::Inflate(InflateError::TruncatedInput));
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn corrupt_small_nondelta_reports_backend_error() {
+        let (pack_bytes, offset) = single_entry_pack(non_delta_entry(8, b"\x78\x9c\xff\xff"));
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+        let mut out = Vec::from("stale");
+        let mut de = Decompress::new(true);
+
+        let err = inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits)
+            .expect_err("expected corrupt stream error");
+
+        assert_eq!(err, PackDecodeError::Inflate(InflateError::Backend));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn threshold_sized_nondelta_routes_through_libdeflate() {
+        let payload = vec![0x5a; LIBDEFLATE_THRESHOLD_BYTES];
+        let compressed = zlib_compress(&payload);
+        let (pack_bytes, offset) = single_entry_pack(non_delta_entry(payload.len(), &compressed));
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+        let mut out = Vec::new();
+        let mut de = Decompress::new(true);
+
+        assert!(pack_inflate_libdeflate::use_libdeflate_for_header(&header));
+        let consumed =
+            inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits).unwrap();
+
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn threshold_plus_one_nondelta_routes_through_flate2() {
+        let payload = vec![0x33; LIBDEFLATE_THRESHOLD_BYTES + 1];
+        let compressed = zlib_compress(&payload);
+        let (pack_bytes, offset) = single_entry_pack(non_delta_entry(payload.len(), &compressed));
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES + 1);
+        let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+        let mut out = Vec::new();
+        let mut de = Decompress::new(true);
+
+        assert!(!pack_inflate_libdeflate::use_libdeflate_for_header(&header));
+        let consumed =
+            inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits).unwrap();
+
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn delta_entries_stay_on_flate2_path_and_decode_unchanged() {
+        let base = b"base payload";
+        let delta = make_add_delta(base.len(), b"XYZ");
+        let compressed_delta = zlib_compress(&delta);
+
+        let mut builder = SyntheticPackBuilder::new();
+        builder.add_non_delta(3, base);
+        let delta_idx = builder.add_ofs_delta(0, &delta);
+        let (pack_bytes, offsets) = builder.build();
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header = entry_header_at(&pack, offsets[delta_idx], &limits).expect("parse header");
+        let mut out = Vec::new();
+        let mut de = Decompress::new(true);
+
+        assert!(!pack_inflate_libdeflate::use_libdeflate_for_header(&header));
+        let consumed =
+            inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits).unwrap();
+
+        assert_eq!(consumed, compressed_delta.len());
+        assert_eq!(out, delta);
+    }
+
+    #[test]
+    fn libdeflate_tls_reentrancy_panics_predictably() {
+        let payload = b"reentrant libdeflate".to_vec();
+        let compressed = zlib_compress(&payload);
+        let (pack_bytes, offset) = single_entry_pack(non_delta_entry(payload.len(), &compressed));
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            crate::pack_inflate_libdeflate::hold_tls_borrow_for_test(|| {
+                let mut out = Vec::new();
+                let _ = inflate_entry_payload(&pack, &header, &mut out, &limits);
+            });
+        }));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn libdeflate_reports_consumed_bytes_before_trailing_garbage() {
+        let payload = b"payload before trailing bytes".to_vec();
+        let compressed = zlib_compress(&payload);
+        let mut entry = non_delta_entry(payload.len(), &compressed);
+        entry.extend_from_slice(b"trailing bytes that should stay unread");
+        let (pack_bytes, offset) = single_entry_pack(entry);
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+        let mut out = Vec::new();
+        let mut de = Decompress::new(true);
+
+        let consumed =
+            inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits).unwrap();
+
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(out, payload);
     }
 }

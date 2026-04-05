@@ -151,6 +151,7 @@ pub mod pack_exec;
 pub mod pack_idx;
 /// Provides bounded inflate helpers and delta encoding for pack objects.
 pub mod pack_inflate;
+pub(crate) mod pack_inflate_libdeflate;
 /// Provides pack I/O utilities for cross-pack REF delta base resolution.
 pub mod pack_io;
 /// Builds per-pack decode plans from candidate blobs and delta dependencies.
