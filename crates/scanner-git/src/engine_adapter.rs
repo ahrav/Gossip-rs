@@ -135,14 +135,18 @@ impl Default for EngineAdapterConfig {
 /// All identity traits (`PartialEq`, `Eq`, `Hash`, `Ord`, `PartialOrd`)
 /// are derived over the full field tuple.
 ///
-/// `start`/`end` are derived from `FindingRec.root_hint_*`, which provide
-/// a *best-effort root match span* in blob coordinates. For transform-derived
-/// findings, these spans map back to the encoded bytes that produced the match.
+/// `start` and `end` are **blob-absolute root-hint offsets** sourced from
+/// `FindingRec.root_hint_start/root_hint_end`. The engine populates
+/// `root_hint_*` via `base_offset + match_span.start` (root findings) or
+/// `base_offset + RootSpanMapCtx::map_span(decoded_span).start` (transform
+/// findings). These coordinates are stable across chunker alignment changes
+/// and are the identity inputs forwarded into Git persistence via
+/// `GitFindingForPersistence`.
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct FindingKey {
-    /// Inclusive start offset within the blob.
+    /// Inclusive blob-absolute start offset of the full match.
     pub start: u32,
-    /// Exclusive end offset within the blob.
+    /// Exclusive blob-absolute end offset of the full match.
     pub end: u32,
     /// Stable rule identifier.
     pub rule_id: u32,

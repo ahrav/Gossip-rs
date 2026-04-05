@@ -171,22 +171,33 @@ fn sentinel_to_option(id: u32) -> Option<u32> {
 /// Persistence-ready representation of one Git finding observed during scan
 /// execution.
 ///
-/// `span_start` and `span_end` are blob-level byte offsets captured from
-/// `FindingEvent::start/end`. For Git findings these correspond to
-/// `FindingKey::start/end` (root-hint coordinates within the blob). The FS
-/// path uses decoded-buffer match spans for the same trait methods, so
-/// cross-source identity convergence is guaranteed only for non-transformed
-/// findings (the common case).
+/// `blob_offset_start` and `blob_offset_end` are blob-absolute offsets
+/// captured from `FindingEvent::start/end`. For root (non-transform) findings
+/// these correspond to the regex match span (group 0) in root-file coordinates
+/// via `base_offset + match_span.start`. For transform findings these are
+/// best-available root-hint coordinates derived via
+/// `base_offset + RootSpanMapCtx::map_span(decoded_span).start`, which maps
+/// decoded-byte positions back to approximate encoded-byte positions.
+///
+/// Both root and transform offsets participate in `OccurrenceId` derivation,
+/// so Git and FS scans of the same content converge on the same occurrence
+/// identity through these root-hint coordinates. Exact-match propagation for
+/// transforms is approximate (encoded-byte-mapped), not byte-exact.
+///
+/// Cross-source convergence is only guaranteed for blobs whose offsets fit in
+/// u32 space (< 4 GiB). The Git path narrows `root_hint_start` to a u32
+/// `FindingKey.start`; offsets that overflow are rejected by
+/// `EngineAdapterError::FindingOffsetOverflow` before reaching this struct.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct GitFindingForPersistence {
     /// Repository-relative object path used as the stable per-object identity input.
     pub(crate) object_path: Box<[u8]>,
     /// Sparse ordinal pointing to the scanned commit that produced this finding.
     pub(crate) commit_id: Option<u32>,
-    /// Half-open span start offset within the object content.
-    pub(crate) span_start: u64,
-    /// Half-open span end offset within the object content.
-    pub(crate) span_end: u64,
+    /// Half-open blob-absolute start offset within the object content.
+    pub(crate) blob_offset_start: u64,
+    /// Half-open blob-absolute end offset within the object content.
+    pub(crate) blob_offset_end: u64,
     /// Content-derived normalization hash for finding identity.
     pub(crate) norm_hash: NormHash,
     /// Rule identifier emitted by the scanner.
@@ -202,8 +213,8 @@ impl fmt::Debug for GitFindingForPersistence {
         f.debug_struct("GitFindingForPersistence")
             .field("object_path_len", &self.object_path.len())
             .field("commit_id", &self.commit_id)
-            .field("span_start", &self.span_start)
-            .field("span_end", &self.span_end)
+            .field("blob_offset_start", &self.blob_offset_start)
+            .field("blob_offset_end", &self.blob_offset_end)
             .field("norm_hash", &"[redacted]")
             .field("rule_id", &self.rule_id)
             .finish()
@@ -222,13 +233,13 @@ impl PersistenceFinding for GitFindingForPersistence {
     }
 
     #[inline]
-    fn span_start(&self) -> u64 {
-        self.span_start
+    fn blob_offset_start(&self) -> u64 {
+        self.blob_offset_start
     }
 
     #[inline]
-    fn span_end(&self) -> u64 {
-        self.span_end
+    fn blob_offset_end(&self) -> u64 {
+        self.blob_offset_end
     }
 }
 
@@ -480,8 +491,8 @@ impl EventOutput for FindingsCaptureSink {
             let record = GitFindingForPersistence {
                 object_path: finding.object_path.into(),
                 commit_id: finding.commit_id,
-                span_start: finding.start,
-                span_end: finding.end,
+                blob_offset_start: finding.start,
+                blob_offset_end: finding.end,
                 norm_hash: NormHash::from_digest(finding.norm_hash),
                 rule_id: finding.rule_id,
             };
@@ -489,8 +500,9 @@ impl EventOutput for FindingsCaptureSink {
                 Ok(mut guard) => guard.push(record),
                 Err(poison) => {
                     tracing::error!(
-                        "captured_findings mutex poisoned during push; \
-                         finding may be lost"
+                        "captured_findings mutex poisoned; recovered guard and \
+                         committed finding — subsequent lock attempts will also \
+                         require poison recovery"
                     );
                     poison.into_inner().push(record);
                 }
@@ -593,8 +605,8 @@ mod tests {
         CoreEvent::Finding(FindingEvent {
             source: SourceKind::Fs,
             object_path: b"/tmp/secret.txt",
-            start: 10,
-            end: 42,
+            start: 100,
+            end: 142,
             rule_id: 7,
             rule_name: "test-rule",
             norm_hash: [0xAA; 32],
@@ -720,8 +732,11 @@ mod tests {
         assert_eq!(captured[0].object_path.as_ref(), b"/tmp/secret.txt");
         assert_eq!(captured[0].commit_id, None);
         assert_eq!(captured[0].rule_id(), 7);
-        assert_eq!(captured[0].span_start(), 10);
-        assert_eq!(captured[0].span_end(), 42);
+        // `GitFindingForPersistence.blob_offset_start/blob_offset_end` carry the blob-absolute
+        // root-hint offsets from `FindingEvent.start/end` — these feed
+        // persistence identity derivation.
+        assert_eq!(captured[0].blob_offset_start(), 100);
+        assert_eq!(captured[0].blob_offset_end(), 142);
         assert_eq!(captured[0].norm_hash(), NormHash::from_digest([0xAA; 32]));
     }
 
@@ -730,8 +745,8 @@ mod tests {
         let finding = GitFindingForPersistence {
             object_path: b"src/lib.rs".to_vec().into_boxed_slice(),
             commit_id: Some(11),
-            span_start: 1,
-            span_end: 9,
+            blob_offset_start: 1,
+            blob_offset_end: 9,
             norm_hash: NormHash::from_digest([0xFF; 32]),
             rule_id: 2,
         };

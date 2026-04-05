@@ -129,3 +129,41 @@ fn scan_file_chunked_drops_prefix_duplicates() -> io::Result<()> {
 
     Ok(())
 }
+
+/// `root_span_hint` must remain file-absolute even when a finding lands past
+/// the first 1 MiB chunk boundary (`DEFAULT_CHUNK_BYTES = 1 << 20`).
+///
+/// These root-hint offsets later feed persistence identity derivation via
+/// `PersistenceFinding::blob_offset_start/blob_offset_end`, so chunk
+/// boundaries must not shift them.
+#[test]
+fn scan_file_chunked_realistic_multi_chunk_root_hint_is_file_absolute() -> io::Result<()> {
+    // Use a permissive single-char rule so the secret match is independent
+    // of surrounding content — the padding is a random byte that cannot
+    // trigger the rule.
+    let engine = Engine::new(vec![toy_rule_x()], Vec::new(), demo_tuning());
+
+    // 2 MiB file with the secret byte 'X' at an absolute offset past the
+    // first 1 MiB chunk boundary. `DEFAULT_CHUNK_BYTES = 1 << 20` in
+    // scanner-git; the integration test uses an explicit chunk size below
+    // matching that value so the test exercises the same boundary logic.
+    const BLOB_SIZE: usize = 2 * 1024 * 1024;
+    const SECRET_OFFSET: usize = 1_500_000;
+    const CHUNK_SIZE: usize = 1 << 20;
+
+    let mut buf = vec![b'A'; BLOB_SIZE];
+    buf[SECRET_OFFSET] = b'X';
+
+    let tmp = write_temp_file(&buf)?;
+    let findings = scan_file_chunked_materialized(&engine, tmp.path(), CHUNK_SIZE)?;
+
+    let x_hits: Vec<&Finding> = findings.iter().filter(|f| f.rule == "toy-token").collect();
+    assert_eq!(x_hits.len(), 1, "expected exactly one toy-token hit");
+    assert_eq!(
+        x_hits[0].root_span_hint,
+        SECRET_OFFSET..(SECRET_OFFSET + 1),
+        "root_span_hint must be file-absolute for findings past the first chunk boundary",
+    );
+
+    Ok(())
+}

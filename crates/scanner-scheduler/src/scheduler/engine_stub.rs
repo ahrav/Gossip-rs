@@ -68,19 +68,19 @@ pub struct RuleId(pub u16);
 /// # Field Semantics
 ///
 /// - `rule_id`: Which rule matched
-/// - `root_hint_start/end`: Byte offsets in the *original* (pre-transform) buffer
+/// - `blob_offset_start/end`: Byte offsets in the *original* (pre-transform) buffer
 ///   where the match "root" (anchor) was found. Used for deduplication.
-/// - `span_start/end`: Full match span (may extend beyond root hint)
+/// - `window_start/end`: Full match span (may extend beyond root hint)
 ///
 /// # Deduplication
 ///
-/// **Cross-chunk** dedupe uses `root_hint_end`: findings with
-/// `root_hint_end < new_bytes_start` are dropped because the previous chunk
+/// **Cross-chunk** dedupe uses `blob_offset_end`: findings with
+/// `blob_offset_end < new_bytes_start` are dropped because the previous chunk
 /// owns them (see [`ScanScratch::drop_prefix_findings`]).
 ///
 /// **Within-chunk** dedupe (in [`local_fs_owner::apply_cross_rule_dedupe`]) uses the
-/// full 6-tuple `(rule_id, root_hint_start, root_hint_end, span_start,
-/// span_end, norm_hash)` from the [`FindingWithHash`] carrier -- not from this
+/// full 6-tuple `(rule_id, blob_offset_start, blob_offset_end, window_start,
+/// window_end, norm_hash)` from the [`FindingWithHash`] carrier -- not from this
 /// stub struct directly (the stub lacks a `norm_hash` field; the hash is
 /// attached by [`ScanEngine::drain_findings_into`]).
 /// `StepId` (transform chain) is intentionally excluded because the same match
@@ -90,14 +90,14 @@ pub struct RuleId(pub u16);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindingRec {
     pub rule_id: RuleId,
-    /// Root hint start offset in original buffer.
-    pub root_hint_start: u64,
-    /// Root hint end offset in original buffer.
-    pub root_hint_end: u64,
-    /// Full match span start.
-    pub span_start: u64,
-    /// Full match span end.
-    pub span_end: u64,
+    /// Blob-absolute start offset in original buffer.
+    pub blob_offset_start: u64,
+    /// Blob-absolute end offset in original buffer.
+    pub blob_offset_end: u64,
+    /// Full match window start.
+    pub window_start: u64,
+    /// Full match window end.
+    pub window_end: u64,
     /// Additive confidence score. The stub engine has no gate pipeline,
     /// so this is always 0 in mock findings.
     pub confidence_score: i8,
@@ -168,16 +168,15 @@ impl ScanScratch {
         self.findings.clear();
     }
 
-    /// Drop findings whose root_hint_end is fully within the overlap prefix.
+    /// Drop findings whose blob_offset_end does not extend past the overlap
+    /// prefix. Retains only findings where `blob_offset_end > new_bytes_start`.
     ///
-    /// Called after scanning a chunk to remove findings that were already
-    /// captured by the previous chunk (since they fall in the overlap prefix).
-    ///
-    /// # Arguments
-    ///
-    /// - `new_bytes_start`: Absolute offset where "new" bytes begin (after overlap)
+    /// Matches the real engine's `ScanScratch::drop_prefix_findings` semantics:
+    /// a finding ending exactly at the boundary (`blob_offset_end ==
+    /// new_bytes_start`) is entirely within the prefix and is dropped.
     pub fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
-        self.findings.retain(|f| f.root_hint_end >= new_bytes_start);
+        self.findings
+            .retain(|f| f.blob_offset_end > new_bytes_start);
     }
 
     /// Drain all findings into the provided vector (append semantics).
@@ -326,10 +325,10 @@ impl MockEngine {
 
                     scratch.push_finding(FindingRec {
                         rule_id: RuleId(rule_idx as u16),
-                        root_hint_start: abs_start,
-                        root_hint_end: abs_end,
-                        span_start: abs_start,
-                        span_end: abs_end,
+                        blob_offset_start: abs_start,
+                        blob_offset_end: abs_end,
+                        window_start: abs_start,
+                        window_end: abs_end,
                         confidence_score: 0,
                     });
 
@@ -358,22 +357,22 @@ impl FindingRecord for FindingRec {
 
     #[inline]
     fn root_hint_start(&self) -> u64 {
-        self.root_hint_start
+        self.blob_offset_start
     }
 
     #[inline]
     fn root_hint_end(&self) -> u64 {
-        self.root_hint_end
+        self.blob_offset_end
     }
 
     #[inline]
     fn span_start(&self) -> u64 {
-        self.span_start
+        self.window_start
     }
 
     #[inline]
     fn span_end(&self) -> u64 {
-        self.span_end
+        self.window_end
     }
 
     #[inline]
@@ -489,8 +488,8 @@ mod tests {
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, RuleId(0));
-        assert_eq!(findings[0].root_hint_start, 6);
-        assert_eq!(findings[0].root_hint_end, 12); // "SECRET".len() = 6
+        assert_eq!(findings[0].blob_offset_start, 6);
+        assert_eq!(findings[0].blob_offset_end, 12); // "SECRET".len() = 6
     }
 
     #[test]
@@ -506,9 +505,9 @@ mod tests {
 
         assert_eq!(findings.len(), 2);
         // First at offset 100
-        assert_eq!(findings[0].root_hint_start, 100);
+        assert_eq!(findings[0].blob_offset_start, 100);
         // Second at offset 100 + 11 = 111
-        assert_eq!(findings[1].root_hint_start, 111);
+        assert_eq!(findings[1].blob_offset_start, 111);
     }
 
     #[test]
@@ -546,7 +545,7 @@ mod tests {
 
         // Only the second finding (ending at 26) should remain
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].root_hint_start, 20);
+        assert_eq!(findings[0].blob_offset_start, 20);
     }
 
     #[test]

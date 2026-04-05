@@ -83,6 +83,7 @@ impl<W: Write + Send> EventOutput for TextEventSink<W> {
         let mut line = Vec::with_capacity(256);
         match event {
             CoreEvent::Finding(finding) => {
+                // Coordinate semantics: see `FindingEvent` field docs.
                 if self.verbose {
                     line.extend_from_slice(b"--- finding ---\n");
                     line.extend_from_slice(b"  rule:   ");
@@ -315,6 +316,7 @@ fn encode_core_event(event: CoreEvent<'_>, line: &mut Vec<u8>) {
     match event {
         CoreEvent::Finding(finding) => {
             // Keep the record shape aligned with scanner-rs golden fixtures.
+            // Coordinate semantics: see `FindingEvent` field docs.
             line.push(b'{');
             push_key(line, b"path");
             write_json_bytes(line, finding.object_path);
@@ -467,6 +469,7 @@ fn encode_git_event(event: GitEvent<'_>, line: &mut Vec<u8>) {
 }
 
 fn encode_sarif_result(finding: &scanner_scheduler::events::FindingEvent<'_>, line: &mut Vec<u8>) {
+    // Coordinate semantics: see `FindingEvent` field docs.
     line.extend_from_slice(b"{\"ruleId\":");
     write_json_str(line, finding.rule_name);
     line.extend_from_slice(b",\"message\":{\"text\":");

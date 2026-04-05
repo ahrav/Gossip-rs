@@ -169,27 +169,33 @@ fn test_adapter_with_sink<'a>(engine: &'a Engine, sink: Arc<VecEventSink>) -> En
 
 #[derive(Default)]
 struct CapturingFindingSink {
-    finding_norm_hashes: Mutex<Vec<[u8; 32]>>,
+    findings: Mutex<Vec<CapturedFindingEvent>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CapturedFindingEvent {
+    start: u64,
+    end: u64,
+    norm_hash: [u8; 32],
 }
 
 impl CapturingFindingSink {
-    fn take_finding_norm_hashes(&self) -> Vec<[u8; 32]> {
-        std::mem::take(
-            &mut *self
-                .finding_norm_hashes
-                .lock()
-                .expect("capturing sink mutex poisoned"),
-        )
+    fn take_findings(&self) -> Vec<CapturedFindingEvent> {
+        std::mem::take(&mut *self.findings.lock().expect("capturing sink mutex poisoned"))
     }
 }
 
 impl EventSink for CapturingFindingSink {
     fn emit(&self, event: ScanEvent<'_>) {
         if let ScanEvent::Finding(finding) = event {
-            self.finding_norm_hashes
+            self.findings
                 .lock()
                 .expect("capturing sink mutex poisoned")
-                .push(finding.norm_hash);
+                .push(CapturedFindingEvent {
+                    start: finding.start,
+                    end: finding.end,
+                    norm_hash: finding.norm_hash,
+                });
         }
     }
 
@@ -200,9 +206,17 @@ fn test_adapter_with_capturing_sink<'a>(
     engine: &'a Engine,
     sink: Arc<CapturingFindingSink>,
 ) -> EngineAdapter<'a> {
+    test_adapter_with_capturing_sink_cfg(engine, sink, EngineAdapterConfig::default())
+}
+
+fn test_adapter_with_capturing_sink_cfg<'a>(
+    engine: &'a Engine,
+    sink: Arc<CapturingFindingSink>,
+    config: EngineAdapterConfig,
+) -> EngineAdapter<'a> {
     EngineAdapter::new_with_event_sink(
         engine,
-        EngineAdapterConfig::default(),
+        config,
         CommitMetaContext {
             event_sink: sink,
             commit_graph_index: Arc::new(CommitGraphIndex::empty()),
@@ -459,12 +473,113 @@ fn git_finding_events_propagate_norm_hash() {
         .emit_loose(&candidate, b"secret.txt", blob)
         .expect("scan");
 
-    let captured = sink.take_finding_norm_hashes();
+    let captured = sink.take_findings();
     assert_eq!(captured.len(), 1, "expected exactly one captured finding");
     assert_eq!(
-        captured[0],
+        captured[0].norm_hash,
         adapter.findings_arena()[0].key.norm_hash,
         "git finding events must forward the finding norm_hash"
+    );
+}
+
+#[test]
+fn git_finding_events_carry_blob_absolute_root_hints() {
+    let engine = test_engine_with_tok_rule();
+    let sink = Arc::new(CapturingFindingSink::default());
+    let mut adapter = test_adapter_with_capturing_sink(&engine, Arc::clone(&sink));
+
+    let candidate = make_candidate_with_ctx(1, ChangeKind::Add);
+    let blob = b"prefix VE9LX0FCQ0RFRkdI suffix";
+    adapter
+        .emit_loose(&candidate, b"secret.txt", blob)
+        .expect("scan transformed finding");
+
+    let captured = sink.take_findings();
+    assert_eq!(captured.len(), 1, "expected exactly one captured finding");
+
+    let finding = captured[0];
+    assert_eq!(
+        (finding.start as u32, finding.end as u32),
+        (
+            adapter.findings_arena()[0].key.start,
+            adapter.findings_arena()[0].key.end,
+        ),
+        "event root-hint coordinates must match the adapter dedupe key (blob-absolute)",
+    );
+}
+
+/// Scanning the same blob with single-chunk vs multi-chunk configurations
+/// must produce identical identity-bearing coordinates. The engine chunker
+/// must not leak its alignment into the persistence identity — otherwise
+/// the same secret in the same blob produces different OccurrenceIds
+/// depending on which chunker was used.
+#[test]
+fn multi_chunk_scan_match_spans_equal_single_chunk_scan() {
+    let engine = test_engine_with_tok_rule();
+
+    // Place the secret far enough into the blob that it lands past the
+    // first chunk boundary when chunk_bytes is small. The secret bytes
+    // "ABCDEFGH" in "TOK_ABCDEFGH" sit at absolute blob offset ~87.
+    let mut blob = Vec::with_capacity(256);
+    blob.extend_from_slice(&[b'.'; 80]);
+    blob.extend_from_slice(b"prefix TOK_ABCDEFGH suffix");
+    blob.extend_from_slice(&[b'.'; 80]);
+
+    // Scan #1: single chunk — chunk_bytes exceeds blob length so the
+    // adapter fast path runs with view.base == 0 and buffer-local
+    // coordinates coincide with blob-absolute coordinates.
+    let sink_single = Arc::new(CapturingFindingSink::default());
+    let cfg_single = EngineAdapterConfig {
+        chunk_bytes: blob.len() + 1024,
+        scan_binary: true,
+    };
+    let mut adapter_single =
+        test_adapter_with_capturing_sink_cfg(&engine, Arc::clone(&sink_single), cfg_single);
+    let candidate = make_candidate_with_ctx(1, ChangeKind::Add);
+    adapter_single
+        .emit_loose(&candidate, b"secret.txt", &blob)
+        .expect("single-chunk scan");
+    let findings_single = sink_single.take_findings();
+
+    // Scan #2: multi-chunk — force the slow path by setting a chunk size
+    // smaller than the blob. The RingChunker will emit a view.base > 0
+    // for the window that contains the secret.
+    let sink_multi = Arc::new(CapturingFindingSink::default());
+    let cfg_multi = EngineAdapterConfig {
+        chunk_bytes: 64,
+        scan_binary: true,
+    };
+    let mut adapter_multi =
+        test_adapter_with_capturing_sink_cfg(&engine, Arc::clone(&sink_multi), cfg_multi);
+    adapter_multi
+        .emit_loose(&candidate, b"secret.txt", &blob)
+        .expect("multi-chunk scan");
+    assert!(
+        adapter_multi.metrics().chunks_scanned > 1,
+        "chunk_bytes must be small enough (after clamping) to trigger multi-chunk scanning",
+    );
+    let findings_multi = sink_multi.take_findings();
+
+    assert_eq!(
+        findings_single.len(),
+        1,
+        "expected one finding from single-chunk scan",
+    );
+    assert_eq!(
+        findings_multi.len(),
+        1,
+        "expected one finding from multi-chunk scan",
+    );
+
+    // The identity-bearing coordinates (`start`/`end`) are the persistence
+    // identity inputs used by `PersistenceFinding::blob_offset_start/blob_offset_end`.
+    // They must be chunker-invariant so the same secret in the same blob
+    // produces the same OccurrenceId regardless of how the scanner split
+    // the input.
+    assert_eq!(
+        (findings_single[0].start, findings_single[0].end),
+        (findings_multi[0].start, findings_multi[0].end),
+        "root-hint coordinates must be chunker-independent (blob-absolute)",
     );
 }
 

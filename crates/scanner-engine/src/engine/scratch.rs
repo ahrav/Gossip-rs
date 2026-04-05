@@ -1611,7 +1611,7 @@ impl ScanScratch {
     #[inline]
     pub(super) fn push_finding_with_drop_hint(
         &mut self,
-        rec: FindingRec,
+        mut rec: FindingRec,
         norm_hash: NormHash,
         drop_hint_end: u64,
         include_span: bool,
@@ -1639,6 +1639,11 @@ impl ScanScratch {
             .as_ref()
             .map(|ctx| ctx.transform_id());
         let normalized_root_hint_end = normalize_root_hint_end_for_dedup(&rec, leaf_transform);
+        // Persist the normalized value so downstream persistence identity
+        // (OccurrenceId) is stable across chunk boundaries. Without this,
+        // Base64 findings with ≤3-byte padding variance could produce
+        // different root_hint_end values depending on chunk alignment.
+        rec.root_hint_end = normalized_root_hint_end;
 
         // Variant discriminator: distinguishes UTF-16 LE/BE findings that
         // otherwise share the same span and root_hint. Without this, both
