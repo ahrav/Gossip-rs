@@ -320,6 +320,7 @@ fn repo_frontier_partial_finalize_produces_no_receipt_or_checkpoint_input() {
     let context = write_context_with_epoch(551);
     let repo_key = repo_frontier_key();
     let adapter = repo_frontier_adapter();
+    let mut aggregator = PrefixCheckpointAggregator::new(context, 0, 4);
 
     // Partial finalize keeps watermark progress non-authoritative, so the outer
     // repo frontier must not observe any checkpointable receipt at all.
@@ -350,6 +351,18 @@ fn repo_frontier_partial_finalize_produces_no_receipt_or_checkpoint_input() {
             .expect("partial checkpoint-input construction should succeed")
             .is_none(),
         "partial finalize must not manufacture outer checkpoint progress"
+    );
+
+    // Aggregator state must be unperturbed by the partial finalize path.
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
+    assert_eq!(aggregator.next_sequence_no(), 0);
+    assert_eq!(aggregator.checkpointed_units(), 0);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .is_none(),
+        "aggregator must have no checkpointable prefix after partial finalize"
     );
 }
 

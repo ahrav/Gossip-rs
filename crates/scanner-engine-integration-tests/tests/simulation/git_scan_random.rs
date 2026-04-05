@@ -185,10 +185,13 @@ fn maybe_push_fault_resource(
     });
 }
 
+/// Builds a randomized fault plan from the given scenario's resource set.
+///
+/// Currently only `Persist` and `SeenPersist` faults are reachable because
+/// `generate_scenario` always produces `artifacts: None`. The
+/// `CommitGraph`/`Midx`/`Pack` branches activate when the generator gains
+/// artifact support. A fallback guarantees at least one `Persist` fault.
 fn random_fault_plan(rng: &mut SimRng, scenario: &GitScenario) -> GitFaultPlan {
-    // Targets only the resource kinds that the scenario generator produces
-    // (Persist, SeenPersist, CommitGraph, Midx, Pack). GitResourceId::Other
-    // is excluded because the scenario generator does not create those.
     let mut resources = Vec::new();
     maybe_push_fault_resource(&mut resources, rng, GitResourceId::Persist);
     maybe_push_fault_resource(&mut resources, rng, GitResourceId::SeenPersist);
@@ -223,6 +226,10 @@ fn random_fault_plan(rng: &mut SimRng, scenario: &GitScenario) -> GitFaultPlan {
 }
 
 fn assert_same_report(left: &RunReport, right: &RunReport, seed: u64) {
+    // Structural guard: any new field added to RunReport is automatically
+    // covered by this comparison, preventing silent omission.
+    assert_eq!(left, right, "seed {seed}: reports diverged");
+    // Per-field assertions provide targeted diagnostics when the guard fails.
     assert_eq!(left.steps, right.steps, "seed {seed}: step count diverged");
     assert_eq!(
         left.commit_count, right.commit_count,
@@ -256,6 +263,9 @@ fn assert_same_report(left: &RunReport, right: &RunReport, seed: u64) {
 }
 
 fn assert_reproducible_failure(left: &FailureReport, right: &FailureReport, seed: u64) {
+    // Structural guard: any new field added to FailureReport is automatically
+    // covered by this comparison, preventing silent omission.
+    assert_eq!(left, right, "seed {seed}: failure reports diverged");
     assert_eq!(
         left.kind, right.kind,
         "seed {seed}: failure kind diverged: {:?} vs {:?}",
@@ -282,6 +292,10 @@ fn assert_same_outcome(left: &RunOutcome, right: &RunOutcome, seed: u64) {
     match (left, right) {
         (RunOutcome::Ok { report: left }, RunOutcome::Ok { report: right }) => {
             assert_same_report(left, right, seed);
+            assert!(
+                left.commit_count > 0 || left.candidate_count > 0,
+                "seed {seed}: successful fault-injected run produced no scan work"
+            );
         }
         (RunOutcome::Failed(left), RunOutcome::Failed(right)) => {
             assert_reproducible_failure(left, right, seed);

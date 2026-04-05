@@ -86,6 +86,8 @@ fn chunking_invariance_edge_cases_match_full_scan() {
         ("empty_blob", Vec::new(), 1),
         ("single_byte_blob", vec![b'X'], 1),
         ("anchor_split_across_boundary", boundary_split, overlap + 1),
+        ("blob_at_overlap_size", vec![b'X'; overlap], overlap + 1),
+        ("minimal_two_chunk", vec![b'X'; overlap + 1], overlap + 1),
     ] {
         // These cases pin the fast path, the smallest non-empty blob, and a
         // boundary-straddling anchor so chunk overlap cannot silently drop it.
