@@ -144,10 +144,11 @@ implements `scanner-git`'s ref-watermark, seen-blob, and finalize seams and
 plugs into `git_repo::run_runtime_git_scan_with_stores`. Distributed
 repo-frontier execution wraps the event sink with `FindingsCaptureSink`, lifts
 Git `FindingEvent` values into `GitFindingForPersistence` while building a
-sparse commit-ordinal-to-OID map from `GitEvent::CommitMeta` events.
-`translate_git_item_result` then derives stable item identity from
-`(connector_instance, object_path)` and strong version identity from
-`(commit_oid, object_path)` for each finding while
+sparse commit-ordinal-to-OID map from `GitEvent::CommitMeta` events. If that
+map reaches its safety ceiling, the sink marks itself saturated and cancels the
+shared scan token before any commit metadata is discarded. `translate_git_item_result`
+then derives stable item identity from `(connector_instance, object_path)` and
+strong version identity from `(commit_oid, object_path)` for each finding while
 keeping the done-ledger row repo-scoped via `repo_id`. Persistence uses
 an explicit `PageCommit` sequence so Git observations may carry per-object
 OVIDs while shard completion remains repo-scoped. This keeps Git findings
@@ -866,7 +867,9 @@ with a deterministic `OpId`.
 4. executes the mirror-backed Git scan through `GitRepoRuntime::execute_repo`,
    using `GitPersistenceAdapter` as the scanner-git seen/watermark/finalize
    store and `FindingsCaptureSink` to retain persistence-ready finding payloads
-   plus the sparse commit-ordinal-to-OID map,
+   plus the sparse commit-ordinal-to-OID map; if the map saturates,
+   `FindingsCaptureSink` cancels the shared scan token and the lease fails
+   before translation,
 5. if `execute_repo` finishes with `FinalizeOutcome::Complete`, translates the
    captured findings into per-object persistence rows through
    `translate_git_item_result`, then durably records findings and the repo-level
