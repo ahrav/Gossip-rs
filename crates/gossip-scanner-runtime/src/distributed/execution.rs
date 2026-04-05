@@ -4,12 +4,13 @@
 //! execution functions, and the two public entry points: [`run_worker`]
 //! (filesystem) and [`run_git_repo_worker`] (repo-frontier).
 
-use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+use ahash::AHashMap;
 
 use anyhow::{Error as AnyError, Result, anyhow};
 use gossip_connectors::FilesystemConnector;
@@ -548,7 +549,7 @@ pub(super) struct GitRepoPersistenceInput<'a> {
     pub(super) repo_id: u64,
     pub(super) bytes_scanned: u64,
     pub(super) findings: &'a [GitFindingForPersistence],
-    pub(super) commit_oid_map: &'a HashMap<u32, scanner_git::OidBytes>,
+    pub(super) commit_oid_map: &'a AHashMap<u32, scanner_git::OidBytes>,
     pub(super) tenant_secret_key: TenantSecretKey,
     pub(super) rule_fingerprint: &'a dyn Fn(u32) -> RuleFingerprint,
     pub(super) claim_time: LogicalTime,
@@ -891,29 +892,30 @@ where
     let (execution, mut stage_metrics) = match execution {
         Ok(result) => result,
         Err(err) => {
-            if capture_sink.is_oid_map_saturated() {
-                return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
-                    anyhow!(
-                        "git repo-frontier shard '{}': commit OID map saturated at {} entries; scan cancelled to prevent consistency violation in findings translation",
-                        stage_sink.redacted_shard_id(),
-                        FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES,
-                    ),
-                )));
+            // Saturation-specific context helps operators distinguish OID-map
+            // exhaustion from generic scan errors. Lease-uncertain errors keep
+            // their original classification because they have different
+            // operational semantics (alerting, coordinator response).
+            if capture_sink.is_oid_map_saturated()
+                && !matches!(err, DistributedRuntimeError::LeaseUncertain(_))
+            {
+                return Err(oid_map_saturation_error(
+                    stage_sink.redacted_shard_id(),
+                    "scan cancelled to prevent consistency violation in findings translation",
+                ));
             }
             return Err(err);
         }
     };
     let complete_time = wall_clock_now();
-    if capture_sink.is_oid_map_saturated()
-        && !matches!(execution.finalize_outcome, FinalizeOutcome::Complete)
-    {
-        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
-            anyhow!(
-                "git repo-frontier shard '{}': commit OID map saturated at {} entries; scan cancelled to prevent consistency violation in findings translation",
-                stage_sink.redacted_shard_id(),
-                FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES,
-            ),
-        )));
+    // Single check covers both the common case (cancellation propagated as
+    // partial finalize) and the last-commit race where the scan completed
+    // before observing the cancellation flag.
+    if capture_sink.is_oid_map_saturated() {
+        return Err(oid_map_saturation_error(
+            stage_sink.redacted_shard_id(),
+            "findings cannot be translated",
+        ));
     }
     if !matches!(execution.finalize_outcome, FinalizeOutcome::Complete) {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
@@ -934,17 +936,6 @@ where
     // translation step can derive per-object version identity from stable
     // commit OIDs instead of the lossy ordinal alone.
     let commit_oid_map = capture_sink.drain_commit_oid_map();
-    // Check after both drains complete so the error reports the final capture
-    // state before translation or integrity checks attempt to consume it.
-    if capture_sink.is_oid_map_saturated() {
-        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
-            anyhow!(
-                "git repo-frontier shard '{}': commit OID map saturated at {} entries; scan completed but findings cannot be translated",
-                stage_sink.redacted_shard_id(),
-                FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES,
-            ),
-        )));
-    }
     let detected_count = capture_sink.detected_finding_count();
     if detected_count != captured_findings.len() as u64 {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
@@ -1075,6 +1066,21 @@ where
 
     ensure_post_drain_lease_trust(&lease_uncertainty)?;
     Ok((execution.report, completion, stage_metrics))
+}
+
+/// Construct a non-retryable runtime error for OID-map saturation.
+///
+/// Centralizes the error shape so the error-path and success-path saturation
+/// checks produce the same `Driver` variant with consistent formatting.
+fn oid_map_saturation_error(
+    redacted_shard_id: &ToxicDigest,
+    detail: &str,
+) -> DistributedRuntimeError {
+    DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(anyhow!(
+        "git repo-frontier shard '{redacted_shard_id}': commit OID map saturated \
+         at {} entries; {detail}",
+        FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES,
+    )))
 }
 
 // ---------------------------------------------------------------------------

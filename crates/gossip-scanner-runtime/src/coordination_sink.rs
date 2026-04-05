@@ -8,10 +8,12 @@
 //! commit pipeline (`ReceiptCommitSink` -> `ResultCommitter`), while event
 //! recording remains best-effort telemetry.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+use ahash::AHashMap;
 
 use anyhow::Result;
 use gossip_contracts::connector::{ItemKey, ToxicDigest};
@@ -384,8 +386,10 @@ pub(crate) struct FindingsCaptureSink {
     /// A `Mutex` keeps the capture path aligned with the crate's poisoning
     /// recovery conventions; contention stays low because scanner-git guarantees
     /// at most one `CommitMeta` event per `commit_id` (gated by `AtomicBitSet`
-    /// in `CommitMetaContext`).
-    commit_oid_map: Mutex<HashMap<u32, OidBytes>>,
+    /// in `CommitMetaContext`). Uses `AHashMap` instead of the default `SipHash`
+    /// hasher because `u32` keys are non-adversarial and the faster hash reduces
+    /// per-probe overhead in the mutex-held section.
+    commit_oid_map: Mutex<AHashMap<u32, OidBytes>>,
     /// Shared cancellation token for the enclosing git lease.
     ///
     /// Lease-deadline expiry and OID-map saturation both drive the same token
@@ -446,7 +450,7 @@ impl FindingsCaptureSink {
             // (0 -> 1 -> 2 -> 4 -> 8) under the lock. Most repos produce zero
             // findings, but when findings do occur they tend to cluster.
             captured_findings: Mutex::new(Vec::with_capacity(8)),
-            commit_oid_map: Mutex::new(HashMap::with_capacity(capped)),
+            commit_oid_map: Mutex::new(AHashMap::with_capacity(capped)),
             cancel,
             oid_map_saturated: AtomicBool::new(false),
         }
@@ -490,7 +494,7 @@ impl FindingsCaptureSink {
     /// git events can append entries. Returns the owned map and leaves the
     /// internal map empty via `std::mem::take`. Poisoned locks are recovered
     /// so the caller can still translate Git findings deterministically.
-    pub(crate) fn drain_commit_oid_map(&self) -> HashMap<u32, OidBytes> {
+    pub(crate) fn drain_commit_oid_map(&self) -> AHashMap<u32, OidBytes> {
         std::mem::take(
             &mut *self
                 .commit_oid_map
@@ -551,19 +555,27 @@ impl GitEventOutput for FindingsCaptureSink {
                 .commit_oid_map
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            let below_cap = map.len() < Self::MAX_COMMIT_OID_MAP_ENTRIES;
-            if below_cap || map.contains_key(&meta.commit_id) {
-                map.insert(meta.commit_id, meta.commit_oid);
-                if below_cap && map.len() == Self::MAX_COMMIT_OID_MAP_ENTRIES {
-                    // Publish saturation before cancelling so later events
-                    // can take the mutex-free fast path immediately.
-                    self.oid_map_saturated.store(true, Ordering::Release);
-                    self.cancel.cancel();
-                    tracing::warn!(
-                        max = Self::MAX_COMMIT_OID_MAP_ENTRIES,
-                        "commit OID map saturated; cancelling scan to prevent consistency violation in findings translation"
-                    );
+            let pre_len = map.len();
+            match map.entry(meta.commit_id) {
+                Entry::Occupied(mut e) => {
+                    e.insert(meta.commit_oid);
                 }
+                Entry::Vacant(e) if pre_len < Self::MAX_COMMIT_OID_MAP_ENTRIES => {
+                    e.insert(meta.commit_oid);
+                }
+                Entry::Vacant(_) => {}
+            }
+            if pre_len < Self::MAX_COMMIT_OID_MAP_ENTRIES
+                && map.len() == Self::MAX_COMMIT_OID_MAP_ENTRIES
+            {
+                // Publish saturation before cancelling so later events
+                // can take the mutex-free fast path immediately.
+                self.oid_map_saturated.store(true, Ordering::Release);
+                self.cancel.cancel();
+                tracing::warn!(
+                    max = Self::MAX_COMMIT_OID_MAP_ENTRIES,
+                    "commit OID map saturated; cancelling scan to prevent consistency violation in findings translation"
+                );
             }
         }
         // Forward unconditionally so recorder telemetry remains complete even

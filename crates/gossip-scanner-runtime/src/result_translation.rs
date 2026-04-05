@@ -26,18 +26,20 @@ use std::{
     sync::Arc,
 };
 
+use ahash::AHashMap;
+
 use gossip_contracts::{
-    connector::{GIT_CONNECTOR_TAG, Location, ScanItem, VersionId, git::RepoKey},
+    connector::{git::RepoKey, Location, ScanItem, VersionId, GIT_CONNECTOR_TAG},
     identity::{
-        CanonicalBytes, ConnectorInstanceIdHash, IdentityInputError, ItemIdentityKey, LogicalTime,
-        NormHash, ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey, domain,
-        domain_hasher, finalize_32, key_secret_hash,
+        domain, domain_hasher, finalize_32, key_secret_hash, CanonicalBytes,
+        ConnectorInstanceIdHash, IdentityInputError, ItemIdentityKey, LogicalTime, NormHash,
+        ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey,
     },
     persistence::{
-        DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
-        DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
-        OvidHash, OvidHashInputs, PersistenceFinding, PersistenceInputError, WriteContext,
-        derive_ovid_hash,
+        derive_ovid_hash, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,
+        DoneLedgerRecord, DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord,
+        OccurrenceRecord, OvidHash, OvidHashInputs, PersistenceFinding, PersistenceInputError,
+        WriteContext,
     },
 };
 use scanner_git::OidBytes;
@@ -552,7 +554,7 @@ pub(crate) fn translate_git_item_result(
     bytes_scanned: u64,
     timing: ScanTiming,
     findings: &[GitFindingForPersistence],
-    commit_oid_map: &HashMap<u32, OidBytes>,
+    commit_oid_map: &AHashMap<u32, OidBytes>,
     rule_fingerprint: &dyn Fn(u32) -> RuleFingerprint,
 ) -> Result<PersistenceTranslation, ResultTranslationError> {
     let done_ledger_item = git_repo_ovid_inputs(repo_id);
@@ -660,7 +662,7 @@ fn translate_git_findings<R>(
     write_context: WriteContext,
     tenant_secret_key: &TenantSecretKey,
     repo_key: &RepoKey,
-    commit_oid_map: &HashMap<u32, OidBytes>,
+    commit_oid_map: &AHashMap<u32, OidBytes>,
     seen_at: LogicalTime,
     findings_input: &[GitFindingForPersistence],
     rule_fingerprint: &R,
@@ -890,11 +892,11 @@ fn git_observation_location(object_path: &[u8]) -> Option<Arc<Location>> {
 mod tests {
     use gossip_contracts::{
         connector::{
-            GIT_CONNECTOR_TAG, ItemKey, ItemRef, Location, ScanItem, VersionId, git::RepoKey,
+            git::RepoKey, ItemKey, ItemRef, Location, ScanItem, VersionId, GIT_CONNECTOR_TAG,
         },
         identity::{
-            CanonicalBytes, ConnectorInstanceIdHash, ItemIdentityKey, LogicalTime, NormHash,
-            ObjectVersionId, StableItemId, domain, domain_hasher, finalize_32,
+            domain, domain_hasher, finalize_32, CanonicalBytes, ConnectorInstanceIdHash,
+            ItemIdentityKey, LogicalTime, NormHash, ObjectVersionId, StableItemId,
         },
         persistence::{DoneLedgerErrorCode, DoneLedgerStatus, PersistenceFinding},
     };
@@ -904,10 +906,12 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        FsFindingRef, ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
-        translate_git_item_result, translate_item_result,
+        translate_git_item_result, translate_item_result, FsFindingRef, ItemResult,
+        PersistenceTranslation, ResultTranslationError, ScanTiming,
     };
     use std::collections::HashMap;
+
+    use ahash::AHashMap;
 
     use crate::coordination_sink::GitFindingForPersistence;
     use crate::event_sink::sanitize_path;

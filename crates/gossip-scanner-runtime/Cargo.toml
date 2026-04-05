@@ -17,6 +17,7 @@ aegis-pure-rust = [
 ]
 
 [dependencies]
+ahash = "0.8"
 anyhow.workspace = true
 fastbloom.workspace = true
 gossip-coordination.workspace = true
