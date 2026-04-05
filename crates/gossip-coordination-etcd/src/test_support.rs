@@ -102,7 +102,6 @@ fn etcd_image() -> ContainerRequest<GenericImage> {
 /// 2. Otherwise, start an etcd container via testcontainers.
 fn shared_endpoint() -> &'static EtcdEndpoint {
     SHARED_ETCD.get_or_init(|| {
-        // Check for a pre-existing etcd endpoint.
         if let Some(endpoint) = external_endpoint() {
             return EtcdEndpoint {
                 endpoint,
@@ -110,7 +109,6 @@ fn shared_endpoint() -> &'static EtcdEndpoint {
             };
         }
 
-        // No external endpoint — start a container.
         let container = etcd_image()
             .start()
             .expect("failed to start etcd container — is Docker running and able to pull quay.io/coreos/etcd:v3.5.15?");

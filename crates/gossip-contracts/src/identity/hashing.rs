@@ -1,16 +1,18 @@
 //! Domain-separated hashing helpers for content-addressed ID derivation.
 //!
-//! Most derive-key ID derivations in the system flow through [`domain_hasher`]
-//! or a cached hasher built from the same BLAKE3 derive-key mode, plus one of
-//! the finalization functions:
+//! Most derive-key ID derivations in the system flow through
+//! [`domain_hasher`](crate::identity::domain_hasher) or a cached hasher built
+//! from the same BLAKE3 derive-key mode, plus one of the finalization
+//! functions:
 //!
-//! - [`finalize_32`] — full 256-bit digest for content-addressed IDs.
-//! - [`finalize_64`] — truncated 64-bit digest for coordination IDs
-//!   (op-log payload hashes, split shard ID derivation).
+//! - [`finalize_32`](crate::identity::finalize_32) — full 256-bit digest for
+//!   content-addressed IDs.
+//! - [`finalize_64`](crate::identity::finalize_64) — truncated 64-bit digest
+//!   for coordination IDs (op-log payload hashes, split shard ID derivation).
 //!
-//! [`key_secret_hash`](super::key_secret_hash) is the one notable exception:
-//! it uses BLAKE3 keyed mode and feeds its domain tag as input data rather than
-//! going through [`domain_hasher`].
+//! [`key_secret_hash`](crate::identity::key_secret_hash) is the one notable
+//! exception: it uses BLAKE3 keyed mode and feeds its domain tag as input data
+//! rather than going through [`domain_hasher`](crate::identity::domain_hasher).
 //!
 //! ```
 //! use gossip_contracts::identity::{domain_hasher, finalize_32, CanonicalBytes};
@@ -22,7 +24,8 @@
 //!
 //! # Domain separation guarantee
 //!
-//! [`domain_hasher`] uses BLAKE3's derive-key mode ([`blake3::Hasher::new_derive_key`]),
+//! [`domain_hasher`](crate::identity::domain_hasher) uses BLAKE3's derive-key
+//! mode ([`blake3::Hasher::new_derive_key`]),
 //! which produces a context-dependent key schedule. Two hashers with different
 //! domain tags are treated as independent hash functions. Cross-domain
 //! collisions remain cryptographically negligible, but not mathematically
@@ -33,8 +36,9 @@
 //! For the cached domain tags used across identity and coordination derivation,
 //! pre-initialized hashers are cached in `LazyLock<Hasher>` statics
 //! (`FINDING_HASHER`, `SPLIT_ID_HASHER`, etc.).
-//! [`derive_from_cached`] clones one of these statics instead of re-running
-//! the key-schedule setup, making repeated same-domain derivations cheaper.
+//! [`derive_from_cached`](crate::identity::hashing::derive_from_cached) clones
+//! one of these statics instead of re-running the key-schedule setup, making
+//! repeated same-domain derivations cheaper.
 //! All `derive_*` functions in the crate use this path.
 //!
 //! # Context string requirements

@@ -65,6 +65,7 @@ use crate::{
     },
 };
 
+/// Type alias for a boxed, thread-safe error used in internal harness diagnostics.
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
 /// Durable row counts observed through the findings-layer test probe.
@@ -1246,10 +1247,8 @@ where
     F: FindingsSink,
 {
     match findings.upsert_batch(batch) {
-        // Failure at submission — acceptable.
         Err(_submit_err) => Ok(()),
         Ok(handle) => match handle.wait() {
-            // Failure at durability — also acceptable.
             Err(_wait_err) => Ok(()),
             Ok(receipt) => Err(PersistenceConformanceError::FindingsInvariant {
                 case,
@@ -1407,8 +1406,11 @@ fn base64_encode(bytes: &[u8]) -> String {
 /// the status lattice merge.
 #[derive(Clone, Debug)]
 struct SampleFixture {
+    /// Tenant scoping identity for the test fixture.
     tenant_id: TenantId,
+    /// Policy scope identity for the test fixture.
     policy_hash: PolicyHash,
+    /// Object version identity for the test fixture.
     ovid_hash: OvidHash,
     /// Layer 1 — stable finding identity.
     finding: FindingRecord,
