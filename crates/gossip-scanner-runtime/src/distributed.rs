@@ -95,7 +95,7 @@
 //! [`CoordinationFacade`]: gossip_coordination::CoordinationFacade
 //! [`CommitPipeline`]: crate::commit_pipeline::CommitPipeline
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -128,7 +128,7 @@ use gossip_frontier::decode_connector_extra;
 use gossip_orchestrator::{
     FilesystemPathKind, FilesystemShardPayload, FilesystemSourceMode, GitShardPayload,
 };
-use scanner_git::{FinalizeOutcome, GitEventOutput};
+use scanner_git::{FinalizeOutcome, GitEventOutput, OidBytes};
 use scanner_scheduler::store::FsFindingRecord;
 use scanner_scheduler::{
     events::{CoreEvent, EventOutput, FindingEvent, SummaryEvent},
@@ -2755,6 +2755,12 @@ struct GitRepoPersistenceInput<'a> {
     repo_id: u64,
     bytes_scanned: u64,
     detected_count: u64,
+    /// Sparse mapping from finding `commit_id` ordinals to stable commit OIDs.
+    ///
+    /// The scan captures this from `CommitMeta` events so Git findings
+    /// translation can derive stable occurrence identities without re-reading
+    /// commit metadata after the worker thread joins.
+    commit_oid_map: HashMap<u32, OidBytes>,
     claim_time: LogicalTime,
     /// Wall-clock timestamp captured after scan execution *and* persistence
     /// finalize complete. The `(claim_time, complete_time)` interval therefore
@@ -2782,31 +2788,39 @@ where
     D: DoneLedger + Clone + Send + Sync + 'static,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
+    let captured_commit_oids = input.commit_oid_map.len();
+
     // --- findings submission ---
     // TODO(git-findings-persistence): replace this guard and the zero-count
-    // receipt with real findings translation — grep for the tag to find the
-    // other two sites that must change atomically.
+    // receipt with real findings translation. `input.commit_oid_map` already
+    // carries the stable commit OIDs required to resolve Git finding
+    // identities from the captured event stream.
     //
-    // Durable Git finding persistence is unsupported. The caller rejects
-    // leases with detected_count > 0, and the hard check below enforces
-    // this invariant in release builds as defense-in-depth.
+    // This helper only submits the done-ledger row. It does not translate the
+    // captured Git findings into a findings batch, so a nonzero finding count
+    // must still reject the lease rather than checkpointing the repo as clean.
     // Synthesize a zero-count receipt to skip an unnecessary sink
     // round-trip for clean shards.
     if input.detected_count > 0 {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow::anyhow!(
                 "submit_git_repo_done_ledger called with detected_count={}; \
+                 captured_commit_oids={captured_commit_oids}; \
                  durable Git finding persistence is unsupported",
                 input.detected_count,
             ),
         )));
     }
+    debug_assert_eq!(
+        captured_commit_oids, 0,
+        "clean git repo scans should not carry commit metadata into done-ledger submission"
+    );
     let findings_receipt = FindingsCommitReceipt::new(0, 0, 0);
 
     // --- done-ledger submission ---
     // TODO(git-findings-persistence): derive findings_count from the real
-    // findings receipt via u32::try_from — grep for the tag to find the
-    // other two sites that must change atomically.
+    // findings receipt via u32::try_from once Git findings translation
+    // populates the findings sink from the captured event stream.
     //
     // The hard check above guarantees detected_count == 0 on this path.
     let findings_count: u32 = 0;
@@ -3035,17 +3049,19 @@ where
     // GitPersistenceBackend would require splitting finalize into: seen-bitmaps
     // → findings persistence → watermark commit.
     let detected_count = capture_sink.detected_finding_count();
+    // Drain the sparse ordinal-to-OID lookup after the scan thread joins so
+    // Git findings persistence can resolve stable commit versions from the
+    // captured event stream without replaying commit metadata.
+    let commit_oid_map = capture_sink.drain_commit_oid_map();
 
     if detected_count > 0 {
         // TODO(git-findings-persistence): remove this guard once durable
-        // findings translation is wired in — grep for the tag to find the
-        // other two sites that must change atomically.
+        // findings translation is wired in. `commit_oid_map` already carries
+        // the stable commit OIDs required to resolve Git finding identities.
         //
-        // Durable findings translation is not yet available. Persisting an
-        // empty batch while advancing the shard checkpoint would mark the
-        // repo as ScannedClean, silently dropping detected findings from
-        // durable storage. Fail the lease so the repo stays reclaimable
-        // and will be rescanned once findings persistence is implemented.
+        // The helper below still synthesizes a zero-count findings receipt.
+        // Advancing the shard checkpoint here would therefore mark the repo as
+        // clean while dropping durable findings state.
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow::anyhow!(
                 "git repo-frontier shard '{}' detected {detected_count} finding(s), \
@@ -3062,6 +3078,7 @@ where
         repo_id: lease.payload().repo_id(),
         bytes_scanned: execution.report.bytes_scanned,
         detected_count,
+        commit_oid_map,
         claim_time: lease.claim_wall_clock(),
         complete_time,
     };
@@ -9001,6 +9018,7 @@ mod tests {
             repo_id: 42,
             bytes_scanned: 1024,
             detected_count: 5,
+            commit_oid_map: HashMap::from([(7, scanner_git::OidBytes::sha1([0xAB; 20]))]),
             claim_time: LogicalTime::from_raw(100),
             complete_time: LogicalTime::from_raw(200),
         };
@@ -9011,6 +9029,10 @@ mod tests {
         assert!(
             msg.contains("detected_count=5"),
             "error must report the count: {msg}"
+        );
+        assert!(
+            msg.contains("captured_commit_oids=1"),
+            "error must report the captured commit metadata count: {msg}"
         );
     }
 }
