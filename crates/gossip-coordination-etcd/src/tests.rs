@@ -46,18 +46,17 @@
 //! ```
 
 use std::future::Future;
-use std::time::{Duration, Instant};
 
 use crate::keyspace::PersistedShardSubtreeKey;
 use crate::test_support::{
     contention_namespace, test_async_coordinator_config, test_coordinator,
     test_coordinator_in_namespace, test_coordinator_in_namespace_with_limits,
     test_coordinator_in_namespace_with_tuning, test_coordinator_with_limits,
-    test_coordinator_with_tuning,
+    test_coordinator_with_tuning, wait_for_owner_binding_expiry,
 };
 use crate::{
-    AsyncEtcdCoordinator, EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorConfigError,
-    EtcdCoordinatorError, EtcdKeyspace, EtcdKeyspaceError, EtcdOperation, EtcdTestFault,
+    AsyncEtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorConfigError, EtcdCoordinatorError,
+    EtcdKeyspace, EtcdKeyspaceError, EtcdOperation, EtcdTestFault,
 };
 use gossip_contracts::coordination::{
     CursorSemantics, CursorUpdate, ShardSpec, ShardSpecRef, SplitReplaceChild, SplitReplacePlan,
@@ -1948,33 +1947,6 @@ fn test_worker(id: u64) -> WorkerId {
 /// Create a logical timestamp from a raw integer.
 fn now(t: u64) -> LogicalTime {
     LogicalTime::from_raw(t)
-}
-
-/// Poll until the owner binding for `key` disappears, or panic if
-/// `ttl_secs + 10s` elapses without cleanup.
-fn wait_for_owner_binding_expiry(
-    backend: &EtcdCoordinator,
-    tenant: TenantId,
-    key: ShardKey,
-    ttl_secs: i64,
-) {
-    let deadline = Instant::now()
-        + Duration::from_secs(u64::try_from(ttl_secs).expect("TTL must be non-negative") + 10);
-    let interval = Duration::from_millis(250);
-    loop {
-        if backend
-            .test_load_owner_binding(tenant, key)
-            .expect("owner lookup should succeed while polling")
-            .is_none()
-        {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "owner binding was not cleaned up within {ttl_secs}s + 10s margin"
-        );
-        std::thread::sleep(interval);
-    }
 }
 
 // ---------------------------------------------------------------------------
