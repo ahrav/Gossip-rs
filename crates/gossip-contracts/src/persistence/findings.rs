@@ -67,8 +67,9 @@ use super::{
 ///
 /// # Invariants
 ///
-/// - `span_end() > span_start()` — zero-length spans (`span_end == span_start`)
-///   are not supported.
+/// - `span_end() >= span_start()` — zero-length spans are permitted (the
+///   translation layer rejects them when inappropriate for identity
+///   derivation, but the trait itself allows them).
 /// - `norm_hash()` returns the canonical redacted [`NormHash`] newtype
 pub trait PersistenceFinding: Send + Sync {
     /// Engine rule identifier that matched.
@@ -84,15 +85,12 @@ pub trait PersistenceFinding: Send + Sync {
     fn span_end(&self) -> u64;
 
     /// Length of the matched byte span.
-    #[inline]
+    ///
+    /// Panics if `span_end() < span_start()` (invariant violation).
     fn span_len(&self) -> u64 {
-        debug_assert!(
-            self.span_end() >= self.span_start(),
-            "span_end ({}) < span_start ({}): broken span invariant",
-            self.span_end(),
-            self.span_start(),
-        );
-        self.span_end() - self.span_start()
+        self.span_end()
+            .checked_sub(self.span_start())
+            .expect("span_end must be >= span_start")
     }
 }
 

@@ -3157,7 +3157,7 @@ where
     // → findings persistence → watermark commit.
     let captured_findings = capture_sink.take_captured_findings();
     let detected_count = capture_sink.detected_finding_count();
-    if detected_count as usize != captured_findings.len() {
+    if detected_count != captured_findings.len() as u64 {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow::anyhow!(
                 "finding counter ({detected_count}) diverged from captured payload count ({}); \

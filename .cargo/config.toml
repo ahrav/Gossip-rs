@@ -1,7 +1,0 @@
-# Machine-local Cargo configuration for Amazon Linux 2023.
-#
-# BOOST_ROOT: vectorscan's cmake needs Boost >= 1.57 headers.
-# AL2023 has no system boost-devel package; this points at a local copy.
-
-[env]
-BOOST_ROOT = "/home/ahrav/.local/share/boost_1_83_0"

@@ -108,7 +108,8 @@ secret bytes, regardless of surrounding context.
 `FsFindingRecord` remains a scheduler-local carrier. The runtime adapts it into
 `gossip_contracts::persistence::PersistenceFinding` at the translation
 boundary rather than implementing that trait in `scanner-scheduler` directly,
-which preserves crate layering and avoids an orphan-rule violation.
+which preserves crate layering and keeps the scheduler decoupled from the
+persistence contract crate.
 
 ### FsFindingBatch
 

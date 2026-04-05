@@ -52,11 +52,12 @@ use crate::git_persistence::git_repo_ovid_inputs;
 // `Hash` output as a u64 and returns that directly.
 // ---------------------------------------------------------------------------
 
-/// Hasher that captures the first 8 bytes written and returns them as a u64.
+/// Hasher that returns the first 8 bytes of the last `write` call as a u64.
 ///
-/// Correct only for types whose `Hash` impl writes at least 8 bytes of
-/// uniformly distributed data as the first operation (true for all
-/// `define_id_32!` types, which derive `Hash` on a `[u8; 32]` inner field).
+/// Correct only for types whose derived `Hash` impl writes at least 8 bytes
+/// of uniformly distributed data (`define_id_32!` types derive `Hash` on a
+/// `[u8; 32]` field — the derived impl writes a length prefix then the
+/// 32-byte payload; this hasher captures the last write >= 8 bytes).
 struct PreHashedHasher(u64);
 
 impl Hasher for PreHashedHasher {
@@ -74,7 +75,7 @@ impl Hasher for PreHashedHasher {
         // write(&self.0). We always overwrite, so the last write wins — and
         // for these types the last write is the 32-byte payload.
         if bytes.len() >= 8 {
-            // SAFETY: bytes.len() >= 8 checked above.
+            // Checked: bytes.len() >= 8 above.
             self.0 = u64::from_ne_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]);
@@ -1548,5 +1549,45 @@ mod tests {
         assert_eq!(translated.finding_count(), 2);
         assert_eq!(translated.occurrence_count(), 2);
         assert_eq!(translated.observation_count(), 2);
+    }
+
+    /// Verifies that [`PreHashedHasher`] extracts the first 8 bytes of the
+    /// 32-byte payload written by `derive(Hash)` on `[u8; 32]` newtypes.
+    ///
+    /// If rustc changes how `derive(Hash)` calls the `Hasher` trait (e.g.,
+    /// drops the length prefix write or reorders calls), this test will catch
+    /// the regression before it silently degrades `HashSet` distribution in
+    /// the translation pipeline.
+    #[test]
+    fn prehashed_hasher_extracts_first_payload_bytes() {
+        use std::hash::BuildHasher;
+
+        use gossip_contracts::identity::FindingId;
+
+        use super::PreHashedBuildHasher;
+
+        let bytes_a = [0xA1; 32];
+        let bytes_b = [0xB2; 32];
+        let id_a = FindingId::from_bytes(bytes_a);
+        let id_b = FindingId::from_bytes(bytes_b);
+
+        let ha = PreHashedBuildHasher.hash_one(id_a);
+        let hb = PreHashedBuildHasher.hash_one(id_b);
+
+        // Distinct IDs must produce distinct hashes.
+        assert_ne!(ha, hb, "distinct FindingIds collapsed to the same hash");
+
+        // The hash must equal the first 8 bytes of the inner [u8; 32],
+        // interpreted as a native-endian u64.
+        assert_eq!(
+            ha,
+            u64::from_ne_bytes([0xA1; 8]),
+            "hash does not match first 8 bytes of payload"
+        );
+        assert_eq!(
+            hb,
+            u64::from_ne_bytes([0xB2; 8]),
+            "hash does not match first 8 bytes of payload"
+        );
     }
 }

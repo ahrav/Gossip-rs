@@ -849,10 +849,11 @@ with a deterministic `OpId`.
 4. executes the mirror-backed Git scan through `GitRepoRuntime::execute_repo`,
    using `GitPersistenceAdapter` as the scanner-git seen/watermark/finalize
    store and `FindingsCaptureSink` to retain persistence-ready finding payloads,
-5. translates the captured findings plus repo identity through
-   `translate_git_item_result`, commits findings and done-ledger rows through
-   `ResultCommitter`, and uses the resulting durable receipts to build the
-   repo-frontier checkpoint input, and
+5. if `execute_repo` finishes with `FinalizeOutcome::Complete`, translates the
+   captured findings plus repo identity through `translate_git_item_result`,
+   commits findings and done-ledger rows through `ResultCommitter`, and uses
+   the resulting durable receipts to build the repo-frontier checkpoint input;
+   partial finalize aborts the lease before this stage, and
 6. re-runs singleton discovery against that checkpoint cursor to decide whether
    the shard is terminally complete or should checkpoint for later replay.
 
