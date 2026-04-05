@@ -572,7 +572,7 @@ fn multi_chunk_scan_match_spans_equal_single_chunk_scan() {
     );
 
     // The identity-bearing coordinates (`start`/`end`) are the persistence
-    // identity inputs used by `PersistenceFinding::span_start/span_end`.
+    // identity inputs used by `PersistenceFinding::blob_offset_start/blob_offset_end`.
     // They must be chunker-invariant so the same secret in the same blob
     // produces the same OccurrenceId regardless of how the scanner split
     // the input.

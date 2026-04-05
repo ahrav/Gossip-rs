@@ -172,13 +172,17 @@ fn sentinel_to_option(id: u32) -> Option<u32> {
 /// execution.
 ///
 /// `blob_offset_start` and `blob_offset_end` are blob-absolute offsets
-/// captured from `FindingEvent::start/end`. These map to the full regex match
-/// span (group 0) in root-file coordinates and participate in `OccurrenceId`
-/// derivation. The engine produces blob-absolute offsets for both root and
-/// transform findings — for root findings via `base_offset +
-/// match_span.start`, for transform findings via
-/// `base_offset + RootSpanMapCtx::map_span(decoded_span).start` — so Git and FS scans of the
-/// same content converge on the same occurrence identity.
+/// captured from `FindingEvent::start/end`. For root (non-transform) findings
+/// these correspond to the regex match span (group 0) in root-file coordinates
+/// via `base_offset + match_span.start`. For transform findings these are
+/// best-available root-hint coordinates derived via
+/// `base_offset + RootSpanMapCtx::map_span(decoded_span).start`, which maps
+/// decoded-byte positions back to approximate encoded-byte positions.
+///
+/// Both root and transform offsets participate in `OccurrenceId` derivation,
+/// so Git and FS scans of the same content converge on the same occurrence
+/// identity through these root-hint coordinates. Exact-match propagation for
+/// transforms is approximate (encoded-byte-mapped), not byte-exact.
 ///
 /// Cross-source convergence is only guaranteed for blobs whose offsets fit in
 /// u32 space (< 4 GiB). The Git path narrows `root_hint_start` to a u32

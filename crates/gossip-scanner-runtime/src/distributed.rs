@@ -5002,6 +5002,8 @@ mod tests {
         assert_eq!(item.findings.len(), 2, "both batches should accumulate");
         assert_eq!(item.findings[0].rule_id, 7);
         assert_eq!(item.findings[1].rule_id, 8);
+        assert_eq!(item.findings[1].blob_offset_start, 30);
+        assert_eq!(item.findings[1].blob_offset_end, 40);
         assert_eq!(item.findings[1].window_start, 30);
         assert_eq!(item.findings[1].window_end, 40);
         drop(guard);
