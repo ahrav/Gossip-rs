@@ -4,7 +4,7 @@
 //! both `unit_tests` and `integration_tests` sibling modules.
 
 // Items are consumed by sibling test modules (`unit_tests`, `integration_tests`)
-// via `super::*`, which the compiler cannot trace across module boundaries.
+// via `super::test_support::*`, which the compiler cannot trace across module boundaries.
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
