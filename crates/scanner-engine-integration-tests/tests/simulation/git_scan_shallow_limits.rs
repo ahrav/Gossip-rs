@@ -150,7 +150,7 @@ fn shallow_root_limit_failure_is_covered_by_sim_harness() {
 
     let tip = oid_from_hex(&git_output(&shallow_repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
-    let persist = InMemoryPersistenceStore::with_seen_scope(7, [0x77; 32]);
+    let persist = InMemoryPersistenceStore::default();
     let mut config = GitScanConfig {
         repo_id: 7,
         policy_hash: [0x77; 32],
