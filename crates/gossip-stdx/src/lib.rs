@@ -183,12 +183,13 @@ pub fn hex_encode_into(bytes: &[u8], buf: &mut [u8], offset: usize) -> usize {
     hex_len
 }
 
-/// Stack-allocated lowercase hex representation of a Git object ID.
+/// Stack-allocated lowercase hex representation of up to 32 raw bytes.
 ///
-/// Git OIDs are 20 bytes (SHA-1) or 32 bytes (SHA-256), producing hex
-/// strings of 40 or 64 characters respectively. `HexOid` stores the hex
-/// in a fixed `[u8; 64]` buffer with a length discriminant, avoiding heap
-/// allocation entirely.
+/// Designed for Git object IDs (20-byte SHA-1 or 32-byte SHA-256), but
+/// accepts any byte slice up to 32 bytes. Stores the hex in a fixed
+/// `[u8; 64]` buffer with a length discriminant, avoiding heap allocation
+/// entirely. OID-width validation (20 or 32 bytes) is the caller's
+/// responsibility (see [`OidBytes`](crate::OidBytes) in `scanner-git`).
 ///
 /// Implements `Display`, `Debug`, `AsRef<str>`, and `Deref<Target = str>`
 /// so it can be used anywhere a `&str` is expected.
@@ -206,7 +207,9 @@ impl HexOid {
     ///
     /// # Panics
     ///
-    /// Panics if `oid_bytes.len() > 32` (i.e. hex output would exceed 64).
+    /// Panics if `oid_bytes.len() > 32` (hex output would exceed 64 chars).
+    /// Does **not** validate Git OID widths (20 or 32); that is enforced
+    /// upstream by `OidBytes::from_slice`.
     #[must_use]
     pub fn from_oid_bytes(oid_bytes: &[u8]) -> Self {
         let hex_len = oid_bytes.len() * 2;
