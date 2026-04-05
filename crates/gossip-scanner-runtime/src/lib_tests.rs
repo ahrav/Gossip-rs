@@ -25,7 +25,9 @@ use tempfile::{NamedTempFile, tempdir};
 
 use super::*;
 use crate::{
-    coordination_sink::{CommitProgressRecord, CoordinationEventRecorder, StoredGitEvent},
+    coordination_sink::{
+        CommitProgressRecord, CoordinationEventRecorder, StageSignal, StoredGitEvent,
+    },
     distributed::{DistributedPersistence, DistributedRuntimeConfig, WorkerIdentity, run_worker},
     test_fixtures::{init_git_repo, run_git_in},
 };
@@ -184,6 +186,10 @@ impl CoordinationEventRecorder for DistributedCoreRecorder {
         _shard_id: &str,
         _event: CommitProgressRecord,
     ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_stage_signal(&self, _shard_id: &str, _signal: StageSignal) -> anyhow::Result<()> {
         Ok(())
     }
 }

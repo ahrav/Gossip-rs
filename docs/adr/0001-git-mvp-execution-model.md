@@ -257,12 +257,20 @@ execution model keeps these invariants explicit:
 7. Logs, metrics, and traces never contain raw secret bytes, repo paths, refs, or tokens.
 8. Duplicate submission and worker replay are idempotent.
 
+Operational telemetry follows the same rule. Stage-oriented Git observability
+may emit scalar timings, shard digests, and closed-set retry or lease-loss
+labels, but never raw mirror roots, repo locators, refs, commit IDs, or
+connector tokens.
+
 ## Consequences
 
 - `ShardStatus` remains the only persisted outer lifecycle for repo work.
 - `RepoFrontier` remains part of the shared receipt and checkpoint model rather
   than a Git-only completion path.
 - Lease loss is a first-class outcome that stops work without parking the shard.
+- Git stage telemetry stays low-cardinality and redaction-safe: worker logs and
+  recorder events emit digests plus scalar timings rather than raw repository
+  identifiers.
 - The first scope optimizes for deterministic replay and narrow control-plane
   state, not for packing density.
 
