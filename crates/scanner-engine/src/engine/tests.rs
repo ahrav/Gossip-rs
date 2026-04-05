@@ -743,16 +743,27 @@ fn base64_padding_in_root_hint() {
     let start = 2usize;
     let end = start + b64.len();
 
+    // After Base64 normalization, `root_hint_end` is snapped to the
+    // padding-free minimum encoded length: ceil(decoded_len * 4/3).
+    // For a 17-byte token, min_encoded = 23, so the normalized end is
+    // start + 23 = 25, one byte less than the full 24-char Base64 span.
+    let decoded_len = token.len() as u64;
+    let min_encoded = (decoded_len * 4).div_ceil(3);
+    let normalized_end = start as u64 + min_encoded;
+
     let hits = scan_chunk_findings(&engine, &hay);
     assert!(
         hits.iter().any(|h| {
             h.rule == "b64-padding"
                 && h.root_span_hint.start <= start
-                && h.root_span_hint.end >= end
+                && h.root_span_hint.end as u64 >= normalized_end
+                && h.root_span_hint.end <= end
         }),
-        "expected base64 root_hint to include padding span {}..{}",
+        "expected base64 root_hint to cover at least the padding-normalized \
+         span {}..{} (raw encoded end {})",
         start,
-        end
+        normalized_end,
+        end,
     );
 }
 
