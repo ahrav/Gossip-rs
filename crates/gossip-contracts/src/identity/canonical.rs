@@ -51,7 +51,11 @@ use blake3::Hasher;
 /// prefer the helper macro in `identity/macros.rs` so the declaration order
 /// and hash order stay coupled in one place.
 pub trait CanonicalBytes {
-    /// Write this value's canonical byte representation into `hasher`.
+    /// Writes the canonical, collision-free byte representation of this value
+    /// into the provided `blake3::Hasher`.
+    ///
+    /// Implementations must not allocate memory and must deterministically
+    /// output the same bytes across all platforms.
     fn write_canonical(&self, hasher: &mut Hasher);
 }
 

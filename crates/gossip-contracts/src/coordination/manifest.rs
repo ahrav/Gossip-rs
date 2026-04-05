@@ -4,6 +4,25 @@
 //! manifest passed to `register_shards`. [`validate_manifest`] enforces
 //! structural constraints (uniqueness, bounded ranges, cursor bounds) before
 //! any records are created in the coordination layer.
+//!
+//! # Invariants
+//!
+//! - **Bounded Ranges:** Production manifests strictly require finite `[start, end)`
+//!   intervals to guarantee overlap detection correctness.
+//! - **Uniqueness:** A single run must never declare duplicate `ShardId`s.
+//!
+//! # Algorithms
+//!
+//! Validation occurs in a fail-fast order: count limits first (before allocation),
+//! followed by uniqueness checks, spec validity, and finally range overlap
+//! detection.
+//!
+//! # Design Trade-offs
+//!
+//! - **O(N log N) Overlap Detection:** We sort shards by start key and check
+//!   adjacent pairs rather than using an interval tree. This optimizes for
+//!   the common case where shards don't overlap, scaling well up to the maximum
+//!   shard limits.
 
 use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
 use crate::coordination::shard_spec::{ShardSpec, ShardSpecInputError, ShardSpecRef};
@@ -13,7 +32,7 @@ use crate::identity::ShardId;
 // Constants
 // ============================================================================
 
-/// Maximum number of shards in a single `register_shards` call (SEC-3).
+/// Maximum number of shards in a single `register_shards` call.
 ///
 /// Prevents resource exhaustion from a single API call creating unbounded
 /// shard records. Checked as the FIRST validation step in `validate_manifest`.
@@ -101,7 +120,7 @@ pub enum ManifestValidationError {
         #[source]
         reason: ShardSpecInputError,
     },
-    /// Too many shards (SEC-3).
+    /// Too many shards.
     #[error("too many shards: {count} exceeds max {max}")]
     TooManyShards { count: usize, max: usize },
     /// A non-initial cursor falls outside the shard's key range.
@@ -158,7 +177,6 @@ pub enum ManifestValidationError {
 /// comparison. This is O(N log N) (dominated by the sort) rather than
 /// O(N^2), which matters at `MAX_INITIAL_SHARDS` (10K).
 pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), ManifestValidationError> {
-    // SEC-3: Bound check FIRST, before any allocation.
     if shards.len() > MAX_INITIAL_SHARDS {
         return Err(ManifestValidationError::TooManyShards {
             count: shards.len(),
@@ -172,7 +190,6 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
 
     let mut sorted_indices: Vec<usize> = (0..shards.len()).collect();
 
-    // Check for duplicate IDs.
     sorted_indices.sort_by_key(|&idx| shards[idx].shard.as_raw());
     for window in sorted_indices.windows(2) {
         let current = shards[window[0]].shard;
@@ -181,7 +198,6 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         }
     }
 
-    // Reject unbounded ranges: production manifests must have finite bounds.
     for shard in shards {
         if shard.spec.key_range_start().is_empty() || shard.spec.key_range_end().is_empty() {
             return Err(ManifestValidationError::UnboundedRange {
@@ -190,10 +206,6 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         }
     }
 
-    // Validate per-spec size limits (key sizes, metadata size, range ordering).
-    // ShardSpecRef is intentionally unvalidated at construction time; this is the
-    // gate that prevents oversized specs from reaching AcquireScratch::write_spec,
-    // which uses panicking asserts on the same size ceilings.
     for shard in shards {
         if let Err(reason) = ShardSpec::validate_ref(shard.spec) {
             return Err(ManifestValidationError::InvalidSpec {
@@ -203,7 +215,6 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         }
     }
 
-    // Sort by key_range_start for overlap detection.
     sorted_indices.sort_by(|&a, &b| {
         shards[a]
             .spec
@@ -213,7 +224,6 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
 
     for &index in sorted_indices.iter() {
         let shard = &shards[index];
-        // Validate that start < end for bounded specs.
         let start = shard.spec.key_range_start();
         let end = shard.spec.key_range_end();
         if !start.is_empty() && !end.is_empty() && start >= end {
@@ -227,11 +237,6 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         }
     }
 
-    // Check for overlapping ranges.
-    // Ranges are sorted by key_range_start. Two adjacent sorted ranges
-    // [a_start, a_end) and [b_start, b_end) overlap iff a_end > b_start.
-    // The empty checks are defense-in-depth: the unbounded-range rejection
-    // above guarantees all starts/ends are non-empty at this point.
     for window in sorted_indices.windows(2) {
         let a = &shards[window[0]];
         let b = &shards[window[1]];
@@ -246,8 +251,6 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         }
     }
 
-    // Cursor key size check (defense-in-depth; CursorUpdate::try_with_last_key
-    // also validates, but callers may use the panicking constructors).
     for shard in shards {
         if let Some(key) = shard.cursor.last_key()
             && key.len() > MAX_KEY_SIZE
@@ -260,7 +263,6 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         }
     }
 
-    // Cursor bounds check for non-initial cursors.
     for shard in shards {
         if let Some(key) = shard.cursor.last_key() {
             let start = shard.spec.key_range_start();

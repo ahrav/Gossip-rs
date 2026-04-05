@@ -105,6 +105,9 @@ fn choose_split_point_selects_byte_weighted_midpoint() {
     // selects the rank midpoint: c.txt (rank 2 of 4).
 }
 
+/// Verifies that split points never select the very first file even if the
+/// byte weight heavily favors the beginning of the repository, preventing
+/// an empty left shard.
 #[test]
 fn choose_split_point_avoids_first_file_when_weight_is_front_loaded() {
     assert_split_point(

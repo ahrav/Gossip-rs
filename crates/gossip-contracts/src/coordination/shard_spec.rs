@@ -9,6 +9,24 @@
 //! committed progress — per-run configuration that affects the strength
 //! of the progress guarantee.
 //!
+//! ## Purpose
+//! Defines the core data structures for partitioning the keyspace among
+//! workers, representing cursor progress guarantees, and validating
+//! dynamic split operations. Includes an allocation-free arena (`ShardArena`)
+//! for long-lived, pooled shard specifications.
+//!
+//! ## Invariants
+//! - **Range Well-formedness**: For any bounded range `[start, end)`, `start < end` in lexicographic byte order.
+//! - **Split Contiguity**: Child ranges of a split operation must perfectly partition the parent's `[start, end)` with no gaps and overlaps.
+//! - **Generation Monotonicity**: Arena slot generations strictly increment to prevent use-after-free via stale handles.
+//!
+//! ## Algorithm
+//! - **Validation**: Split coverage validation sorts proposed children by `start` key, then checks boundary contiguity in a linear scan, ensuring `child[i].end == child[i+1].start`.
+//! - **Pooling**: `ShardArena` allocates spec payload bytes in a single `ByteSlab` and recycles fixed-size slots. Handle resolution checks `(arena_id, slot_index, generation)`.
+//!
+//! ## Design trade-offs
+//! - **Borrowed vs. Owned vs. Pooled**: We provide `ShardSpecRef` for zero-allocation hot paths, `ShardSpec` (using `Box<[u8]>`) for standalone worker representations, and `ShardArena` for high-density coordinator storage. This adds API surface but prevents heap fragmentation.
+//!
 //! Reference: Bigtable (Chang et al., OSDI 2006) — tablets as
 //! contiguous row ranges; Spanner (Corbett et al., OSDI 2012) —
 //! half-open key-range splits; CockroachDB —
@@ -84,6 +102,9 @@ impl CursorSemantics {
     /// Parse a `u8` discriminant to the corresponding variant.
     ///
     /// Returns `None` for unrecognized values — forward compatibility.
+    ///
+    /// ## Complexity
+    /// `O(1)`
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Completed),
@@ -93,6 +114,9 @@ impl CursorSemantics {
     }
 
     /// Return the stable `u8` discriminant.
+    ///
+    /// ## Complexity
+    /// `O(1)`
     #[inline]
     pub const fn as_u8(self) -> u8 {
         self as u8
@@ -106,7 +130,6 @@ impl CanonicalBytes for CursorSemantics {
     }
 }
 
-// Compile-time assertions for CursorSemantics discriminant stability.
 const _: () = assert!(CursorSemantics::Completed as u8 == 0);
 const _: () = assert!(CursorSemantics::Dispatched as u8 == 1);
 
@@ -860,6 +883,9 @@ impl ShardArena {
     /// runtime operations (alloc/free/view) never touch the global allocator.
     /// `spec_slots` determines the maximum number of live specs; `byte_capacity`
     /// determines the total slab bytes available for spec key ranges and metadata.
+    ///
+    /// ## Complexity
+    /// `O(N)` where N is `spec_slots`.
     #[must_use]
     pub fn with_capacity(spec_slots: usize, byte_capacity: usize) -> Self {
         let mut slots = Vec::with_capacity(spec_slots);
@@ -883,6 +909,9 @@ impl ShardArena {
     ///
     /// The spec bytes are copied into arena-owned storage. The returned handle
     /// is independent of the caller's input buffers.
+    ///
+    /// ## Complexity
+    /// `O(K)` where K is the total byte length of the spec's key ranges and metadata.
     ///
     /// # Errors
     ///
@@ -928,6 +957,9 @@ impl ShardArena {
     ///
     /// Use [`try_view_spec`](Self::try_view_spec) for non-panicking lookup.
     ///
+    /// ## Complexity
+    /// `O(1)`
+    ///
     /// # Panics
     ///
     /// Panics if `handle` is stale or invalid.
@@ -942,6 +974,9 @@ impl ShardArena {
     /// Returns `None` when the handle is invalid, stale, or points to a
     /// freed slot. This API is intended for call sites where stale handles
     /// are an expected runtime outcome.
+    ///
+    /// ## Complexity
+    /// `O(1)`
     #[must_use]
     pub fn try_view_spec(&self, handle: &ShardSpecHandle) -> Option<ShardSpecRef<'_>> {
         if handle.arena_id != self.arena_id {
@@ -960,6 +995,9 @@ impl ShardArena {
     /// Stale or already-freed handles are ignored (returns silently).
     /// In debug builds, an invalid slot index triggers a debug_assert
     /// to catch corrupted handles early.
+    ///
+    /// ## Complexity
+    /// `O(1)`
     pub fn free_spec(&mut self, handle: ShardSpecHandle) {
         if handle.arena_id != self.arena_id {
             return;
@@ -989,6 +1027,9 @@ impl ShardArena {
     /// The final `reverse()` restores the LIFO ordering invariant: the
     /// lowest-index slot sits at the top of the stack so `pop()` yields
     /// slot 0 first, matching the initial construction order.
+    ///
+    /// ## Complexity
+    /// `O(N)` where N is the total number of slots in the arena.
     pub fn clear(&mut self) {
         self.slab.clear();
         self.free_slots.clear();
@@ -1220,6 +1261,9 @@ pub enum SplitValidationError {
 /// Error indices (`child_index`) refer to the caller's input order, not
 /// the internal sorted order.
 ///
+/// ## Complexity
+/// `O(N log N)` where `N` is the number of children (due to sorting prior to validation).
+///
 /// # Errors
 ///
 /// - [`SplitValidationError::NoChildren`] — empty children slice.
@@ -1288,13 +1332,11 @@ pub fn validate_split_coverage_bounds(
         return Err(SplitValidationError::SingleChild);
     }
 
-    // Pair each child with its original index, then sort by start key.
-    // This lets us report the caller's input indices in errors.
+    // Preserve original caller indices for error reporting while sorting.
     let mut indexed: Vec<(usize, ShardSpecRef<'_>)> =
         children.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| a.1.key_range_start().cmp(b.1.key_range_start()));
 
-    // First child start == parent start.
     if indexed[0].1.key_range_start() != parent_start {
         return Err(SplitValidationError::StartMismatch {
             parent_start: parent_start.len(),
@@ -1302,7 +1344,6 @@ pub fn validate_split_coverage_bounds(
         });
     }
 
-    // Last child end == parent end.
     let last = indexed[indexed.len() - 1];
     if last.1.key_range_end() != parent_end {
         return Err(SplitValidationError::EndMismatch {
@@ -1311,8 +1352,7 @@ pub fn validate_split_coverage_bounds(
         });
     }
 
-    // Contiguity: each child's end == next child's start.
-    // Also reject empty internal boundaries: an empty `key_range_end` means
+    // Reject empty internal boundaries: an empty `key_range_end` means
     // "extends to end of keyspace" which is only valid for the last child.
     // Empty internal boundaries indicate overlapping children (e.g. two
     // fully-unbounded children `[[], [])` pass the equality check but
@@ -1334,7 +1374,6 @@ pub fn validate_split_coverage_bounds(
         }
     }
 
-    // Each child individually well-formed.
     for &(orig_idx, child) in &indexed {
         if !child.key_range_start().is_empty()
             && !child.key_range_end().is_empty()
@@ -1385,6 +1424,10 @@ pub fn validate_split_coverage_bounds(
 /// and `residual` must cover the right portion (end matches old parent).
 /// This prevents callers from accidentally swapping the two arguments.
 ///
+/// ## Complexity
+/// `O(1)` to validate parent bounds, then `O(1)` to validate the two children
+/// since there are exactly 2 children being checked in `validate_split_coverage`.
+///
 /// # Errors
 ///
 /// - [`SplitValidationError::StartMismatch`] — `new_parent`'s start ≠
@@ -1421,6 +1464,9 @@ where
 /// slices for the old parent's range bounds rather than a full spec.
 /// Used by the coordinator's split precondition checks to avoid
 /// materializing a temporary `ShardSpec` from pooled slab storage.
+///
+/// ## Complexity
+/// `O(1)` bounds check followed by `O(1)` delegation for 2 children.
 #[must_use = "returns a Result that must be checked for validation errors"]
 pub fn validate_residual_split_bounds(
     old_parent_start: &[u8],
@@ -1428,14 +1474,14 @@ pub fn validate_residual_split_bounds(
     new_parent: ShardSpecRef<'_>,
     residual: ShardSpecRef<'_>,
 ) -> Result<(), SplitValidationError> {
-    // The parent must keep the left (lower) portion of the range.
+    // Enforce monotonicity: parent retains the processed prefix.
     if new_parent.key_range_start() != old_parent_start {
         return Err(SplitValidationError::StartMismatch {
             parent_start: old_parent_start.len(),
             first_child_start: new_parent.key_range_start().len(),
         });
     }
-    // The residual must cover the right (upper) portion.
+    // Residual assumes responsibility for unprocessed suffix.
     if residual.key_range_end() != old_parent_end {
         return Err(SplitValidationError::EndMismatch {
             parent_end: old_parent_end.len(),

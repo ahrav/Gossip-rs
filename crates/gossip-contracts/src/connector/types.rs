@@ -43,10 +43,6 @@
 //! - Cursor states with `token` but no `last_key` are invalid by contract and
 //!   rejected when crossing the coordination boundary.
 
-// ---------------------------------------------------------------------------
-// ToxicDigest — hash-only, fixed-size representation of untrusted bytes
-// ---------------------------------------------------------------------------
-
 /// A hash-only, fixed-size representation of toxic bytes.
 ///
 /// Connector keys and cursors are untrusted external data ("toxic bytes")
@@ -134,8 +130,6 @@ impl std::fmt::Debug for ToxicDigest {
         std::fmt::Display::fmt(self, f)
     }
 }
-
-// ---------------------------------------------------------------------------
 
 use std::{
     fmt,
@@ -290,11 +284,15 @@ fn validate_toxic_bytes(
 /// HOT-path page emission, where wrappers borrow bytes from a page-local slab.
 #[derive(Clone)]
 enum ToxicBytesStorage {
+    /// Independent heap allocation. Used for isolated values like cursor fields.
     Owned(Box<[u8]>),
+    /// Borrowed from a shared page-local slab. Used during high-volume enumeration.
     Pooled(PooledToxicBytes),
 }
 
 impl ToxicBytesStorage {
+    /// Returns the underlying byte slice regardless of storage mechanism.
+    /// Resolves the slot via the shared slab to return the byte slice.
     #[inline]
     fn as_bytes(&self) -> &[u8] {
         match self {
@@ -303,6 +301,7 @@ impl ToxicBytesStorage {
         }
     }
 
+    /// Returns `true` if the underlying storage is pooled.
     #[inline]
     fn is_pooled(&self) -> bool {
         matches!(self, Self::Pooled(_))
@@ -325,6 +324,8 @@ impl ToxicBytesStorage {
 /// [`zeroize_used`]: gossip_stdx::ByteSlab::zeroize_used
 /// [`clear`]: gossip_stdx::ByteSlab::clear
 pub struct PooledByteSlab {
+    /// The underlying slab allocation. Shared references to this struct are held
+    /// by `PooledToxicBytes` handles emitted from the page.
     slab: ByteSlab,
 }
 
@@ -355,6 +356,7 @@ impl PooledByteSlab {
         self.slab.allocate(bytes)
     }
 
+    /// Resolves a previously allocated slot to its underlying byte slice.
     #[inline]
     fn get(&self, slot: ByteSlot) -> &[u8] {
         self.slab.get(slot)
@@ -413,16 +415,20 @@ const _: fn() = || {
 /// before a `clear`) panics when resolved.
 #[derive(Clone)]
 struct PooledToxicBytes {
+    /// Opaque handle to the bytes within the slab's allocation.
     slot: ByteSlot,
+    /// Reference-counted shared ownership of the underlying slab.
     slab: Arc<PooledByteSlab>,
 }
 
 impl PooledToxicBytes {
+    /// Constructs a new pooled handle to a slot within the given slab.
     #[inline]
     fn new(slot: ByteSlot, slab: Arc<PooledByteSlab>) -> Self {
         Self { slot, slab }
     }
 
+    /// Resolves the slot via the shared slab to return the byte slice.
     #[inline]
     fn as_bytes(&self) -> &[u8] {
         self.slab.get(self.slot)
@@ -673,7 +679,9 @@ define_toxic_bytes! {
 ///   [`ConnectorInputError::TokenWithoutLastKey`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cursor {
+    /// The last fully processed ordered item key, used to bound the next page.
     last_key: Option<ItemKey>,
+    /// Connector-opaque token for resuming enumeration at a specific state.
     token: Option<TokenBytes>,
 }
 
@@ -839,7 +847,9 @@ impl VersionId {
 /// can forward source-native metadata without lossy normalization.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ContentHints {
+    /// Optional MIME-like media type hint.
     media_type: Option<String>,
+    /// Optional transfer or content encoding hint.
     encoding: Option<String>,
 }
 
@@ -915,7 +925,9 @@ impl ContentHints {
 /// canonicalized at this layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Location {
+    /// Required human-readable display string for this location.
     display: String,
+    /// Optional deep-link or reference URI. Not canonically parsed.
     url: Option<String>,
 }
 
@@ -983,12 +995,19 @@ impl Location {
 /// after constructing the required identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanItem {
+    /// Ordered key used for pagination and cursor progression.
     item_key: ItemKey,
+    /// Opaque handle used by connectors for subsequent read or open operations.
     item_ref: ItemRef,
+    /// Stable, tenant-independent identity of the underlying data.
     stable_item_id: StableItemId,
+    /// Strength and payload of the connector's version evidence.
     version: VersionId,
+    /// Optional byte-size estimate for the content.
     size_hint: Option<u64>,
+    /// Optional hints for parsing or interpreting the content.
     content_hints: Option<ContentHints>,
+    /// Optional display-safe metadata for locating the item.
     location: Option<Location>,
 }
 
@@ -1139,8 +1158,11 @@ impl ScanItem {
 /// unrepresentable. Use [`try_new`](Self::try_new) to construct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budgets {
+    /// Upper bound on the number of returned items.
     max_items: NonZeroUsize,
+    /// Upper bound on the cumulative bytes consumed during the scan.
     max_bytes: NonZeroU64,
+    /// Optional monotonic deadline for scan termination.
     deadline: Option<Instant>,
 }
 

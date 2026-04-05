@@ -48,37 +48,31 @@ pub struct ObservedScanItem {
 }
 
 impl ObservedScanItem {
-    /// Returns the ordered item key.
     #[must_use]
     pub fn item_key(&self) -> &ItemKey {
         &self.item_key
     }
 
-    /// Returns the connector-opaque item reference.
     #[must_use]
     pub fn item_ref(&self) -> &ItemRef {
         &self.item_ref
     }
 
-    /// Returns the stable item identity.
     #[must_use]
     pub fn stable_item_id(&self) -> StableItemId {
         self.stable_item_id
     }
 
-    /// Returns the connector-provided version claim.
     #[must_use]
     pub fn version(&self) -> VersionId {
         self.version
     }
 
-    /// Returns the optional size hint.
     #[must_use]
     pub fn size_hint(&self) -> Option<u64> {
         self.size_hint
     }
 
-    /// Returns the optional display-safe location metadata.
     #[must_use]
     pub fn location(&self) -> Option<&Location> {
         self.location.as_ref()
@@ -134,25 +128,21 @@ impl OrderedContentDrain {
         }
     }
 
-    /// Returns all emitted items in order.
     #[must_use]
     pub fn items(&self) -> &[ObservedScanItem] {
         &self.items
     }
 
-    /// Returns the length of each emitted page in order.
     #[must_use]
     pub fn page_lengths(&self) -> &[usize] {
         &self.page_lengths
     }
 
-    /// Returns the total number of emitted items.
     #[must_use]
     pub fn len(&self) -> usize {
         self.items.len()
     }
 
-    /// Returns whether the drain emitted no items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
@@ -526,8 +516,6 @@ where
     let PageState::HasMore { cursor } = first_page.state() else {
         return Ok(false);
     };
-    // validate_page_sequence guarantees HasMore carries a last_key that
-    // matches the page's actual last emitted key.
     let resume_key = cursor
         .last_key()
         .cloned()
@@ -657,12 +645,9 @@ fn first_divergent_detail(
             Some(ToxicDigest::of(b.items()[idx].item_key())),
         );
     }
-    // Items match up to the shorter length — a length difference is an item
-    // divergence at the shorter length.
     if a.items().len() != b.items().len() {
         return (Some(a.items().len().min(b.items().len())), None, None);
     }
-    // Items are identical; page_lengths must differ.
     (None, None, None)
 }
 
@@ -743,8 +728,6 @@ where
                 source,
             })?;
         let Some(page) = page else {
-            // When prior pages were consumed, verify the source does not produce
-            // more items on a retry with the same cursor position.
             if let Some(prev_key) = previous_last.as_ref() {
                 let probe = source
                     .fill_page(shard, &Cursor::with_last_key(prev_key.clone()), budgets)
@@ -782,12 +765,11 @@ where
             PageState::HasMore {
                 cursor: next_cursor,
             } => {
-                // Cursor stall: the HasMore cursor's last_key must strictly
-                // advance past the previous page boundary. The shape and
-                // alignment checks in validate_page_sequence guarantee the
-                // cursor last_key equals the page's last emitted key, but a
-                // single-item page whose key equals the prior last_key is
-                // still a stall.
+                // Cursor stall: `HasMore` must advance strictly past the prior
+                // page boundary. `validate_page_sequence` already guarantees
+                // this cursor carries the page's last emitted key, but a
+                // single-item page that repeats the previous boundary is still
+                // a non-advancing cursor.
                 let next_last = next_cursor
                     .last_key()
                     .expect("validate_page_sequence guarantees HasMore carries last_key");
