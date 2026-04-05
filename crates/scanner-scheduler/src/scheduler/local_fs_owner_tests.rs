@@ -1,6 +1,9 @@
 use super::*;
 use crate::Engine;
-use crate::api::{FileId, RuleSpec, TransformConfig, Tuning, ValidatorKind};
+use crate::api::{
+    AnchorPolicy, FileId, Gate, RuleSpec, TransformConfig, TransformId, TransformMode, Tuning,
+    ValidatorKind,
+};
 use crate::archive::PartialReason;
 use crate::events::VecEventOutput;
 use crate::scheduler::engine_stub::{FindingRec, MockEngine, MockRule, RuleId};
@@ -1764,5 +1767,126 @@ fn multi_chunk_file_with_partial_findings_emits_only_finding_batches() {
         report.metrics.findings_emitted > 0,
         "expected findings_emitted > 0, got {}",
         report.metrics.findings_emitted
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Transform-derived finding: blob-absolute root-hint offsets
+// ---------------------------------------------------------------------------
+
+/// Build a rule that matches `TOK_` followed by 8 alphanumeric characters,
+/// with a base64 transform so the engine decodes base64-encoded spans before
+/// scanning them.
+fn transform_tok_rule() -> RuleSpec {
+    RuleSpec {
+        name: "tok",
+        anchors: &[b"TOK_"],
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: None,
+        local_context: None,
+        secret_group: Some(1),
+        min_confidence: None,
+        offline_validation: None,
+        uuid_format_secret: false,
+        re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
+    }
+}
+
+fn base64_transform() -> TransformConfig {
+    TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 16,
+        max_spans_per_buffer: 4,
+        max_encoded_len: 1024,
+        max_decoded_bytes: 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }
+}
+
+/// Transform-derived findings (e.g., a secret found inside a base64-decoded
+/// span) must carry blob-absolute `blob_offset_start`/`blob_offset_end`
+/// values on the persisted `FsFindingRecord`, pointing back to the encoded
+/// span in the original file rather than offsets into the decoded buffer.
+///
+/// The engine's `RootSpanMapCtx::map_span` maps decoded-buffer match
+/// coordinates back to root-file coordinates. This test verifies that the
+/// FS scanner round-trips those root-file coordinates through to
+/// persistence.
+#[test]
+fn transform_derived_fs_finding_has_blob_absolute_root_hints() {
+    use crate::store::InMemoryStoreProducer;
+
+    let engine = Arc::new(Engine::new_with_anchor_policy(
+        vec![transform_tok_rule()],
+        vec![base64_transform()],
+        real_test_tuning(64),
+        AnchorPolicy::ManualOnly,
+    ));
+    let sink = Arc::new(VecEventOutput::new());
+    let producer = Arc::new(InMemoryStoreProducer::default());
+
+    // "TOK_ABCDEFGH" base64-encodes to "VE9LX0FCQ0RFRkdI" (16 bytes).
+    // Place padding before the encoded token so its absolute file offset
+    // is well past zero, making blob-absolute vs decoded-buffer-relative
+    // distinguishable.
+    let prefix = b"nothing interesting here ";
+    let encoded = b"VE9LX0FCQ0RFRkdI";
+    let suffix = b" trailing text that pads the file out";
+
+    let expected_encoded_start = prefix.len() as u64;
+    let expected_encoded_end = expected_encoded_start + encoded.len() as u64;
+
+    let mut data = Vec::new();
+    data.extend_from_slice(prefix);
+    data.extend_from_slice(encoded);
+    data.extend_from_slice(suffix);
+
+    let mut tmp = NamedTempFile::new().unwrap();
+    tmp.write_all(&data).unwrap();
+    tmp.flush().unwrap();
+    let path = tmp.path().to_path_buf();
+    let size = tmp.as_file().metadata().unwrap().len();
+
+    let source = VecFileSource::new(vec![LocalFile { path, size }]);
+    let mut cfg = small_config_with_sink(sink);
+    cfg.chunk_size = 1024; // single chunk — isolate transform offset mapping
+    cfg.store_producer = Some(producer.clone());
+    cfg.skip_binary = false;
+
+    let report = scan_local(engine, source, cfg);
+
+    assert_eq!(
+        report.metrics.findings_emitted, 1,
+        "expected exactly one transform-derived finding"
+    );
+
+    let batches = producer.batches();
+    let records: Vec<_> = batches.iter().flat_map(|b| b.findings.iter()).collect();
+    assert_eq!(records.len(), 1, "expected one persisted finding record");
+    let rec = &records[0];
+
+    // `blob_offset_start`/`blob_offset_end` must point to the base64-encoded
+    // span in the original file, not the decoded-buffer-relative match
+    // position. A decoded-buffer-relative offset would start near 0 (the
+    // match is at the beginning of the decoded output), while the correct
+    // blob-absolute offset starts at the encoded span's position in the file.
+    assert_eq!(
+        rec.blob_offset_start, expected_encoded_start,
+        "blob_offset_start must be blob-absolute (encoded span start in file), got {}",
+        rec.blob_offset_start
+    );
+    assert_eq!(
+        rec.blob_offset_end, expected_encoded_end,
+        "blob_offset_end must be blob-absolute (encoded span end in file), got {}",
+        rec.blob_offset_end
     );
 }

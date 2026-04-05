@@ -179,6 +179,11 @@ fn sentinel_to_option(id: u32) -> Option<u32> {
 /// match_span.start`, for transform findings via
 /// `base_offset + RootSpanMapCtx::map_span(decoded_span).start` — so Git and FS scans of the
 /// same content converge on the same occurrence identity.
+///
+/// Cross-source convergence is only guaranteed for blobs whose offsets fit in
+/// u32 space (< 4 GiB). The Git path narrows `root_hint_start` to a u32
+/// `FindingKey.start`; offsets that overflow are rejected by
+/// `EngineAdapterError::FindingOffsetOverflow` before reaching this struct.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct GitFindingForPersistence {
     pub(crate) blob_offset_start: u64,

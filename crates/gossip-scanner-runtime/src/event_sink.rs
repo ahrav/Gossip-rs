@@ -83,10 +83,7 @@ impl<W: Write + Send> EventOutput for TextEventSink<W> {
         let mut line = Vec::with_capacity(256);
         match event {
             CoreEvent::Finding(finding) => {
-                // Text output renders `start`/`end` (blob-absolute root-hint
-                // span — the full regex match in root-file coordinates) as the
-                // user-facing display range. These same offsets also feed
-                // persistence identity derivation downstream.
+                // Coordinate semantics: see `FindingEvent` field docs.
                 if self.verbose {
                     line.extend_from_slice(b"--- finding ---\n");
                     line.extend_from_slice(b"  rule:   ");
@@ -319,10 +316,7 @@ fn encode_core_event(event: CoreEvent<'_>, line: &mut Vec<u8>) {
     match event {
         CoreEvent::Finding(finding) => {
             // Keep the record shape aligned with scanner-rs golden fixtures.
-            //
-            // The JSON finding record exposes `start`/`end` — blob-absolute
-            // root-hint offsets in root-file coordinates. These same offsets
-            // feed persistence identity derivation downstream.
+            // Coordinate semantics: see `FindingEvent` field docs.
             line.push(b'{');
             push_key(line, b"path");
             write_json_bytes(line, finding.object_path);
@@ -475,9 +469,7 @@ fn encode_git_event(event: GitEvent<'_>, line: &mut Vec<u8>) {
 }
 
 fn encode_sarif_result(finding: &scanner_scheduler::events::FindingEvent<'_>, line: &mut Vec<u8>) {
-    // The SARIF region is derived from `start`/`end` — blob-absolute root-hint
-    // offsets covering the full regex match in root-file coordinates. These
-    // same offsets participate in persistence identity derivation.
+    // Coordinate semantics: see `FindingEvent` field docs.
     line.extend_from_slice(b"{\"ruleId\":");
     write_json_str(line, finding.rule_name);
     line.extend_from_slice(b",\"message\":{\"text\":");

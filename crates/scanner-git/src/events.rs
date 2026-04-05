@@ -129,9 +129,7 @@ impl EventOutput for VecEventSink {
         let mut line = Vec::with_capacity(256);
         match event {
             CoreEvent::Finding(f) => {
-                // The JSON finding record exposes `start`/`end` — blob-absolute
-                // root-hint offsets in root-file coordinates. These same
-                // offsets feed persistence identity derivation downstream.
+                // Coordinate semantics: see `FindingEvent` field docs.
                 line.extend_from_slice(b"{\"type\":\"finding\"");
 
                 line.extend_from_slice(b",\"source\":");

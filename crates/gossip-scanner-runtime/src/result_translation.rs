@@ -931,6 +931,16 @@ mod tests {
         );
     }
 
+    /// Single-chunk case where blob_offset_start == 0 and coincides with
+    /// the buffer-local span — verify identity derivation handles offset 0.
+    #[test]
+    fn persistence_identity_at_zero_offset_boundary() {
+        let rec = fs_finding_with_offsets(7, 0, 10, 0, 10, [0xAB; 32], 7);
+        let translated = translate_scanned(&[rec]);
+        assert_eq!(translated.occurrence_count(), 1);
+        assert_eq!(translated.observation_count(), 1);
+    }
+
     #[test]
     fn translate_git_item_result_produces_valid_three_layer_batch() {
         let translated = translate_git_scanned(&[git_finding(3, 10, 24, 0xAB)]);
