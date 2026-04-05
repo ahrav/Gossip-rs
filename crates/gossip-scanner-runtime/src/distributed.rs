@@ -3159,6 +3159,11 @@ where
     // GitPersistenceBackend would require splitting finalize into: seen-bitmaps
     // → findings persistence → watermark commit.
     let captured_findings = capture_sink.take_captured_findings();
+    // Drain the sparse commit-OID map alongside captured findings so the
+    // allocation is freed after scan. The map is infrastructure for future
+    // commit-level occurrence identity derivation; current Git findings
+    // persistence derives identities from the captured finding payloads.
+    let _commit_oid_map = capture_sink.drain_commit_oid_map();
     let detected_count = capture_sink.detected_finding_count();
     if detected_count != captured_findings.len() as u64 {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
