@@ -29,7 +29,7 @@ pub(crate) fn run_git_in(dir: &Path, args: &[&str]) {
 }
 
 pub(crate) fn init_git_repo(dir: &Path, email: &str, name: &str) {
-    run_git_in(dir, &["init", "-q"]);
+    run_git_in(dir, &["init", "-q", "-b", "main"]);
     run_git_in(dir, &["config", "user.email", email]);
     run_git_in(dir, &["config", "user.name", name]);
 }

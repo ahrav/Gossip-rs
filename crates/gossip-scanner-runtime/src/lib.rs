@@ -2129,8 +2129,8 @@ fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     Ok(canonical_input)
 }
 
-#[cfg(test)]
-mod test_fixtures;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_fixtures;
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

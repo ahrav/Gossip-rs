@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::process::Command;
 
+#[cfg(test)]
 use gossip_contracts::{
     connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
     identity::{
@@ -14,26 +15,32 @@ use gossip_contracts::{
     },
     persistence::WriteContext,
 };
+#[cfg(test)]
 use scanner_scheduler::store::FsFindingRecord;
 
+#[cfg(test)]
 use crate::{
     commit_model::CompletedUnit,
     result_translation::{ItemResult, PersistenceTranslation, ScanTiming, translate_item_result},
 };
 
+#[cfg(test)]
 pub(crate) fn test_rule_fingerprint(rule_id: u32) -> RuleFingerprint {
     let name = format!("test-rule-{rule_id}");
     derive_rule_fingerprint(&name)
 }
 
+#[cfg(test)]
 pub(crate) fn tenant_secret_key() -> TenantSecretKey {
     TenantSecretKey::from_bytes([0x99; 32])
 }
 
+#[cfg(test)]
 pub(crate) fn write_context() -> WriteContext {
     write_context_with_epoch(55)
 }
 
+#[cfg(test)]
 pub(crate) fn write_context_with_epoch(fence_epoch_raw: u64) -> WriteContext {
     WriteContext::new(
         TenantId::from_bytes([0x11; 32]),
@@ -44,14 +51,21 @@ pub(crate) fn write_context_with_epoch(fence_epoch_raw: u64) -> WriteContext {
     )
 }
 
-/// Run `git` inside `dir` and assert the command succeeds.
-pub(crate) fn run_git_in(dir: &Path, args: &[&str]) {
+/// Run `git` inside `dir`, assert the command succeeds, and return the raw
+/// process output. Both [`run_git_in`] and [`run_git_in_stdout`] delegate here.
+fn assert_git_output(dir: &Path, args: &[&str]) -> std::process::Output {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
         .output()
-        .expect("run git");
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to spawn git -C {} {}: {e}",
+                dir.display(),
+                args.join(" "),
+            )
+        });
     assert!(
         output.status.success(),
         "git command failed: git -C {} {}\nstdout:{}\nstderr:{}",
@@ -60,19 +74,46 @@ pub(crate) fn run_git_in(dir: &Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    output
+}
+
+/// Run `git` inside `dir` and assert the command succeeds.
+pub fn run_git_in(dir: &Path, args: &[&str]) {
+    assert_git_output(dir, args);
+}
+
+/// Run `git` inside `dir`, assert success, and return trimmed stdout.
+pub fn run_git_in_stdout(dir: &Path, args: &[&str]) -> String {
+    let output = assert_git_output(dir, args);
+    String::from_utf8(output.stdout)
+        .unwrap_or_else(|e| {
+            panic!(
+                "git -C {} {} produced non-UTF-8 stdout: {e}",
+                dir.display(),
+                args.join(" "),
+            )
+        })
+        .trim()
+        .to_owned()
 }
 
 /// Initialize a git repository with the configured author identity.
-pub(crate) fn init_git_repo(dir: &Path, email: &str, name: &str) {
-    run_git_in(dir, &["init", "-q"]);
+///
+/// The `-b main` flag ensures the initial branch is always `main` regardless
+/// of the host's `init.defaultBranch` setting, making callers portable across
+/// git configurations.
+pub fn init_git_repo(dir: &Path, email: &str, name: &str) {
+    run_git_in(dir, &["init", "-q", "-b", "main"]);
     run_git_in(dir, &["config", "user.email", email]);
     run_git_in(dir, &["config", "user.name", name]);
 }
 
+#[cfg(test)]
 pub(crate) fn timing() -> ScanTiming {
     timing_with_offset(0)
 }
 
+#[cfg(test)]
 pub(crate) fn timing_with_offset(offset: u64) -> ScanTiming {
     ScanTiming::new(
         LogicalTime::from_raw(1_000 + offset),
@@ -80,6 +121,7 @@ pub(crate) fn timing_with_offset(offset: u64) -> ScanTiming {
     )
 }
 
+#[cfg(test)]
 /// Spin-polls `predicate` at 5ms intervals for up to 10s (2 000 iterations).
 /// Panics if the condition is never satisfied.
 pub(crate) fn wait_until(mut predicate: impl FnMut() -> bool) {
@@ -92,6 +134,7 @@ pub(crate) fn wait_until(mut predicate: impl FnMut() -> bool) {
     panic!("condition was not satisfied before timeout");
 }
 
+#[cfg(test)]
 pub(crate) fn finding(
     rule_id: u32,
     span_start: u64,
@@ -109,10 +152,12 @@ pub(crate) fn finding(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn item_key(item_suffix: u8) -> ItemKey {
     ItemKey::try_from_slice(&[b't', b'/', item_suffix]).unwrap()
 }
 
+#[cfg(test)]
 pub(crate) fn scan_item(item_suffix: u8) -> ScanItem {
     let item_ref = ItemRef::try_from_vec(vec![b'r', item_suffix]).unwrap();
     let path = format!("tenant/repo/file-{item_suffix}.txt");
@@ -129,10 +174,12 @@ pub(crate) fn scan_item(item_suffix: u8) -> ScanItem {
     .with_location(Location::try_new(path, Some(url)).unwrap())
 }
 
+#[cfg(test)]
 pub(crate) fn completed_unit(sequence_no: u64, item_suffix: u8) -> CompletedUnit {
     CompletedUnit::ordered_content(sequence_no, Cursor::with_last_key(item_key(item_suffix)))
 }
 
+#[cfg(test)]
 pub(crate) fn scanned_translation_with(
     write_context: WriteContext,
     item_suffix: u8,
@@ -152,6 +199,7 @@ pub(crate) fn scanned_translation_with(
     .expect("translation should succeed")
 }
 
+#[cfg(test)]
 pub(crate) fn scanned_translation(
     write_context: WriteContext,
     item_suffix: u8,
@@ -168,6 +216,7 @@ pub(crate) fn scanned_translation(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn clean_scanned_translation(
     write_context: WriteContext,
     item_suffix: u8,

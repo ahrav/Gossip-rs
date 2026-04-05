@@ -36,10 +36,13 @@ pub enum EtcdTestFault {
     DropOwnerBeforeNextSplitResidualTxn,
 }
 
+/// Internal state tracking armed fault injection triggers.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Default)]
 pub(super) struct EtcdTestFaultState {
+    /// Flag to trigger `DropOwnerBeforeNextSplitReplaceTxn` fault.
     drop_owner_before_next_split_replace_txn: bool,
+    /// Flag to trigger `DropOwnerBeforeNextSplitResidualTxn` fault.
     drop_owner_before_next_split_residual_txn: bool,
 }
 

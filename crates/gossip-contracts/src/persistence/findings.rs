@@ -763,7 +763,8 @@ impl<'a> FindingsUpsertBatch<'a> {
         Ok(())
     }
 
-    /// Total number of records across all three layers.
+    /// Calculate the aggregate count of records scheduled for upsert across
+    /// all three layers (findings, occurrences, and observations).
     #[inline]
     #[must_use]
     pub const fn total_records(self) -> usize {

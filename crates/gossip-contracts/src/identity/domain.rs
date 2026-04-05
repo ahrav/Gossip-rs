@@ -15,19 +15,19 @@
 //!
 //! # Hash mode
 //!
-//! Most constants are used with [`domain_hasher`] which invokes BLAKE3
+//! Most constants are used with
+//! [`domain_hasher`](crate::identity::domain_hasher) which invokes BLAKE3
 //! derive-key mode (`Hasher::new_derive_key`). The one exception is
-//! [`SECRET_HASH_V1`], which is fed as data into a BLAKE3 keyed-mode hasher
-//! (`Hasher::new_keyed`).
+//! [`SECRET_HASH_V1`](crate::identity::domain::SECRET_HASH_V1), which is fed as
+//! data into a BLAKE3 keyed-mode hasher (`Hasher::new_keyed`).
 //!
 //! # Safety requirements
 //!
 //! - No two constants may share the same value. The `no_duplicate_values`
 //!   test enforces this at `cargo test` time.
-//! - Constants are `&str` so [`domain_hasher`] can pass them directly to
+//! - Constants are `&str` so
+//!   [`domain_hasher`](crate::identity::domain_hasher) can pass them directly to
 //!   BLAKE3's derive-key API without runtime UTF-8 validation.
-//!
-//! [`domain_hasher`]: super::domain_hasher
 
 // =========================================================================
 // Coordination subsystem

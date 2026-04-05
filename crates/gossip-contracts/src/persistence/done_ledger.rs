@@ -47,12 +47,15 @@ use super::{
     ovid::OvidHash,
 };
 
+/// Helper to reinterpret a `u64` bit-pattern as a signed `i64`.
+///
+/// PostgreSQL stores `RunId` and `ShardId` as signed `BIGINT`. When the
+/// done-ledger performs provenance tie-breaking using row-wise comparison, it
+/// orders these fields as signed integers. This helper replicates that exact
+/// ordering on the Rust side to ensure `DoneLedgerRecord::merge` matches the
+/// database's behavior.
 #[inline]
 pub(crate) fn pg_bigint_bits_sort_key(raw: u64) -> i64 {
-    // Bit-pattern reinterpret to signed i64 — PostgreSQL stores RunId/ShardId
-    // as signed BIGINT via u64_to_pg_bigint_bits, so the provenance-winner
-    // ROW() comparison orders them as signed. This helper replicates that
-    // ordering on the Rust side.
     i64::from_ne_bytes(raw.to_ne_bytes())
 }
 
@@ -747,6 +750,8 @@ impl DoneLedgerRecord {
         )
     }
 
+    /// Derives the lexicographical sort key used to break ties between conflicting
+    /// provenance records when merging done-ledger entries.
     fn provenance_winner_key(&self) -> (u8, u64, u64, u64, i64, i64, &[u8]) {
         (
             self.status.rank(),
@@ -761,6 +766,7 @@ impl DoneLedgerRecord {
         )
     }
 
+    /// Extracts the findings count only if the status is `ScannedWithFindings`.
     fn swf_findings_count(&self) -> u32 {
         if self.status == DoneLedgerStatus::ScannedWithFindings {
             self.findings_count

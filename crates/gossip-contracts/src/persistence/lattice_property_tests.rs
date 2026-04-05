@@ -1,3 +1,10 @@
+//! Property tests for `DoneLedgerRecord` CRDT-like merge logic.
+//!
+//! This module ensures that merging multiple `DoneLedgerRecord` updates
+//! behaves correctly in a distributed system context. Specifically, the merge
+//! operation must be commutative, associative, idempotent, and monotonic,
+//! mimicking a semi-lattice to resolve out-of-order ledger updates consistently.
+
 use proptest::{
     prelude::*,
     sample::select,

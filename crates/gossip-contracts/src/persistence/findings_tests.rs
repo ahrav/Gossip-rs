@@ -1,3 +1,8 @@
+//! Tests for findings persistence, ID validation, and referential integrity.
+//!
+//! Verifies the construction, canonical identity derivation, and referential
+//! invariants of `FindingRecord`, `OccurrenceRecord`, and `ObservationRecord`.
+
 use std::{num::NonZeroU64, sync::Arc};
 
 use crate::{
@@ -324,7 +329,6 @@ fn finding_record_verify_id_with_correct_derivation() {
 #[test]
 fn finding_record_verify_id_with_wrong_id() {
     let mut record = make_finding_record(0x01);
-    // Tamper with the finding_id.
     record.finding_id = FindingId::from_bytes([0xFF; 32]);
     assert!(
         !record.verify_id(),

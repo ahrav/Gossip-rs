@@ -23,7 +23,7 @@
 //! - `error.rs` defines shared input-validation errors used by persistence-only
 //!   value wrappers.
 //! - `conformance.rs` defines the backend-agnostic persistence conformance
-//!   harness used by reference backends and future production implementations.
+//!   harness used by reference backends and production implementations.
 //!
 //! ## Conformance harness
 //!
@@ -31,12 +31,11 @@
 //! implementors to verify correctness against the contract surface:
 //!
 //! - `run_conformance` executes done-ledger, findings, and redaction checks.
-//! - `run_done_ledger_conformance` executes only the done-ledger checks (5)
-//!   for backends that have not implemented findings persistence yet.
-//! - `run_findings_conformance` executes only the findings-layer checks (4)
-//!   for backends that have findings but not done-ledger persistence.
-//! - `run_redaction_conformance` executes only the `Debug`-redaction checks
-//!   (3) and requires no backend instance (pure in-memory assertions).
+//! - `run_done_ledger_conformance` executes only the done-ledger checks
+//!   for backends that do not implement findings persistence.
+//! - `run_findings_conformance` executes only the findings-layer checks
+//!   for backends that implement findings but not done-ledger persistence.
+//! - `run_redaction_conformance` executes only the `Debug`-redaction checks and requires no backend instance (pure in-memory assertions).
 //! - `FindingsConformanceProbe` keeps findings replay/idempotency verification
 //!   out of the production `FindingsSink` trait surface.
 //! - External backend crates can depend on this public module in integration

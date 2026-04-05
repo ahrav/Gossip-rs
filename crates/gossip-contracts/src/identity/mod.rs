@@ -16,8 +16,10 @@
 
 mod canonical;
 mod coordination;
+/// Domain separators and registry for hashing.
 pub mod domain;
 mod finding;
+/// Specialized hashing utilities for stable identities.
 pub mod hashing;
 mod item;
 mod macros;
