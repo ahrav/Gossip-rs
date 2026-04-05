@@ -3,23 +3,31 @@
 //! Environment knobs:
 //! - `SIM_GIT_SCAN_DEEP=1` enables larger defaults.
 //! - `SIM_GIT_SCAN_SEED_START` and `SIM_GIT_SCAN_SEED_COUNT` control seed ranges.
+//! - `SIM_GIT_SCAN_FAULT_SEED_COUNT` controls the extra fault-injected
+//!   reproducibility sweep.
 //! - `SIM_GIT_SCENARIO_COMMITS`, `SIM_GIT_SCENARIO_REFS`, `SIM_GIT_SCENARIO_BLOBS_PER_TREE`
 //!   override generator sizing.
 //! - `SIM_GIT_RUN_WORKERS`, `SIM_GIT_RUN_MAX_STEPS`, `SIM_GIT_RUN_STABILITY_RUNS`,
 //!   `SIM_GIT_RUN_TRACE_CAP` override runner config.
 //! - `GIT_SIM_WRITE_FAIL=1` writes failing artifacts to `tests/failures/`.
 //!
-//! The run is deterministic for a given seed set and environment configuration.
+//! The sweeps are deterministic for a given `(scenario_seed, schedule_seed,
+//! fault_plan, environment)` tuple. The plain sweep keeps the happy path green;
+//! the fault-injected sweep checks that the same tuple reproduces the same
+//! success or failure shape across repeated runs while `stability_runs >= 2`.
 
 use std::fs;
 
 use crate::scanner_rs::sim::rng::SimRng;
+use crate::scanner_rs::sim_git_scan::fault::GitResourceFaults;
 use crate::scanner_rs::sim_git_scan::{
-    GitFaultPlan, GitReproArtifact, GitRunConfig, GitScenarioGenConfig, GitSimRunner, GitTraceDump,
-    RunOutcome, generate_scenario,
+    FailureKind, FailureReport, GitCorruption, GitFaultPlan, GitIoFault, GitReadFault,
+    GitReproArtifact, GitResourceId, GitRunConfig, GitScenario, GitScenarioGenConfig, GitSimRunner,
+    GitTraceDump, RunOutcome, RunReport, generate_scenario,
 };
 
 const DEFAULT_SEED_COUNT: u64 = 25;
+const DEFAULT_FAULT_SEED_COUNT: u64 = 8;
 
 fn seed_value_from_env(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -100,6 +108,196 @@ fn random_run_config(rng: &mut SimRng, deep: bool) -> GitRunConfig {
     }
 }
 
+fn random_fault_seed_count(deep: bool) -> u64 {
+    let default = if deep {
+        DEFAULT_FAULT_SEED_COUNT.saturating_mul(2)
+    } else {
+        DEFAULT_FAULT_SEED_COUNT
+    };
+    seed_value_from_env("SIM_GIT_SCAN_FAULT_SEED_COUNT", default)
+}
+
+fn random_corruption(rng: &mut SimRng) -> GitCorruption {
+    match rng.gen_range(0, 3) {
+        0 => GitCorruption::TruncateTo {
+            new_len: rng.gen_range(0, 16),
+        },
+        1 => GitCorruption::FlipBit {
+            offset: rng.gen_range(0, 16),
+            mask: 1u8 << (rng.gen_range(0, 8) as u8),
+        },
+        _ => GitCorruption::Overwrite {
+            offset: rng.gen_range(0, 16),
+            bytes: vec![
+                rng.gen_range(0, 256) as u8,
+                rng.gen_range(0, 256) as u8,
+                rng.gen_range(0, 256) as u8,
+            ],
+        },
+    }
+}
+
+fn random_read_fault(rng: &mut SimRng) -> GitReadFault {
+    let latency_ticks = rng.gen_range(0, 4) as u64;
+    match rng.gen_range(0, 5) {
+        0 => GitReadFault {
+            fault: Some(GitIoFault::ErrKind {
+                kind: rng.gen_range(1, 4) as u8,
+            }),
+            latency_ticks,
+            corruption: None,
+        },
+        1 => GitReadFault {
+            fault: Some(GitIoFault::PartialRead {
+                max_len: rng.gen_range(1, 32),
+            }),
+            latency_ticks,
+            corruption: None,
+        },
+        2 => GitReadFault {
+            fault: Some(GitIoFault::EIntrOnce),
+            latency_ticks,
+            corruption: None,
+        },
+        _ => GitReadFault {
+            fault: None,
+            latency_ticks,
+            corruption: Some(random_corruption(rng)),
+        },
+    }
+}
+
+fn maybe_push_fault_resource(
+    resources: &mut Vec<GitResourceFaults>,
+    rng: &mut SimRng,
+    resource: GitResourceId,
+) {
+    if !rng.gen_bool(1, 2) {
+        return;
+    }
+    resources.push(GitResourceFaults {
+        resource,
+        reads: vec![random_read_fault(rng)],
+    });
+}
+
+fn random_fault_plan(rng: &mut SimRng, scenario: &GitScenario) -> GitFaultPlan {
+    let mut resources = Vec::new();
+    maybe_push_fault_resource(&mut resources, rng, GitResourceId::Persist);
+    maybe_push_fault_resource(&mut resources, rng, GitResourceId::SeenPersist);
+
+    if let Some(artifacts) = scenario.artifacts.as_ref() {
+        if artifacts.commit_graph.is_some() {
+            maybe_push_fault_resource(&mut resources, rng, GitResourceId::CommitGraph);
+        }
+        if artifacts.midx.is_some() {
+            maybe_push_fault_resource(&mut resources, rng, GitResourceId::Midx);
+        }
+        if !artifacts.packs.is_empty() {
+            let idx = rng.gen_range(0, artifacts.packs.len() as u32) as usize;
+            maybe_push_fault_resource(
+                &mut resources,
+                rng,
+                GitResourceId::Pack {
+                    pack_id: artifacts.packs[idx].pack_id,
+                },
+            );
+        }
+    }
+
+    if resources.is_empty() {
+        resources.push(GitResourceFaults {
+            resource: GitResourceId::Persist,
+            reads: vec![random_read_fault(rng)],
+        });
+    }
+
+    GitFaultPlan { resources }
+}
+
+fn same_failure_kind(expected: &FailureKind, actual: &FailureKind) -> bool {
+    match (expected, actual) {
+        (FailureKind::Panic, FailureKind::Panic)
+        | (FailureKind::Hang, FailureKind::Hang)
+        | (FailureKind::OracleMismatch, FailureKind::OracleMismatch)
+        | (FailureKind::StabilityMismatch, FailureKind::StabilityMismatch) => true,
+        (
+            FailureKind::InvariantViolation { code: left },
+            FailureKind::InvariantViolation { code: right },
+        ) => left == right,
+        _ => false,
+    }
+}
+
+fn assert_same_report(left: &RunReport, right: &RunReport, seed: u64) {
+    assert_eq!(left.steps, right.steps, "seed {seed}: step count diverged");
+    assert_eq!(
+        left.commit_count, right.commit_count,
+        "seed {seed}: commit count diverged"
+    );
+    assert_eq!(
+        left.candidate_count, right.candidate_count,
+        "seed {seed}: candidate count diverged"
+    );
+    assert_eq!(
+        left.skipped_count, right.skipped_count,
+        "seed {seed}: skipped count diverged"
+    );
+    assert_eq!(left.outcome, right.outcome, "seed {seed}: outcome diverged");
+    assert_eq!(
+        left.scanned_hash, right.scanned_hash,
+        "seed {seed}: scanned hash diverged"
+    );
+    assert_eq!(
+        left.skipped_hash, right.skipped_hash,
+        "seed {seed}: skipped hash diverged"
+    );
+    assert_eq!(
+        left.trace_hash, right.trace_hash,
+        "seed {seed}: trace hash diverged"
+    );
+    assert_eq!(
+        left.trace_dump, right.trace_dump,
+        "seed {seed}: trace dump diverged"
+    );
+}
+
+fn assert_reproducible_failure(left: &FailureReport, right: &FailureReport, seed: u64) {
+    assert!(
+        same_failure_kind(&left.kind, &right.kind),
+        "seed {seed}: failure kind diverged: {:?} vs {:?}",
+        left.kind,
+        right.kind
+    );
+    assert_eq!(
+        left.message, right.message,
+        "seed {seed}: failure message diverged"
+    );
+    assert_eq!(left.step, right.step, "seed {seed}: failure step diverged");
+    assert!(
+        !matches!(
+            left.kind,
+            FailureKind::Panic | FailureKind::Hang | FailureKind::StabilityMismatch
+        ),
+        "seed {seed}: fault-injected sweep must not panic, hang, or lose schedule stability: {:?}",
+        left.kind
+    );
+}
+
+fn assert_same_outcome(left: &RunOutcome, right: &RunOutcome, seed: u64) {
+    match (left, right) {
+        (RunOutcome::Ok { report: left }, RunOutcome::Ok { report: right }) => {
+            assert_same_report(left, right, seed);
+        }
+        (RunOutcome::Failed(left), RunOutcome::Failed(right)) => {
+            assert_reproducible_failure(left, right, seed);
+        }
+        _ => {
+            panic!("seed {seed}: repeated fault-injected runs must stay in the same outcome shape")
+        }
+    }
+}
+
 #[test]
 fn bounded_random_git_sims() {
     let deep = env_bool("SIM_GIT_SCAN_DEEP", false);
@@ -133,6 +331,31 @@ fn bounded_random_git_sims() {
                 panic!("git sim failed (seed {seed}): {fail:?}");
             }
         }
+    }
+}
+
+#[test]
+fn bounded_random_git_sims_with_fault_injection_are_reproducible() {
+    let deep = env_bool("SIM_GIT_SCAN_DEEP", false);
+    let seed_start = seed_value_from_env("SIM_GIT_SCAN_SEED_START", 0);
+    let seed_count = random_fault_seed_count(deep);
+
+    for seed in seed_start..seed_start.saturating_add(seed_count) {
+        let mut rng = SimRng::new(seed.wrapping_add(0x51A7_FA11));
+        let mut run_cfg = random_run_config(&mut rng, deep);
+        run_cfg.stability_runs = run_cfg.stability_runs.max(2);
+        let gen_cfg = scenario_config_from_env(deep);
+
+        let scenario = generate_scenario(seed, &gen_cfg).expect("generate scenario");
+        let fault_plan = random_fault_plan(&mut rng, &scenario);
+        let schedule_seed = seed.wrapping_add(0xF411_7A9E);
+        let runner = GitSimRunner::new(run_cfg, schedule_seed);
+
+        // Re-running the exact same tuple is the smallest proof that injected
+        // resource faults do not introduce hidden nondeterminism in the harness.
+        let first = runner.run(&scenario, &fault_plan);
+        let second = runner.run(&scenario, &fault_plan);
+        assert_same_outcome(&first, &second, seed);
     }
 }
 
