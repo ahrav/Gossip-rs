@@ -107,7 +107,8 @@ use anyhow::{Context as _, Error as AnyError, Result, anyhow};
 use gossip_connectors::FilesystemConnector;
 use gossip_contracts::{
     connector::{
-        Budgets, Cursor, ErrorClass, ItemKey, ItemRef, Location, PageState, ScanItem, VersionId,
+        Budgets, Cursor, ErrorClass, ItemKey, ItemRef, Location, PageState, ScanItem, ToxicDigest,
+        VersionId,
         git::{GitMirrorManager, RepoKey},
         ordered::OrderedContentSource,
     },
@@ -2832,7 +2833,7 @@ where
 /// persistence submission helper.
 struct GitRepoPersistenceInput<'a> {
     write_context: WriteContext,
-    shard_id: &'a str,
+    shard_id: &'a ToxicDigest,
     repo_key: &'a RepoKey,
     repo_id: u64,
     bytes_scanned: u64,
@@ -3179,7 +3180,7 @@ where
 
     let input = GitRepoPersistenceInput {
         write_context: execution.write_context,
-        shard_id: lease.shard_id(),
+        shard_id: stage_sink.redacted_shard_id(),
         repo_key: lease.payload().repo_key(),
         repo_id: lease.payload().repo_id(),
         bytes_scanned: execution.report.bytes_scanned,
@@ -9498,7 +9499,7 @@ mod tests {
         }];
         let input = GitRepoPersistenceInput {
             write_context: write_context(),
-            shard_id: "test-shard",
+            shard_id: &ToxicDigest::of_bytes(b"test-shard"),
             repo_key: &repo_key,
             repo_id: 42,
             bytes_scanned: 1024,
@@ -9539,7 +9540,7 @@ mod tests {
         let repo_key = git_repo_key(tmp.path());
         let input = GitRepoPersistenceInput {
             write_context: write_context(),
-            shard_id: "test-shard",
+            shard_id: &ToxicDigest::of_bytes(b"test-shard"),
             repo_key: &repo_key,
             repo_id: 42,
             bytes_scanned: 1024,
