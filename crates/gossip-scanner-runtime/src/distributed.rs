@@ -3453,9 +3453,6 @@ where
 
         let checkpoint_started_at = Instant::now();
         if let Err(error) = advance_shard(coordinator, identity.tenant, &lease, &completion) {
-            stage_sink.emit_stage_signal(StageSignal::CheckpointAdvanced {
-                latency_ms: elapsed_ms(checkpoint_started_at),
-            });
             if let DistributedRuntimeError::LeaseUncertain(reason) = &error {
                 emit_lease_uncertainty(stage_sink.as_ref(), *reason);
             }

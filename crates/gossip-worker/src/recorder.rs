@@ -931,14 +931,12 @@ impl SanitizedCoordinationRecord {
     }
 }
 
-/// Tracing capture utilities for integration and unit tests across the
-/// `gossip-worker` package (both library and binary crate targets).
+/// Tracing capture utilities shared by library and binary targets in this
+/// package.
 ///
-/// Not gated behind `#[cfg(test)]` because the binary-crate tests link
-/// against the library as a regular dependency, and `cfg(test)` is only
-/// active for the crate currently under test.  The types here are trivial
-/// and `tracing-subscriber` is already a normal dependency, so there is
-/// no cost to always compiling them.
+/// Compiled in all builds because `cfg(test)` is scoped to the crate under
+/// compilation; dependent binary targets require these helpers in normal
+/// dependency mode.
 pub mod test_support {
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
