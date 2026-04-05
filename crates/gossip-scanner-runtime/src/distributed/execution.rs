@@ -638,21 +638,30 @@ where
         )),
     );
     let page = PageCommit::new(scope);
-    let findings_handle = persistence
-        .findings_sink
-        .upsert_batch(findings_batch)
-        .map_err(|error| {
+
+    // Clean scans (zero findings) skip the findings sink entirely: the
+    // only durable row needed is the done-ledger entry. This avoids a
+    // round-trip with an empty batch that could fail on some backends and
+    // leave the repo reclaimable for no reason.
+    let page = if findings_batch.is_empty() {
+        page.record_findings(FindingsCommitReceipt::new(0, 0, 0))
+    } else {
+        let findings_handle = persistence
+            .findings_sink
+            .upsert_batch(findings_batch)
+            .map_err(|error| {
+                DistributedRuntimeError::Durability(AnyError::new(error).context(format!(
+                    "git repo-frontier shard '{}' findings submission failed",
+                    input.shard_id,
+                )))
+            })?;
+        page.wait_findings(findings_handle).map_err(|error| {
             DistributedRuntimeError::Durability(AnyError::new(error).context(format!(
-                "git repo-frontier shard '{}' findings submission failed",
+                "git repo-frontier shard '{}' findings durability failed",
                 input.shard_id,
             )))
-        })?;
-    let page = page.wait_findings(findings_handle).map_err(|error| {
-        DistributedRuntimeError::Durability(AnyError::new(error).context(format!(
-            "git repo-frontier shard '{}' findings durability failed",
-            input.shard_id,
-        )))
-    })?;
+        })?
+    };
     let done_handle = persistence
         .done_ledger
         .batch_upsert(std::slice::from_ref(translation.done_ledger()))
@@ -853,14 +862,14 @@ where
             Ok((execution, stage_metrics))
         })();
 
-        // Seal the uncertainty signal after durable execution so a late
-        // deadline watchdog cannot retroactively poison already-committed
-        // persistence state. Mirrors the filesystem drain-then-close
-        // pattern in `drain_commit_stage`.
+        // Seal the uncertainty signal once the scoped-thread block
+        // completes so the watchdog (about to be joined) cannot record a
+        // stale note after the block exits.  A separate pre-persistence
+        // deadline check below guards the durable write window.
         if execution.is_ok() {
-            // Final deadline check before sealing — narrows the race window
-            // where the watchdog parks between the scan completing and waking
-            // to observe an elapsed deadline.
+            // Final deadline check while the watchdog is still joinable —
+            // narrows the race window where the watchdog parks between the
+            // scan completing and waking to observe an elapsed deadline.
             if let Some(reason) = armed_lease_deadline.expiry_reason() {
                 lease_uncertainty.note(reason);
             }
@@ -925,6 +934,15 @@ where
         claim_time: lease.claim_wall_clock(),
         complete_time,
     };
+
+    // Guard the durable write window: the watchdog is dead (joined above)
+    // so no further uncertainty can be noted. A stale lease detected here
+    // avoids wasted persistence work and a guaranteed coordinator rejection
+    // on shard advance.
+    if let Some(reason) = armed_lease_deadline.expiry_reason() {
+        return Err(DistributedRuntimeError::LeaseUncertain(reason));
+    }
+
     let receipt_started_at = Instant::now();
     let (findings_receipt, done_ledger_receipt) = submit_git_repo_persistence(persistence, &input)
         .inspect_err(|_| {

@@ -634,4 +634,17 @@ fn finding_record_debug_redacts_secret_hash() {
         secret_hash_bytes.contains("[redacted]"),
         "SecretHash Debug itself must be redacted, got: {secret_hash_bytes}",
     );
+    // Negative assertion: no long hex sequence should appear anywhere in the
+    // FindingRecord Debug output. Non-restricted IDs show an 8-char prefix
+    // (4 bytes) followed by "..". A leaked 32-byte hash would produce a
+    // 64-char hex run. Reject anything over 8 consecutive hex digits.
+    let has_long_hex = debug
+        .as_bytes()
+        .windows(10)
+        .any(|w| w.iter().all(|b| b.is_ascii_hexdigit()));
+    assert!(
+        !has_long_hex,
+        "FindingRecord Debug must not contain hex sequences longer than 8 chars \
+         (potential raw hash leak), got: {debug}",
+    );
 }

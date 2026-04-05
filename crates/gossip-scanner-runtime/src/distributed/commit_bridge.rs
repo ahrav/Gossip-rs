@@ -227,10 +227,11 @@ impl ReceiptCommitSink {
 
     /// Records a finish-progress event for telemetry.
     ///
-    /// This records that the item's scan completed and was submitted to the
-    /// commit pipeline — not that the commit landed durably. Durability
-    /// confirmation flows through the receipt/checkpoint path, not through
-    /// telemetry.
+    /// Pairs with [`record_begin`](Self::record_begin) to close the item's
+    /// telemetry lifecycle. Emitted both on successful pipeline submission
+    /// and on terminal translation failure so telemetry consumers always see
+    /// a balanced Begin/Finish pair. Durability confirmation flows through
+    /// the receipt/checkpoint path, not through telemetry.
     fn record_finish(&self, item_key: &ItemKey) {
         self.record_progress(CommitProgressRecord::Finish {
             write_context: self.write_context,

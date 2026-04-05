@@ -494,6 +494,10 @@ where
                     .map_err(DistributedRuntimeError::Coordinator);
             }
             Err(ClaimError::NoneAvailable { earliest_deadline }) => {
+                // Refresh the wall clock after the (potentially slow)
+                // coordinator call so retry delay and progress queries
+                // use an up-to-date timestamp.
+                let now = wall_clock_now();
                 let progress = coordinator
                     .get_run_progress(now, tenant, run)
                     .map_err(|error| DistributedRuntimeError::Coordinator(AnyError::new(error)))?;
@@ -503,6 +507,7 @@ where
                 std::thread::sleep(claim_retry_delay(now, earliest_deadline));
             }
             Err(ClaimError::Throttled { retry_after }) => {
+                let now = wall_clock_now();
                 std::thread::sleep(claim_retry_delay(now, Some(retry_after)));
             }
             Err(error) => {

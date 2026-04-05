@@ -145,8 +145,9 @@ plugs into `git_repo::run_runtime_git_scan_with_stores`. Distributed
 repo-frontier execution wraps the event sink with `FindingsCaptureSink`, lifts
 Git `FindingEvent` values into `GitFindingForPersistence` while building a
 sparse commit-ordinal-to-OID map from `GitEvent::CommitMeta` events.
-`translate_git_item_result` then derives per-object stable identity from
-`(connector_instance, object_path, commit_oid)` for each finding while
+`translate_git_item_result` then derives stable item identity from
+`(connector_instance, object_path)` and strong version identity from
+`(commit_oid, object_path)` for each finding while
 keeping the done-ledger row repo-scoped via `repo_id`. Persistence uses
 an explicit `PageCommit` sequence so Git observations may carry per-object
 OVIDs while shard completion remains repo-scoped. This keeps Git findings

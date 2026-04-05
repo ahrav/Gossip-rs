@@ -696,26 +696,25 @@ where
             .get(&commit_id)
             .ok_or(ResultTranslationError::MissingGitCommitOid { index, commit_id })?;
         let cache_key = (finding.object_path.as_ref(), commit_id);
-        let &(item, observation_ovid_hash) = if let Some(cached) = identity_cache.get(&cache_key) {
-            cached
-        } else {
-            let identity = ItemIdentityKey::try_new(
-                GIT_CONNECTOR_TAG,
-                connector_instance,
-                finding.object_path.as_ref(),
-            )
-            .map_err(|source| ResultTranslationError::GitItemIdentity { index, source })?;
-            let item = TranslationItem {
-                stable_item_id: identity.stable_id(),
-                version: VersionId::Strong(git_object_version_id(
-                    commit_oid,
+        let &(item, observation_ovid_hash) = match identity_cache.entry(cache_key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let identity = ItemIdentityKey::try_new(
+                    GIT_CONNECTOR_TAG,
+                    connector_instance,
                     finding.object_path.as_ref(),
-                )),
-            };
-            let ovid_hash = item.ovid_hash();
-            identity_cache.insert(cache_key, (item, ovid_hash));
-            // SAFETY of unwrap: we just inserted the entry on the line above.
-            identity_cache.get(&cache_key).unwrap()
+                )
+                .map_err(|source| ResultTranslationError::GitItemIdentity { index, source })?;
+                let item = TranslationItem {
+                    stable_item_id: identity.stable_id(),
+                    version: VersionId::Strong(git_object_version_id(
+                        commit_oid,
+                        finding.object_path.as_ref(),
+                    )),
+                };
+                let ovid_hash = item.ovid_hash();
+                e.insert((item, ovid_hash))
+            }
         };
         let location = location_cache
             .entry(finding.object_path.as_ref())
