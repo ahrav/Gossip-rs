@@ -361,11 +361,11 @@ struct RunState<'a> {
 
 impl<'a> RunState<'a> {
     fn new(scenario: &'a GitScenario, trace_capacity: u32, fault_plan: GitFaultPlan) -> Self {
-        let persist_plan = fault_plan.clone();
+        let (runner_plan, persist_plan) = partition_fault_plan(fault_plan);
         Self {
             scenario,
             trace: GitTraceRing::new(trace_capacity as usize),
-            faults: GitFaultInjector::new(fault_plan),
+            faults: GitFaultInjector::new(runner_plan),
             ref_arena: None,
             refs: Vec::new(),
             commit_graph: None,
@@ -380,6 +380,28 @@ impl<'a> RunState<'a> {
             outcome: None,
         }
     }
+}
+
+/// Split a fault plan into runner-owned and persistence-owned partitions.
+///
+/// The runner injector handles artifact I/O faults (`CommitGraph`, `Midx`,
+/// `Pack`, `Other`). The persistence store handles `Persist` and `SeenPersist`
+/// faults via its own internal injector. Partitioning avoids cloning the full
+/// plan into both consumers and makes the ownership boundary explicit.
+fn partition_fault_plan(plan: GitFaultPlan) -> (GitFaultPlan, GitFaultPlan) {
+    let (persist, runner): (Vec<_>, Vec<_>) = plan
+        .resources
+        .into_iter()
+        .partition(|r| is_persist_resource(&r.resource));
+    (
+        GitFaultPlan { resources: runner },
+        GitFaultPlan { resources: persist },
+    )
+}
+
+/// Returns true for resources consumed by `SimPersistStore`.
+fn is_persist_resource(id: &GitResourceId) -> bool {
+    matches!(id, GitResourceId::Persist | GitResourceId::SeenPersist)
 }
 
 /// Spawn one stage task and remember the stage kind at the assigned task index.
@@ -580,9 +602,11 @@ fn stage_spill_dedupe(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
             .as_ref()
             .ok_or_else(|| failure_inv(27, "candidates missing"))?;
         let oid_len = to_object_format(state.scenario.repo.object_format).oid_len();
+        // The TempDir must outlive the Spiller — the spiller writes run
+        // files to spill_dir.path() and cleans them up on finalize/drop.
         let spill_dir = tempdir().map_err(|err| failure_inv(28, err))?;
         let mut spiller = Spiller::new(SpillLimits::RESTRICTIVE, oid_len, spill_dir.path())
-            .map_err(|err| failure_inv(28, err))?;
+            .map_err(|err| failure_inv(44, err))?;
 
         for cand in candidates.iter_resolved() {
             spiller
@@ -1417,6 +1441,53 @@ mod tests {
             FailureKind::InvariantViolation { code: 42 }
         ));
         assert!(failure.message.contains("seen-persist"));
+    }
+
+    #[test]
+    fn spill_dedupe_handles_zero_candidates() {
+        let scenario = GitScenario {
+            schema_version: super::super::scenario::GIT_SCENARIO_SCHEMA_VERSION,
+            repo: GitRepoModel {
+                object_format: GitObjectFormat::Sha1,
+                refs: vec![GitRefSpec {
+                    name: b"refs/heads/main".to_vec(),
+                    tip: oid(1),
+                    watermark: None,
+                }],
+                commits: vec![GitCommitSpec {
+                    oid: oid(1),
+                    parents: Vec::new(),
+                    tree: oid(2),
+                    generation: 1,
+                }],
+                trees: vec![GitTreeSpec {
+                    oid: oid(2),
+                    entries: Vec::new(),
+                }],
+                blobs: Vec::new(),
+            },
+            artifacts: None,
+        };
+
+        let mut state = RunState::new(&scenario, 64, GitFaultPlan::default());
+
+        assert_eq!(stage_repo_open(&mut state).unwrap(), 1);
+        assert_eq!(stage_commit_walk(&mut state).unwrap(), 1);
+        assert_eq!(stage_tree_diff(&mut state).unwrap(), 0);
+        assert_eq!(stage_spill_dedupe(&mut state).unwrap(), 0);
+
+        let seen_ops: Vec<_> = state
+            .persist_store
+            .log()
+            .into_iter()
+            .filter(|op| op.phase == PersistPhase::SeenDelta)
+            .collect();
+        assert!(seen_ops.is_empty());
+
+        let spill_stats = state.spill_stats.as_ref().expect("spill stats");
+        assert_eq!(spill_stats.candidates_received, 0);
+        assert_eq!(spill_stats.emitted_blobs, 0);
+        assert_eq!(state.unique_oids.as_deref(), Some(&[][..]));
     }
 
     #[test]
