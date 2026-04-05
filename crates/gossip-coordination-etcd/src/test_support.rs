@@ -48,6 +48,9 @@ use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, ContainerRequest, GenericImage, ImageExt};
 
+use gossip_contracts::identity::TenantId;
+use gossip_coordination::ShardKey;
+
 use crate::{EtcdCoordinator, EtcdCoordinatorConfig};
 
 /// Monotonic counter for generating unique namespace prefixes across
@@ -264,4 +267,34 @@ pub fn test_coordinator_in_namespace_with_limits(
         .with_shard_limits(max_shards_per_tenant, max_total_shards)
         .expect("test shard limits should be valid");
     EtcdCoordinator::connect(config).expect("test etcd should be reachable")
+}
+
+/// Poll until the owner binding for `key` disappears, or panic if
+/// `ttl_secs + 10s` elapses without cleanup.  The generous fixed margin
+/// absorbs CI-host scheduling jitter.
+pub fn wait_for_owner_binding_expiry(
+    backend: &EtcdCoordinator,
+    tenant: TenantId,
+    key: ShardKey,
+    ttl_secs: i64,
+) {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(
+            u64::try_from(ttl_secs).expect("TTL must be non-negative") + 10,
+        );
+    let interval = std::time::Duration::from_millis(250);
+    loop {
+        if backend
+            .test_load_owner_binding(tenant, key)
+            .expect("owner lookup should succeed while polling")
+            .is_none()
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "owner binding was not cleaned up within {ttl_secs}s + 10s margin"
+        );
+        std::thread::sleep(interval);
+    }
 }

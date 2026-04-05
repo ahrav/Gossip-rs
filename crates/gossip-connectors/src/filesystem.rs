@@ -3,38 +3,26 @@
 //! This module provides [`FilesystemConnector`], which implements the
 //! ordered-content source contract for local filesystem roots.
 //!
-//! # Enumeration model
+//! # Purpose
+//! Provides a deterministic, ordered-content source over a local Unix filesystem,
+//! offering secure, lazy enumeration and bounded-memory read traversal.
 //!
-//! - Enumeration walks the canonical root lazily with a bounded stack of
-//!   per-directory entry buffers. The connector never builds a whole-tree
-//!   sorted snapshot.
-//! - Item ordering is the lexicographic order of relative path bytes.
-//!   Directory siblings are sorted with a virtual trailing `/` so depth-first
-//!   traversal emits files in the same order as their full relative paths.
-//! - Resumption is key-only for now. `fill_page` restarts from the root view
-//!   and skips all keys at or below `cursor.last_key()`. Incoming cursor
-//!   tokens are ignored because the connector does not advertise
-//!   `token_resume`.
+//! # Invariants
+//! - **Bounded Memory**: The connector never loads the entire directory tree into memory.
+//! - **Confinement**: Read operations are strictly confined to the canonical root directory using `openat` and `O_NOFOLLOW`.
+//! - **Identity Preservation**: Single-file identities `(dev, ino)` must match their recorded state at initialization to prevent TOCTOU replacement attacks.
+//! - **Ordering**: Item ordering matches the lexicographic order of relative path bytes.
 //!
-//! # Identity and version model
+//! # Algorithm
+//! - **Enumeration**: Lazily walks the canonical root using a depth-first traversal with a bounded stack.
+//!   Directory siblings are sorted with a virtual trailing `/` to ensure depth-first traversal matches the lexicographical order of full paths.
+//! - **Resumption**: Skips keys at or below `cursor.last_key()`. Re-traverses from the root on each `fill_page`.
+//! - **Read Path Validation**: Uses component-by-component `openat` from a pinned parent descriptor to prevent symlink and substitution attacks.
 //!
-//! - `item_key` and `item_ref` are identical relative-path bytes.
-//! - `StableItemId` is derived from the canonical filesystem connector tag,
-//!   the canonical root path, and the relative locator bytes.
-//! - Versions are intentionally weak: they derive from the relative path plus
-//!   filesystem metadata, which is useful for change detection but does not
-//!   claim immutable content identity.
-//!
-//! # Read-path confinement
-//!
-//! Both directory and single-file roots are read with component-by-component
-//! `openat` traversal from a pinned parent directory fd, using `O_NOFOLLOW` at
-//! each step. This blocks symlink escapes and intermediate directory
-//! substitution attacks. Single-file roots additionally verify that the opened
-//! file's `(dev, ino)` matches the identity recorded at initialization.
-//!
-//! Files are opened with `O_NONBLOCK`, validated as regular files via
-//! metadata, then `O_NONBLOCK` is cleared before reads.
+//! # Design Trade-offs
+//! - **Memory vs. Resumption Cost**: Lazily expanding directories keeps memory bounded to `O(depth * max_dir_entries)` but requires re-traversing ancestor nodes on resumption.
+//! - **Confinement Overhead**: Component-by-component `openat` traversal adds system call overhead on cache misses and first reads, but adjacent `read_range` calls can reuse the cached descriptor while preserving confinement guarantees.
+//! - **Weak Versioning**: Versions derive from metadata (`mtime`, `size`, `ino`, `dev`) and paths. This enables fast change detection but does not guarantee immutable content identity.
 //!
 //! # Budget behavior
 //!
@@ -94,9 +82,13 @@ use crate::split_estimator::StreamingSplitEstimator;
 
 /// Single-entry read cache keyed by `item_ref` bytes.
 ///
-/// `read_range` workloads often perform adjacent reads on the same file; this
-/// avoids repeated open-path resolution in the common sequential case while
-/// keeping descriptor retention bounded.
+/// # Purpose
+/// Optimizes sequential `read_range` workloads by caching the file descriptor
+/// of the most recently accessed file.
+///
+/// # Guarantees
+/// - Caches exactly one file descriptor at a time, keeping descriptor retention bounded.
+/// - Avoids repeated component-by-component `openat` resolution in the common sequential case.
 struct CachedFile {
     item_ref: Box<[u8]>,
     file: fs::File,
@@ -105,9 +97,17 @@ struct CachedFile {
 /// Reader adapter that enforces `max_bytes` and checks the deadline before
 /// every delegated read call.
 ///
-/// When the byte budget is exhausted, `read()` returns `Ok(0)` (the standard
-/// EOF signal). Callers that need to distinguish budget exhaustion from true
-/// end-of-file must compare total bytes read against the item's `size_hint`.
+/// # Purpose
+/// Enforces scanning budgets at the read stream layer, intercepting `io::Read`
+/// operations to restrict elapsed time and total byte limits.
+///
+/// # Guarantees
+/// - Total bytes read will never exceed `max_bytes`.
+/// - Exhaustion of the byte budget returns standard EOF (`Ok(0)`). Callers
+///   must distinguish budget exhaustion from true end-of-file by comparing total bytes read against the item's `size_hint`.
+///
+/// # Errors
+/// - Yields `io::ErrorKind::TimedOut` if the budget deadline expires before or during a read.
 struct BudgetedReader<R> {
     inner: R,
     remaining: u64,
@@ -149,6 +149,13 @@ impl<R: io::Read> io::Read for BudgetedReader<R> {
 // ---------------------------------------------------------------------------
 
 /// Minimal per-entry state retained while sorting a single directory.
+///
+/// # Purpose
+/// Buffers the name and file type of directory elements required for
+/// lexicographical sorting and traversal.
+///
+/// # Guarantees
+/// - Uses minimal memory by keeping only the `OsString` name and `fs::FileType`.
 struct BufferedDirEntry {
     name: OsString,
     file_type: fs::FileType,
@@ -156,8 +163,13 @@ struct BufferedDirEntry {
 
 /// One stack frame in the bounded depth-first walk.
 ///
-/// Each frame owns only the currently-open directory's sorted entries plus the
-/// relative-path prefix needed to derive child keys.
+/// # Purpose
+/// Represents the traversal state for a single opened directory, preserving
+/// context for lazy enumeration.
+///
+/// # Guarantees
+/// - Owns only the currently-open directory's sorted entries and the
+///   relative-path prefix needed to derive child keys.
 struct WalkFrame {
     abs_path: PathBuf,
     rel_path: Vec<u8>,
@@ -166,6 +178,10 @@ struct WalkFrame {
 }
 
 /// File candidate yielded by the live directory walk.
+///
+/// # Purpose
+/// Packages a fully resolved relative path and its associated filesystem
+/// metadata for emission as a `ScanItem`.
 struct WalkFile {
     rel_path: Vec<u8>,
     metadata: fs::Metadata,
@@ -173,8 +189,13 @@ struct WalkFile {
 
 /// Bounded-memory filesystem walker over the canonical directory root.
 ///
-/// The walk keeps only the active ancestor stack in memory. Each directory is
-/// read, sorted, and dropped once traversal leaves that subtree.
+/// # Purpose
+/// Executes a lazy, depth-first traversal of the filesystem, respecting
+/// configured bounds and limits.
+///
+/// # Guarantees
+/// - Keeps only the active ancestor stack in memory.
+/// - Each directory is read, sorted, and dropped once traversal leaves that subtree.
 struct DirectoryWalker<'a> {
     stack: Vec<WalkFrame>,
     start: Option<&'a [u8]>,
@@ -279,6 +300,11 @@ impl<'a> DirectoryWalker<'a> {
 // FilesystemConnector
 // ---------------------------------------------------------------------------
 
+/// Mode of operation for the configured filesystem root.
+///
+/// # Purpose
+/// Distinguishes between directory traversal and single-file roots, holding
+/// the necessary pre-verified state for secure confined reads.
 enum RootMode {
     Directory,
     SingleFile {
@@ -291,15 +317,17 @@ enum RootMode {
 /// Deterministic ordered-content connector backed by a canonical local
 /// directory or a single regular file.
 ///
-/// The connector lazily canonicalizes `root`, derives a connector-instance
-/// scope from that canonical path, and caches the root mode needed for secure
-/// fd-relative reads. Directory roots enumerate every regular file beneath the
-/// tree. Single-file roots expose exactly one item whose key matches the file
-/// name recorded at initialization.
+/// # Purpose
+/// Implements the standard connector protocol for filesystem sources, providing
+/// repeatable enumeration and split-estimation capabilities.
 ///
-/// Connector-level key-range bounds are sticky configuration: every
-/// enumeration or split-point request intersects its shard bounds with the
-/// range configured via [`FilesystemConnector::with_key_range`].
+/// # Guarantees
+/// - Lazily canonicalizes `root`, derives a connector-instance scope from that canonical path,
+///   and caches the root mode needed for secure fd-relative reads.
+/// - Directory roots enumerate every regular file beneath the tree.
+/// - Single-file roots expose exactly one item whose key matches the file name recorded at initialization.
+/// - Connector-level key-range bounds act as sticky configuration: every enumeration or split-point request
+///   intersects its shard bounds with the range configured via [`FilesystemConnector::with_key_range`].
 pub struct FilesystemConnector {
     root: PathBuf,
     walk_key_range_start: Option<Box<[u8]>>,
@@ -321,11 +349,17 @@ impl FilesystemConnector {
 
     /// Create a connector rooted at `root`.
     ///
-    /// Root canonicalization and root-mode discovery are deferred until the
-    /// first operation that needs filesystem access.
+    /// # Purpose
+    /// Initializes a filesystem connector. Root canonicalization and root-mode discovery are deferred
+    /// until the first operation that needs filesystem access.
+    ///
+    /// # Preconditions
+    /// - `root` must not be an empty path.
+    ///
+    /// # Guarantees
+    /// - Delays disk I/O until absolutely necessary.
     ///
     /// # Panics
-    ///
     /// Panics if `root` is an empty path, because the connector cannot derive
     /// a stable identity or valid `openat` base from it.
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -346,13 +380,16 @@ impl FilesystemConnector {
         }
     }
 
-    #[must_use]
     /// Restrict enumeration and split-point selection to keys inside the
     /// half-open range `[start, end)`.
     ///
-    /// The configured bounds become part of the connector state and are
-    /// intersected with per-request shard bounds on every call. `None` means
-    /// unbounded on that side.
+    /// # Purpose
+    /// Limits the connector's operating scope to a specific sub-range of keys.
+    ///
+    /// # Guarantees
+    /// - The configured bounds are sticky and will be intersected with per-request shard bounds.
+    /// - `None` acts as an unbounded limit on the respective side.
+    #[must_use]
     pub fn with_key_range(mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Self {
         self.walk_key_range_start = start.map(|bound| bound.to_vec().into_boxed_slice());
         self.walk_key_range_end = end.map(|bound| bound.to_vec().into_boxed_slice());
@@ -549,6 +586,8 @@ impl FilesystemConnector {
             // the security model used by `open_file_for_ref`. Using fd-relative
             // operations here avoids the TOCTOU gap inherent in path-based
             // `symlink_metadata`.
+            // Safety: `parent_fd` is a valid file descriptor. `c_name` is a valid,
+            // null-terminated C string.
             let fd = unsafe {
                 libc::openat(
                     parent_fd.as_raw_fd(),
@@ -563,7 +602,7 @@ impl FilesystemConnector {
                     &io::Error::last_os_error(),
                 ));
             }
-            // SAFETY: `fd >= 0` from the check above.
+            // Safety: `fd >= 0` from the check above.
             let file = unsafe { fs::File::from_raw_fd(fd) };
             file.metadata().map_err(|error| {
                 classify_io_enumerate_error("fstat_single_file", &self.root, &error)
@@ -703,7 +742,7 @@ impl FilesystemConnector {
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
             };
 
-            // SAFETY: `parent_fd` is a valid directory descriptor, the path is
+            // Safety: `parent_fd` is a valid directory descriptor, the path is
             // a null-terminated stack buffer, and successful `openat` returns a
             // fresh fd that is wrapped in `OwnedFd`.
             let raw_fd = unsafe { libc::openat(parent_fd, component_ptr, flags) };
@@ -714,7 +753,7 @@ impl FilesystemConnector {
                     &io::Error::last_os_error(),
                 ));
             }
-            // SAFETY: `raw_fd >= 0` from the check above.
+            // Safety: `raw_fd >= 0` from the check above.
             dir_fd = Some(unsafe { OwnedFd::from_raw_fd(raw_fd) });
         }
 
@@ -802,20 +841,19 @@ impl FilesystemConnector {
 
     /// Fill one bounded page of ordered filesystem items.
     ///
-    /// The returned page respects the intersection of shard bounds and any
-    /// connector-level key-range bounds. Cursor resume is key-based only: the
-    /// walk restarts from the root view and skips keys at or below
-    /// `cursor.last_key()`.
+    /// # Purpose
+    /// Enumerates filesystem items incrementally, yielding a bounded subset that respects all configured
+    /// limits and shard constraints.
     ///
-    /// The page enforces both `max_items` and `max_bytes`, except that the
-    /// first in-scope item is still emitted when its `size_hint` alone exceeds
-    /// the byte budget so pagination can make forward progress.
+    /// # Guarantees
+    /// - Always respects the intersection of shard bounds and connector-level key bounds.
+    /// - Memory usage is bounded by directory depth and entry count.
+    /// - Ensures forward progress: the first in-scope item is always emitted even if it exceeds the `max_bytes` budget.
+    /// - Re-evaluates metadata if cursor resumes, picking up mutations since the last poll.
     ///
     /// # Errors
-    ///
-    /// Returns a retryable error when the budget deadline has already expired
-    /// or expires during traversal. Returns a permanent error if the root no
-    /// longer resolves to a supported regular-file or directory view.
+    /// - Returns a retryable error when the budget deadline expires before or during traversal.
+    /// - Returns a permanent error if the root path cannot be resolved or changes type unexpectedly.
     pub fn fill_page(
         &mut self,
         shard: &ShardSpec,
@@ -861,16 +899,18 @@ impl FilesystemConnector {
 
     /// Return a best-effort split-point hint for dynamic shard subdivision.
     ///
-    /// The hint comes from the integrated `StreamingSplitEstimator` after
-    /// intersecting shard bounds with connector-level key-range bounds. The
-    /// connector may still return `Ok(None)` when insufficient samples have
-    /// been observed or when the estimated key would violate the current
-    /// cursor or upper-bound guards.
+    /// # Purpose
+    /// Estimates a splitting key that divides the remaining un-scanned work approximately in half,
+    /// enabling dynamic workload parallelization.
+    ///
+    /// # Guarantees
+    /// - Computes the hint using an integrated `StreamingSplitEstimator` combined with active bounds.
+    /// - Gracefully falls back to `Ok(None)` if there is insufficient historical data.
+    /// - Guarantees the emitted split point strictly advances the cursor and respects the upper bound.
     ///
     /// # Errors
-    ///
-    /// Returns a retryable error when the budget deadline has expired and a
-    /// permanent error when shard bounds are invalid.
+    /// - Returns a retryable error if the deadline expires.
+    /// - Returns a permanent error if the shard bounds are malformed or logically inverted.
     pub fn choose_split_point(
         &mut self,
         shard: &ShardSpec,
@@ -885,19 +925,20 @@ impl FilesystemConnector {
     /// Open the full content for an item, enforcing the read byte budget on
     /// the returned reader.
     ///
-    /// Resolution happens beneath the pinned root fd with `O_NOFOLLOW` on each
-    /// path component. For single-file roots, `item_ref` must exactly match the
-    /// configured file name and the reopened file must retain its recorded
-    /// `(dev, ino)` identity.
+    /// # Purpose
+    /// Securely resolves and opens a file stream restricted by the provided budget limits.
     ///
-    /// The returned reader yields `Ok(0)` once `budgets.max_bytes()` has been
-    /// consumed, even if the underlying file still has remaining bytes.
+    /// # Guarantees
+    /// - Resolution happens via component-by-component `O_NOFOLLOW` validation relative to a pinned root `fd`.
+    /// - Single-file targets must identically match the original configuration and recorded `(dev, ino)` state.
+    /// - Caps output at `budgets.max_bytes()`, treating exhaustion as a stream EOF.
+    ///
+    /// # Preconditions
+    /// - `item_ref` must resolve within the initialized root directory scope.
     ///
     /// # Errors
-    ///
-    /// Returns a retryable error when the deadline has expired. Returns a
-    /// permanent error for invalid item references, non-regular files, symlink
-    /// escapes, or single-file identity drift.
+    /// - Yields a retryable error when the budget deadline is expired.
+    /// - Permanent errors on malformed `item_ref`, symlink detours, unreadable files, or single-file identity changes.
     pub fn open(
         &mut self,
         item_ref: &ItemRef,
@@ -915,19 +956,21 @@ impl FilesystemConnector {
 
     /// Range-read a file, clamping the returned bytes to `budgets.max_bytes()`.
     ///
-    /// The connector keeps a single cached file descriptor keyed by
-    /// `item_ref`, which avoids repeated path resolution for adjacent reads on
-    /// the same file while keeping descriptor retention bounded.
+    /// # Purpose
+    /// Fetches a specific byte interval from an item, leveraging file-descriptor caching
+    /// to speed up adjacent reads on the same file.
     ///
-    /// At most `min(dst.len(), budgets.max_bytes())` bytes are read. An empty
-    /// effective budget returns `Ok(0)` without touching the filesystem.
+    /// # Guarantees
+    /// - Caps byte output to `min(dst.len(), budgets.max_bytes())`.
+    /// - Maintains bounds guarantees: zero-length or zero-budget reads return `Ok(0)` without disk access.
+    /// - Descriptor caching is limited to a single retained entry to bound OS resources.
+    ///
+    /// # Preconditions
+    /// - `offset + dst.len()` must not overflow `u64`.
     ///
     /// # Errors
-    ///
-    /// Returns a retryable error when the deadline has expired. Returns a
-    /// permanent error when `offset + dst.len()` overflows or when the target
-    /// path fails the same confinement and identity checks enforced by
-    /// [`FilesystemConnector::open`].
+    /// - Retryable error on expired deadline.
+    /// - Permanent errors for offset overflow, confinement violations, or identity drift.
     pub fn read_range(
         &mut self,
         item_ref: &ItemRef,
@@ -1254,7 +1297,7 @@ fn intersect_key_bounds<'a>(
 fn open_dir_fd(path: &Path) -> Result<OwnedFd, io::Error> {
     let c_path = path_to_cstring(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "null byte in path"))?;
-    // SAFETY: POSIX open(2) with a valid null-terminated path.
+    // Safety: POSIX open(2) with a valid null-terminated path.
     let fd = unsafe {
         libc::open(
             c_path.as_ptr(),
@@ -1264,14 +1307,14 @@ fn open_dir_fd(path: &Path) -> Result<OwnedFd, io::Error> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `fd >= 0` from the check above.
+    // Safety: `fd >= 0` from the check above.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Clear `O_NONBLOCK` from an already-opened file descriptor.
 fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
     let fd = file.as_raw_fd();
-    // SAFETY: `fcntl(F_GETFL)` on a valid file descriptor.
+    // Safety: `fcntl(F_GETFL)` on a valid file descriptor.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(classify_io_read_error(
@@ -1280,7 +1323,7 @@ fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
             &io::Error::last_os_error(),
         ));
     }
-    // SAFETY: `fcntl(F_SETFL)` on a valid file descriptor with flags obtained
+    // Safety: `fcntl(F_SETFL)` on a valid file descriptor with flags obtained
     // from `F_GETFL`.
     let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
     if result < 0 {
@@ -1301,11 +1344,11 @@ fn path_to_cstring(path: &Path) -> Result<CString, std::ffi::NulError> {
 /// Read the `(dev, ino)` identity pair for an already-open file descriptor.
 fn fd_dev_ino(fd: &OwnedFd) -> io::Result<(u64, u64)> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `fstat` writes a fully initialized `stat` struct on success.
+    // Safety: `fstat` writes a fully initialized `stat` struct on success.
     if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `fstat` succeeded, so the buffer is initialized.
+    // Safety: `fstat` succeeded, so the buffer is initialized.
     let stat = unsafe { stat.assume_init() };
     #[allow(clippy::unnecessary_cast)]
     Ok((stat.st_dev as u64, stat.st_ino as u64))

@@ -1,16 +1,19 @@
-//! Regression coverage for the filesystem connector's ordered-content contract.
+//! Purpose: Provides regression coverage for the filesystem connector's ordered-content contract.
 //!
-//! The tests in this module exercise the same invariants production callers rely on:
-//! enumeration must remain lexicographically ordered, resume must honor `last_key`
-//! even when persisted tokens are stale, stable IDs must be rooted in the canonical
-//! connector instance, and path handling must not allow callers to escape the
-//! configured root. The fixtures intentionally mix directory roots and single-file
-//! roots because the connector supports both modes with different identity checks.
+//! Invariants:
+//! - Enumeration must remain lexicographically ordered.
+//! - Resume must honor `last_key` even when persisted tokens are stale.
+//! - Stable IDs must be rooted in the canonical connector instance.
+//! - Path handling must not allow callers to escape the configured root.
 //!
-//! The helpers below keep the individual tests focused on behavior instead of setup,
-//! but they also encode the contract being asserted. In particular, `fill_page` is
-//! always driven with explicit budgets so pagination, byte limits, and deadline
-//! handling stay visible in the test inputs.
+//! Algorithm Overview:
+//! Tests exercise the `FilesystemConnector` directly and via the `OrderedContentSource`
+//! conformance harness. Fixtures mix directory roots and single-file roots to validate
+//! path and identity checks under both operating modes.
+//!
+//! Design Trade-offs:
+//! Test helpers require explicit budget parameters instead of using defaults to ensure
+//! pagination, byte limits, and deadline handling remain visible at the call site.
 
 use std::{
     io::{self, Read as _},
@@ -33,10 +36,10 @@ use rstest::rstest;
 use super::*;
 use crate::common::test_util::make_key;
 
-/// Create a temporary directory populated with the given files.
+/// Intent: Provide a temporary directory with a known file layout.
 ///
-/// Each entry is `(relative_path, content)`. Parent directories are created
-/// automatically.
+/// Invariants:
+/// - Parent directories for nested files are implicitly created.
 fn create_test_dir(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("create tempdir");
     for (rel, content) in files {
@@ -49,15 +52,15 @@ fn create_test_dir(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     dir
 }
 
-/// Returns a shard that does not further restrict the connector's key space.
+/// Intent: Provide a full-range shard for tests not exercising bounds.
 fn unbounded_shard() -> ShardSpec {
     ShardSpec::unbounded()
 }
 
-/// Runs `fill_page` with explicit item and byte limits and unwraps the resulting page.
+/// Intent: Execute `fill_page` with explicit limits, unwrapping the page.
 ///
-/// The helper keeps tests centered on ordering and pagination semantics while still
-/// making the chosen budgets part of the assertion setup.
+/// Invariants:
+/// - Requires all budget parameters to be specified explicitly so limits remain visible at the test call site.
 fn fill_page_with_limits(
     connector: &mut FilesystemConnector,
     shard: &ShardSpec,
@@ -75,10 +78,10 @@ fn fill_page_with_limits(
         .expect("page should be present")
 }
 
-/// Recomputes the stable ID a filesystem item should advertise for a given root.
+/// Intent: Recompute the stable ID a filesystem item should advertise.
 ///
-/// The expected connector instance hash is derived from the canonicalized root path
-/// so equivalent roots resolve to the same identity bytes.
+/// Invariants:
+/// - The instance hash is derived from the canonicalized root path, guaranteeing equivalent roots resolve to the same identity.
 fn expected_stable_item_id(
     root: &Path,
     rel_path: &[u8],
@@ -89,7 +92,7 @@ fn expected_stable_item_id(
     ItemIdentityKey::new(FILESYSTEM_CONNECTOR_TAG, connector_instance, rel_path).stable_id()
 }
 
-/// Extracts the ordered item keys from a conformance run for direct assertions.
+/// Intent: Extract ordered item keys from a conformance run for direct assertions.
 fn drain_keys(run: &gossip_contracts::connector::conformance::OrderedContentDrain) -> Vec<Vec<u8>> {
     run.items()
         .iter()
@@ -546,10 +549,10 @@ fn fill_page_emits_large_first_item_to_make_progress() {
 fn max_items_exactly_matching_file_count_yields_complete_page() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
     let mut connector = FilesystemConnector::new(dir.path());
-
-    // max_items == file count: the peek after collection sees None and reports
-    // Complete. The peek error is intentionally swallowed (ok().is_some_and)
-    // rather than propagated via ?, which would discard already-collected items.
+    // When the page limit exactly matches the remaining file count,
+    // `fill_page` can peek past the terminal item and return `Complete`.
+    // The peek error is intentionally swallowed via `ok().is_some_and`
+    // rather than propagated via `?` to avoid discarding already-collected items.
     let page = fill_page_with_limits(
         &mut connector,
         &unbounded_shard(),
@@ -568,8 +571,7 @@ fn max_items_exactly_matching_file_count_yields_complete_page() {
 fn max_items_less_than_file_count_yields_has_more() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
     let mut connector = FilesystemConnector::new(dir.path());
-
-    // max_items < file count: the peek sees another file and reports HasMore.
+    // Hitting `max_items` before exhausting the directory keeps pagination open.
     let page = fill_page_with_limits(
         &mut connector,
         &unbounded_shard(),
@@ -839,8 +841,6 @@ fn single_file_open_detects_replacement_after_init() {
 
     let mut connector = FilesystemConnector::new(&file_path);
     let item_ref = ItemRef::try_from_slice(b"data.txt").expect("valid ref");
-
-    // First open succeeds and initializes root mode with the file's identity.
     let mut reader = connector
         .open(&item_ref, crate::common::test_util::default_budgets())
         .expect("initial open should succeed");
@@ -856,9 +856,7 @@ fn single_file_open_detects_replacement_after_init() {
     fs::write(&staging, b"impostor").expect("write replacement");
     fs::remove_file(&file_path).expect("remove original");
     fs::rename(&staging, &file_path).expect("swap replacement into place");
-
-    // The replacement lives at the same path but has a different inode.
-    // A secure connector must reject it.
+    // A distinct inode at the same path must be rejected.
     let result = connector.open(&item_ref, crate::common::test_util::default_budgets());
     assert!(
         result.is_err(),

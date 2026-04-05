@@ -80,8 +80,11 @@ impl fmt::Display for ErrorClass {
     }
 }
 
-/// Writes `message` to `f`, replacing control characters with U+FFFD
-/// (REPLACEMENT CHARACTER) to prevent log injection.
+/// Writes `message` to `f`, applying a security-focused sanitization policy.
+///
+/// Specifically, this replaces all control characters (except HT/LF/CR) with U+FFFD
+/// (REPLACEMENT CHARACTER) to actively prevent log injection attacks and terminal
+/// disruption. Connectors must use this rather than raw display of untrusted error messages.
 ///
 /// Replaced ranges: C0 (U+0000..U+001F) except HT/LF/CR, DEL (U+007F),
 /// and C1 (U+0080..U+009F). Together with HT/LF/CR (which are preserved),

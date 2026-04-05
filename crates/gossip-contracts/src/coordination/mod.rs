@@ -28,18 +28,28 @@
 //! └── limits.rs           MAX_SPLIT_CHILDREN, MAX_SPAWNED_PER_SHARD — split capacity constants
 //! ```
 
-// ---- Sub-modules (alphabetical) ----
-
+/// Two-layer progress marker defining where a connector should resume.
 pub mod cursor;
+
+/// Split capacity constants and sizing limits.
 pub mod limits;
+
+/// Shard registration validation and initial shard input models.
 pub mod manifest;
+
 /// Arena-pooled wrappers for shard byte fields (spec, cursor, spawned).
 ///
 /// Coordination backends interact with pooled types through
 /// `gossip_coordination::ShardRecord` and `gossip_coordination::AcquireScratch`.
 pub mod pooled;
+
+/// Grouped acquire/restore coordination payload for backend state transitions.
 pub mod restored_state;
+
+/// Key ranges, split validation, and shard specification models.
 pub mod shard_spec;
+
+/// Split planner core for replace and residual splits (backend-agnostic).
 pub mod split;
 
 // -- Progress tracking --
@@ -77,5 +87,3 @@ pub use split::{
     plan_split_replace_at_points, plan_split_replace_at_points_initial_cursor, plan_split_residual,
     plan_split_residual_at_point, plan_split_residual_from_cursor,
 };
-
-// shard_spec_tests.rs is declared inside shard_spec.rs via #[path] attribute.

@@ -24,8 +24,6 @@ fuzz_target!(|data: &[u8]| {
     }
 
     if data.len() >= 41 {
-        // The constructor expects 8 tag bytes, 32 instance-id bytes, and a
-        // non-empty locator suffix.
         let tag_bytes: [u8; 8] = data[..8].try_into().unwrap();
         let instance_id_bytes = &data[8..40];
         let locator = data[40..].to_vec();
@@ -41,7 +39,6 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // Version IDs accept arbitrary non-empty byte sequences.
     if !data.is_empty() {
         let _ = ObjectVersionId::from_version_bytes(data);
     }

@@ -581,6 +581,8 @@ pub(crate) enum SanitizedCoordinationRecord {
 impl SanitizedCoordinationRecord {
     /// Converts a raw core event into a sanitized record, redacting `shard_id`,
     /// `object_path`, `rule_name`, `change_kind`, and diagnostic messages.
+    ///
+    /// Secret-derived `norm_hash` values are dropped instead of logged.
     fn from_core_event(shard_id: &str, event: OwnedCoreEvent) -> Self {
         let shard_id = RedactedDigest::text("shard_id", shard_id);
         match event {
@@ -591,6 +593,7 @@ impl SanitizedCoordinationRecord {
                 end,
                 rule_id,
                 rule_name,
+                norm_hash: _,
                 commit_id,
                 change_kind,
                 confidence_score,
@@ -845,6 +848,7 @@ mod tests {
                     end: 20,
                     rule_id: 17,
                     rule_name: canary.to_owned(),
+                    norm_hash: Some([0xAB; 32]),
                     commit_id: Some(99),
                     change_kind: Some(canary.to_owned()),
                     confidence_score: 7,
@@ -1081,6 +1085,35 @@ mod tests {
     }
 
     #[test]
+    fn sanitized_core_finding_drops_norm_hash() {
+        let record = SanitizedCoordinationRecord::from_core_event(
+            "shard",
+            OwnedCoreEvent::Finding {
+                source: SourceKind::Fs,
+                object_path: b"path".to_vec(),
+                start: 0,
+                end: 10,
+                rule_id: 1,
+                rule_name: "rule".to_owned(),
+                norm_hash: Some([0xDE; 32]),
+                commit_id: None,
+                change_kind: None,
+                confidence_score: 5,
+            },
+        );
+
+        let debug = format!("{record:?}");
+        assert!(
+            !debug.contains("norm_hash"),
+            "sanitized telemetry must drop norm_hash, got: {debug}"
+        );
+        assert!(
+            !debug.contains("222, 222, 222"),
+            "sanitized telemetry must not leak norm_hash bytes, got: {debug}"
+        );
+    }
+
+    #[test]
     fn tracing_sink_never_logs_raw_canary_bytes() {
         let recorder = ProductionCoordinationEventRecorder::default();
         let canary = secret_canary();
@@ -1201,6 +1234,7 @@ mod tests {
                         end: 10,
                         rule_id: 1,
                         rule_name: "rule".to_owned(),
+                        norm_hash: Some([0xBC; 32]),
                         commit_id: None,
                         change_kind: None,
                         confidence_score: 5,

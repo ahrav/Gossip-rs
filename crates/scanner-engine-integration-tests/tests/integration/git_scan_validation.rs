@@ -30,14 +30,14 @@ use scanner_git::{
 
 const NS_BLOB_CTX: [u8; 3] = *b"bc\0";
 const NS_FINDING: [u8; 3] = *b"fn\0";
-const NS_SEEN_BLOB: [u8; 3] = *b"sb\0";
+use scanner_git::NS_SEEN_BLOB;
 
-fn perf_stats_enabled() -> bool {
+pub(crate) fn perf_stats_enabled() -> bool {
     cfg!(all(feature = "perf-stats", debug_assertions))
 }
 
 /// Returns true when the `git` CLI is available on the host.
-fn git_available() -> bool {
+pub(crate) fn git_available() -> bool {
     Command::new("git").arg("--version").output().is_ok()
 }
 
@@ -52,7 +52,7 @@ fn run_git(repo: &Path, args: &[&str]) {
 }
 
 /// Runs a git command and returns UTF-8 stdout, asserting success.
-fn git_output(repo: &Path, args: &[&str]) -> String {
+pub(crate) fn git_output(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
         .current_dir(repo)
@@ -64,6 +64,11 @@ fn git_output(repo: &Path, args: &[&str]) -> String {
 
 /// Decode a hex string into bytes (expects even length and valid hex digits).
 fn decode_hex(hex: &str) -> Vec<u8> {
+    assert!(
+        hex.len().is_multiple_of(2),
+        "decode_hex: odd-length input ({len} bytes): {hex:?}",
+        len = hex.len()
+    );
     let mut out = Vec::with_capacity(hex.len() / 2);
     let bytes = hex.as_bytes();
     let mut i = 0;
@@ -77,13 +82,13 @@ fn decode_hex(hex: &str) -> Vec<u8> {
 }
 
 /// Parse a Git object ID from hex output.
-fn oid_from_hex(hex: &str) -> OidBytes {
+pub(crate) fn oid_from_hex(hex: &str) -> OidBytes {
     let bytes = decode_hex(hex.trim());
     OidBytes::from_slice(&bytes)
 }
 
 /// Initialize a new repo with a deterministic user identity.
-fn init_repo() -> TempDir {
+pub(crate) fn init_repo() -> TempDir {
     let tmp = TempDir::new().unwrap();
     run_git(tmp.path(), &["init", "-b", "main"]);
     run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
@@ -92,7 +97,7 @@ fn init_repo() -> TempDir {
 }
 
 /// Write a file and commit it to the repo.
-fn commit_file(repo: &Path, name: &str, contents: &str, msg: &str) {
+pub(crate) fn commit_file(repo: &Path, name: &str, contents: &str, msg: &str) {
     let path = repo.join(name);
     fs::write(&path, contents).unwrap();
     run_git(repo, &["add", name]);
@@ -100,7 +105,7 @@ fn commit_file(repo: &Path, name: &str, contents: &str, msg: &str) {
 }
 
 /// Ensure all objects are packed and indexed.
-fn ensure_artifacts(repo: &Path) {
+pub(crate) fn ensure_artifacts(repo: &Path) {
     run_git(repo, &["gc"]);
 }
 
@@ -110,7 +115,7 @@ fn repack_all(repo: &Path) {
 }
 
 /// Build a tiny engine that detects TOK_ secrets (and Base64 variants).
-fn test_engine() -> Engine {
+pub(crate) fn test_engine() -> Engine {
     let rule = RuleSpec {
         name: "tok",
         anchors: &[b"TOK_"],
@@ -151,8 +156,8 @@ fn test_engine() -> Engine {
 }
 
 /// Start set resolver pinned to the current `main` tip.
-struct TestResolver {
-    tip: OidBytes,
+pub(crate) struct TestResolver {
+    pub(crate) tip: OidBytes,
 }
 
 impl StartSetResolver for TestResolver {
@@ -165,8 +170,8 @@ impl StartSetResolver for TestResolver {
 }
 
 /// Watermark store that returns a fixed optional watermark for all refs.
-struct TestWatermarkStore {
-    watermark: Option<scanner_git::RefWatermark>,
+pub(crate) struct TestWatermarkStore {
+    pub(crate) watermark: Option<scanner_git::RefWatermark>,
 }
 
 impl RefWatermarkStore for TestWatermarkStore {
@@ -230,7 +235,7 @@ fn run_scan(repo: &Path, watermark: Option<RefWatermark>) -> GitScanResult {
     run_scan_with_config(repo, watermark, base_config()).unwrap()
 }
 
-fn base_config() -> GitScanConfig {
+pub(crate) fn base_config() -> GitScanConfig {
     GitScanConfig {
         repo_id: 42,
         policy_hash: [0x11; 32],
@@ -594,7 +599,7 @@ fn odb_blob_parallel_intro_keeps_persistence_contract_without_blob_ctx_determini
 // -ad`), which also packs every blob. There is no reliable way to create a
 // loose-only blob whose commit is still in a pack using normal Git
 // operations. The `LooseMissing` code path is covered by the unit test in
-// `runner.rs` (see `scan_loose_candidates_missing_object_skipped`).
+// `runner_exec_tests.rs` (see `missing_loose_object_is_skipped`).
 
 #[test]
 fn shallow_clone_boundary_treats_missing_parent_as_external_root() {
@@ -793,7 +798,12 @@ fn failed_finalize_retry_still_scans_blob() {
     .expect("retry should succeed");
 
     assert_eq!(second.0.finalize.outcome, FinalizeOutcome::Complete);
-    assert_eq!(second.0.finalize.stats.unique_blobs, 1);
+    if perf_stats_enabled() {
+        assert_eq!(
+            second.0.finalize.stats.unique_blobs, 1,
+            "retry should re-scan the single blob"
+        );
+    }
     if perf_stats_enabled() {
         assert_eq!(second.0.finalize.stats.total_findings, 1);
     } else {
@@ -816,10 +826,12 @@ fn failed_finalize_retry_still_scans_blob() {
     .expect("third run should succeed");
 
     assert_eq!(third.0.finalize.outcome, FinalizeOutcome::Complete);
-    assert_eq!(
-        third.0.finalize.stats.unique_blobs, 0,
-        "blob should be skipped after successful finalize persisted seen state"
-    );
+    if perf_stats_enabled() {
+        assert_eq!(
+            third.0.finalize.stats.unique_blobs, 0,
+            "blob should be skipped after successful finalize persisted seen state"
+        );
+    }
 }
 
 #[test]

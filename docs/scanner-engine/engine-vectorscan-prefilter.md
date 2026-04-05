@@ -162,9 +162,9 @@ Specialized for stream-mode anchor scanning with multi-chunk processing:
 Variants represent different text encodings:
 
 ```rust
-Variant::Raw(0)        // Raw bytes / ASCII
-Variant::Utf16Le(1)    // UTF-16 Little-Endian
-Variant::Utf16Be(2)    // UTF-16 Big-Endian
+Variant::Raw           // Raw bytes / ASCII (index=0)
+Variant::Utf16Le       // UTF-16 Little-Endian (index=1)
+Variant::Utf16Be       // UTF-16 Big-Endian (index=2)
 ```
 
 ### Variant Index Encoding in Callbacks
