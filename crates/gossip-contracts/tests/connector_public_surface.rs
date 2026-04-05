@@ -53,8 +53,8 @@ fn family_contracts_are_available_from_namespaced_modules() {
     let _run = run_ordered_content_conformance::<fn() -> UnusedSource, UnusedSource>;
 }
 
-/// A dummy implementation of `OrderedContentSource` used solely to verify
-/// that trait methods and associated types are publicly accessible.
+/// Minimal `OrderedContentSource` stub for compile-time API-surface checks.
+/// `fill_page` returns terminal completion (`Ok(None)`), and `open` is unsupported.
 struct UnusedSource;
 
 impl OrderedContentSource for UnusedSource {
