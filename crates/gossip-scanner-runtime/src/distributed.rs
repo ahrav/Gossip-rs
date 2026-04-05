@@ -761,14 +761,19 @@ pub struct DistributedRunReport {
     /// Number of shards that were scanned.
     pub shards_scanned: u64,
     /// Aggregate claim latency in milliseconds across the invocation.
+    /// Populated only by Git repo-frontier worker runs; zero for filesystem runs.
     pub total_claim_ms: u64,
     /// Aggregate Git mirror-sync latency in milliseconds.
+    /// Populated only by Git repo-frontier worker runs; zero for filesystem runs.
     pub total_mirror_sync_ms: u64,
     /// Aggregate Git execution latency in milliseconds.
+    /// Populated only by Git repo-frontier worker runs; zero for filesystem runs.
     pub total_scan_ms: u64,
     /// Aggregate durable receipt latency in milliseconds.
+    /// Populated only by Git repo-frontier worker runs; zero for filesystem runs.
     pub total_durable_receipt_ms: u64,
     /// Aggregate shard-advance latency in milliseconds.
+    /// Populated only by Git repo-frontier worker runs; zero for filesystem runs.
     pub total_checkpoint_ms: u64,
 }
 
@@ -800,6 +805,11 @@ fn elapsed_ms(start: Instant) -> u64 {
     duration_ms(start.elapsed())
 }
 
+/// Maps an [`ErrorClass`] to a static metric label.
+///
+/// The wildcard arm is required because `ErrorClass` is `#[non_exhaustive]`.
+/// New variants should be matched explicitly here; the fallback ensures
+/// forward compatibility but should not be relied upon silently.
 const fn error_class_label(class: ErrorClass) -> &'static str {
     match class {
         ErrorClass::Retryable => "retryable",
@@ -2811,6 +2821,10 @@ struct GitRepoPersistenceInput<'a> {
     complete_time: LogicalTime,
 }
 
+/// Number of distinct receipt families produced by [`submit_git_repo_done_ledger`]
+/// (findings-commit + done-ledger-commit).
+const GIT_REPO_RECEIPT_FAMILIES: u64 = 2;
+
 /// Submit a done-ledger entry for one completed Git repo scan.
 ///
 /// Constructs the done-ledger record from the scan metadata and submits it
@@ -3048,7 +3062,14 @@ where
                 Arc::clone(&event_sink),
                 git_persistence_backend.clone(),
             )
-            .map_err(DistributedRuntimeError::Runtime)?;
+            .map_err(|error| {
+                stage_sink.emit_stage_signal(StageSignal::ScanCompleted {
+                    latency_ms: elapsed_ms(scan_started_at),
+                    items_scanned: 0,
+                    bytes_scanned: 0,
+                });
+                DistributedRuntimeError::Runtime(error)
+            })?;
             stage_metrics.scan_ms = elapsed_ms(scan_started_at);
             stage_sink.emit_stage_signal(StageSignal::ScanCompleted {
                 latency_ms: stage_metrics.scan_ms,
@@ -3128,11 +3149,16 @@ where
     };
     let receipt_started_at = Instant::now();
     let (findings_receipt, done_ledger_receipt) =
-        submit_git_repo_done_ledger(&persistence.done_ledger, &input)?;
+        submit_git_repo_done_ledger(&persistence.done_ledger, &input).inspect_err(|_| {
+            stage_sink.emit_stage_signal(StageSignal::DurableReceiptCompleted {
+                latency_ms: elapsed_ms(receipt_started_at),
+                receipts: 0,
+            });
+        })?;
     stage_metrics.durable_receipt_ms = elapsed_ms(receipt_started_at);
     stage_sink.emit_stage_signal(StageSignal::DurableReceiptCompleted {
         latency_ms: stage_metrics.durable_receipt_ms,
-        receipts: 2,
+        receipts: GIT_REPO_RECEIPT_FAMILIES,
     });
 
     tracing::debug!(
@@ -6706,6 +6732,19 @@ mod tests {
 
         assert_eq!(report.leases_seen, 1);
         assert_eq!(report.shards_scanned, 1);
+        // Timing fields are populated by the worker loop. Individual stages
+        // may complete in sub-millisecond on fast machines (as_millis
+        // truncates), so assert the aggregate is at least non-panicking and
+        // structurally consistent rather than demanding > 0.
+        let timing_sum = report.total_claim_ms
+            + report.total_mirror_sync_ms
+            + report.total_scan_ms
+            + report.total_durable_receipt_ms
+            + report.total_checkpoint_ms;
+        assert!(
+            timing_sum > 0,
+            "aggregate stage timings should be nonzero for a real scan"
+        );
 
         let signals = test_recorder
             .stage_signals
@@ -6717,19 +6756,139 @@ mod tests {
             "successful path should emit five stage signals"
         );
         assert!(matches!(signals[0], StageSignal::ShardClaimed { .. }));
+        let StageSignal::MirrorSyncCompleted { error_class, .. } = signals[1] else {
+            panic!("expected MirrorSyncCompleted, got {:?}", signals[1]);
+        };
+        assert!(error_class.is_none(), "success path should have no error");
+        let StageSignal::ScanCompleted {
+            items_scanned,
+            bytes_scanned,
+            ..
+        } = signals[2]
+        else {
+            panic!("expected ScanCompleted, got {:?}", signals[2]);
+        };
+        assert!(
+            items_scanned > 0,
+            "fixture should contain at least one scannable item"
+        );
+        assert!(bytes_scanned > 0, "fixture should have nonzero bytes");
         assert!(matches!(
-            signals[1],
-            StageSignal::MirrorSyncCompleted {
-                error_class: None,
+            signals[3],
+            StageSignal::DurableReceiptCompleted {
+                receipts: GIT_REPO_RECEIPT_FAMILIES,
                 ..
             }
         ));
-        assert!(matches!(signals[2], StageSignal::ScanCompleted { .. }));
-        assert!(matches!(
-            signals[3],
-            StageSignal::DurableReceiptCompleted { receipts: 2, .. }
-        ));
         assert!(matches!(signals[4], StageSignal::CheckpointAdvanced { .. }));
+    }
+
+    #[test]
+    fn run_git_repo_worker_emits_lease_uncertainty_signal_on_expired_lease() {
+        let repo = create_clean_git_repo_fixture();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        let test_recorder = Arc::new(Recorder::default());
+        let identity = git_worker_identity_with_recorder(
+            repo.path(),
+            Arc::clone(&test_recorder) as Arc<dyn CoordinationEventRecorder>,
+        );
+        // 1 ms lease — will expire before run_git_repo_lease can complete.
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 1);
+
+        let result = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            identity,
+            backend,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        );
+        assert!(result.is_err(), "expired lease should cause worker failure");
+
+        let signals = test_recorder
+            .stage_signals
+            .lock()
+            .expect("stage signals lock");
+        assert!(
+            !signals.is_empty(),
+            "at least ShardClaimed should be emitted before the error"
+        );
+        assert!(
+            matches!(signals[0], StageSignal::ShardClaimed { .. }),
+            "first signal should be ShardClaimed, got {:?}",
+            signals[0]
+        );
+        assert!(
+            signals
+                .iter()
+                .any(|s| matches!(s, StageSignal::LeaseUncertaintyObserved { .. })),
+            "expired lease should emit LeaseUncertaintyObserved, got: {signals:?}"
+        );
+    }
+
+    #[test]
+    fn run_git_repo_worker_emits_mirror_error_signal_on_sync_failure() {
+        let repo = create_clean_git_repo_fixture();
+        let backend = TestGitBackend::default();
+        let test_recorder = Arc::new(Recorder::default());
+        let identity = git_worker_identity_with_recorder(
+            repo.path(),
+            Arc::clone(&test_recorder) as Arc<dyn CoordinationEventRecorder>,
+        );
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+        let mut mirrors = FailingMirrorManager;
+
+        let result = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            identity,
+            backend,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        );
+        assert!(
+            result.is_err(),
+            "failing mirror should cause worker failure"
+        );
+
+        let signals = test_recorder
+            .stage_signals
+            .lock()
+            .expect("stage signals lock");
+        assert!(
+            signals.len() >= 2,
+            "expected at least ShardClaimed + MirrorSyncCompleted, got {signals:?}"
+        );
+        assert!(
+            matches!(signals[0], StageSignal::ShardClaimed { .. }),
+            "first signal should be ShardClaimed, got {:?}",
+            signals[0]
+        );
+        let StageSignal::MirrorSyncCompleted {
+            error_class,
+            latency_ms: _,
+        } = signals[1]
+        else {
+            panic!(
+                "second signal should be MirrorSyncCompleted, got {:?}",
+                signals[1]
+            );
+        };
+        assert_eq!(
+            error_class,
+            Some("permanent"),
+            "FailingMirrorManager returns permanent error class"
+        );
+    }
+
+    #[test]
+    fn error_class_label_maps_known_variants() {
+        assert_eq!(error_class_label(ErrorClass::Retryable), "retryable");
+        assert_eq!(error_class_label(ErrorClass::Permanent), "permanent");
     }
 
     /// A successful git repo scan of a clean (zero-findings) fixture must

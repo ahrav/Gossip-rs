@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::Result;
-use gossip_contracts::connector::ItemKey;
+use gossip_contracts::connector::{ItemKey, ToxicDigest};
 use gossip_contracts::persistence::WriteContext;
 use scanner_git::{GitEvent, GitEventOutput};
 use scanner_scheduler::events::{CoreEvent, EventOutput};
@@ -69,7 +69,8 @@ pub enum StageSignal {
     /// Mirror acquisition or refresh finished for the claimed repo.
     ///
     /// `latency_ms` is the wall-clock duration of the mirror step.
-    /// `error_class` is a closed-set retry posture when mirror sync failed;
+    /// `error_class` is a closed-set retry-posture label produced by
+    /// `error_class_label`: `"retryable"` or `"permanent"`.
     /// `None` means the mirror step succeeded.
     MirrorSyncCompleted {
         latency_ms: u64,
@@ -126,6 +127,10 @@ fn sentinel_to_option(id: u32) -> Option<u32> {
 /// flooding logs during sustained recorder outages.
 pub struct CoordinationEventSink {
     shard_id: Arc<str>,
+    /// Pre-computed digest of `shard_id` for log-safe error messages.
+    /// Raw shard identifiers may contain repository-identifying data and must
+    /// not appear in log output.
+    redacted_shard_id: ToxicDigest,
     recorder: Arc<dyn CoordinationEventRecorder>,
     core_error_logged: AtomicBool,
     git_error_logged: AtomicBool,
@@ -136,8 +141,10 @@ impl CoordinationEventSink {
     /// Creates a sink that forwards events to `recorder` tagged with `shard_id`.
     #[must_use]
     pub fn new(recorder: Arc<dyn CoordinationEventRecorder>, shard_id: Arc<str>) -> Self {
+        let redacted_shard_id = ToxicDigest::of_bytes(shard_id.as_bytes());
         Self {
             shard_id,
+            redacted_shard_id,
             recorder,
             core_error_logged: AtomicBool::new(false),
             git_error_logged: AtomicBool::new(false),
@@ -153,7 +160,7 @@ impl CoordinationEventSink {
     ) {
         if !error_flag.swap(true, Ordering::Relaxed) {
             tracing::warn!(
-                shard_id = %self.shard_id,
+                shard_id = %self.redacted_shard_id,
                 %error,
                 "{message}",
             );

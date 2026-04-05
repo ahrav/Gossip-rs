@@ -158,6 +158,7 @@ fn log_distributed_report(cfg: &DistributedWorkerConfig, report: DistributedRunR
             path = %source.path().display(),
             leases_seen = report.leases_seen,
             shards_scanned = report.shards_scanned,
+            total_claim_ms = report.total_claim_ms,
             "distributed scan completed",
         ),
         DistributedSourceSettings::Git(source) => tracing::info!(
@@ -252,6 +253,7 @@ mod tests {
     use tracing::Level;
     use tracing_subscriber::fmt::writer::MakeWriter;
 
+    /// In-memory buffer for capturing tracing output in tests.
     #[derive(Clone, Default)]
     struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
 
@@ -281,7 +283,9 @@ mod tests {
         }
     }
 
-    fn capture_logs(level: Level, f: impl FnOnce()) -> String {
+    /// Runs `body` under a temporary tracing subscriber that captures all
+    /// output at or above `level`, returning the captured log text.
+    fn capture_logs(level: Level, body: impl FnOnce()) -> String {
         let buffer = SharedLogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(level)
@@ -289,7 +293,7 @@ mod tests {
             .without_time()
             .with_writer(buffer.clone())
             .finish();
-        tracing::subscriber::with_default(subscriber, f);
+        tracing::subscriber::with_default(subscriber, body);
         let bytes = buffer.0.lock().expect("shared log buffer lock").clone();
         String::from_utf8(bytes).expect("captured logs should be valid UTF-8")
     }
