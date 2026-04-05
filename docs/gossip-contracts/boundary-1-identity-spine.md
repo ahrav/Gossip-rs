@@ -217,6 +217,12 @@ Because `SecretHash = BLAKE3_keyed(tenant_key, domain_tag || norm_hash)`:
 | `OccurrenceIdInputs` | 80 B             | struct literal                                     | --                                   | Clone Copy Debug Eq CanonicalBytes      | No                                                |
 | `PolicyHashInputs`   | 41 B             | struct literal                                     | --                                   | Clone Copy Debug Eq CanonicalBytes      | No                                                |
 
+Persistence code reaches `NormHash` through
+`gossip_contracts::persistence::PersistenceFinding`. Source-family finding
+types may store the digest differently, but they are normalized to this
+restricted newtype before `key_secret_hash()` derives the tenant-scoped
+`SecretHash`.
+
 ---
 
 ## 5. Domain Separation Registry

@@ -69,6 +69,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+use std::fmt;
+
 /// Provides a lock-free atomic bitset with test-and-set for concurrent dedup.
 pub mod atomic_bitset;
 /// Provides composite concurrent dedup tracker for git object traversal.
@@ -154,4 +156,199 @@ pub fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+/// Lookup table shared by hex encoding functions.
+const HEX_LUT: &[u8; 16] = b"0123456789abcdef";
+
+/// Encode a byte slice as lowercase hex into a caller-provided buffer.
+///
+/// Returns the number of bytes written (`bytes.len() * 2`). The caller must
+/// ensure `buf` has at least `bytes.len() * 2` bytes available starting at
+/// `offset`. Panics otherwise.
+#[inline]
+pub fn hex_encode_into(bytes: &[u8], buf: &mut [u8], offset: usize) -> usize {
+    let hex_len = bytes.len() * 2;
+    assert!(
+        buf.len() >= offset + hex_len,
+        "hex_encode_into: buffer too small ({} < {})",
+        buf.len(),
+        offset + hex_len,
+    );
+    let dest = &mut buf[offset..offset + hex_len];
+    for (i, &byte) in bytes.iter().enumerate() {
+        dest[i * 2] = HEX_LUT[(byte >> 4) as usize];
+        dest[i * 2 + 1] = HEX_LUT[(byte & 0x0f) as usize];
+    }
+    hex_len
+}
+
+/// Stack-allocated lowercase hex representation of up to 32 raw bytes.
+///
+/// Designed for Git object IDs (20-byte SHA-1 or 32-byte SHA-256), but
+/// accepts any byte slice up to 32 bytes. Stores the hex in a fixed
+/// `[u8; 64]` buffer with a length discriminant, avoiding heap allocation
+/// entirely. OID-width validation (20 or 32 bytes) is the caller's
+/// responsibility (see `OidBytes` in `scanner-git`).
+///
+/// Implements `Display`, `Debug`, `AsRef<str>`, and `Deref<Target = str>`
+/// so it can be used anywhere a `&str` is expected.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HexOid {
+    buf: [u8; Self::MAX_HEX_LEN],
+    len: u8,
+}
+
+impl HexOid {
+    /// Maximum hex output length: SHA-256 OID = 32 bytes = 64 hex chars.
+    pub const MAX_HEX_LEN: usize = 64;
+
+    /// Encode raw OID bytes into a stack-resident hex string.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `oid_bytes.len() > 32` (hex output would exceed 64 chars).
+    /// Does **not** validate Git OID widths (20 or 32); that is enforced
+    /// upstream by `OidBytes::from_slice`.
+    #[must_use]
+    pub fn from_oid_bytes(oid_bytes: &[u8]) -> Self {
+        let hex_len = oid_bytes.len() * 2;
+        assert!(
+            hex_len <= Self::MAX_HEX_LEN,
+            "OID too large for HexOid: {} bytes",
+            oid_bytes.len(),
+        );
+        let mut buf = [0u8; Self::MAX_HEX_LEN];
+        hex_encode_into(oid_bytes, &mut buf, 0);
+        Self {
+            buf,
+            len: hex_len as u8,
+        }
+    }
+
+    /// View the hex content as a `&str`.
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // SAFETY: hex_encode_into only writes ASCII hex digits (0-9, a-f),
+        // which are valid UTF-8.
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len as usize]) }
+    }
+}
+
+impl std::ops::Deref for HexOid {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for HexOid {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for HexOid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Debug for HexOid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HexOid(\"{}\")", self.as_str())
+    }
+}
+
+impl PartialEq<str> for HexOid {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for HexOid {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_oid_sha1_20_bytes() {
+        let oid = HexOid::from_oid_bytes(&[0u8; 20]);
+        assert_eq!(oid.as_str().len(), 40);
+        assert_eq!(oid.as_str(), "0000000000000000000000000000000000000000");
+    }
+
+    #[test]
+    fn hex_oid_sha256_32_bytes() {
+        let oid = HexOid::from_oid_bytes(&[0xffu8; 32]);
+        assert_eq!(oid.as_str().len(), 64);
+        assert_eq!(
+            oid.as_str(),
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+    }
+
+    #[test]
+    fn hex_oid_empty_input() {
+        let oid = HexOid::from_oid_bytes(&[]);
+        assert_eq!(oid.as_str(), "");
+        assert_eq!(oid.as_str().len(), 0);
+    }
+
+    #[test]
+    fn hex_oid_known_value() {
+        let oid = HexOid::from_oid_bytes(&[0xCA, 0xFE]);
+        assert_eq!(oid.as_str(), "cafe");
+    }
+
+    #[test]
+    fn hex_oid_display_and_debug() {
+        let oid = HexOid::from_oid_bytes(&[0xAB, 0xCD]);
+        assert_eq!(format!("{oid}"), "abcd");
+        assert_eq!(format!("{oid:?}"), "HexOid(\"abcd\")");
+    }
+
+    #[test]
+    fn hex_oid_partial_eq_str() {
+        let oid = HexOid::from_oid_bytes(&[0xCA, 0xFE]);
+        assert_eq!(oid, *"cafe");
+        assert_eq!(oid, "cafe");
+    }
+
+    #[test]
+    fn hex_oid_deref_to_str() {
+        let oid = HexOid::from_oid_bytes(&[0xDE, 0xAD]);
+        let s: &str = &oid;
+        assert_eq!(s, "dead");
+    }
+
+    #[test]
+    #[should_panic(expected = "OID too large")]
+    fn hex_oid_oversized_panics() {
+        let _ = HexOid::from_oid_bytes(&[0u8; 33]);
+    }
+
+    #[test]
+    fn hex_encode_into_correctness() {
+        let mut buf = [0u8; 8];
+        let written = hex_encode_into(&[0xAB, 0xCD, 0xEF, 0x01], &mut buf, 0);
+        assert_eq!(written, 8);
+        assert_eq!(&buf, b"abcdef01");
+    }
+
+    #[test]
+    #[should_panic(expected = "buffer too small")]
+    fn hex_encode_into_buffer_too_small_panics() {
+        let mut buf = [0u8; 3];
+        hex_encode_into(&[0xAB, 0xCD], &mut buf, 0);
+    }
 }

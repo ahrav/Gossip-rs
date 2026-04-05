@@ -1042,7 +1042,7 @@ mod tests {
                     end: 20,
                     rule_id: 17,
                     rule_name: canary.to_owned(),
-                    norm_hash: Some([0xAB; 32]),
+                    norm_hash: [0xAB; 32],
                     commit_id: Some(99),
                     change_kind: Some(canary.to_owned()),
                     confidence_score: 7,
@@ -1083,7 +1083,12 @@ mod tests {
                 format!("git-commit-shard-{canary}"),
                 StoredGitEvent::CommitMeta {
                     commit_id: 17,
-                    oid_hex: canary.to_owned(),
+                    // Use a distinctive 20-byte pattern (SHA-1 length) whose hex
+                    // representation contains the canary's first 8 hex chars.
+                    oid_hex: gossip_stdx::HexOid::from_oid_bytes(&[
+                        0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67,
+                        0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98,
+                    ]),
                     timestamp: 1234,
                     author_name_id: Some(1),
                     author_email_id: Some(2),
@@ -1354,7 +1359,7 @@ mod tests {
                 end: 10,
                 rule_id: 1,
                 rule_name: "rule".to_owned(),
-                norm_hash: Some([0xDE; 32]),
+                norm_hash: [0xDE; 32],
                 commit_id: None,
                 change_kind: None,
                 confidence_score: 5,
@@ -1516,7 +1521,7 @@ mod tests {
                         end: 10,
                         rule_id: 1,
                         rule_name: "rule".to_owned(),
-                        norm_hash: Some([0xBC; 32]),
+                        norm_hash: [0xBC; 32],
                         commit_id: None,
                         change_kind: None,
                         confidence_score: 5,
@@ -1530,7 +1535,7 @@ mod tests {
                     "none-git-shard",
                     StoredGitEvent::CommitMeta {
                         commit_id: 1,
-                        oid_hex: "abc123".to_owned(),
+                        oid_hex: gossip_stdx::HexOid::from_oid_bytes(&[0xAB, 0xC1, 0x23]),
                         timestamp: 100,
                         author_name_id: None,
                         author_email_id: None,

@@ -29,7 +29,7 @@
 //! | [`InMemoryStoreProducer`] | Collects batches in memory for tests and diagnostics |
 
 use crate::engine::NormHash;
-use std::sync::Mutex;
+use std::{fmt, sync::Mutex};
 
 /// Persistence-ready representation of one FS finding.
 ///
@@ -37,7 +37,7 @@ use std::sync::Mutex;
 /// All offsets are absolute byte positions within the scanned object (file or
 /// archive entry). The `norm_hash` is the BLAKE3 digest of the normalized
 /// secret value, used for cross-run deduplication by the persistence backend.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FsFindingRecord {
     /// Engine rule identifier that matched.
     pub rule_id: u32,
@@ -53,6 +53,20 @@ pub struct FsFindingRecord {
     pub norm_hash: NormHash,
     /// Additive confidence score from gate signals (Phase 1 range: 0–10).
     pub confidence_score: i8,
+}
+
+impl fmt::Debug for FsFindingRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FsFindingRecord")
+            .field("rule_id", &self.rule_id)
+            .field("root_hint_start", &self.root_hint_start)
+            .field("root_hint_end", &self.root_hint_end)
+            .field("span_start", &self.span_start)
+            .field("span_end", &self.span_end)
+            .field("norm_hash", &"[redacted]")
+            .field("confidence_score", &self.confidence_score)
+            .finish()
+    }
 }
 
 /// Compile-time guard: `FsFindingRecord` must fit in 80 bytes to stay cache-friendly.
@@ -425,6 +439,29 @@ mod tests {
         assert_eq!(loss.dropped_findings, 0);
         assert_eq!(loss.persistence_emit_failures, 0);
         assert!(!loss.incomplete());
+    }
+
+    #[test]
+    fn fs_finding_record_debug_redacts_norm_hash() {
+        let finding = FsFindingRecord {
+            rule_id: 7,
+            root_hint_start: 0,
+            root_hint_end: 12,
+            span_start: 3,
+            span_end: 9,
+            norm_hash: [0xEE; 32],
+            confidence_score: 5,
+        };
+
+        let debug = format!("{finding:?}");
+        assert!(
+            debug.contains("[redacted]"),
+            "Debug output must redact norm_hash, got: {debug}"
+        );
+        assert!(
+            debug.contains(r#"norm_hash: "[redacted]""#),
+            "Debug output must show redacted norm_hash field, got: {debug}"
+        );
     }
 
     // ---------------------------------------------------------------

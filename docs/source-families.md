@@ -122,8 +122,10 @@ persistence seams and maps complete inner finalizes onto the shared
 repo-frontier receipt/checkpoint path. `run_git_repo_worker` in
 `gossip-scanner-runtime/src/distributed.rs` composes the full singleton path:
 static discovery, mirror sync, mirror-backed execution through
-`GitRepoRuntime::execute_repo`, then direct shard advancement from the durable
-repo-frontier checkpoint cursor.
+`GitRepoRuntime::execute_repo`, capture of emitted finding payloads through
+`FindingsCaptureSink`, translation via the shared
+`PersistenceFinding`/`translate_git_item_result` path, and finally shard
+advancement from the durable repo-frontier checkpoint cursor.
 
 ---
 

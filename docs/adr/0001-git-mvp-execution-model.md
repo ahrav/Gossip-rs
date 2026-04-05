@@ -113,7 +113,7 @@ flowchart TD
     C --> D{"FinalizeOutcome"}
     D -->|Complete| E["data_ops + watermark_ops durable"]
     D -->|Partial| F["data_ops durable; watermark_ops suppressed"]
-    E --> G["Translate durable repo result"]
+    E --> G["Translate repo result + captured findings<br/>via translate_git_item_result"]
     F --> G
     G --> H["ResultCommitter -> ItemCommitReceipt"]
     H --> I["CompletedUnit::repo_frontier + ItemCommitReceipt -> UnitCommitReceipt"]
@@ -138,6 +138,12 @@ The outer runtime already has the receipt-only rule it needs:
 - `PrefixCheckpointAggregator` advances only from durable contiguous prefixes.
 - `RepoFrontier` remains a normal checkpoint-boundary kind in the shared
   aggregator rather than a Git-only side channel.
+
+The translation step now includes Git findings themselves, not only finalize
+outcome metadata. Repo-frontier workers capture emitted finding payloads during
+scan execution, normalize them behind `PersistenceFinding`, and commit them
+through the same findings-first, done-ledger-second `ResultCommitter` path used
+by ordered-content scans before they synthesize the outer checkpoint receipt.
 
 ### Crash window: `InnerDurable -> OuterCheckpointed`
 

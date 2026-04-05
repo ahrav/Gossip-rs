@@ -37,10 +37,10 @@ use std::{collections::HashSet, error::Error, num::NonZeroU64, sync::Arc};
 use crate::{
     connector::Location,
     identity::{
-        FenceEpoch, FindingId, FindingIdInputs, LogicalTime, ObjectVersionId, ObservationId,
-        ObservationIdInputs, OccurrenceId, OccurrenceIdInputs, PolicyHash, RuleFingerprint, RunId,
-        SecretHash, ShardId, StableItemId, TenantId, derive_finding_id, derive_observation_id,
-        derive_occurrence_id,
+        FenceEpoch, FindingId, FindingIdInputs, LogicalTime, NormHash, ObjectVersionId,
+        ObservationId, ObservationIdInputs, OccurrenceId, OccurrenceIdInputs, PolicyHash,
+        RuleFingerprint, RunId, SecretHash, ShardId, StableItemId, TenantId, derive_finding_id,
+        derive_observation_id, derive_occurrence_id,
     },
 };
 
@@ -49,6 +49,53 @@ use super::{
     commit::{CommitHandle, FindingsCommitReceipt},
     ovid::OvidHash,
 };
+
+/// Unified identity surface for findings destined for persistence.
+///
+/// Source-specific scan paths normalize their local finding representations
+/// behind this trait before deriving durable finding, occurrence, and
+/// observation records. Only the identity-relevant fields participate:
+///
+/// - `rule_id`
+/// - `norm_hash`
+/// - `span_start`
+/// - `span_end`
+///
+/// Root-hint offsets, object paths, commit metadata, and confidence scores stay
+/// on the discovery or telemetry path unless they become part of persistence
+/// identity in the future.
+///
+/// # Invariants
+///
+/// - `span_end() >= span_start()` — zero-length spans are permitted (the
+///   translation layer rejects them when inappropriate for identity
+///   derivation, but the trait itself allows them).
+/// - `norm_hash()` returns the canonical redacted [`NormHash`] newtype
+pub trait PersistenceFinding: Send + Sync {
+    /// Engine rule identifier that matched.
+    fn rule_id(&self) -> u32;
+
+    /// Canonical digest of the normalized secret content.
+    fn norm_hash(&self) -> NormHash;
+
+    /// Inclusive byte offset where the match starts.
+    fn span_start(&self) -> u64;
+
+    /// Exclusive byte offset where the match ends.
+    fn span_end(&self) -> u64;
+
+    /// Length of the matched byte span.
+    ///
+    /// Panics if `span_end() < span_start()` (invariant violation).
+    fn span_len(&self) -> u64 {
+        self.span_end()
+            .checked_sub(self.span_start())
+            .expect("span_end must be >= span_start")
+    }
+}
+
+// Compile-time object-safety assertion; primary dispatch is static (`&[impl PersistenceFinding]`).
+const _: fn(&dyn PersistenceFinding) = |_| {};
 
 /// Stable finding record (layer 1 of 3).
 ///

@@ -48,6 +48,7 @@
 //! - Path refs in results point into the mapping arena supplied by the caller.
 //! - When the debug allocation guard is enabled, scanning must not allocate.
 
+use std::fmt;
 use std::sync::Arc;
 
 use gix_commitgraph::Position;
@@ -137,7 +138,7 @@ impl Default for EngineAdapterConfig {
 /// `start`/`end` are derived from `FindingRec.root_hint_*`, which provide
 /// a *best-effort root match span* in blob coordinates. For transform-derived
 /// findings, these spans map back to the encoded bytes that produced the match.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct FindingKey {
     /// Inclusive start offset within the blob.
     pub start: u32,
@@ -148,6 +149,17 @@ pub struct FindingKey {
     /// Normalized secret hash — the sole representation of the matched
     /// secret, so raw secret bytes never appear in scan output structures.
     pub norm_hash: NormHash,
+}
+
+impl fmt::Debug for FindingKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FindingKey")
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("rule_id", &self.rule_id)
+            .field("norm_hash", &"[redacted]")
+            .finish()
+    }
 }
 
 /// A finding paired with its confidence score from gate evaluation.
@@ -557,9 +569,7 @@ impl<'a> EngineAdapter<'a> {
                 end: u64::from(f.key.end),
                 rule_id: f.key.rule_id,
                 rule_name: self.engine.rule_name(f.key.rule_id),
-                // Preserve the normalized-secret digest for downstream
-                // persistence identity derivation.
-                norm_hash: Some(f.key.norm_hash),
+                norm_hash: f.key.norm_hash,
                 commit_id: Some(commit_id),
                 change_kind: Some(change_kind),
                 confidence_score: f.confidence_score,
