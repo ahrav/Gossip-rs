@@ -139,11 +139,15 @@ When the caller owns durable Git state, `git_persistence::GitPersistenceAdapter`
 implements `scanner-git`'s ref-watermark, seen-blob, and finalize seams and
 plugs into `git_repo::run_runtime_git_scan_with_stores`. Distributed
 repo-frontier execution wraps the event sink with `FindingsCaptureSink`, lifts
-Git `FindingEvent` values into `GitFindingForPersistence`, translates them
-through the same `PersistenceFinding`-based path used by ordered-content items,
-and only then synthesizes the outer repo-frontier `UnitCommitReceipt` and
-`CheckpointAggregatorInput`. This keeps Git findings on the same
-findings-first, done-ledger-second durable ordering as filesystem scans.
+Git `FindingEvent` values into `GitFindingForPersistence` while building a
+sparse commit-ordinal-to-OID map from `GitEvent::CommitMeta` events.
+`translate_git_item_result` then derives per-object stable identity from
+`(connector_instance, object_path, commit_oid)` for each finding while
+keeping the done-ledger row repo-scoped via `repo_id`. Persistence uses
+an explicit `PageCommit` sequence so Git observations may carry per-object
+OVIDs while shard completion remains repo-scoped. This keeps Git findings
+on the same findings-first, done-ledger-second durable ordering as
+filesystem scans.
 
 The distributed module exports the concrete worker-loop types and helpers:
 `WorkerIdentity`, `ShardLease`, `DistributedPersistence`,
@@ -608,11 +612,14 @@ identity, version claim, write scope, tenant secret key, a rule-fingerprint
 resolver callback, and scan findings fully determine the resulting OVID,
 finding IDs, occurrence IDs, observation IDs, and done-ledger key.
 
-`translate_findings` is generic over `gossip_contracts::persistence::PersistenceFinding`.
-Filesystem `FsFindingRecord` values are adapted into that trait at the runtime
-boundary, while repo-frontier Git scans feed `GitFindingForPersistence`
-directly. This keeps source-specific metadata out of persistence derivation
-without forcing the scheduler crate to depend on `gossip-contracts`.
+`translate_findings` is generic over `gossip_contracts::persistence::PersistenceFinding`
+and handles filesystem items via `FsFindingRef`. Repo-frontier Git scans use a
+dedicated `translate_git_findings` that derives per-object stable identity (via
+`ItemIdentityKey`) and strong version identity (via commit OID + object path)
+for each finding before calling the shared `push_finding_layers` helper. Both
+paths share the same finding/occurrence/observation derivation logic, keeping
+source-specific metadata out of persistence identity without forcing the
+scheduler crate to depend on `gossip-contracts`.
 
 `translate_item_result` accepts a `&dyn Fn(u32) -> RuleFingerprint` callback
 that resolves positional `rule_id` values to stable, name-derived

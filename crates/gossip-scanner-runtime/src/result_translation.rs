@@ -349,9 +349,13 @@ impl PersistenceTranslation {
     }
 
     /// Done-ledger object-version identity for the translated item.
+    ///
+    /// For Git translations, observation OVIDs are per-object and differ from
+    /// this repo-scoped value. Use observation-level accessors for per-object
+    /// identity.
     #[inline]
     #[must_use]
-    pub const fn ovid_hash(&self) -> OvidHash {
+    pub const fn done_ledger_ovid_hash(&self) -> OvidHash {
         self.done_ledger_ovid_hash
     }
 
@@ -670,9 +674,19 @@ where
 
     let mut acc = TranslationAccumulator::with_capacity(findings_input.len());
     let connector_instance = ConnectorInstanceIdHash::from_instance_id_bytes(repo_key.as_bytes());
+    // Heuristic: distinct (object_path, commit) pairs are typically much fewer
+    // than total findings — many findings cluster on the same source file.
+    let estimated_groups = (findings_input.len() / 4).max(8);
+    // Cache derived (TranslationItem, OvidHash) per unique (object_path,
+    // commit_id) so findings referencing the same file in the same commit share
+    // the three BLAKE3 derivations (stable_id, object_version_id, ovid_hash)
+    // instead of repeating them.
+    let mut identity_cache: HashMap<(&[u8], u32), (TranslationItem, OvidHash)> =
+        HashMap::with_capacity(estimated_groups);
     // Cache sanitized location per unique object path so findings on the same
     // file share a single Arc<Location> instead of re-allocating per finding.
-    let mut location_cache: HashMap<&[u8], Option<Arc<Location>>> = HashMap::new();
+    let mut location_cache: HashMap<&[u8], Option<Arc<Location>>> =
+        HashMap::with_capacity(estimated_groups);
 
     for (index, finding) in findings_input.iter().enumerate() {
         let commit_id = finding
@@ -681,20 +695,28 @@ where
         let commit_oid = commit_oid_map
             .get(&commit_id)
             .ok_or(ResultTranslationError::MissingGitCommitOid { index, commit_id })?;
-        let identity = ItemIdentityKey::try_new(
-            GIT_CONNECTOR_TAG,
-            connector_instance,
-            finding.object_path.as_ref(),
-        )
-        .map_err(|source| ResultTranslationError::GitItemIdentity { index, source })?;
-        let item = TranslationItem {
-            stable_item_id: identity.stable_id(),
-            version: VersionId::Strong(git_object_version_id(
-                commit_oid,
+        let cache_key = (finding.object_path.as_ref(), commit_id);
+        let &(item, observation_ovid_hash) = if let Some(cached) = identity_cache.get(&cache_key) {
+            cached
+        } else {
+            let identity = ItemIdentityKey::try_new(
+                GIT_CONNECTOR_TAG,
+                connector_instance,
                 finding.object_path.as_ref(),
-            )),
+            )
+            .map_err(|source| ResultTranslationError::GitItemIdentity { index, source })?;
+            let item = TranslationItem {
+                stable_item_id: identity.stable_id(),
+                version: VersionId::Strong(git_object_version_id(
+                    commit_oid,
+                    finding.object_path.as_ref(),
+                )),
+            };
+            let ovid_hash = item.ovid_hash();
+            identity_cache.insert(cache_key, (item, ovid_hash));
+            // SAFETY of unwrap: we just inserted the entry on the line above.
+            identity_cache.get(&cache_key).unwrap()
         };
-        let observation_ovid_hash = item.ovid_hash();
         let location = location_cache
             .entry(finding.object_path.as_ref())
             .or_insert_with(|| git_observation_location(finding.object_path.as_ref()));
@@ -852,9 +874,17 @@ fn git_object_version_id(commit_oid: &OidBytes, object_path: &[u8]) -> ObjectVer
 }
 
 fn git_observation_location(object_path: &[u8]) -> Option<Arc<Location>> {
-    Location::try_new(sanitize_path(object_path), None)
-        .ok()
-        .map(Arc::new)
+    match Location::try_new(sanitize_path(object_path), None) {
+        Ok(loc) => Some(Arc::new(loc)),
+        Err(_) => {
+            tracing::debug!(
+                object_path_len = object_path.len(),
+                "git observation location rejected by Location::try_new; \
+                 observation will lack display path"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1075,7 +1105,7 @@ mod tests {
         assert_eq!(observations.len(), 2);
         for obs in observations {
             assert_eq!(obs.write_context(), write_context());
-            assert_eq!(obs.ovid_hash(), translated.ovid_hash());
+            assert_eq!(obs.ovid_hash(), translated.done_ledger_ovid_hash());
             assert_eq!(obs.seen_at(), timing().finished_at());
             assert_eq!(
                 obs.location().expect("location").display(),
@@ -1424,7 +1454,7 @@ mod tests {
         )
         .expect("weak translation");
 
-        assert_ne!(strong.ovid_hash(), weak.ovid_hash());
+        assert_ne!(strong.done_ledger_ovid_hash(), weak.done_ledger_ovid_hash());
         assert_ne!(strong.done_ledger().key(), weak.done_ledger().key());
     }
 
@@ -1879,8 +1909,56 @@ mod tests {
         );
         assert_eq!(
             translated.done_ledger().key().ovid_hash(),
-            translated.ovid_hash(),
+            translated.done_ledger_ovid_hash(),
             "translation accessor should expose the repo-level done-ledger OVID",
+        );
+    }
+
+    #[test]
+    fn translate_git_item_result_uses_distinct_ovids_for_same_path_different_commits() {
+        let commit_oid_a = OidBytes::sha1([0x11; 20]);
+        let commit_oid_b = OidBytes::sha1([0x22; 20]);
+        let commit_oid_map = HashMap::from([(7, commit_oid_a), (8, commit_oid_b)]);
+        let repo_key = git_repo_key();
+        let translated = translate_git_item_result(
+            write_context(),
+            &tenant_secret_key(),
+            &repo_key,
+            42,
+            4_096,
+            timing(),
+            &[
+                GitFindingForPersistence {
+                    object_path: boxed_path(b"src/lib.rs"),
+                    commit_id: Some(7),
+                    span_start: 10,
+                    span_end: 20,
+                    norm_hash: NormHash::from_digest([0xAA; 32]),
+                    rule_id: 7,
+                },
+                GitFindingForPersistence {
+                    object_path: boxed_path(b"src/lib.rs"),
+                    commit_id: Some(8),
+                    span_start: 10,
+                    span_end: 20,
+                    norm_hash: NormHash::from_digest([0xBB; 32]),
+                    rule_id: 7,
+                },
+            ],
+            &commit_oid_map,
+            &test_rule_fingerprint,
+        )
+        .expect("git translation should succeed");
+        assert_eq!(translated.observation_count(), 2);
+        assert_ne!(
+            translated.observations()[0].ovid_hash(),
+            translated.observations()[1].ovid_hash(),
+            "same object_path at different commits must produce distinct observation OVIDs",
+        );
+        assert_ne!(
+            translated.observations()[0].ovid_hash(),
+            translated.done_ledger().key().ovid_hash(),
+            "per-object observations must differ from the repo-scoped done-ledger OVID",
         );
     }
 
