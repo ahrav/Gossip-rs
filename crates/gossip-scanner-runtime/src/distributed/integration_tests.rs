@@ -22,12 +22,12 @@ use super::*;
 
 use super::commit_bridge::ReceiptCommitSink;
 use super::execution::{
-    run_filesystem_lease, scan_ordered_filesystem_lease_with_engine, secret_fixture,
-    GIT_REPO_RECEIPT_FAMILIES,
+    GIT_REPO_RECEIPT_FAMILIES, run_filesystem_lease, scan_ordered_filesystem_lease_with_engine,
+    secret_fixture,
 };
 use super::lease_ops::advance_shard;
 use super::types::{
-    wall_clock_now, HydratedFilesystemSource, PageLoopTermination, ShardCompletionOutcome,
+    HydratedFilesystemSource, PageLoopTermination, ShardCompletionOutcome, wall_clock_now,
 };
 
 // -- External crate imports -------------------------------------------------
@@ -46,11 +46,10 @@ use scanner_scheduler::events::NullEventOutput;
 use tempfile::tempdir;
 
 use crate::{
-    build_runtime_engine,
+    CancellationToken, ScanBudgets, ScanRuntimeError, build_runtime_engine,
     commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput},
     coordination_sink::{CoordinationEventRecorder, MirrorErrorClass, StageSignal},
     git_mirror::LocalMirrorManager,
-    CancellationToken, ScanBudgets, ScanRuntimeError,
 };
 
 // ============================================================================
@@ -521,10 +520,12 @@ fn run_filesystem_lease_clean_only_shard_produces_checkpoint_and_done_ledger_ent
         checkpoint.last_key().is_some(),
         "clean file should still produce a checkpoint cursor for resume"
     );
-    assert!(findings_sink
-        .observations_snapshot()
-        .expect("observations snapshot")
-        .is_empty());
+    assert!(
+        findings_sink
+            .observations_snapshot()
+            .expect("observations snapshot")
+            .is_empty()
+    );
     let rows = done_ledger.snapshot().expect("done-ledger snapshot");
     assert_eq!(
         rows.len(),
@@ -561,10 +562,12 @@ fn run_filesystem_lease_commit_failure_prevents_completion() {
             || error.to_string().contains("done-ledger durability failed"),
         "unexpected error: {error}"
     );
-    assert!(done_ledger
-        .snapshot()
-        .expect("done-ledger snapshot")
-        .is_empty());
+    assert!(
+        done_ledger
+            .snapshot()
+            .expect("done-ledger snapshot")
+            .is_empty()
+    );
     assert!(
         !findings_sink
             .observations_snapshot()
@@ -1342,9 +1345,11 @@ fn run_worker_processes_multiple_shards_from_queue() {
     assert_eq!(report.shards_scanned, 2);
     let summaries = shard_summaries(&coordinator);
     assert_eq!(summaries.len(), 2);
-    assert!(summaries
-        .iter()
-        .all(|summary| summary.status() == ShardStatus::Done));
+    assert!(
+        summaries
+            .iter()
+            .all(|summary| summary.status() == ShardStatus::Done)
+    );
 }
 
 #[test]
@@ -1649,9 +1654,11 @@ fn run_git_repo_worker_completes_singleton_repo_frontier_shard() {
     assert_eq!(report.leases_seen, 1);
     assert_eq!(report.shards_scanned, 1);
     assert_eq!(run_progress(&coordinator).done(), 1);
-    assert!(shard_summaries(&coordinator)
-        .iter()
-        .all(|summary| summary.status() == ShardStatus::Done));
+    assert!(
+        shard_summaries(&coordinator)
+            .iter()
+            .all(|summary| summary.status() == ShardStatus::Done)
+    );
     assert!(
         backend.batch_call_count() > 0,
         "git repo worker must durably persist repo state before advancing the shard"
@@ -3130,10 +3137,12 @@ fn run_filesystem_lease_zero_item_shard_returns_exhausted_empty_completion() {
 
     assert_eq!(report.items_scanned, 0);
     assert_eq!(completion, ShardCompletionOutcome::ExhaustedEmpty);
-    assert!(done_ledger
-        .snapshot()
-        .expect("done-ledger snapshot")
-        .is_empty());
+    assert!(
+        done_ledger
+            .snapshot()
+            .expect("done-ledger snapshot")
+            .is_empty()
+    );
 }
 
 #[test]
