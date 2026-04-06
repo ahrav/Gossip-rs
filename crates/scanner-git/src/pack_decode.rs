@@ -158,7 +158,10 @@ pub fn inflate_entry_payload_with(
     limits: &PackDecodeLimits,
 ) -> Result<usize, PackDecodeError> {
     if pack_inflate_libdeflate::use_libdeflate_for_header(header) {
+        // `de` is unused: libdeflate uses its own thread-local decompressor.
         let slice = pack.slice_from(header.data_start);
+        // Safe truncation: `use_libdeflate_for_header` gates on size <= 256 KB,
+        // which fits in any `usize`.
         let expected = header.size as usize;
         return match libde {
             Some(libde) => {
@@ -170,6 +173,8 @@ pub fn inflate_entry_payload_with(
 
     match header.kind {
         EntryKind::NonDelta { .. } => {
+            // Safe truncation: `entry_header_at` rejects sizes above
+            // `max_object_bytes` (a `usize`), so `header.size` fits.
             let expected = header.size as usize;
             let consumed =
                 inflate_exact_with(de, pack.slice_from(header.data_start), out, expected)?;
@@ -222,6 +227,8 @@ pub fn inflate_entry_payload(
     if pack_inflate_libdeflate::use_libdeflate_for_header(header) {
         return pack_inflate_libdeflate::inflate_nondelta_exact(
             pack.slice_from(header.data_start),
+            // Safe truncation: `use_libdeflate_for_header` gates on size <= 256 KB,
+            // which fits in any `usize`.
             header.size as usize,
             out,
         );
@@ -229,6 +236,8 @@ pub fn inflate_entry_payload(
 
     match header.kind {
         EntryKind::NonDelta { .. } => {
+            // Safe truncation: `entry_header_at` rejects sizes above
+            // `max_object_bytes` (a `usize`), so `header.size` fits.
             let expected = header.size as usize;
             let consumed = inflate_exact(pack.slice_from(header.data_start), out, expected)?;
             Ok(consumed)
@@ -351,7 +360,7 @@ mod tests {
             .expect_err("expected truncated exact-size decode");
 
         assert_eq!(err, PackDecodeError::Inflate(InflateError::TruncatedInput));
-        assert_eq!(out, payload);
+        assert!(out.is_empty());
     }
 
     #[test]

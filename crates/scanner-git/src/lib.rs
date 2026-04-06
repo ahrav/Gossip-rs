@@ -398,6 +398,8 @@ pub use scanner_engine::{
 pub use work_items::WorkItems;
 
 // ── Benchmark support ───────────────────────────────────────────────────
+#[doc(hidden)]
+pub use pack_inflate_libdeflate::LIBDEFLATE_THRESHOLD_BYTES;
 #[cfg(feature = "bench")]
 pub use runner_exec::{
     bench_apply_locality_shard_cap, bench_select_strategy, bench_synthetic_locality_plan,

@@ -8,8 +8,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use scanner_git::pack_decode::{self, PackDecodeLimits};
 use scanner_git::pack_inflate;
 use scanner_git::pack_inflate::PackFile;
-
-const LIBDEFLATE_THRESHOLD_BYTES: usize = 256 * 1024;
+use scanner_git::LIBDEFLATE_THRESHOLD_BYTES;
 
 fn patterned_bytes(size: usize) -> Vec<u8> {
     (0..size).map(|i| (i % 251) as u8).collect()
@@ -24,6 +23,9 @@ fn zlib_compress(data: &[u8]) -> Vec<u8> {
     encoder.write_all(data).unwrap();
     encoder.finish().unwrap()
 }
+
+// Pack construction helpers below mirror `delta_test_helpers.rs` but live here
+// because `#[cfg(test)]` items are unavailable to external benchmark binaries.
 
 fn encode_entry_header(obj_type: u8, size: usize) -> Vec<u8> {
     let mut out = Vec::new();
@@ -286,7 +288,7 @@ fn bench_apply_delta(c: &mut Criterion) {
         b.iter(|| {
             pack_inflate::apply_delta(black_box(&base), black_box(&delta), &mut out, result_len)
                 .unwrap();
-            black_box(out.len());
+            black_box(out.as_slice());
         });
     });
 
@@ -337,7 +339,7 @@ fn bench_inflate_entry_payload(c: &mut Criterion) {
                 )
                 .unwrap();
                 black_box(consumed);
-                black_box(out.len());
+                black_box(out.as_slice());
             });
         });
     }
@@ -377,7 +379,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
                 )
                 .unwrap();
                 black_box(consumed);
-                black_box(out.len());
+                black_box(out.as_slice());
             });
         });
 
@@ -393,7 +395,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
                 )
                 .unwrap();
                 black_box(consumed);
-                black_box(out.len());
+                black_box(out.as_slice());
             });
         });
     }
@@ -419,7 +421,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
                 )
                 .unwrap();
                 black_box(consumed);
-                black_box(out.len());
+                black_box(out.as_slice());
             });
         });
 
@@ -435,7 +437,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
                 )
                 .unwrap();
                 black_box(consumed);
-                black_box(out.len());
+                black_box(out.as_slice());
             });
         });
     }
@@ -461,7 +463,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
                 )
                 .unwrap();
                 black_box(consumed);
-                black_box(out.len());
+                black_box(out.as_slice());
             });
         });
 
@@ -477,7 +479,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
                 )
                 .unwrap();
                 black_box(consumed);
-                black_box(out.len());
+                black_box(out.as_slice());
             });
         });
     }
@@ -506,7 +508,7 @@ fn bench_tls_overhead(c: &mut Criterion) {
         let mut out = Vec::new();
         b.iter(|| {
             pack_inflate::inflate_limited(black_box(&compressed), &mut out, 64).unwrap();
-            black_box(out.len());
+            black_box(out.as_slice());
         });
     });
 
@@ -517,7 +519,7 @@ fn bench_tls_overhead(c: &mut Criterion) {
         b.iter(|| {
             pack_inflate::inflate_limited_with(&mut de, black_box(&compressed), &mut out, 64)
                 .unwrap();
-            black_box(out.len());
+            black_box(out.as_slice());
         });
     });
 

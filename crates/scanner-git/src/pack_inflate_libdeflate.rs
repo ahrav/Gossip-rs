@@ -22,15 +22,15 @@ use std::ptr::NonNull;
 use libdeflate_sys::{
     libdeflate_alloc_decompressor, libdeflate_decompressor, libdeflate_free_decompressor,
     libdeflate_result, libdeflate_result_LIBDEFLATE_BAD_DATA,
-    libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE, libdeflate_result_LIBDEFLATE_SHORT_OUTPUT,
-    libdeflate_result_LIBDEFLATE_SUCCESS, libdeflate_zlib_decompress_ex,
+    libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE, libdeflate_result_LIBDEFLATE_SUCCESS,
+    libdeflate_zlib_decompress_ex,
 };
 
 use super::pack_decode::PackDecodeError;
 use super::pack_inflate::{EntryHeader, EntryKind, InflateError};
 
 /// Size threshold for routing exact-size non-delta inflates through libdeflate.
-pub(crate) const LIBDEFLATE_THRESHOLD_BYTES: usize = 256 * 1024;
+pub const LIBDEFLATE_THRESHOLD_BYTES: usize = 256 * 1024;
 
 thread_local! {
     static LIBDEFLATE_SCRATCH: RefCell<LibdeflateDecompressor> =
@@ -41,11 +41,17 @@ thread_local! {
 enum LibdeflateError {
     BadData,
     InsufficientSpace,
-    ShortOutput,
 }
 
 pub struct LibdeflateDecompressor {
     raw: NonNull<libdeflate_decompressor>,
+}
+
+impl std::fmt::Debug for LibdeflateDecompressor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LibdeflateDecompressor")
+            .finish_non_exhaustive()
+    }
 }
 
 impl LibdeflateDecompressor {
@@ -75,6 +81,11 @@ impl LibdeflateDecompressor {
         // Both `actual_in` and `actual_out` are valid out-pointers for the
         // duration of the call, which preserves the existing decode contract by
         // reporting the exact number of compressed bytes consumed.
+        //
+        // The `_ex` variant never returns `SHORT_OUTPUT` when
+        // `actual_out_nbytes_ret` is non-NULL (which we always pass). The
+        // short-output case is instead reported as SUCCESS with
+        // `actual_out < out.len()`, handled by the caller.
         let result: libdeflate_result = unsafe {
             libdeflate_zlib_decompress_ex(
                 self.raw.as_ptr(),
@@ -93,8 +104,6 @@ impl LibdeflateDecompressor {
             Err(LibdeflateError::BadData)
         } else if result == libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE {
             Err(LibdeflateError::InsufficientSpace)
-        } else if result == libdeflate_result_LIBDEFLATE_SHORT_OUTPUT {
-            Err(LibdeflateError::ShortOutput)
         } else {
             panic!("libdeflate_zlib_decompress_ex returned an unknown error type");
         }
@@ -174,33 +183,36 @@ fn inflate_nondelta_exact_core(
     out.reserve(expected);
     crate::pack_inflate::poison_spare_capacity(out);
 
-    let spare = &mut out.spare_capacity_mut()[..expected];
-    // SAFETY: `reserve(expected)` guarantees `capacity() >= expected` and
-    // `clear()` set `len()` to 0, so the slice is in-bounds. The cast from
-    // `MaybeUninit<u8>` to `u8` is sound because libdeflate treats the
-    // output buffer as write-only.
-    let buf = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), expected) };
+    // SAFETY: `clear()` set len to 0, `reserve(expected)` guarantees
+    // `capacity() >= expected`. libdeflate writes at most `expected` bytes
+    // into this buffer on success, and we verify `actual_out == expected`
+    // before returning. On error we reset len to 0. The bytes between len
+    // and capacity are written by libdeflate before being read.
+    //
+    // When `expected == 0`, `Vec::as_mut_ptr()` is guaranteed non-null and
+    // valid for zero-length writes per Rust's Vec contract, so passing it
+    // to libdeflate with `out_nbytes_avail == 0` is safe.
+    unsafe { out.set_len(expected) };
 
-    match libde.zlib_decompress_exact(pack_slice, buf) {
+    match libde.zlib_decompress_exact(pack_slice, out) {
         Ok((actual_in, actual_out)) => {
             if actual_out == expected {
-                // SAFETY: libdeflate initialized exactly `expected` bytes
-                // into the spare capacity.
-                unsafe { out.set_len(expected) };
                 Ok(actual_in)
             } else {
-                // Partial decompression — expose what was written.
-                // SAFETY: libdeflate initialized exactly `actual_out` bytes.
-                unsafe { out.set_len(actual_out) };
+                out.clear();
                 Err(PackDecodeError::Inflate(InflateError::TruncatedInput))
             }
         }
-        Err(LibdeflateError::BadData) => Err(PackDecodeError::Inflate(InflateError::Backend)),
-        Err(LibdeflateError::InsufficientSpace) => {
-            Err(PackDecodeError::Inflate(InflateError::LimitExceeded))
+        Err(LibdeflateError::BadData) => {
+            out.clear();
+            Err(PackDecodeError::Inflate(InflateError::Backend))
         }
-        Err(LibdeflateError::ShortOutput) => {
-            Err(PackDecodeError::Inflate(InflateError::TruncatedInput))
+        Err(LibdeflateError::InsufficientSpace) => {
+            // The output buffer is sized exactly to the header-declared size.
+            // InsufficientSpace means the actual data exceeds the declared
+            // size, indicating corrupt pack data.
+            out.clear();
+            Err(PackDecodeError::Inflate(InflateError::Backend))
         }
     }
 }
