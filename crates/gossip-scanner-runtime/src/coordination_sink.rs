@@ -204,7 +204,7 @@ pub(crate) struct GitFindingForPersistence {
     pub(crate) rule_id: u32,
 }
 
-// Layout budget (64-bit): Box<[u8]>=16, OidBytes=34 (+alignment padding),
+// Layout budget (64-bit): Box<[u8]>=16, OidBytes=33 (+alignment padding),
 // 2*u64=16, NormHash=32, u32+pad=8. Exact size depends on field ordering
 // chosen by the compiler; the ceiling accommodates alignment padding.
 const _: () = assert!(std::mem::size_of::<GitFindingForPersistence>() <= 128);
@@ -403,7 +403,8 @@ impl FindingsCaptureSink {
         }
     }
 
-    /// Return the number of `Finding` events observed during the scan.
+    /// Return the total number of `Finding` events observed during the scan,
+    /// including any with invalid or missing `blob_oid` that were not captured.
     ///
     /// Intended to be called after the scan thread has joined, so the count
     /// reflects the full scan. The `Relaxed` load is safe because the thread
@@ -431,9 +432,13 @@ impl FindingsCaptureSink {
 impl EventOutput for FindingsCaptureSink {
     fn emit_core(&self, event: CoreEvent<'_>) {
         if let CoreEvent::Finding(finding) = &event {
+            // Count every finding unconditionally so the post-scan integrity
+            // check (`detected_count != captured_findings.len()`) fires when a
+            // finding is dropped due to a missing or malformed blob_oid.
+            self.finding_count.fetch_add(1, Ordering::Relaxed);
+
             match finding.blob_oid.and_then(OidBytes::decode_from_wire) {
                 Some(blob_oid) => {
-                    self.finding_count.fetch_add(1, Ordering::Relaxed);
                     let record = GitFindingForPersistence {
                         object_path: finding.object_path.into(),
                         blob_oid,
@@ -745,8 +750,8 @@ mod tests {
 
         assert_eq!(
             sink.detected_finding_count(),
-            0,
-            "invalid blob OID must not increment finding counter"
+            1,
+            "counter must track all findings so the integrity check detects dropped entries"
         );
         assert!(
             sink.take_captured_findings().is_empty(),
@@ -780,8 +785,8 @@ mod tests {
 
         assert_eq!(
             sink.detected_finding_count(),
-            0,
-            "finding with None blob_oid must not increment the counter"
+            1,
+            "counter must track all findings so the integrity check detects dropped entries"
         );
         assert!(
             sink.take_captured_findings().is_empty(),

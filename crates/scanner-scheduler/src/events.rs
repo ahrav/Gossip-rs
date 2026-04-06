@@ -420,6 +420,12 @@ mod tests {
 
     #[test]
     fn finding_event_debug_redacts_norm_hash() {
+        // Valid SHA-1 wire encoding: byte 0 = length (20), bytes 1..=20 = OID
+        // content, bytes 21..=32 = zero-padding.
+        let mut wire_oid = [0u8; 33];
+        wire_oid[0] = 20;
+        wire_oid[1..=20].fill(0xAA);
+
         let finding = FindingEvent {
             source: SourceKind::Git,
             object_path: b"dir/file.txt",
@@ -428,7 +434,7 @@ mod tests {
             rule_id: 7,
             rule_name: "rule",
             norm_hash: [0xDE; 32],
-            blob_oid: Some([20; 33]),
+            blob_oid: Some(wire_oid),
             commit_id: Some(3),
             change_kind: Some("modify"),
             confidence_score: 85,
