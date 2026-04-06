@@ -22,12 +22,12 @@ use super::*;
 
 use super::commit_bridge::ReceiptCommitSink;
 use super::execution::{
-    GIT_REPO_RECEIPT_FAMILIES, run_filesystem_lease, scan_ordered_filesystem_lease_with_engine,
-    secret_fixture,
+    run_filesystem_lease, scan_ordered_filesystem_lease_with_engine, secret_fixture,
+    GIT_REPO_RECEIPT_FAMILIES,
 };
 use super::lease_ops::advance_shard;
 use super::types::{
-    HydratedFilesystemSource, PageLoopTermination, ShardCompletionOutcome, wall_clock_now,
+    wall_clock_now, HydratedFilesystemSource, PageLoopTermination, ShardCompletionOutcome,
 };
 
 // -- External crate imports -------------------------------------------------
@@ -46,13 +46,14 @@ use scanner_scheduler::events::NullEventOutput;
 use tempfile::tempdir;
 
 use crate::{
-    CancellationToken, ScanBudgets, ScanRuntimeError, build_runtime_engine,
+    build_runtime_engine,
     commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput},
     coordination_sink::{
         CoordinationEventRecorder, FindingsCaptureSink, MirrorErrorClass, StageSignal,
     },
     git_mirror::LocalMirrorManager,
     test_fixtures::{init_git_repo, run_git_in},
+    CancellationToken, ScanBudgets, ScanRuntimeError,
 };
 
 // ============================================================================
@@ -523,12 +524,10 @@ fn run_filesystem_lease_clean_only_shard_produces_checkpoint_and_done_ledger_ent
         checkpoint.last_key().is_some(),
         "clean file should still produce a checkpoint cursor for resume"
     );
-    assert!(
-        findings_sink
-            .observations_snapshot()
-            .expect("observations snapshot")
-            .is_empty()
-    );
+    assert!(findings_sink
+        .observations_snapshot()
+        .expect("observations snapshot")
+        .is_empty());
     let rows = done_ledger.snapshot().expect("done-ledger snapshot");
     assert_eq!(
         rows.len(),
@@ -565,12 +564,10 @@ fn run_filesystem_lease_commit_failure_prevents_completion() {
             || error.to_string().contains("done-ledger durability failed"),
         "unexpected error: {error}"
     );
-    assert!(
-        done_ledger
-            .snapshot()
-            .expect("done-ledger snapshot")
-            .is_empty()
-    );
+    assert!(done_ledger
+        .snapshot()
+        .expect("done-ledger snapshot")
+        .is_empty());
     assert!(
         !findings_sink
             .observations_snapshot()
@@ -1348,11 +1345,9 @@ fn run_worker_processes_multiple_shards_from_queue() {
     assert_eq!(report.shards_scanned, 2);
     let summaries = shard_summaries(&coordinator);
     assert_eq!(summaries.len(), 2);
-    assert!(
-        summaries
-            .iter()
-            .all(|summary| summary.status() == ShardStatus::Done)
-    );
+    assert!(summaries
+        .iter()
+        .all(|summary| summary.status() == ShardStatus::Done));
 }
 
 #[test]
@@ -1681,11 +1676,9 @@ fn run_git_repo_worker_completes_singleton_repo_frontier_shard() {
     assert_eq!(report.leases_seen, 1);
     assert_eq!(report.shards_scanned, 1);
     assert_eq!(run_progress(&coordinator).done(), 1);
-    assert!(
-        shard_summaries(&coordinator)
-            .iter()
-            .all(|summary| summary.status() == ShardStatus::Done)
-    );
+    assert!(shard_summaries(&coordinator)
+        .iter()
+        .all(|summary| summary.status() == ShardStatus::Done));
     assert!(
         backend.batch_call_count() > 0,
         "git repo worker must durably persist repo state before advancing the shard"
@@ -2556,9 +2549,9 @@ fn run_git_repo_worker_fails_fast_when_commit_oid_map_saturates() {
     assert!(
         matches!(
             err,
-            DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(_))
+            DistributedRuntimeError::Runtime(ScanRuntimeError::CommitOidMapSaturated { .. })
         ),
-        "expected Runtime(Driver), got: {err:?}"
+        "expected Runtime(CommitOidMapSaturated), got: {err:?}"
     );
     let msg = err.to_string();
     assert!(
@@ -2642,7 +2635,9 @@ fn run_git_repo_worker_does_not_reclaim_commit_oid_saturated_shard() {
         DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
         DistributedRuntimeConfig::default(),
     )
-    .expect("parked shard must not be claimable again");
+    .unwrap_or_else(|e| {
+        panic!("second worker run should return Ok (shard is parked, no claim possible), got: {e}")
+    });
 
     assert_eq!(report.leases_seen, 0);
     assert_eq!(report.shards_scanned, 0);
@@ -2657,10 +2652,8 @@ fn run_git_repo_worker_does_not_reclaim_commit_oid_saturated_shard() {
 }
 
 /// Thin coordinator wrapper that delegates all operations to the inner
-/// `InMemoryCoordinator` except `park_shard`, which unconditionally
-/// returns `ParkError::BackendError`. This lets the test exercise the
-/// degradation path where OID-map saturation is detected but the
-/// subsequent best-effort park fails.
+/// `InMemoryCoordinator` except `park_shard`, which always returns
+/// `ParkError::BackendError`.
 struct ParkFailingCoordinator {
     inner: gossip_coordination::InMemoryCoordinator,
 }
@@ -3152,12 +3145,10 @@ fn run_filesystem_lease_zero_item_shard_returns_exhausted_empty_completion() {
 
     assert_eq!(report.items_scanned, 0);
     assert_eq!(completion, ShardCompletionOutcome::ExhaustedEmpty);
-    assert!(
-        done_ledger
-            .snapshot()
-            .expect("done-ledger snapshot")
-            .is_empty()
-    );
+    assert!(done_ledger
+        .snapshot()
+        .expect("done-ledger snapshot")
+        .is_empty());
 }
 
 #[test]

@@ -892,20 +892,18 @@ where
     let (execution, mut stage_metrics) = match execution {
         Ok(result) => result,
         Err(err) => {
-            // Saturation-specific context helps operators distinguish OID-map
-            // exhaustion from generic scan errors. Lease-uncertain errors keep
-            // their original classification because they have different
-            // operational semantics (alerting, coordinator response).
+            // OID-map saturation is a permanent condition intrinsic to the
+            // repository's commit count and always takes priority over the
+            // original scan error — including LeaseUncertain — so the outer
+            // worker can park the shard and prevent a re-claim loop.
             //
             // Defense-in-depth: fires only when execute_repo returns Err
-            // for a non-abort reason (e.g., I/O error) concurrent with
-            // OID-map saturation. The primary saturation path exits through
-            // the is_oid_map_saturated() check after the match because
-            // execute_repo converts abort-signalled errors to
+            // for a non-abort reason (e.g., I/O error, lease expiry)
+            // concurrent with OID-map saturation. The primary saturation
+            // path exits through the is_oid_map_saturated() check after the
+            // match because execute_repo converts abort-signalled errors to
             // Ok(FinalizeOutcome::Partial).
-            if capture_sink.is_oid_map_saturated()
-                && !matches!(err, DistributedRuntimeError::LeaseUncertain(_))
-            {
+            if capture_sink.is_oid_map_saturated() {
                 tracing::warn!(
                     original_error = %err,
                     "OID-map saturation supersedes scan error; \
@@ -1080,54 +1078,26 @@ where
     Ok((execution.report, completion, stage_metrics))
 }
 
-/// Typed error marker for commit-OID-map saturation.
-///
-/// Wrapping saturation in a concrete type enables
-/// [`should_park_git_repo_failure`] to classify the failure via
-/// `downcast_ref` rather than parsing the display string.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "git repo-frontier shard '{shard_id}': commit OID map saturated at {} entries; {detail}",
-    FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES
-)]
-struct CommitOidMapSaturationError {
-    shard_id: String,
-    detail: String,
-}
-
-impl CommitOidMapSaturationError {
-    fn new(redacted_shard_id: &ToxicDigest, detail: impl Into<String>) -> Self {
-        Self {
-            shard_id: redacted_shard_id.to_string(),
-            detail: detail.into(),
-        }
-    }
-}
-
 /// Construct a non-retryable runtime error for OID-map saturation.
 ///
 /// Centralizes the error shape so the error-path and success-path saturation
-/// checks produce the same `Driver` variant with consistent formatting. The
-/// stable inner error type lets the caller classify saturation via downcast
-/// rather than parsing the display string.
-///
-/// The returned error must remain the root cause of the `Driver` variant
-/// (no `.context()` wrapping) so [`should_park_git_repo_failure`] can
-/// recover it via `downcast_ref`.
+/// checks produce the same `CommitOidMapSaturated` variant with consistent
+/// formatting.
 pub(super) fn oid_map_saturation_error(
     redacted_shard_id: &ToxicDigest,
     detail: &str,
 ) -> DistributedRuntimeError {
-    DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(AnyError::new(
-        CommitOidMapSaturationError::new(redacted_shard_id, detail),
-    )))
+    DistributedRuntimeError::Runtime(ScanRuntimeError::CommitOidMapSaturated {
+        shard_id: redacted_shard_id.to_string(),
+        entry_limit: FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES,
+        detail: detail.to_string(),
+    })
 }
 
 pub(super) fn should_park_git_repo_failure(error: &DistributedRuntimeError) -> bool {
     matches!(
         error,
-        DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(source))
-            if source.downcast_ref::<CommitOidMapSaturationError>().is_some()
+        DistributedRuntimeError::Runtime(ScanRuntimeError::CommitOidMapSaturated { .. })
     )
 }
 
