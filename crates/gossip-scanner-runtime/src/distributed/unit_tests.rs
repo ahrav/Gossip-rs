@@ -31,12 +31,15 @@ use super::commit_bridge::{
     drain_commit_stage, emit_ordered_summary, resolve_filesystem_lease_results,
     wait_for_submitted_commits,
 };
-use super::execution::{GitRepoPersistenceInput, submit_git_repo_persistence};
+use super::execution::{
+    GitRepoPersistenceInput, oid_map_saturation_error, should_park_git_repo_failure,
+    submit_git_repo_persistence,
+};
 use super::lease_ops::{
     ArmedLeaseDeadline, CLAIM_RACE_RETRY_DELAY, EMPTY_RANGE_SENTINEL_KEY, LeaseUncertaintySignal,
     advance_shard, build_lease_from_acquire, claim_retry_delay, deterministic_op_id,
-    ensure_post_drain_lease_trust, mirror_error_class, select_shard_completion,
-    watch_lease_deadline,
+    ensure_post_drain_lease_trust, mirror_error_class, park_shard_on_error,
+    select_shard_completion, watch_lease_deadline,
 };
 use super::types::{
     OrderedSourceAssignmentOutcome, PageLoopTermination, ShardCompletionOutcome, wall_clock_now,
@@ -57,8 +60,8 @@ use gossip_contracts::{
 };
 use gossip_coordination::{
     AcquireScratch, CursorSemantics, CursorUpdate as CoordCursorUpdate,
-    InMemoryCoordinator as CoordinationInMemoryCoordinator, InitialShardInput, OpKind,
-    RunManagement, ShardClaiming, ShardStatus,
+    InMemoryCoordinator as CoordinationInMemoryCoordinator, InitialShardInput, OpKind, ParkError,
+    ParkReason, RunManagement, ShardClaiming, ShardStatus,
 };
 use gossip_frontier::{ShardSpecScratch, range_shard_ref};
 use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
@@ -2777,4 +2780,120 @@ fn drain_commit_stage_returns_error_on_durable_commit_failure() {
             "error should mention durable commit failure, got: {msg}"
         );
     });
+}
+
+// ============================================================================
+// park_shard_on_error tests
+// ============================================================================
+
+#[test]
+fn park_shard_on_error_rejects_tenant_mismatch() {
+    let dir = tempdir().expect("tempdir");
+    let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+    let identity = worker_identity(Path::new("/fallback"));
+    let lease = claim_lease(&mut coordinator, &identity);
+
+    // Use a different tenant than the one embedded in the lease.
+    let wrong_tenant = TenantId::from_bytes([0xFF; 32]);
+    assert_ne!(wrong_tenant, identity.tenant);
+
+    let err = park_shard_on_error(&mut coordinator, wrong_tenant, &lease, ParkReason::Poisoned)
+        .expect_err("park_shard_on_error with mismatched tenant must fail");
+
+    assert!(
+        matches!(err, ParkError::TenantMismatch { .. }),
+        "expected TenantMismatch variant, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tenant mismatch"),
+        "error message should mention tenant mismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn park_shard_on_error_idempotent_replay() {
+    let dir = tempdir().expect("tempdir");
+    let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+    let identity = worker_identity(Path::new("/fallback"));
+    let lease = claim_lease(&mut coordinator, &identity);
+
+    // First park succeeds.
+    park_shard_on_error(
+        &mut coordinator,
+        identity.tenant,
+        &lease,
+        ParkReason::Poisoned,
+    )
+    .expect("first park_shard_on_error must succeed");
+
+    // Second park with the same lease is an idempotent replay — must also succeed.
+    park_shard_on_error(
+        &mut coordinator,
+        identity.tenant,
+        &lease,
+        ParkReason::Poisoned,
+    )
+    .expect("idempotent replay of park_shard_on_error must succeed");
+
+    // The shard should be in Parked status.
+    let summaries = shard_summaries(&coordinator);
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].status(), ShardStatus::Parked);
+}
+
+// ============================================================================
+// should_park_git_repo_failure tests
+// ============================================================================
+
+#[test]
+fn should_park_git_repo_failure_detects_saturation() {
+    let error = oid_map_saturation_error(&ToxicDigest::of_bytes(b"test-shard"), "test detail");
+    assert!(
+        should_park_git_repo_failure(&error),
+        "OID-map saturation error must be classified as park-worthy"
+    );
+}
+
+#[test]
+fn should_park_git_repo_failure_rejects_non_saturation_errors() {
+    // Driver with a non-saturation inner error.
+    let driver =
+        DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(AnyError::msg("generic")));
+    assert!(
+        !should_park_git_repo_failure(&driver),
+        "generic Driver error must not trigger parking"
+    );
+
+    // A Driver error whose message matches the saturation display string must
+    // still be rejected — classification is variant-based, not string-based.
+    let lookalike = DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(AnyError::msg(
+        "commit OID map saturated",
+    )));
+    assert!(
+        !should_park_git_repo_failure(&lookalike),
+        "message-equivalent Driver error must not trigger parking"
+    );
+
+    let coordinator = DistributedRuntimeError::Coordinator(AnyError::msg("coord"));
+    assert!(
+        !should_park_git_repo_failure(&coordinator),
+        "Coordinator error must not trigger parking"
+    );
+
+    let durability = DistributedRuntimeError::Durability(AnyError::msg("durability"));
+    assert!(
+        !should_park_git_repo_failure(&durability),
+        "Durability error must not trigger parking"
+    );
+
+    let lease_uncertain =
+        DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::DeadlineElapsed {
+            deadline: LogicalTime::from_raw(10),
+            observed: LogicalTime::from_raw(11),
+        });
+    assert!(
+        !should_park_git_repo_failure(&lease_uncertain),
+        "LeaseUncertain error must not trigger parking"
+    );
 }

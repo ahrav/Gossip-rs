@@ -164,7 +164,7 @@ transform-derived findings include it only when root-span mapping is unavailable
 (to avoid collapsing distinct matches that share a coarse root hint window).
 Additional canonicalization applied at this stage:
 
-- Root-hint end normalization tolerant to base64 padding variance (`min..min+3`).
+- Root-hint end normalization tolerant to base64 padding variance (`min..min+3`), with the snapped value written back to the emitted `FindingRec`.
 - UTF-16 LE/BE variant discriminator packed into `rule_id_with_variant`.
 
 The scheduler applies a separate **cross-rule** dedup pass

@@ -661,7 +661,7 @@ pub struct ScanScratch {
     pub(super) base64_stats: Base64DecodeStats,
 }
 
-/// Normalize `root_hint_end` for dedup key construction.
+/// Normalize `root_hint_end` for dedup key construction and emitted findings.
 ///
 /// Only Base64 transforms have 4/3 padding rules that cause the encoded-region
 /// length to vary by up to 3 bytes for identical decoded content. Other
@@ -669,7 +669,8 @@ pub struct ScanScratch {
 /// normalized.
 ///
 /// For Base64 non-root findings, snaps `root_hint_end` to the padding-free
-/// minimum if the actual encoded length exceeds it by 1–3 bytes.
+/// minimum if the actual encoded length exceeds it by 1–3 bytes so dedup and
+/// downstream occurrence identity stay stable across chunk alignments.
 #[inline(always)]
 fn normalize_root_hint_end_for_dedup(rec: &FindingRec, leaf_transform: Option<TransformId>) -> u64 {
     if rec.step_id == STEP_ROOT {
@@ -678,6 +679,12 @@ fn normalize_root_hint_end_for_dedup(rec: &FindingRec, leaf_transform: Option<Tr
     if leaf_transform != Some(TransformId::Base64) {
         return rec.root_hint_end;
     }
+    debug_assert!(
+        rec.span_end > rec.span_start,
+        "zero-length decoded match in Base64 normalize: span_start={} span_end={}",
+        rec.span_start,
+        rec.span_end,
+    );
     let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
     // Base64 encodes 3 bytes → 4 chars; inverse: min_encoded = ⌈decoded × 4/3⌉.
     let min_encoded = (decoded_len * 4).div_ceil(3);
@@ -1729,7 +1736,9 @@ impl ScanScratch {
     ///    content that aids triage).
     /// 2. RAW findings never replace an existing transform finding.
     /// 3. Among same-type duplicates, the finding with the larger
-    ///    `root_hint_end` wins (wider context window).
+    ///    `root_hint_end` wins (wider context window). For Base64 findings,
+    ///    pre-normalization typically equalizes `root_hint_end`, so the
+    ///    confidence tiebreak at step 4 is the effective discriminator.
     #[cold]
     fn replace_same_scan_duplicate(
         &mut self,
@@ -1745,31 +1754,44 @@ impl ScanScratch {
             }
 
             // Match criteria vary by finding type:
-            //   RAW vs RAW:       exact span + root_hint match
-            //   transform vs RAW: root_hint_start match + ≤3-byte padding tolerance
-            //   transform vs transform: normalized root_hint match
+            //   RAW vs RAW:             exact span + root_hint match
+            //   transform vs RAW:       root_hint_start match + ≤3-byte padding tolerance
+            //   transform vs transform: direct root_hint match (both stored pre-normalized)
             let existing_matches = if rec.step_id == STEP_ROOT {
                 existing.span_start == rec.span_start
                     && existing.span_end == rec.span_end
                     && existing.root_hint_start == rec.root_hint_start
                     && existing.root_hint_end == rec.root_hint_end
             } else if existing.step_id == STEP_ROOT {
+                // Base64 padding only adds bytes, so the un-normalized (RAW) end
+                // is always >= the normalized value. If this invariant fails,
+                // skip this candidate rather than silently discarding the finding.
+                if leaf_transform == Some(TransformId::Base64)
+                    && existing.root_hint_end < normalized_root_hint_end
+                {
+                    debug_assert!(
+                        false,
+                        "RAW root_hint_end {} unexpectedly smaller than normalized {}",
+                        existing.root_hint_end, normalized_root_hint_end,
+                    );
+                    continue;
+                }
                 existing.root_hint_start == rec.root_hint_start
                     && existing.root_hint_end <= normalized_root_hint_end.saturating_add(3)
                     && existing.root_hint_end >= normalized_root_hint_end
             } else {
-                existing.root_hint_start == rec.root_hint_start && {
-                    let existing_normalized_end =
-                        normalize_root_hint_end_for_dedup(existing, leaf_transform);
-                    existing_normalized_end == normalized_root_hint_end
-                }
+                // Both findings were stored with pre-normalized root_hint_end.
+                existing.root_hint_start == rec.root_hint_start
+                    && existing.root_hint_end == normalized_root_hint_end
             };
 
             if existing_matches {
                 // Dedup replacement priority (highest wins):
                 //   1. Transform > RAW (decoded content aids triage).
                 //   2. Among same type, prefer wider context (larger root_hint_end).
-                //   3. Equal span: keep the higher confidence_score.
+                //   3. Equal root_hint_end: keep the higher confidence_score.
+                //      (Pre-normalization equalizes Base64 root_hint_end, so this
+                //      tiebreak is the typical discriminator for transform duplicates.)
                 let should_replace = if rec.step_id != STEP_ROOT && existing.step_id == STEP_ROOT {
                     true
                 } else if rec.step_id == STEP_ROOT && existing.step_id != STEP_ROOT {

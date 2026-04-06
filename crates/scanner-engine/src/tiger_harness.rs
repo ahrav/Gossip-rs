@@ -248,13 +248,13 @@ pub fn scan_chunked_records(engine: &Engine, buf: &[u8], mut plan: ChunkPlan) ->
 ///
 /// Coverage rule:
 /// - Same rule id.
-/// - Root-span containment (after base64 padding normalization):
+/// - Root-span containment using the emitted root hints directly:
 ///   `chunked.root_hint_start <= oracle.root_hint_start` and
-///   `normalized_end(chunked) >= normalized_end(oracle)`.
+///   `chunked.root_hint_end >= oracle.root_hint_end`.
 ///
-/// For transform-derived findings, `root_hint_end` is normalized to strip
-/// up to 3 bytes of base64 padding so chunked scans that see an unpadded
-/// span still cover the oracle span that includes padding.
+/// The engine normalizes Base64 `root_hint_end` before emission, so tests
+/// should compare the stored coordinates directly instead of re-normalizing
+/// them here and masking regressions.
 ///
 /// Errors:
 /// - Returns a message describing the first missing oracle finding.
@@ -263,29 +263,11 @@ pub fn check_oracle_covered(
     oracle: &[FindingRec],
     chunked: &[FindingRec],
 ) -> Result<(), String> {
-    // Match dedupe's base64 padding normalization so chunked scans that see
-    // an unpadded span still cover the oracle span that includes padding.
-    fn normalized_root_hint_end(rec: &FindingRec) -> u64 {
-        if rec.step_id == crate::api::STEP_ROOT {
-            return rec.root_hint_end;
-        }
-        let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
-        let min_encoded = (decoded_len * 4).div_ceil(3);
-        let actual_encoded = rec.root_hint_end.saturating_sub(rec.root_hint_start);
-        if actual_encoded > min_encoded && actual_encoded <= min_encoded.saturating_add(3) {
-            rec.root_hint_start.saturating_add(min_encoded)
-        } else {
-            rec.root_hint_end
-        }
-    }
-
     for o in oracle {
-        let oracle_end = normalized_root_hint_end(o);
         let ok = chunked.iter().any(|s| {
-            let chunk_end = normalized_root_hint_end(s);
             s.rule_id == o.rule_id
                 && s.root_hint_start <= o.root_hint_start
-                && chunk_end >= oracle_end
+                && s.root_hint_end >= o.root_hint_end
         });
 
         if !ok {

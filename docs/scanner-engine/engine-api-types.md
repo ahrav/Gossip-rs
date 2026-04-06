@@ -342,7 +342,7 @@ ring-buffer-friendly hot-path accumulation. Materialized into `Finding` later.
 | `span_start` | `u32` | Span start in current buffer (byte index). |
 | `span_end` | `u32` | Span end in current buffer (byte index). |
 | `root_hint_start` | `u64` | Best-effort root span hint start (absolute file byte offset). |
-| `root_hint_end` | `u64` | Best-effort root span hint end (absolute file byte offset). |
+| `root_hint_end` | `u64` | Best-effort root span hint end (absolute file byte offset). Base64 transform findings snap this to the padding-free minimum before emission. |
 | `dedupe_with_span` | `bool` | Whether `span_start`/`span_end` participate in dedup. `false` for transform-derived findings with precise root mapping. |
 | `step_id` | `StepId` | Decode-step chain id. `STEP_ROOT` for root-buffer findings. |
 | `confidence_score` | `i8` | Additive confidence from evidence signals (0–10). Does not participate in dedup. |
