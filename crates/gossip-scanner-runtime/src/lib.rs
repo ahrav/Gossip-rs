@@ -765,19 +765,6 @@ pub enum ScanRuntimeError {
     /// A connector input parameter was invalid.
     #[error("{0}")]
     ConnectorInput(#[source] ConnectorInputError),
-    /// Commit OID map reached capacity, preventing consistent findings
-    /// translation. The shard should be parked to prevent re-claim loops.
-    #[error(
-        "git repo-frontier shard '{shard_id}': commit OID map saturated at {entry_limit} entries; {detail}"
-    )]
-    CommitOidMapSaturated {
-        /// Redacted shard identifier for log correlation.
-        shard_id: String,
-        /// Maximum number of entries the OID map supports.
-        entry_limit: usize,
-        /// Human-readable context about how saturation was detected.
-        detail: String,
-    },
     /// The family runtime returned an execution error.
     #[error("runtime execution failed: {0}")]
     Driver(#[source] anyhow::Error),
@@ -1666,6 +1653,8 @@ pub enum OwnedCoreEvent {
         rule_name: String,
         /// BLAKE3 digest of the normalized secret content.
         norm_hash: [u8; 32],
+        /// Encoded Git blob object ID forwarded from `FindingEvent::blob_oid`.
+        blob_oid: Option<[u8; 33]>,
         commit_id: Option<u32>,
         change_kind: Option<String>,
         confidence_score: i8,
@@ -1703,6 +1692,7 @@ impl fmt::Debug for OwnedCoreEvent {
                 rule_id,
                 rule_name,
                 norm_hash: _norm_hash,
+                blob_oid,
                 commit_id,
                 change_kind,
                 confidence_score,
@@ -1716,6 +1706,7 @@ impl fmt::Debug for OwnedCoreEvent {
                 .field("rule_name", rule_name)
                 // Secret-derived digests are redacted to keep debug output safe.
                 .field("norm_hash", &RedactedNormHash)
+                .field("blob_oid", blob_oid)
                 .field("commit_id", commit_id)
                 .field("change_kind", change_kind)
                 .field("confidence_score", confidence_score)
@@ -1774,6 +1765,7 @@ impl OwnedCoreEvent {
                 rule_id: finding.rule_id,
                 rule_name: finding.rule_name.to_owned(),
                 norm_hash: finding.norm_hash,
+                blob_oid: finding.blob_oid,
                 commit_id: finding.commit_id,
                 change_kind: finding.change_kind.map(ToOwned::to_owned),
                 confidence_score: finding.confidence_score,
@@ -1816,6 +1808,7 @@ impl OwnedCoreEvent {
                 rule_id,
                 rule_name,
                 norm_hash,
+                blob_oid,
                 commit_id,
                 change_kind,
                 confidence_score,
@@ -1827,6 +1820,7 @@ impl OwnedCoreEvent {
                 rule_id: *rule_id,
                 rule_name,
                 norm_hash: *norm_hash,
+                blob_oid: *blob_oid,
                 commit_id: *commit_id,
                 change_kind: change_kind.as_deref(),
                 confidence_score: *confidence_score,
@@ -1880,6 +1874,7 @@ impl PartialEq for OwnedCoreEvent {
                     rule_id: r1,
                     rule_name: rn1,
                     norm_hash: nh1,
+                    blob_oid: bo1,
                     commit_id: c1,
                     change_kind: ck1,
                     confidence_score: cs1,
@@ -1892,6 +1887,7 @@ impl PartialEq for OwnedCoreEvent {
                     rule_id: r2,
                     rule_name: rn2,
                     norm_hash: nh2,
+                    blob_oid: bo2,
                     commit_id: c2,
                     change_kind: ck2,
                     confidence_score: cs2,
@@ -1904,6 +1900,7 @@ impl PartialEq for OwnedCoreEvent {
                     && r1 == r2
                     && rn1 == rn2
                     && nh1 == nh2
+                    && bo1 == bo2
                     && c1 == c2
                     && ck1 == ck2
                     && cs1 == cs2
