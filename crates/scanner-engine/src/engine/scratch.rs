@@ -1756,15 +1756,18 @@ impl ScanScratch {
                     && existing.root_hint_end == rec.root_hint_end
             } else if existing.step_id == STEP_ROOT {
                 // Base64 padding only adds bytes, so the un-normalized (RAW) end
-                // is always >= the normalized value. Guard this invariant so
-                // future transforms cannot silently break the tolerance window.
-                debug_assert!(
-                    existing.root_hint_end >= normalized_root_hint_end
-                        || leaf_transform != Some(TransformId::Base64),
-                    "RAW root_hint_end {} unexpectedly smaller than normalized {}",
-                    existing.root_hint_end,
-                    normalized_root_hint_end,
-                );
+                // is always >= the normalized value. If this invariant fails,
+                // skip this candidate rather than silently discarding the finding.
+                if leaf_transform == Some(TransformId::Base64)
+                    && existing.root_hint_end < normalized_root_hint_end
+                {
+                    debug_assert!(
+                        false,
+                        "RAW root_hint_end {} unexpectedly smaller than normalized {}",
+                        existing.root_hint_end, normalized_root_hint_end,
+                    );
+                    continue;
+                }
                 existing.root_hint_start == rec.root_hint_start
                     && existing.root_hint_end <= normalized_root_hint_end.saturating_add(3)
                     && existing.root_hint_end >= normalized_root_hint_end
