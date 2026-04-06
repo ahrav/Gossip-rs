@@ -151,6 +151,7 @@ pub mod pack_exec;
 pub mod pack_idx;
 /// Provides bounded inflate helpers and delta encoding for pack objects.
 pub mod pack_inflate;
+pub(crate) mod pack_inflate_libdeflate;
 /// Provides pack I/O utilities for cross-pack REF delta base resolution.
 pub mod pack_io;
 /// Builds per-pack decode plans from candidate blobs and delta dependencies.
@@ -397,6 +398,9 @@ pub use scanner_engine::{
 pub use work_items::WorkItems;
 
 // ── Benchmark support ───────────────────────────────────────────────────
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub use pack_inflate_libdeflate::{LibdeflateDecompressor, LIBDEFLATE_THRESHOLD_BYTES};
 #[cfg(feature = "bench")]
 pub use runner_exec::{
     bench_apply_locality_shard_cap, bench_select_strategy, bench_synthetic_locality_plan,
