@@ -208,6 +208,65 @@ impl<D> BloomFilteredDoneLedger<D> {
         }
     }
 
+    /// Build a decorator by bulk-loading terminal hashes from the inner
+    /// done-ledger.
+    ///
+    /// Calls [`DoneLedger::list_done_hashes`] once, then delegates to
+    /// [`from_hashes`](Self::from_hashes). When the scope is too small for a
+    /// useful Bloom filter, the estimated memory would exceed the cap, or
+    /// enumeration fails, the result is a passthrough wrapper.
+    ///
+    /// # Allocation note
+    ///
+    /// `list_done_hashes` materializes the full key set into a `Vec<OvidHash>`.
+    /// For scopes with tens of millions of terminal keys the transient
+    /// allocation can reach gigabytes. A streaming or count-first `DoneLedger`
+    /// method would allow pre-checking before materialization.
+    pub(crate) fn from_ledger(
+        done_ledger: D,
+        tenant_id: TenantId,
+        policy_hash: PolicyHash,
+        worker_kind: &'static str,
+    ) -> Self
+    where
+        D: DoneLedger,
+        D::Error: std::error::Error + Send + Sync + 'static,
+    {
+        match done_ledger.list_done_hashes(tenant_id, policy_hash) {
+            Ok(done_hashes) => {
+                let decorated = Self::from_hashes(done_ledger, &done_hashes);
+                if decorated.has_filter() {
+                    tracing::info!(
+                        worker_kind,
+                        bloom_prefilter = "active",
+                        done_hashes = done_hashes.len(),
+                        filter_bytes = decorated.filter_memory_bytes().unwrap_or_default(),
+                        "done-ledger Bloom prefilter enabled"
+                    );
+                } else {
+                    tracing::debug!(
+                        worker_kind,
+                        bloom_prefilter = "inactive",
+                        done_hashes = done_hashes.len(),
+                        min_threshold = DoneLedgerBloomFilter::MIN_THRESHOLD,
+                        max_bytes = DoneLedgerBloomFilter::MAX_BYTES,
+                        "done-ledger Bloom prefilter inactive; using passthrough mode"
+                    );
+                }
+                decorated
+            }
+            Err(error) => {
+                tracing::warn!(
+                    worker_kind,
+                    bloom_prefilter = "error",
+                    error = %error,
+                    "done-ledger Bloom prefilter unavailable; using passthrough mode"
+                );
+                Self::passthrough(done_ledger)
+            }
+        }
+    }
+
     pub(crate) fn has_filter(&self) -> bool {
         self.filter.is_some()
     }
@@ -273,6 +332,9 @@ where
                 "inner DoneLedger batch_get returned wrong-length Vec; \
                  falling back to unfiltered call"
             );
+            // Permanently disable prefiltering so subsequent calls delegate
+            // directly instead of repeating the detect-and-retry cycle.
+            self.invalidate_prefilter.store(true, Ordering::Release);
             return self.inner.batch_get(tenant_id, policy_hash, ovid_hashes);
         }
 
@@ -677,6 +739,84 @@ mod tests {
         }
     }
 
+    /// DoneLedger whose `list_done_hashes` always fails.
+    #[derive(Clone, Debug)]
+    struct FailingListDoneLedger;
+
+    impl DoneLedger for FailingListDoneLedger {
+        type Error = io::Error;
+        type CommitHandle = ReadyCommitHandle<DoneLedgerCommitReceipt, io::Error>;
+
+        fn batch_get(
+            &self,
+            _tenant_id: TenantId,
+            _policy_hash: PolicyHash,
+            _ovid_hashes: &[OvidHash],
+        ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        fn batch_upsert(
+            &self,
+            _records: &[DoneLedgerRecord],
+        ) -> Result<Self::CommitHandle, Self::Error> {
+            Ok(ReadyCommitHandle::ok(DoneLedgerCommitReceipt::new(0, 0, 0)))
+        }
+
+        fn list_done_hashes(
+            &self,
+            _tenant_id: TenantId,
+            _policy_hash: PolicyHash,
+        ) -> Result<Vec<OvidHash>, Self::Error> {
+            Err(io::Error::other("injected list_done_hashes failure"))
+        }
+    }
+
+    #[test]
+    fn from_ledger_enables_filter_above_threshold() {
+        let tenant_id = tenant(131);
+        let policy_hash = policy(132);
+        let mut records = Vec::new();
+        for seed in 0..DoneLedgerBloomFilter::MIN_THRESHOLD as u64 {
+            records.push(scanned_record(tenant_id, policy_hash, ovid(seed)));
+        }
+        let inner = TrackingDoneLedger::with_records(records);
+
+        let wrapped =
+            BloomFilteredDoneLedger::from_ledger(inner.clone(), tenant_id, policy_hash, "test");
+
+        assert!(wrapped.has_filter());
+        assert!(wrapped.filter_memory_bytes().is_some());
+        assert_eq!(
+            inner.list_done_hashes_calls(),
+            vec![(tenant_id, policy_hash)]
+        );
+    }
+
+    #[test]
+    fn from_ledger_passthrough_below_threshold() {
+        let tenant_id = tenant(141);
+        let policy_hash = policy(142);
+        let inner =
+            TrackingDoneLedger::with_records([scanned_record(tenant_id, policy_hash, ovid(143))]);
+
+        let wrapped = BloomFilteredDoneLedger::from_ledger(inner, tenant_id, policy_hash, "test");
+
+        assert!(!wrapped.has_filter());
+    }
+
+    #[test]
+    fn from_ledger_passthrough_on_enumeration_error() {
+        let wrapped = BloomFilteredDoneLedger::from_ledger(
+            FailingListDoneLedger,
+            tenant(151),
+            policy(152),
+            "test",
+        );
+
+        assert!(!wrapped.has_filter());
+    }
+
     #[test]
     fn empty_filter_returns_false() {
         let filter = DoneLedgerBloomFilter::new(DoneLedgerBloomFilter::MIN_THRESHOLD)
@@ -872,7 +1012,14 @@ mod tests {
             .batch_get(tenant_id, policy_hash, &[positive_a, positive_b])
             .expect("all-positive batch_get should succeed");
 
-        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].as_ref().map(|record| record.key().ovid_hash()),
+            Some(positive_a)
+        );
+        assert_eq!(
+            results[1].as_ref().map(|record| record.key().ovid_hash()),
+            Some(positive_b)
+        );
         assert_eq!(inner.batch_get_calls(), vec![vec![positive_a, positive_b]]);
     }
 
@@ -1021,11 +1168,12 @@ mod tests {
 
     /// Exercises the release-mode safety net: when the inner `batch_get`
     /// returns a wrong-length Vec, the decorator falls back to delegating
-    /// the full original slice. Gated to release-only because the
-    /// `debug_assert_eq!` in the production code fires first in debug builds.
+    /// the full original slice and permanently disables prefiltering.
+    /// Gated to release-only because the `debug_assert_eq!` in the
+    /// production code fires first in debug builds.
     #[cfg(not(debug_assertions))]
     #[test]
-    fn wrong_length_inner_falls_back_to_full_delegation() {
+    fn wrong_length_inner_falls_back_and_invalidates() {
         let tenant_id = tenant(121);
         let policy_hash = policy(122);
         let positive_a = ovid(123);
@@ -1038,10 +1186,11 @@ mod tests {
             scanned_record(tenant_id, policy_hash, positive_a),
             scanned_record(tenant_id, policy_hash, positive_b),
         ]);
-        let inner = WrongLengthDoneLedger::new(tracking);
+        let inner = WrongLengthDoneLedger::new(tracking.clone());
         let wrapped = BloomFilteredDoneLedger::from_hashes(inner, &done_hashes);
 
-        // Mixed query forces the partial-positive scatter/gather path.
+        // First call: mixed query forces the partial-positive path. The
+        // wrong-length result triggers fallback to full delegation.
         let results = wrapped
             .batch_get(tenant_id, policy_hash, &[positive_a, negative, positive_b])
             .expect("fallback batch_get should succeed");
@@ -1055,6 +1204,22 @@ mod tests {
         assert_eq!(
             results[2].as_ref().map(|r| r.key().ovid_hash()),
             Some(positive_b)
+        );
+
+        // Second call: filter must be permanently disabled, so the inner
+        // receives the full original slice directly (no Bloom partitioning).
+        let calls_before = tracking.batch_get_calls().len();
+        let _ = wrapped
+            .batch_get(tenant_id, policy_hash, &[positive_a, negative, positive_b])
+            .expect("post-invalidation batch_get should succeed");
+        let calls_after = tracking.batch_get_calls();
+        // The second outer batch_get should produce exactly one inner call
+        // with the full unfiltered slice (not a filtered subset).
+        assert_eq!(calls_after.len(), calls_before + 1);
+        assert_eq!(
+            calls_after.last().expect("at least one call"),
+            &vec![positive_a, negative, positive_b],
+            "post-mismatch batch_get should delegate full slice, proving filter was invalidated"
         );
     }
 

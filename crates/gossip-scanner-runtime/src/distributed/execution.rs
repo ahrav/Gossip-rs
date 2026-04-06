@@ -54,7 +54,7 @@ use crate::{
         CoordinationEventRecorder, CoordinationEventSink, FindingsCaptureSink,
         GitFindingForPersistence, StageSignal,
     },
-    done_ledger_bloom::{BloomFilteredDoneLedger, DoneLedgerBloomFilter},
+    done_ledger_bloom::BloomFilteredDoneLedger,
     git_discovery::StaticGitRepoDiscoverySource,
     git_persistence::GitPersistenceBackend,
     git_repo::{GitRepoRuntime, single_repo_target},
@@ -64,51 +64,6 @@ use crate::{
     },
     result_translation::{ScanTiming, translate_git_item_result},
 };
-
-fn decorate_done_ledger_with_bloom<D>(
-    done_ledger: D,
-    tenant_id: TenantId,
-    policy_hash: PolicyHash,
-    worker_kind: &'static str,
-) -> BloomFilteredDoneLedger<D>
-where
-    D: DoneLedger,
-    D::Error: std::error::Error + Send + Sync + 'static,
-{
-    match done_ledger.list_done_hashes(tenant_id, policy_hash) {
-        Ok(done_hashes) => {
-            let decorated = BloomFilteredDoneLedger::from_hashes(done_ledger, &done_hashes);
-            if decorated.has_filter() {
-                tracing::info!(
-                    worker_kind,
-                    bloom_prefilter = "active",
-                    done_hashes = done_hashes.len(),
-                    filter_bytes = decorated.filter_memory_bytes().unwrap_or_default(),
-                    "done-ledger Bloom prefilter enabled"
-                );
-            } else {
-                tracing::debug!(
-                    worker_kind,
-                    bloom_prefilter = "inactive",
-                    done_hashes = done_hashes.len(),
-                    min_threshold = DoneLedgerBloomFilter::MIN_THRESHOLD,
-                    max_bytes = DoneLedgerBloomFilter::MAX_BYTES,
-                    "done-ledger Bloom prefilter inactive; using passthrough mode"
-                );
-            }
-            decorated
-        }
-        Err(error) => {
-            tracing::warn!(
-                worker_kind,
-                bloom_prefilter = "error",
-                error = %error,
-                "done-ledger Bloom prefilter unavailable; using passthrough mode"
-            );
-            BloomFilteredDoneLedger::passthrough(done_ledger)
-        }
-    }
-}
 
 /// Wrap the done-ledger inside `persistence` in a [`BloomFilteredDoneLedger`]
 /// so Bloom-negative keys are pruned before the backing store sees them.
@@ -125,7 +80,7 @@ where
 {
     DistributedPersistence::new(
         persistence.findings_sink,
-        decorate_done_ledger_with_bloom(
+        BloomFilteredDoneLedger::from_ledger(
             persistence.done_ledger,
             tenant_id,
             policy_hash,
