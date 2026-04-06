@@ -215,6 +215,7 @@ Because `SecretHash = BLAKE3_keyed(tenant_key, domain_tag || norm_hash)`:
 | `IdHashMode`         | 1 B (`repr(u8)`) | `from_u8` / variant literal                        | --                                   | Clone Copy Debug Eq Hash CanonicalBytes | No                                                |
 | `FindingIdInputs`    | 128 B            | struct literal                                     | --                                   | Clone Copy Debug Eq CanonicalBytes      | No                                                |
 | `OccurrenceIdInputs` | 80 B             | struct literal                                     | --                                   | Clone Copy Debug Eq CanonicalBytes      | No                                                |
+| `ObservationIdInputs`| 96 B             | struct literal                                     | --                                   | Clone Copy Debug Eq CanonicalBytes      | No                                                |
 | `PolicyHashInputs`   | 41 B             | struct literal                                     | --                                   | Clone Copy Debug Eq CanonicalBytes      | No                                                |
 
 Persistence code reaches `NormHash` through
