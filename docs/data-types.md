@@ -280,9 +280,9 @@ classDiagram
     }
 
     class FileTable {
-        -Vec~PathSpan~ path_spans
-        -ScratchVec~u8~ path_bytes
-        -Vec~PathBuf~ paths
+        -Vec~PathSpan~ path_spans [unix only]
+        -ScratchVec~u8~ path_bytes [unix only]
+        -Vec~PathBuf~ paths [non-Unix only]
         -Vec~u64~ sizes
         -Vec~(u64, u64)~ dev_inodes
         -Vec~u32~ flags
