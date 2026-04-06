@@ -222,6 +222,45 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Audit namespace helpers
+// ---------------------------------------------------------------------------
+
+/// Namespace key used for design-doc-audit data inside `FleetState`.
+const AUDIT_NS: &str = "design-doc-audit";
+
+/// Per-file state for the design-doc-audit pipeline.
+///
+/// Tracks the blob SHA at the time of last successful audit so that unchanged
+/// files can be skipped on subsequent runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditFileState {
+    pub blob_sha: String,
+    pub processed_at: String,
+    pub run_id: String,
+}
+
+/// Extract and deserialize the design-doc-audit namespace from a `FleetState`.
+/// Returns an empty map when the namespace is absent.
+pub fn get_audit_state(state: &FleetState) -> Result<HashMap<String, AuditFileState>> {
+    match state.namespaces.get(AUDIT_NS) {
+        Some(value) => serde_json::from_value(value.clone())
+            .context("deserialize design-doc-audit namespace from fleet state"),
+        None => Ok(HashMap::new()),
+    }
+}
+
+/// Serialize and set the design-doc-audit namespace inside a `FleetState`.
+pub fn set_audit_state(
+    state: &mut FleetState,
+    audit: &HashMap<String, AuditFileState>,
+) -> Result<()> {
+    let value =
+        serde_json::to_value(audit).context("serialize design-doc-audit state to JSON value")?;
+    state.namespaces.insert(AUDIT_NS.to_owned(), value);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Guide-sync namespace helpers
 // ---------------------------------------------------------------------------
 
@@ -628,5 +667,48 @@ mod tests {
 
         let recovered_gs = get_guide_sync_state(&loaded).unwrap();
         assert_eq!(recovered_gs.meta.last_run_id, "run-1");
+    }
+
+    #[test]
+    fn audit_state_namespace_roundtrip() {
+        let mut state = FleetState::default();
+
+        let mut audit = HashMap::new();
+        audit.insert(
+            "docs/README.md".to_owned(),
+            AuditFileState {
+                blob_sha: "abc123".to_owned(),
+                processed_at: "2026-04-04T00:00:00Z".to_owned(),
+                run_id: "audit-2026-04-04".to_owned(),
+            },
+        );
+
+        set_audit_state(&mut state, &audit).unwrap();
+
+        let recovered = get_audit_state(&state).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered["docs/README.md"].blob_sha, "abc123");
+        assert_eq!(recovered["docs/README.md"].run_id, "audit-2026-04-04");
+    }
+
+    #[test]
+    fn get_audit_state_returns_empty_when_absent() {
+        let state = FleetState::default();
+        let audit = get_audit_state(&state).unwrap();
+        assert!(audit.is_empty());
+    }
+
+    #[test]
+    fn audit_state_preserves_sibling_namespaces() {
+        let mut state = FleetState::default();
+        state
+            .namespaces
+            .insert("guide-sync".to_owned(), serde_json::json!({"meta": {}}));
+
+        let audit = HashMap::new();
+        set_audit_state(&mut state, &audit).unwrap();
+
+        assert!(state.namespaces.contains_key("guide-sync"));
+        assert!(state.namespaces.contains_key("design-doc-audit"));
     }
 }

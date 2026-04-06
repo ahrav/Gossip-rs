@@ -50,7 +50,7 @@ pub struct PrSummary {
 /// Result of a successful PR creation.
 #[derive(Debug)]
 pub struct PrResult {
-    /// Full URL of the created PR (e.g. "https://github.com/org/repo/pull/42").
+    /// Full URL of the created PR (e.g. `https://github.com/org/repo/pull/42`).
     pub url: String,
     /// PR number within the repository.
     pub number: u64,
@@ -281,6 +281,97 @@ fn parse_pr_output(url: &str) -> anyhow::Result<PrResult> {
         url: url.to_owned(),
         number,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Audit PR creation
+// ---------------------------------------------------------------------------
+
+/// Summary data for an audit sweep PR body.
+#[derive(Debug, Clone)]
+pub struct AuditPrSummary {
+    /// Number of files audited in this batch.
+    pub files_audited: usize,
+    /// Total agents launched.
+    pub agents_launched: usize,
+    /// Agent branches that merged successfully.
+    pub branches_merged: usize,
+    /// Files skipped because they were unchanged since the last audit.
+    pub skipped_count: usize,
+    /// Files remaining for future runs (exceeded the per-run cap).
+    pub deferred_count: usize,
+    /// Post-merge verification notes (fmt, check, doc results).
+    pub verification_notes: String,
+    /// `(agent_id, trajectory_url)` pairs for auditability.
+    pub trajectory_links: Vec<(String, String)>,
+    /// ISO date string (e.g. "2026-04-05").
+    pub date: String,
+    /// Unique run identifier.
+    pub run_id: String,
+}
+
+/// Build the markdown body for an audit sweep PR.
+fn format_audit_body(summary: &AuditPrSummary) -> String {
+    let mut body = String::with_capacity(1024);
+
+    body.push_str("## Design Doc Audit Sweep\n\n");
+
+    body.push_str(&format!(
+        "Next {} unprocessed docs/diagrams ({} remaining after this batch).\n\n",
+        summary.files_audited, summary.deferred_count
+    ));
+
+    body.push_str("### Summary\n\n");
+    body.push_str("| Metric | Count |\n");
+    body.push_str("|--------|-------|\n");
+    body.push_str(&format!("| Files audited | {} |\n", summary.files_audited));
+    body.push_str(&format!(
+        "| Agents launched | {} |\n",
+        summary.agents_launched
+    ));
+    body.push_str(&format!(
+        "| Branches merged | {} |\n",
+        summary.branches_merged
+    ));
+    body.push_str(&format!(
+        "| Already processed (skipped) | {} |\n",
+        summary.skipped_count
+    ));
+    body.push_str(&format!(
+        "| Remaining for future runs | {} |\n",
+        summary.deferred_count
+    ));
+
+    body.push_str("\n### Verification\n\n");
+    if summary.verification_notes.is_empty() {
+        body.push_str("All checks passed.\n");
+    } else {
+        body.push_str(&summary.verification_notes);
+        body.push('\n');
+    }
+
+    format_trajectory_section(&mut body, &summary.trajectory_links);
+
+    body.push_str(&format!(
+        "\n---\nRun `{}` | {}\n",
+        summary.run_id, summary.date
+    ));
+
+    body
+}
+
+/// Create a pull request for a design-doc audit sweep.
+///
+/// Shells out to `gh pr create` with the formatted title and body.
+pub fn create_audit_pr(
+    repo: &str,
+    branch: &str,
+    base: &str,
+    summary: &AuditPrSummary,
+) -> anyhow::Result<PrResult> {
+    let title = format!("docs: design doc audit sweep ({})", summary.date);
+    let body = format_audit_body(summary);
+    run_gh_pr_create(repo, branch, base, &title, &body)
 }
 
 // ---------------------------------------------------------------------------
@@ -699,7 +790,7 @@ mod tests {
 
     #[test]
     fn total_stats_aggregation() {
-        let summaries = vec![
+        let summaries = [
             PrSummary {
                 section_id: "01".to_owned(),
                 chapters_updated: vec!["01-01".to_owned(), "01-02".to_owned()],
@@ -739,5 +830,73 @@ mod tests {
         assert_eq!(total.total_merged, 3);
         assert_eq!(total.total_failed, 1);
         assert_eq!(total.total_stale, 3);
+    }
+
+    // -- Audit PR formatting --------------------------------------------------
+
+    fn sample_audit_summary() -> AuditPrSummary {
+        AuditPrSummary {
+            files_audited: 15,
+            agents_launched: 5,
+            branches_merged: 4,
+            skipped_count: 10,
+            deferred_count: 3,
+            verification_notes: "- cargo fmt: PASSED\n- cargo check: PASSED".to_owned(),
+            trajectory_links: vec![(
+                "batch-01".to_owned(),
+                "https://example.com/traj/batch-01".to_owned(),
+            )],
+            date: "2026-04-05".to_owned(),
+            run_id: "audit-2026-04-05-1430".to_owned(),
+        }
+    }
+
+    #[test]
+    fn audit_body_contains_summary_table() {
+        let summary = sample_audit_summary();
+        let body = format_audit_body(&summary);
+
+        assert!(body.contains("## Design Doc Audit Sweep"));
+        assert!(body.contains("| Files audited | 15 |"));
+        assert!(body.contains("| Agents launched | 5 |"));
+        assert!(body.contains("| Branches merged | 4 |"));
+        assert!(body.contains("| Already processed (skipped) | 10 |"));
+        assert!(body.contains("| Remaining for future runs | 3 |"));
+    }
+
+    #[test]
+    fn audit_body_contains_verification() {
+        let summary = sample_audit_summary();
+        let body = format_audit_body(&summary);
+
+        assert!(body.contains("### Verification"));
+        assert!(body.contains("cargo fmt: PASSED"));
+    }
+
+    #[test]
+    fn audit_body_contains_trajectories() {
+        let summary = sample_audit_summary();
+        let body = format_audit_body(&summary);
+
+        assert!(body.contains("**batch-01**"));
+        assert!(body.contains("https://example.com/traj/batch-01"));
+    }
+
+    #[test]
+    fn audit_body_contains_run_footer() {
+        let summary = sample_audit_summary();
+        let body = format_audit_body(&summary);
+
+        assert!(body.contains("Run `audit-2026-04-05-1430`"));
+        assert!(body.contains("2026-04-05"));
+    }
+
+    #[test]
+    fn audit_body_empty_verification_shows_all_passed() {
+        let mut summary = sample_audit_summary();
+        summary.verification_notes.clear();
+        let body = format_audit_body(&summary);
+
+        assert!(body.contains("All checks passed."));
     }
 }

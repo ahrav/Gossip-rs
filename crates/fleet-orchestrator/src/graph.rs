@@ -307,7 +307,7 @@ mod tests {
         let graph = parse_source_file_map(SAMPLE_TABLE).unwrap();
 
         // Every source in chapter_to_sources must appear in source_to_chapters.
-        for (_chapter, sources) in &graph.chapter_to_sources {
+        for sources in graph.chapter_to_sources.values() {
             for src in sources {
                 assert!(
                     graph.source_to_chapters.contains_key(src),
@@ -317,7 +317,7 @@ mod tests {
         }
 
         // Every chapter in source_to_chapters must appear in chapter_to_sources.
-        for (_source, chapters) in &graph.source_to_chapters {
+        for chapters in graph.source_to_chapters.values() {
             for ch in chapters {
                 assert!(
                     graph.chapter_to_sources.contains_key(ch),

@@ -23,3 +23,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 fs2 = "0.4"
 anyhow = { workspace = true }
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }

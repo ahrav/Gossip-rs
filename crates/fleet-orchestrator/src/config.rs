@@ -80,6 +80,69 @@ impl Default for FleetConfig {
     }
 }
 
+/// Configuration for the design-doc-audit pipeline.
+///
+/// Each field has a sensible default sourced from the original
+/// `run-audit-fleet.sh` script. The audit pipeline walks `docs/` and
+/// `diagrams/` for `.md` files, filters by blob-SHA state, distributes
+/// files across agents via round-robin, and merges results into a
+/// consolidated PR.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// Repository in `owner/repo` format (e.g. `"ahrav/gossip-rs"`).
+    pub repository: String,
+    /// Base branch name.
+    pub base_branch: String,
+    /// Jetty API base URL.
+    pub jetty_host: String,
+    /// Jetty collection identifier.
+    pub jetty_collection: String,
+    /// Agent runtime type.
+    pub agent_type: String,
+    /// Model identifier passed to the agent runtime.
+    pub model: String,
+    /// Per-agent execution timeout in seconds.
+    pub timeout_sec: u64,
+    /// Overall polling timeout in seconds.
+    pub poll_timeout_sec: u64,
+    /// Number of agents to launch concurrently per wave.
+    pub wave_size: usize,
+    /// Delay in seconds between successive launch waves.
+    pub wave_delay_sec: u64,
+    /// Path to the fleet state file (JSON).
+    pub state_file: String,
+    /// Path to the audit runbook markdown template.
+    pub runbook_file: String,
+    /// Path to the scope-map TOML that pairs docs with source directories.
+    pub scope_map_path: String,
+    /// Maximum number of files to process per run.
+    pub file_cap: usize,
+    /// Maximum number of agents to launch.
+    pub agents_cap: usize,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            repository: "ahrav/gossip-rs".to_owned(),
+            base_branch: "main".to_owned(),
+            jetty_host: "https://flows-api.jetty.io".to_owned(),
+            jetty_collection: "asdf22223".to_owned(),
+            agent_type: "gemini-cli".to_owned(),
+            model: "gemini/gemini-3.1-pro-preview".to_owned(),
+            timeout_sec: 5400,
+            poll_timeout_sec: 7200,
+            wave_size: 15,
+            wave_delay_sec: 2,
+            state_file: ".fleet-state.json".to_owned(),
+            runbook_file: "runbooks/design-doc-audit-partitioned.md".to_owned(),
+            scope_map_path: "docs/scope-map.toml".to_owned(),
+            file_cap: 40,
+            agents_cap: 10,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,9 +194,11 @@ mod tests {
 
     #[test]
     fn roundtrip_serde_json_with_model_overrides() {
-        let mut cfg = FleetConfig::default();
-        cfg.coordinator_model = Some("o3-pro".to_owned());
-        cfg.chapter_agent_model = Some("gpt-5.4-mini".to_owned());
+        let cfg = FleetConfig {
+            coordinator_model: Some("o3-pro".to_owned()),
+            chapter_agent_model: Some("gpt-5.4-mini".to_owned()),
+            ..FleetConfig::default()
+        };
 
         let json = serde_json::to_string(&cfg).unwrap();
         let recovered: FleetConfig = serde_json::from_str(&json).unwrap();
@@ -142,5 +207,29 @@ mod tests {
             recovered.chapter_agent_model.as_deref(),
             Some("gpt-5.4-mini")
         );
+    }
+
+    #[test]
+    fn audit_config_defaults() {
+        let cfg = AuditConfig::default();
+        assert_eq!(cfg.repository, "ahrav/gossip-rs");
+        assert_eq!(cfg.base_branch, "main");
+        assert_eq!(cfg.agent_type, "gemini-cli");
+        assert_eq!(cfg.model, "gemini/gemini-3.1-pro-preview");
+        assert_eq!(cfg.timeout_sec, 5400);
+        assert_eq!(cfg.file_cap, 40);
+        assert_eq!(cfg.agents_cap, 10);
+        assert_eq!(cfg.scope_map_path, "docs/scope-map.toml");
+        assert_eq!(cfg.runbook_file, "runbooks/design-doc-audit-partitioned.md");
+    }
+
+    #[test]
+    fn audit_config_roundtrip_serde_json() {
+        let cfg = AuditConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let recovered: AuditConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.repository, cfg.repository);
+        assert_eq!(recovered.file_cap, cfg.file_cap);
+        assert_eq!(recovered.agents_cap, cfg.agents_cap);
     }
 }

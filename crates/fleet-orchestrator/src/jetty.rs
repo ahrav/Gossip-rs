@@ -282,7 +282,8 @@ impl JettyClient {
     /// Launch agents in waves of `wave_size`, sleeping `delay` between waves.
     ///
     /// Within each wave, all agents are launched concurrently via a
-    /// `JoinSet`. Results are collected in manifest order.
+    /// `JoinSet`. Results are collected in manifest order. Uses the default
+    /// guide-sync user message format.
     pub async fn launch_wave(
         &self,
         manifests: &[AgentManifest],
@@ -290,6 +291,34 @@ impl JettyClient {
         wave_size: usize,
         delay: Duration,
     ) -> Vec<anyhow::Result<Trajectory>> {
+        self.launch_wave_with(manifests, runbook, wave_size, delay, |m| {
+            format!(
+                "Run guide-sync for section '{}' on this repository. \
+                 Update {} chapters.",
+                m.section,
+                m.write_set.len()
+            )
+        })
+        .await
+    }
+
+    /// Launch agents in waves with a caller-supplied user message builder.
+    ///
+    /// Like [`launch_wave`](Self::launch_wave) but the `user_message_fn`
+    /// closure generates the user prompt for each agent manifest, allowing
+    /// different pipelines to customise the message.
+    pub async fn launch_wave_with<F>(
+        &self,
+        manifests: &[AgentManifest],
+        runbook: &str,
+        wave_size: usize,
+        delay: Duration,
+        user_message_fn: F,
+    ) -> Vec<anyhow::Result<Trajectory>>
+    where
+        F: Fn(&AgentManifest) -> String + Send + Sync + 'static,
+    {
+        let user_message_fn = Arc::new(user_message_fn);
         let mut results = Vec::with_capacity(manifests.len());
 
         for (wave_idx, chunk) in manifests.chunks(wave_size).enumerate() {
@@ -306,14 +335,10 @@ impl JettyClient {
                 let inner = Arc::clone(&self.inner);
                 let manifest = m.clone();
                 let runbook = runbook.to_owned();
-                let user_message = format!(
-                    "Run guide-sync for section '{}' on this repository. \
-                     Update {} chapters.",
-                    m.section,
-                    m.write_set.len()
-                );
+                let msg_fn = Arc::clone(&user_message_fn);
 
                 set.spawn(async move {
+                    let user_message = msg_fn(&manifest);
                     let client = JettyClient { inner };
                     let result = client
                         .launch_agent(&manifest, &runbook, &user_message)

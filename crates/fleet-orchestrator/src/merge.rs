@@ -152,17 +152,18 @@ pub fn create_merge_worktree(
 
 /// Merge agent branches into a section integration branch.
 ///
-/// Creates a branch named `guide-sync/section-{section_id}/{run_id}` inside
-/// the worktree, then attempts to merge each agent branch. Branches that
-/// produce merge conflicts are aborted and recorded in
+/// Creates a branch named `{branch_prefix}/section-{section_id}/{run_id}`
+/// inside the worktree, then attempts to merge each agent branch. Branches
+/// that produce merge conflicts are aborted and recorded in
 /// [`SectionMergeResult::conflicts`].
 pub fn merge_section(
     worktree: &WorktreeHandle,
     section_id: &str,
     agent_branches: &[String],
     run_id: &str,
+    branch_prefix: &str,
 ) -> anyhow::Result<SectionMergeResult> {
-    let branch_name = format!("guide-sync/section-{section_id}/{run_id}");
+    let branch_name = format!("{branch_prefix}/section-{section_id}/{run_id}");
 
     git_ok(&worktree.path, &["checkout", "-b", &branch_name])
         .with_context(|| format!("create section branch {branch_name}"))?;
@@ -210,15 +211,17 @@ pub fn merge_section(
 
 /// Merge section integration branches into a single consolidated branch.
 ///
-/// Creates `guide-sync/consolidated/{run_id}` starting from `origin/main`,
-/// then merges each section branch sequentially. Section branches that
-/// conflict are aborted and recorded in [`ConsolidatedResult::conflicts`].
+/// Creates `{branch_prefix}/consolidated/{run_id}` starting from
+/// `origin/main`, then merges each section branch sequentially. Section
+/// branches that conflict are aborted and recorded in
+/// [`ConsolidatedResult::conflicts`].
 pub fn merge_consolidated(
     worktree: &WorktreeHandle,
     section_branches: &[String],
     run_id: &str,
+    branch_prefix: &str,
 ) -> anyhow::Result<ConsolidatedResult> {
-    let branch_name = format!("guide-sync/consolidated/{run_id}");
+    let branch_name = format!("{branch_prefix}/consolidated/{run_id}");
 
     git_ok(
         &worktree.path,
@@ -288,6 +291,208 @@ pub fn cleanup_worktree(handle: WorktreeHandle, repo_path: &Path) -> anyhow::Res
         })?;
     }
 
+    Ok(())
+}
+
+/// Create a temporary clone for merge operations in the same repository.
+///
+/// Used by the audit pipeline where the target repository is the same as
+/// the source. Clones into a temp directory, checks out a merge branch from
+/// `origin/{base_branch}`, and configures the fleet-orchestrator identity.
+/// The returned `WorktreeHandle` can be used with the same merge functions.
+pub fn create_clone_worktree(
+    remote_url: &str,
+    base_branch: &str,
+    run_id: &str,
+) -> anyhow::Result<WorktreeHandle> {
+    let name = format!("fleet-clone-{run_id}");
+    let clone_path = std::env::temp_dir().join(&name);
+
+    // Remove leftover directory from a previous crashed run.
+    if clone_path.exists() {
+        let _ = std::fs::remove_dir_all(&clone_path);
+    }
+
+    // Shallow clone (single branch) to minimise disk and network usage.
+    let output = Command::new("git")
+        .args([
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            "--single-branch",
+            "--branch",
+            base_branch,
+            remote_url,
+            &clone_path.to_string_lossy(),
+        ])
+        .output()
+        .context("spawn git clone for merge worktree")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git clone failed (exit {:?}): {}",
+            output.status.code(),
+            stderr.trim_end()
+        );
+    }
+
+    // Create a merge branch starting from origin/{base_branch}.
+    let merge_branch = format!("{run_id}-merge");
+    git_ok(
+        &clone_path,
+        &[
+            "checkout",
+            "-b",
+            &merge_branch,
+            &format!("origin/{base_branch}"),
+        ],
+    )
+    .context("checkout merge branch in clone")?;
+
+    // Configure committer identity.
+    git_ok(&clone_path, &["config", "user.name", "fleet-orchestrator"])?;
+    git_ok(
+        &clone_path,
+        &["config", "user.email", "fleet@gossip-rs.local"],
+    )?;
+
+    Ok(WorktreeHandle {
+        path: clone_path,
+        name,
+    })
+}
+
+/// Merge agent branches directly into the current branch (flat merge).
+///
+/// Unlike `merge_section` which creates a new integration branch, this
+/// function merges each agent branch into whatever branch is currently
+/// checked out. Suited for the audit pipeline where all agent branches
+/// merge into a single consolidated branch without intermediate grouping.
+pub fn merge_flat(
+    worktree: &WorktreeHandle,
+    agent_branches: &[String],
+) -> anyhow::Result<SectionMergeResult> {
+    let mut merged = Vec::new();
+    let mut conflicts = Vec::new();
+
+    for branch in agent_branches {
+        // Check that the branch exists on the remote before attempting fetch.
+        let ls_output = git(
+            &worktree.path,
+            &[
+                "ls-remote",
+                "--exit-code",
+                "origin",
+                &format!("refs/heads/{branch}"),
+            ],
+        )?;
+
+        if !ls_output.status.success() {
+            debug!(branch = %branch, "no branch pushed, skipping");
+            continue;
+        }
+
+        git_ok(&worktree.path, &["fetch", "origin", branch])
+            .with_context(|| format!("fetch origin/{branch}"))?;
+
+        let merge_msg = format!("Merge {branch} audit fixes");
+        let output = git(
+            &worktree.path,
+            &[
+                "merge",
+                &format!("origin/{branch}"),
+                "--no-edit",
+                "-m",
+                &merge_msg,
+            ],
+        )?;
+
+        if output.status.success() {
+            debug!(branch = %branch, "merged successfully");
+            merged.push(branch.clone());
+        } else {
+            warn!(branch = %branch, "merge conflict, aborting and skipping");
+            let _ = git(&worktree.path, &["merge", "--abort"]);
+            conflicts.push(branch.clone());
+        }
+    }
+
+    // The integration_branch field is set to the current branch name.
+    let head_output = git_ok(&worktree.path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let current_branch = String::from_utf8_lossy(&head_output.stdout)
+        .trim()
+        .to_owned();
+
+    Ok(SectionMergeResult {
+        merged,
+        conflicts,
+        integration_branch: current_branch,
+    })
+}
+
+/// Post-merge verification checks.
+#[derive(Debug)]
+pub struct VerificationResult {
+    /// Human-readable notes (one line per check).
+    pub notes: String,
+    /// `true` when every check passed.
+    pub all_passed: bool,
+}
+
+/// Run post-merge verification (fmt, check, doc) inside a worktree.
+///
+/// Non-fatal: records pass/fail for each check and returns a summary.
+pub fn run_post_merge_checks(worktree: &WorktreeHandle) -> VerificationResult {
+    let mut notes = Vec::new();
+    let mut all_passed = true;
+
+    let checks: &[(&str, &[&str])] = &[
+        ("cargo fmt", &["cargo", "fmt", "--all", "--", "--check"]),
+        ("cargo check", &["cargo", "check", "--all-features"]),
+        (
+            "cargo doc",
+            &["cargo", "doc", "--no-deps", "--all-features"],
+        ),
+    ];
+
+    for (label, args) in checks {
+        let mut cmd = Command::new(args[0]);
+        cmd.current_dir(&worktree.path).args(&args[1..]);
+
+        // Set RUSTDOCFLAGS for the doc check.
+        if *label == "cargo doc" {
+            cmd.env("RUSTDOCFLAGS", "-D warnings");
+        }
+
+        match cmd.output() {
+            Ok(output) if output.status.success() => {
+                notes.push(format!("- {label}: PASSED"));
+            }
+            Ok(_) => {
+                notes.push(format!("- {label}: FAILED"));
+                all_passed = false;
+            }
+            Err(e) => {
+                notes.push(format!("- {label}: ERROR ({e})"));
+                all_passed = false;
+            }
+        }
+    }
+
+    VerificationResult {
+        notes: notes.join("\n"),
+        all_passed,
+    }
+}
+
+/// Clean up a clone-based worktree (just removes the directory).
+pub fn cleanup_clone(handle: WorktreeHandle) -> anyhow::Result<()> {
+    if handle.path.exists() {
+        std::fs::remove_dir_all(&handle.path).with_context(|| {
+            format!("remove clone worktree directory {}", handle.path.display(),)
+        })?;
+    }
     Ok(())
 }
 
@@ -455,7 +660,7 @@ mod tests {
         let handle = create_merge_worktree(&repo, &default_branch, &run_id).unwrap();
 
         let branches = vec!["agent/a".to_owned(), "agent/b".to_owned()];
-        let result = merge_section(&handle, "s1", &branches, &run_id).unwrap();
+        let result = merge_section(&handle, "s1", &branches, &run_id, "guide-sync").unwrap();
 
         assert_eq!(result.merged.len(), 2);
         assert!(result.conflicts.is_empty());
@@ -494,7 +699,7 @@ mod tests {
         let handle = create_merge_worktree(&repo, &default_branch, &run_id).unwrap();
 
         let branches = vec!["agent/x".to_owned(), "agent/y".to_owned()];
-        let result = merge_section(&handle, "s2", &branches, &run_id).unwrap();
+        let result = merge_section(&handle, "s2", &branches, &run_id, "guide-sync").unwrap();
 
         // First branch merges, second conflicts.
         assert_eq!(result.merged, vec!["agent/x"]);

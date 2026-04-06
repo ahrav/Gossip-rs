@@ -1,12 +1,12 @@
 //! Fleet orchestrator library.
 //!
-//! Dependency-aware parallel documentation build orchestration for guide-sync.
-//! Each module handles one concern of the pipeline: graph construction,
-//! affected-chapter analysis, fleet state tracking, work partitioning,
-//! Jetty API communication, git merge operations, PR lifecycle, and
-//! configuration.
+//! Parallel documentation build and audit orchestration. Supports multiple
+//! pipelines (guide-sync and design-doc-audit) that share common
+//! infrastructure: Jetty API communication, git merge operations, PR
+//! lifecycle management, fleet state tracking, and configuration.
 
 pub mod affected;
+pub mod audit;
 pub mod config;
 pub mod graph;
 pub mod jetty;
