@@ -821,9 +821,10 @@ pub trait DoneLedger: Send + Sync {
     /// durable status is terminal.
     ///
     /// This is a COLD-tier operation used to bulk-load a probabilistic
-    /// prefilter. Backends may return keys in any order. Implementations must
-    /// exclude `FailedRetryable` rows because those items remain eligible for
-    /// a retry and cannot be suppressed by the filter.
+    /// prefilter such as the runtime's Bloom-filtered done-ledger decorator.
+    /// Backends may return keys in any order. Implementations must exclude
+    /// `FailedRetryable` rows because those items remain eligible for a retry
+    /// and cannot be suppressed by the filter.
     ///
     /// Backends that cannot enumerate efficiently may return `Ok(Vec::new())`.
     /// A stale or empty prefilter only causes extra persistence lookups; it

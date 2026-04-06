@@ -1,7 +1,11 @@
-//! In-memory Bloom filter for done-ledger prefiltering.
+//! Bloom-backed done-ledger prefiltering helpers.
 //!
-//! This wrapper accepts [`OvidHash`] keys directly while keeping the lookup
-//! path allocation-free. Construction is intentionally gated:
+//! [`DoneLedgerBloomFilter`] stores terminal [`OvidHash`] keys in a compact
+//! in-memory Bloom filter sized at worker startup. [`BloomFilteredDoneLedger`]
+//! wraps any [`DoneLedger`] implementation and uses that filter to short-circuit
+//! `batch_get` lookups for keys that are definitely absent.
+//!
+//! Construction is intentionally gated:
 //!
 //! - scopes below [`DoneLedgerBloomFilter::MIN_THRESHOLD`] skip the filter
 //!   because the fixed setup cost outweighs the benefit;
@@ -9,19 +13,27 @@
 //!   [`DoneLedgerBloomFilter::MAX_BYTES`] skip the filter to stay within the
 //!   configured memory budget.
 //!
-//! The done-ledger is monotonic, so a missing filter only causes extra
-//! persistence lookups. It never causes an already-processed item to be
-//! treated as new.
-#![allow(dead_code)]
+//! The filter itself is immutable after construction. A shared invalidation bit
+//! disables prefiltering after the first successful `batch_upsert` accepted by
+//! any clone, preserving the `DoneLedger` contract for newly written keys
+//! without adding lock contention to the read path.
 
 use std::{
     f64::consts::LN_2,
+    fmt,
     hash::{BuildHasherDefault, Hasher},
     mem::size_of,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use fastbloom::BloomFilter;
-use gossip_contracts::persistence::OvidHash;
+use gossip_contracts::{
+    identity::{PolicyHash, TenantId},
+    persistence::{DoneLedger, DoneLedgerRecord, OvidHash},
+};
 
 type RawU64BuildHasher = BuildHasherDefault<RawU64Hasher>;
 type InnerBloomFilter = BloomFilter<512, RawU64BuildHasher>;
@@ -38,6 +50,39 @@ pub(crate) struct DoneLedgerBloomFilter {
     memory_bytes: usize,
 }
 
+/// Done-ledger decorator that prunes definitely-absent keys before `batch_get`
+/// reaches the backing store.
+///
+/// The decorator bulk-loads terminal keys once at COLD tier from
+/// `DoneLedger::list_done_hashes` and then uses the resulting Bloom filter on
+/// every `batch_get`. Bloom-negative keys are known absent and return `None`
+/// without touching the inner backend; Bloom-positive keys are delegated to the
+/// wrapped ledger so false positives remain safe.
+///
+/// `batch_upsert` never mutates the filter. Instead, a shared invalidation bit
+/// disables prefiltering after the first successful write accepted by any
+/// clone. That keeps newly written keys visible to subsequent `batch_get`
+/// calls while avoiding per-key feedback plumbing or lock contention.
+#[derive(Clone)]
+pub(crate) struct BloomFilteredDoneLedger<D> {
+    inner: D,
+    filter: Option<DoneLedgerBloomFilter>,
+    invalidate_prefilter: Arc<AtomicBool>,
+}
+
+impl<D: fmt::Debug> fmt::Debug for BloomFilteredDoneLedger<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BloomFilteredDoneLedger")
+            .field("inner", &self.inner)
+            .field("filter_enabled", &self.filter.is_some())
+            .field(
+                "invalidate_prefilter",
+                &self.invalidate_prefilter.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
 impl DoneLedgerBloomFilter {
     /// Skip Bloom construction for tiny scopes.
     pub(crate) const MIN_THRESHOLD: usize = 10_000;
@@ -48,14 +93,9 @@ impl DoneLedgerBloomFilter {
 
     /// Construct an empty Bloom filter sized for `expected_items`.
     ///
-    /// Callers must pass the **full lifetime population** (preloaded keys +
-    /// expected growth during the run) so the false-positive rate stays near
-    /// [`TARGET_FPR`](Self::TARGET_FPR). Passing only the initial
-    /// `list_done_hashes()` count and then inserting many more keys will
-    /// degrade the filter.
-    ///
-    /// Returns `None` when the scope is too small to justify the filter or
-    /// when the requested capacity would exceed the memory cap.
+    /// Callers must pass the full lifetime population the filter should cover.
+    /// Returning `None` disables prefiltering for scopes where the setup cost
+    /// or memory budget would outweigh the benefit.
     pub(crate) fn new(expected_items: usize) -> Option<Self> {
         if expected_items < Self::MIN_THRESHOLD {
             return None;
@@ -69,9 +109,8 @@ impl DoneLedgerBloomFilter {
         let inner = BloomFilter::with_false_pos(Self::TARGET_FPR)
             .hasher(RawU64BuildHasher::default())
             .expected_items(expected_items);
-        // Safety net: the library may round the bitset up to the next block
-        // boundary, so the actual allocation can slightly exceed the estimate.
-        // This check is cheap and should rarely fire in practice.
+        // The library may round the bitset up to the next block boundary, so
+        // check the actual allocation before enabling the filter.
         let memory_bytes = inner.as_slice().len().checked_mul(size_of::<u64>())?;
         if memory_bytes > Self::MAX_BYTES {
             return None;
@@ -104,12 +143,14 @@ impl DoneLedgerBloomFilter {
     ///
     /// Counts each `insert` call, including duplicates. This is a diagnostic
     /// counter and does not affect Bloom filter membership semantics.
+    #[cfg(test)]
     #[inline]
     pub(crate) const fn len(&self) -> usize {
         self.len
     }
 
     /// Returns `true` when no keys have been inserted yet.
+    #[cfg(test)]
     #[inline]
     pub(crate) const fn is_empty(&self) -> bool {
         self.len == 0
@@ -133,6 +174,126 @@ impl DoneLedgerBloomFilter {
             return None;
         }
         Some((bits as usize).max(512))
+    }
+}
+
+impl<D> BloomFilteredDoneLedger<D> {
+    /// Build a decorator from preloaded terminal done-ledger hashes.
+    ///
+    /// Returns a passthrough wrapper when the scope is too small for a useful
+    /// Bloom filter or the estimated filter memory would exceed the cap.
+    pub(crate) fn from_hashes(inner: D, done_hashes: &[OvidHash]) -> Self {
+        let filter = DoneLedgerBloomFilter::new(done_hashes.len()).map(|mut filter| {
+            for hash in done_hashes {
+                filter.insert(hash);
+            }
+            filter
+        });
+        Self {
+            inner,
+            filter,
+            invalidate_prefilter: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Wrap `inner` without a Bloom filter so all calls delegate directly.
+    pub(crate) fn passthrough(inner: D) -> Self {
+        Self {
+            inner,
+            filter: None,
+            invalidate_prefilter: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn has_filter(&self) -> bool {
+        self.filter.is_some()
+    }
+
+    pub(crate) fn filter_memory_bytes(&self) -> Option<usize> {
+        self.filter
+            .as_ref()
+            .map(DoneLedgerBloomFilter::memory_bytes)
+    }
+}
+
+impl<D> DoneLedger for BloomFilteredDoneLedger<D>
+where
+    D: DoneLedger,
+{
+    type Error = D::Error;
+    type CommitHandle = D::CommitHandle;
+
+    /// Returns rows aligned with `ovid_hashes`, skipping backend I/O for keys
+    /// the Bloom filter proves absent.
+    fn batch_get(
+        &self,
+        tenant_id: TenantId,
+        policy_hash: PolicyHash,
+        ovid_hashes: &[OvidHash],
+    ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+        let Some(filter) = &self.filter else {
+            return self.inner.batch_get(tenant_id, policy_hash, ovid_hashes);
+        };
+        if self.invalidate_prefilter.load(Ordering::Acquire) {
+            return self.inner.batch_get(tenant_id, policy_hash, ovid_hashes);
+        }
+        if ovid_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut positive_indices = Vec::new();
+        let mut positive_hashes = Vec::new();
+        for (index, hash) in ovid_hashes.iter().copied().enumerate() {
+            if filter.maybe_contains(&hash) {
+                positive_indices.push(index);
+                positive_hashes.push(hash);
+            }
+        }
+
+        if positive_hashes.is_empty() {
+            return Ok(vec![None; ovid_hashes.len()]);
+        }
+        if positive_hashes.len() == ovid_hashes.len() {
+            return self.inner.batch_get(tenant_id, policy_hash, ovid_hashes);
+        }
+
+        let delegated = self
+            .inner
+            .batch_get(tenant_id, policy_hash, &positive_hashes)?;
+        if delegated.len() != positive_indices.len() {
+            debug_assert_eq!(
+                delegated.len(),
+                positive_indices.len(),
+                "BloomFilteredDoneLedger inner batch_get violated positional contract"
+            );
+            return self.inner.batch_get(tenant_id, policy_hash, ovid_hashes);
+        }
+
+        let mut results = vec![None; ovid_hashes.len()];
+        for (record, index) in delegated.into_iter().zip(positive_indices) {
+            results[index] = record;
+        }
+        Ok(results)
+    }
+
+    /// Delegates writes directly and disables prefiltering for later reads once
+    /// the inner backend accepts a batch.
+    fn batch_upsert(
+        &self,
+        records: &[DoneLedgerRecord],
+    ) -> Result<Self::CommitHandle, Self::Error> {
+        let handle = self.inner.batch_upsert(records)?;
+        self.invalidate_prefilter.store(true, Ordering::Release);
+        Ok(handle)
+    }
+
+    /// Delegates terminal-key enumeration without consulting the Bloom filter.
+    fn list_done_hashes(
+        &self,
+        tenant_id: TenantId,
+        policy_hash: PolicyHash,
+    ) -> Result<Vec<OvidHash>, Self::Error> {
+        self.inner.list_done_hashes(tenant_id, policy_hash)
     }
 }
 
@@ -180,11 +341,18 @@ impl std::hash::Hash for RawBloomWord {
 mod tests {
     use super::*;
 
+    use std::{
+        collections::{HashMap, HashSet},
+        io,
+        sync::{Arc, Mutex},
+    };
+
     use gossip_contracts::{
         identity::{FenceEpoch, LogicalTime, PolicyHash, RunId, ShardId, TenantId},
         persistence::{
-            CommitHandle, DoneLedger, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,
-            DoneLedgerRecord, DoneLedgerStatus,
+            CommitHandle, DoneLedger, DoneLedgerCommitReceipt, DoneLedgerErrorCode, DoneLedgerKey,
+            DoneLedgerProvenance, DoneLedgerRecord, DoneLedgerStatus, ReadyCommitHandle,
+            run_done_ledger_conformance,
         },
     };
     use gossip_persistence_inmemory::InMemoryDoneLedger;
@@ -259,6 +427,169 @@ mod tests {
         record
     }
 
+    fn activated_hashes(primary: &[OvidHash]) -> Vec<OvidHash> {
+        let mut hashes = Vec::new();
+        let mut seen = HashSet::new();
+        for &hash in primary {
+            if seen.insert(hash) {
+                hashes.push(hash);
+            }
+        }
+        let mut seed = 1_000_000_u64;
+        while hashes.len() < DoneLedgerBloomFilter::MIN_THRESHOLD {
+            let hash = ovid(seed);
+            seed = seed.saturating_add(1);
+            if seen.insert(hash) {
+                hashes.push(hash);
+            }
+        }
+        hashes
+    }
+
+    fn built_filter(done_hashes: &[OvidHash]) -> DoneLedgerBloomFilter {
+        let mut filter =
+            DoneLedgerBloomFilter::new(done_hashes.len()).expect("activated filter should build");
+        for hash in done_hashes {
+            filter.insert(hash);
+        }
+        filter
+    }
+
+    fn first_negative_hash(filter: &DoneLedgerBloomFilter, start_seed: u64) -> OvidHash {
+        let mut seed = start_seed;
+        loop {
+            let candidate = ovid(seed);
+            if !filter.maybe_contains(&candidate) {
+                return candidate;
+            }
+            seed = seed.saturating_add(1);
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct TrackingDoneLedger {
+        records: HashMap<OvidHash, DoneLedgerRecord>,
+        batch_get_calls: Arc<Mutex<Vec<Vec<OvidHash>>>>,
+        batch_upsert_calls: Arc<Mutex<Vec<Vec<DoneLedgerRecord>>>>,
+        list_done_hashes_calls: Arc<Mutex<Vec<(TenantId, PolicyHash)>>>,
+    }
+
+    impl TrackingDoneLedger {
+        fn with_records(records: impl IntoIterator<Item = DoneLedgerRecord>) -> Self {
+            Self {
+                records: records
+                    .into_iter()
+                    .map(|record| (record.key().ovid_hash(), record))
+                    .collect(),
+                batch_get_calls: Arc::new(Mutex::new(Vec::new())),
+                batch_upsert_calls: Arc::new(Mutex::new(Vec::new())),
+                list_done_hashes_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn empty() -> Self {
+            Self::with_records(std::iter::empty::<DoneLedgerRecord>())
+        }
+
+        fn batch_get_calls(&self) -> Vec<Vec<OvidHash>> {
+            self.batch_get_calls
+                .lock()
+                .expect("batch_get_calls lock")
+                .clone()
+        }
+
+        fn batch_upsert_calls(&self) -> Vec<Vec<DoneLedgerRecord>> {
+            self.batch_upsert_calls
+                .lock()
+                .expect("batch_upsert_calls lock")
+                .clone()
+        }
+
+        fn list_done_hashes_calls(&self) -> Vec<(TenantId, PolicyHash)> {
+            self.list_done_hashes_calls
+                .lock()
+                .expect("list_done_hashes_calls lock")
+                .clone()
+        }
+    }
+
+    impl DoneLedger for TrackingDoneLedger {
+        type Error = io::Error;
+        type CommitHandle = ReadyCommitHandle<DoneLedgerCommitReceipt, io::Error>;
+
+        fn batch_get(
+            &self,
+            _tenant_id: TenantId,
+            _policy_hash: PolicyHash,
+            ovid_hashes: &[OvidHash],
+        ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            self.batch_get_calls
+                .lock()
+                .expect("batch_get_calls lock")
+                .push(ovid_hashes.to_vec());
+            Ok(ovid_hashes
+                .iter()
+                .map(|ovid_hash| self.records.get(ovid_hash).cloned())
+                .collect())
+        }
+
+        fn batch_upsert(
+            &self,
+            records: &[DoneLedgerRecord],
+        ) -> Result<Self::CommitHandle, Self::Error> {
+            self.batch_upsert_calls
+                .lock()
+                .expect("batch_upsert_calls lock")
+                .push(records.to_vec());
+            Ok(ReadyCommitHandle::ok(DoneLedgerCommitReceipt::new(0, 0, 0)))
+        }
+
+        fn list_done_hashes(
+            &self,
+            tenant_id: TenantId,
+            policy_hash: PolicyHash,
+        ) -> Result<Vec<OvidHash>, Self::Error> {
+            self.list_done_hashes_calls
+                .lock()
+                .expect("list_done_hashes_calls lock")
+                .push((tenant_id, policy_hash));
+            Ok(self
+                .records
+                .values()
+                .filter_map(|record| {
+                    (record.key().tenant_id() == tenant_id
+                        && record.key().policy_hash() == policy_hash
+                        && record.status().is_terminal())
+                    .then_some(record.key().ovid_hash())
+                })
+                .collect())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FailingDoneLedger;
+
+    impl DoneLedger for FailingDoneLedger {
+        type Error = io::Error;
+        type CommitHandle = ReadyCommitHandle<DoneLedgerCommitReceipt, io::Error>;
+
+        fn batch_get(
+            &self,
+            _tenant_id: TenantId,
+            _policy_hash: PolicyHash,
+            _ovid_hashes: &[OvidHash],
+        ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            Err(io::Error::other("injected batch_get failure"))
+        }
+
+        fn batch_upsert(
+            &self,
+            _records: &[DoneLedgerRecord],
+        ) -> Result<Self::CommitHandle, Self::Error> {
+            Ok(ReadyCommitHandle::ok(DoneLedgerCommitReceipt::new(0, 0, 0)))
+        }
+    }
+
     #[test]
     fn empty_filter_returns_false() {
         let filter = DoneLedgerBloomFilter::new(DoneLedgerBloomFilter::MIN_THRESHOLD)
@@ -295,25 +626,14 @@ mod tests {
     }
 
     #[test]
-    fn feedback_committed_keys_become_positive() {
-        let hash = ovid(42);
-        let mut filter = DoneLedgerBloomFilter::new(DoneLedgerBloomFilter::MIN_THRESHOLD)
-            .expect("threshold-sized filter should be constructed");
-
-        assert!(!filter.maybe_contains(&hash));
-        filter.insert(&hash);
-
-        assert!(filter.maybe_contains(&hash));
-        assert_eq!(filter.len(), 1);
-        assert!(!filter.is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "pass-through hasher")]
     fn raw_u64_hasher_write_panics() {
         use std::hash::Hasher as _;
+
         let mut h = RawU64Hasher::default();
-        h.write(b"must panic");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.write(b"must panic");
+        }));
+        assert!(result.is_err(), "RawU64Hasher::write should panic");
     }
 
     #[test]
@@ -357,8 +677,8 @@ mod tests {
         let hashes = ledger
             .list_done_hashes(tenant_id, policy_hash)
             .expect("bulk load should succeed");
-        let actual: std::collections::HashSet<_> = hashes.iter().copied().collect();
-        let expected = std::collections::HashSet::from([terminal_hash]);
+        let actual: HashSet<_> = hashes.iter().copied().collect();
+        let expected = HashSet::from([terminal_hash]);
         assert_eq!(actual, expected);
 
         let mut filter = DoneLedgerBloomFilter::new(DoneLedgerBloomFilter::MIN_THRESHOLD)
@@ -369,6 +689,225 @@ mod tests {
 
         assert!(filter.maybe_contains(&terminal_hash));
         assert!(!filter.maybe_contains(&retryable_hash));
+    }
+
+    #[test]
+    fn passthrough_mode_delegates_original_batch() {
+        let tenant_id = tenant(11);
+        let policy_hash = policy(12);
+        let present = ovid(13);
+        let missing = ovid(14);
+        let inner =
+            TrackingDoneLedger::with_records([scanned_record(tenant_id, policy_hash, present)]);
+        let small_hashes = activated_hashes(&[]);
+        let wrapped = BloomFilteredDoneLedger::from_hashes(
+            inner.clone(),
+            &small_hashes[..DoneLedgerBloomFilter::MIN_THRESHOLD - 1],
+        );
+
+        assert!(!wrapped.has_filter());
+
+        let results = wrapped
+            .batch_get(tenant_id, policy_hash, &[present, missing])
+            .expect("passthrough batch_get should succeed");
+        assert_eq!(
+            results[0].as_ref().map(|record| record.key().ovid_hash()),
+            Some(present)
+        );
+        assert!(results[1].is_none());
+        assert_eq!(inner.batch_get_calls(), vec![vec![present, missing]]);
+    }
+
+    #[test]
+    fn all_bloom_negative_skips_inner_entirely() {
+        let tenant_id = tenant(21);
+        let policy_hash = policy(22);
+        let done_hashes = activated_hashes(&[ovid(23)]);
+        let filter = built_filter(&done_hashes);
+        let inner = TrackingDoneLedger::empty();
+        let wrapped = BloomFilteredDoneLedger::from_hashes(inner.clone(), &done_hashes);
+        let negative_a = first_negative_hash(&filter, 30_000_000);
+        let negative_b = first_negative_hash(&filter, 30_000_100);
+
+        let results = wrapped
+            .batch_get(tenant_id, policy_hash, &[negative_a, negative_b])
+            .expect("Bloom-negative batch_get should succeed");
+
+        assert_eq!(results, vec![None, None]);
+        assert!(inner.batch_get_calls().is_empty());
+    }
+
+    #[test]
+    fn partial_bloom_positive_delegates_only_positives() {
+        let tenant_id = tenant(31);
+        let policy_hash = policy(32);
+        let positive_a = ovid(33);
+        let positive_b = ovid(34);
+        let done_hashes = activated_hashes(&[positive_a, positive_b]);
+        let filter = built_filter(&done_hashes);
+        let negative = first_negative_hash(&filter, 40_000_000);
+        let inner = TrackingDoneLedger::with_records([
+            scanned_record(tenant_id, policy_hash, positive_a),
+            retryable_record(tenant_id, policy_hash, positive_b),
+        ]);
+        let wrapped = BloomFilteredDoneLedger::from_hashes(inner.clone(), &done_hashes);
+
+        let results = wrapped
+            .batch_get(tenant_id, policy_hash, &[positive_a, negative, positive_b])
+            .expect("mixed batch_get should succeed");
+
+        assert_eq!(
+            results[0].as_ref().map(|record| record.key().ovid_hash()),
+            Some(positive_a)
+        );
+        assert!(results[1].is_none());
+        assert_eq!(
+            results[2].as_ref().map(|record| record.key().ovid_hash()),
+            Some(positive_b)
+        );
+        assert_eq!(inner.batch_get_calls(), vec![vec![positive_a, positive_b]]);
+    }
+
+    #[test]
+    fn all_bloom_positive_delegates_original_slice() {
+        let tenant_id = tenant(41);
+        let policy_hash = policy(42);
+        let positive_a = ovid(43);
+        let positive_b = ovid(44);
+        let done_hashes = activated_hashes(&[positive_a, positive_b]);
+        let inner = TrackingDoneLedger::with_records([
+            scanned_record(tenant_id, policy_hash, positive_a),
+            scanned_record(tenant_id, policy_hash, positive_b),
+        ]);
+        let wrapped = BloomFilteredDoneLedger::from_hashes(inner.clone(), &done_hashes);
+
+        let results = wrapped
+            .batch_get(tenant_id, policy_hash, &[positive_a, positive_b])
+            .expect("all-positive batch_get should succeed");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(inner.batch_get_calls(), vec![vec![positive_a, positive_b]]);
+    }
+
+    #[test]
+    fn batch_upsert_delegates_and_invalidates_across_clones() {
+        let ledger = InMemoryDoneLedger::new();
+        let tenant_id = tenant(51);
+        let policy_hash = policy(52);
+        let existing = ovid(53);
+        let seed_handle = ledger
+            .batch_upsert(&[scanned_record(tenant_id, policy_hash, existing)])
+            .expect("seed upsert should succeed");
+        seed_handle.wait().expect("seed upsert should be durable");
+
+        let done_hashes = activated_hashes(&[existing]);
+        let filter = built_filter(&done_hashes);
+        let new_hash = first_negative_hash(&filter, 50_000_000);
+        let wrapped = BloomFilteredDoneLedger::from_hashes(ledger.clone(), &done_hashes);
+        let reader = wrapped.clone();
+
+        assert_eq!(
+            reader
+                .batch_get(tenant_id, policy_hash, &[new_hash])
+                .expect("pre-write batch_get should succeed"),
+            vec![None]
+        );
+
+        let handle = wrapped
+            .batch_upsert(&[scanned_record(tenant_id, policy_hash, new_hash)])
+            .expect("decorated batch_upsert should succeed");
+        handle
+            .wait()
+            .expect("decorated batch_upsert should be durable");
+
+        let results = reader
+            .batch_get(tenant_id, policy_hash, &[new_hash])
+            .expect("post-write batch_get should succeed");
+        assert_eq!(
+            results[0].as_ref().map(|record| record.key().ovid_hash()),
+            Some(new_hash)
+        );
+    }
+
+    #[test]
+    fn batch_upsert_forwards_records_unchanged() {
+        let tenant_id = tenant(61);
+        let policy_hash = policy(62);
+        let record = scanned_record(tenant_id, policy_hash, ovid(63));
+        let inner = TrackingDoneLedger::empty();
+        let wrapped = BloomFilteredDoneLedger::passthrough(inner.clone());
+
+        let handle = wrapped
+            .batch_upsert(std::slice::from_ref(&record))
+            .expect("batch_upsert should delegate");
+        handle.wait().expect("delegated handle should resolve");
+
+        assert_eq!(inner.batch_upsert_calls(), vec![vec![record]]);
+    }
+
+    #[test]
+    fn list_done_hashes_delegates_unchanged() {
+        let tenant_id = tenant(71);
+        let policy_hash = policy(72);
+        let terminal = ovid(73);
+        let retryable = ovid(74);
+        let inner = TrackingDoneLedger::with_records([
+            scanned_record(tenant_id, policy_hash, terminal),
+            retryable_record(tenant_id, policy_hash, retryable),
+        ]);
+        let wrapped = BloomFilteredDoneLedger::passthrough(inner.clone());
+
+        let hashes = wrapped
+            .list_done_hashes(tenant_id, policy_hash)
+            .expect("list_done_hashes should delegate");
+
+        assert_eq!(HashSet::<_>::from_iter(hashes), HashSet::from([terminal]));
+        assert_eq!(
+            inner.list_done_hashes_calls(),
+            vec![(tenant_id, policy_hash)]
+        );
+    }
+
+    #[test]
+    fn empty_batch_returns_empty_without_inner_call() {
+        let tenant_id = tenant(81);
+        let policy_hash = policy(82);
+        let done_hashes = activated_hashes(&[ovid(83)]);
+        let inner = TrackingDoneLedger::empty();
+        let wrapped = BloomFilteredDoneLedger::from_hashes(inner.clone(), &done_hashes);
+
+        let results = wrapped
+            .batch_get(tenant_id, policy_hash, &[])
+            .expect("empty batch_get should succeed");
+
+        assert!(results.is_empty());
+        assert!(inner.batch_get_calls().is_empty());
+    }
+
+    #[test]
+    fn batch_get_propagates_inner_error() {
+        let tenant_id = tenant(91);
+        let policy_hash = policy(92);
+        let positive = ovid(93);
+        let done_hashes = activated_hashes(&[positive]);
+        let wrapped = BloomFilteredDoneLedger::from_hashes(FailingDoneLedger, &done_hashes);
+
+        let error = wrapped
+            .batch_get(tenant_id, policy_hash, &[positive])
+            .expect_err("Bloom-positive delegated failure should propagate");
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn decorator_passes_done_ledger_conformance_suite() {
+        let wrapped =
+            BloomFilteredDoneLedger::from_hashes(InMemoryDoneLedger::new(), &activated_hashes(&[]));
+
+        let checks = run_done_ledger_conformance(&wrapped)
+            .expect("decorated done-ledger should satisfy conformance");
+
+        assert_eq!(checks, 5);
     }
 
     proptest! {
@@ -391,6 +930,41 @@ mod tests {
             for hash in &hashes {
                 prop_assert!(filter.maybe_contains(hash));
             }
+        }
+
+        #[test]
+        fn decorator_matches_inner_results(
+            positives in proptest::collection::vec(any::<[u8; 32]>(), 0..32),
+            queries in proptest::collection::vec(any::<[u8; 32]>(), 0..64),
+        ) {
+            let tenant_id = tenant(101);
+            let policy_hash = policy(102);
+            let mut positive_hashes = Vec::new();
+            let mut seen = HashSet::new();
+            for bytes in positives {
+                let hash = OvidHash::from_bytes(bytes);
+                if seen.insert(hash) {
+                    positive_hashes.push(hash);
+                }
+            }
+            let done_hashes = activated_hashes(&positive_hashes);
+            let inner = TrackingDoneLedger::with_records(
+                positive_hashes
+                    .iter()
+                    .copied()
+                    .map(|hash| scanned_record(tenant_id, policy_hash, hash))
+            );
+            let wrapped = BloomFilteredDoneLedger::from_hashes(inner.clone(), &done_hashes);
+            let query_hashes: Vec<_> = queries.into_iter().map(OvidHash::from_bytes).collect();
+
+            let direct = inner
+                .batch_get(tenant_id, policy_hash, &query_hashes)
+                .expect("direct batch_get should succeed");
+            let decorated = wrapped
+                .batch_get(tenant_id, policy_hash, &query_hashes)
+                .expect("decorated batch_get should succeed");
+
+            prop_assert_eq!(decorated, direct);
         }
     }
 }

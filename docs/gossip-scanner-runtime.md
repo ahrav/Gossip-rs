@@ -36,7 +36,7 @@ and validation, and Git connector mode uses the direct path.
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
 | `src/commit_sink.rs` | `CommitSink` trait, `CliNoOpCommitSink` (no-op), and lightweight bridge record types (`ItemMeta`, `FindingRecord`, `FindingsBatch`) for scan-loop lifecycle |
 | `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`, `StageSignal`), `CoordinationEventRecorder` trait, and `FindingsCaptureSink`/`GitFindingForPersistence` adapters for repo-frontier Git finding capture before durable translation |
-| `src/done_ledger_bloom.rs` | Internal done-ledger Bloom filter wrapper: OvidHash-aware membership checks, scope-size gating, and memory-cap enforcement for prefilter construction |
+| `src/done_ledger_bloom.rs` | Internal done-ledger Bloom filter and decorator: OvidHash-aware membership checks, scope-size gating, worker-startup construction, write-triggered invalidation, and memory-cap enforcement for prefilter construction |
 | `src/distributed.rs` | Module root: re-exports public API and documents the distributed worker-loop architecture |
 | `src/distributed/types.rs` | Worker identity (`WorkerIdentity`, `GitWorkerIdentity`), lease types (`ShardLease`, `GitShardLease`, `LeaseView`), config (`DistributedRuntimeConfig`), report, and error types |
 | `src/distributed/execution.rs` | Lease execution functions (`run_filesystem_lease`, `run_git_repo_lease`) and worker entry points (`run_worker`, `run_git_repo_worker`) |
@@ -90,9 +90,9 @@ Current behavior after validation:
 
 - direct filesystem scans route to `ordered_content::scan_local_filesystem`
 - connector-mode filesystem scans instantiate `FilesystemConnector` and route
-  through ordered-content page validation (done-ledger prefiltering and bounded
-  scan-miss execution are available as library APIs but are not wired into the
-  live dispatcher)
+  through ordered-content page validation; the distributed worker path also
+  applies done-ledger prefiltering and bounded scan-miss execution before
+  durable commit
 - git scans route to `git_repo::scan_local_repo`
 - contract-level mirror-backed repo execution routes through
   `git_executor::ScannerGitExecutor`, which reuses the same lower-level runner
@@ -129,12 +129,13 @@ exists. This lets distributed callers require the exhausted-empty suffix
 before they treat a shard as fully enumerated, while still preserving
 checkpointable progress on retryable stops. The current
 `scan_fs_connector` entry point returns the validated page report without
-performing content reads. Done-ledger prefiltering and
+performing content reads. The distributed worker path layers done-ledger
+prefiltering and
 `OrderedContentRuntime::execute_scan_misses` (which bridges runtime
 `ScanBudgets` into connector read budgets, scans each item through the
 shared chunked engine path, preserves retryable versus permanent read
-failures, and returns ordered non-durable outcomes) are available as
-library APIs but are not wired into the live dispatcher.
+failures, and returns ordered non-durable outcomes) on top of that validated
+page loop.
 
 Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
@@ -952,7 +953,7 @@ and coordination-backend observations).
 | Durable findings -> done-ledger commit stage | `crates/gossip-scanner-runtime/src/result_committer.rs` |
 | Bounded execution -> commit worker and outcome queues | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` |
 | Coordination recorder payloads | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
-| Done-ledger Bloom prefilter helper | `crates/gossip-scanner-runtime/src/done_ledger_bloom.rs` |
+| Done-ledger Bloom prefilter and decorator | `crates/gossip-scanner-runtime/src/done_ledger_bloom.rs` |
 | Distributed worker-loop runtime (`src/distributed/` submodules) | `crates/gossip-scanner-runtime/src/distributed.rs` (module root), `src/distributed/types.rs`, `src/distributed/execution.rs`, `src/distributed/commit_bridge.rs`, `src/distributed/lease_ops.rs` |
 | Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | Static Git repo discovery source | `crates/gossip-scanner-runtime/src/git_discovery.rs` |

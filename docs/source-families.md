@@ -185,7 +185,7 @@ and `types.rs`.
 | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` | Family-neutral bounded execution -> durable-commit bridge shared after result translation |
 | `crates/gossip-scanner-runtime/src/commit_sink.rs` | Commit-sink trait and bridge record types for scan-loop lifecycle |
 | `crates/gossip-scanner-runtime/src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt` |
-| `crates/gossip-scanner-runtime/src/done_ledger_bloom.rs` | In-memory Bloom filter used to prefilter done-ledger lookups during durable commit processing |
+| `crates/gossip-scanner-runtime/src/done_ledger_bloom.rs` | In-memory Bloom filter and decorator used to prefilter done-ledger lookups during page-level done-ledger classification |
 | `crates/gossip-scanner-runtime/src/event_sink.rs` | Owned event sinks and forwarders for CLI/runtime output surfaces |
 | `crates/gossip-scanner-runtime/src/parity.rs` | Cross-scanner parity helpers shared by runtime tests and tooling |
 | `crates/gossip-scanner-runtime/src/result_translation.rs` | Deterministic scan-result -> persistence-row translation |

@@ -100,7 +100,7 @@ pub mod commit_pipeline;
 pub mod commit_sink;
 // Coordination-backed event sink for distributed scans.
 pub mod coordination_sink;
-// In-memory Bloom filter for done-ledger prefiltering.
+// Bloom-backed done-ledger prefiltering helpers.
 pub(crate) mod done_ledger_bloom;
 // Distributed worker runtime and receipt-backed commit plumbing.
 pub mod distributed;

@@ -211,6 +211,12 @@ to respect backend batch ceilings. Chunks are issued sequentially and
 their results concatenated, preserving positional alignment with the
 original page order.
 
+**Bloom pre-check.** Distributed worker startup may wrap the done ledger in
+`BloomFilteredDoneLedger`, which returns `None` immediately for Bloom-negative
+hashes and delegates only Bloom-positive hashes to the backing store. Once any
+clone accepts a write batch, the wrapper disables prefiltering and falls back
+to the inner ledger for later reads so newly written keys stay visible.
+
 **Version-aware dedup.** The `OvidHash` includes version strength (strong
 vs. weak), so the same stable item under a different version claim is
 correctly treated as a miss.

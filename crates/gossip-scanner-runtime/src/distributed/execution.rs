@@ -21,7 +21,7 @@ use gossip_contracts::{
         ordered::OrderedContentSource,
     },
     coordination::RestoredShardState,
-    identity::{LogicalTime, RuleFingerprint, TenantSecretKey},
+    identity::{LogicalTime, PolicyHash, RuleFingerprint, TenantId, TenantSecretKey},
     persistence::{
         CheckpointBoundary, CheckpointCommitReceipt, CommitScope, DoneLedger,
         DoneLedgerCommitReceipt, FindingsCommitReceipt, FindingsSink, PageCommit, WriteContext,
@@ -54,6 +54,7 @@ use crate::{
         CoordinationEventRecorder, CoordinationEventSink, FindingsCaptureSink,
         GitFindingForPersistence, StageSignal,
     },
+    done_ledger_bloom::{BloomFilteredDoneLedger, DoneLedgerBloomFilter},
     git_discovery::StaticGitRepoDiscoverySource,
     git_persistence::GitPersistenceBackend,
     git_repo::{GitRepoRuntime, single_repo_target},
@@ -63,6 +64,48 @@ use crate::{
     },
     result_translation::{ScanTiming, translate_git_item_result},
 };
+
+fn decorate_done_ledger_with_bloom<D>(
+    done_ledger: D,
+    tenant_id: TenantId,
+    policy_hash: PolicyHash,
+    worker_kind: &'static str,
+) -> BloomFilteredDoneLedger<D>
+where
+    D: DoneLedger,
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    match done_ledger.list_done_hashes(tenant_id, policy_hash) {
+        Ok(done_hashes) => {
+            let decorated = BloomFilteredDoneLedger::from_hashes(done_ledger, &done_hashes);
+            if decorated.has_filter() {
+                tracing::debug!(
+                    worker_kind,
+                    done_hashes = done_hashes.len(),
+                    filter_bytes = decorated.filter_memory_bytes().unwrap_or_default(),
+                    "done-ledger Bloom prefilter enabled"
+                );
+            } else {
+                tracing::debug!(
+                    worker_kind,
+                    done_hashes = done_hashes.len(),
+                    min_threshold = DoneLedgerBloomFilter::MIN_THRESHOLD,
+                    max_bytes = DoneLedgerBloomFilter::MAX_BYTES,
+                    "done-ledger Bloom prefilter inactive; using passthrough mode"
+                );
+            }
+            decorated
+        }
+        Err(error) => {
+            tracing::warn!(
+                worker_kind,
+                error = %error,
+                "done-ledger Bloom prefilter unavailable; using passthrough mode"
+            );
+            BloomFilteredDoneLedger::passthrough(done_ledger)
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Ordered-content scanning (page loop)
@@ -120,7 +163,9 @@ where
 ///
 /// Identical to [`scan_ordered_filesystem_lease_with_engine`] but accepts any
 /// [`OrderedContentSource`], enabling injection of scripted test doubles for
-/// suffix-protocol verification.
+/// suffix-protocol verification. Callers may wrap `done_ledger` in a
+/// `BloomFilteredDoneLedger` so Bloom-negative keys are pruned before the
+/// backing store sees them.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_ordered_source_with_engine<S, D>(
     source: &mut S,
@@ -1173,6 +1218,23 @@ where
     F::Error: std::error::Error + Send + Sync + 'static,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
+    let DistributedPersistence {
+        findings_sink,
+        done_ledger,
+    } = persistence;
+    // Build the prefilter once per worker invocation. If the scope is too
+    // small, too large, or enumeration fails, the wrapper degrades to
+    // passthrough mode and the runtime keeps the original done-ledger
+    // behavior.
+    let persistence = DistributedPersistence::new(
+        findings_sink,
+        decorate_done_ledger_with_bloom(
+            done_ledger,
+            identity.tenant,
+            identity.policy_hash,
+            "filesystem",
+        ),
+    );
     let mut scratch = Box::new(AcquireScratch::new());
     let mut report = DistributedRunReport::default();
 
@@ -1263,6 +1325,17 @@ where
     F::Error: std::error::Error + Send + Sync + 'static,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
+    let DistributedPersistence {
+        findings_sink,
+        done_ledger,
+    } = persistence;
+    // Git workers share the same tenant+policy done-ledger scope as the
+    // filesystem path, so constructing the decorator here keeps worker startup
+    // behavior uniform while still degrading cleanly to passthrough mode.
+    let persistence = DistributedPersistence::new(
+        findings_sink,
+        decorate_done_ledger_with_bloom(done_ledger, identity.tenant, identity.policy_hash, "git"),
+    );
     let mut scratch = Box::new(AcquireScratch::new());
     let mut report = DistributedRunReport::default();
 
