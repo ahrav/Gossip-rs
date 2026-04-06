@@ -885,6 +885,31 @@ where
     });
     watch_result
         .map_err(|error| DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(error)))?;
+
+    // Saturation is a permanent condition intrinsic to the repository's commit
+    // count — it takes priority over all other outcomes including lease
+    // uncertainty, because the shard must be parked to prevent a re-claim loop.
+    // Checked before lease uncertainty so the outer worker always sees the
+    // saturation variant and can park the shard even when the deadline watchdog
+    // concurrently recorded expiry.
+    if capture_sink.is_oid_map_saturated() {
+        if let Some(reason) = lease_uncertainty.current() {
+            tracing::warn!(
+                lease_reason = %reason,
+                "lease uncertainty concurrent with OID-map saturation; \
+                 saturation takes parking priority"
+            );
+        }
+        let detail = match &execution {
+            Ok(_) => "scan cancelled cooperatively to prevent consistency violation in findings translation".to_string(),
+            Err(err) => format!("scan error superseded by OID-map saturation (original: {err})"),
+        };
+        return Err(oid_map_saturation_error(
+            stage_sink.redacted_shard_id(),
+            &detail,
+        ));
+    }
+
     if let Some(reason) = lease_uncertainty.current() {
         return Err(DistributedRuntimeError::LeaseUncertain(reason));
     }
