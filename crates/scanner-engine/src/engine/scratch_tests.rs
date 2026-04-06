@@ -5,6 +5,7 @@ use crate::api::{
 };
 use crate::engine::Engine;
 use regex::bytes::Regex;
+use rstest::rstest;
 
 #[test]
 fn scanscratch_cold_region_is_cacheline_aligned() {
@@ -90,6 +91,20 @@ fn simple_rule() -> RuleSpec {
         offline_validation: None,
         uuid_format_secret: false,
         re: Regex::new(r"SECRET[A-Z0-9]{8}").unwrap(),
+    }
+}
+
+fn base64_test_transform_config() -> TransformConfig {
+    TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::None,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
     }
 }
 
@@ -599,17 +614,7 @@ fn transform_finding_storage_normalizes_base64_root_hint_end() {
     let mut scratch = new_test_scratch();
     scratch.update_chunk_overlap(FileId(0), 0, 4096);
 
-    let transform = TransformConfig {
-        id: TransformId::Base64,
-        mode: TransformMode::Always,
-        gate: Gate::None,
-        min_len: 4,
-        max_spans_per_buffer: 16,
-        max_encoded_len: 64 * 1024,
-        max_decoded_bytes: 64 * 1024,
-        plus_to_space: false,
-        base64_allow_space_ws: false,
-    };
+    let transform = base64_test_transform_config();
     let encoded = b"U0VDUkVUQUJDREVGR0g=".to_vec();
     scratch.root_span_map_ctx = Some(RootSpanMapCtx::new(&transform, &encoded, 1000, 0));
 
@@ -655,17 +660,7 @@ fn same_scan_base64_transform_replacement_keeps_normalized_root_hint_end() {
     };
     scratch.push_finding_with_drop_hint(raw_rec, [0x11; 32], raw_rec.root_hint_end, false);
 
-    let transform = TransformConfig {
-        id: TransformId::Base64,
-        mode: TransformMode::Always,
-        gate: Gate::None,
-        min_len: 4,
-        max_spans_per_buffer: 16,
-        max_encoded_len: 64 * 1024,
-        max_decoded_bytes: 64 * 1024,
-        plus_to_space: false,
-        base64_allow_space_ws: false,
-    };
+    let transform = base64_test_transform_config();
     let encoded = b"U0VDUkVUQUJDREVGR0g=".to_vec();
     scratch.root_span_map_ctx = Some(RootSpanMapCtx::new(&transform, &encoded, 1000, 0));
 
@@ -705,5 +700,36 @@ fn same_scan_base64_transform_replacement_keeps_normalized_root_hint_end() {
         scratch.findings()[0].root_hint_end,
         1018,
         "replacement path must keep the normalized base64 root hint end"
+    );
+
+    let mut findings = Vec::with_capacity(1);
+    let mut hashes = Vec::with_capacity(1);
+    scratch.drain_findings_with_hashes(&mut findings, &mut hashes);
+    assert_eq!(
+        hashes[0], [0x22; 32],
+        "norm_hash must be updated to the transform finding's hash"
+    );
+}
+
+#[test]
+fn normalization_skipped_without_root_span_map_ctx() {
+    let mut scratch = new_test_scratch();
+    scratch.update_chunk_overlap(FileId(0), 0, 4096);
+    // No root_span_map_ctx — leaf_transform resolves to None, so the
+    // normalize function returns root_hint_end unchanged even for a
+    // non-root step.
+    let step = scratch.step_arena.push(
+        STEP_ROOT,
+        DecodeStep::Transform {
+            transform_idx: 0,
+            parent_span: 0..20,
+        },
+    );
+    let rec = make_rec(step, 200, 213, 1000, 1019);
+    scratch.push_finding_with_drop_hint(rec, [0xAA; 32], 1024, false);
+    assert_eq!(
+        scratch.findings()[0].root_hint_end,
+        1019,
+        "without root_span_map_ctx, root_hint_end must remain un-normalized"
     );
 }

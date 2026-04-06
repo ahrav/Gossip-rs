@@ -1812,8 +1812,8 @@ fn normalize_findings(findings: &[FindingRec]) -> BTreeSet<FindingKey> {
 /// - Clamp remaining non-root hints to the last `required_overlap()` bytes so
 ///   the oracle focuses on semantic differences while staying consistent with
 ///   guaranteed overlap.
-/// - Normalize base64-derived `root_hint_end` when padding is elided so
-///   truncated spans (chunked) compare equal to padded spans (reference).
+/// - Base64-derived `root_hint_end` arrives pre-normalized from the engine;
+///   no local re-normalization is needed.
 fn normalize_findings_for_diff(
     engine: &Engine,
     findings: &CollectedFindings,
@@ -1830,43 +1830,19 @@ fn normalize_findings_for_diff(
         }
     }
 
-    fn normalize_root_hint_end(rec: &FindingRec, leaf_transform: Option<TransformId>) -> u64 {
-        if rec.step_id == STEP_ROOT {
-            return rec.root_hint_end;
-        }
-        // Only Base64 uses 4/3 padding rules; other transforms must not normalize.
-        if leaf_transform != Some(TransformId::Base64) {
-            return rec.root_hint_end;
-        }
-        // Base64 decoding is padding-tolerant; chunked scans can surface a match
-        // before trailing '=' arrives. Normalize to the minimal encoded length
-        // when the observed span is within padding tolerance (<= 3 chars).
-        let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
-        let min_encoded = (decoded_len * 4).div_ceil(3);
-        let actual_encoded = rec.root_hint_end.saturating_sub(rec.root_hint_start);
-        if actual_encoded > min_encoded && actual_encoded <= min_encoded.saturating_add(3) {
-            rec.root_hint_start.saturating_add(min_encoded)
-        } else {
-            rec.root_hint_end
-        }
-    }
-
     findings
         .recs
         .iter()
-        .zip(findings.leaf_transforms.iter())
-        .filter_map(|(rec, leaf_transform)| {
-            let normalized_end = normalize_root_hint_end(rec, *leaf_transform);
+        .filter_map(|rec| {
             if rec.step_id != STEP_ROOT {
-                let hint_len = normalized_end.saturating_sub(rec.root_hint_start);
+                let hint_len = rec.root_hint_end.saturating_sub(rec.root_hint_start);
                 if hint_len > overlap {
                     return None;
                 }
                 if let Some(spans) = root_spans.get(&(rec.file_id.0, rec.rule_id)) {
-                    if spans
-                        .iter()
-                        .any(|(start, end)| rec.root_hint_start <= *start && normalized_end >= *end)
-                    {
+                    if spans.iter().any(|(start, end)| {
+                        rec.root_hint_start <= *start && rec.root_hint_end >= *end
+                    }) {
                         return None;
                     }
                 }
@@ -1879,7 +1855,7 @@ fn normalize_findings_for_diff(
             let (root_hint_start, root_hint_end) = if rec.step_id == STEP_ROOT {
                 (rec.root_hint_start, rec.root_hint_end)
             } else {
-                (normalized_end.saturating_sub(overlap), normalized_end)
+                (rec.root_hint_end.saturating_sub(overlap), rec.root_hint_end)
             };
             Some(FindingKey {
                 file_id: rec.file_id.0,
@@ -2144,12 +2120,6 @@ fn oracle_differential(
                 });
             };
             if ends.remove(&exp.root_hint_end) {
-                continue;
-            }
-            let lo = exp.root_hint_end.saturating_sub(3);
-            let hi = exp.root_hint_end.saturating_add(3);
-            if let Some(&candidate) = ends.range(lo..=hi).next() {
-                ends.remove(&candidate);
                 continue;
             }
             let message = format!(

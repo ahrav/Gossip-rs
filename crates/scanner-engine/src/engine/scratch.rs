@@ -1746,24 +1746,32 @@ impl ScanScratch {
             }
 
             // Match criteria vary by finding type:
-            //   RAW vs RAW:       exact span + root_hint match
-            //   transform vs RAW: root_hint_start match + ≤3-byte padding tolerance
-            //   transform vs transform: normalized root_hint match
+            //   RAW vs RAW:             exact span + root_hint match
+            //   transform vs RAW:       root_hint_start match + ≤3-byte padding tolerance
+            //   transform vs transform: direct root_hint match (both stored pre-normalized)
             let existing_matches = if rec.step_id == STEP_ROOT {
                 existing.span_start == rec.span_start
                     && existing.span_end == rec.span_end
                     && existing.root_hint_start == rec.root_hint_start
                     && existing.root_hint_end == rec.root_hint_end
             } else if existing.step_id == STEP_ROOT {
+                // Base64 padding only adds bytes, so the un-normalized (RAW) end
+                // is always >= the normalized value. Guard this invariant so
+                // future transforms cannot silently break the tolerance window.
+                debug_assert!(
+                    existing.root_hint_end >= normalized_root_hint_end
+                        || leaf_transform != Some(TransformId::Base64),
+                    "RAW root_hint_end {} unexpectedly smaller than normalized {}",
+                    existing.root_hint_end,
+                    normalized_root_hint_end,
+                );
                 existing.root_hint_start == rec.root_hint_start
                     && existing.root_hint_end <= normalized_root_hint_end.saturating_add(3)
                     && existing.root_hint_end >= normalized_root_hint_end
             } else {
-                existing.root_hint_start == rec.root_hint_start && {
-                    let existing_normalized_end =
-                        normalize_root_hint_end_for_dedup(existing, leaf_transform);
-                    existing_normalized_end == normalized_root_hint_end
-                }
+                // Both findings were stored with pre-normalized root_hint_end.
+                existing.root_hint_start == rec.root_hint_start
+                    && existing.root_hint_end == normalized_root_hint_end
             };
 
             if existing_matches {

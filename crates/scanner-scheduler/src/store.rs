@@ -67,7 +67,7 @@ pub struct FsFindingRecord {
     pub window_end: u64,
     /// BLAKE3 digest of the normalized secret value (32 bytes).
     pub norm_hash: NormHash,
-    /// Additive confidence score from gate signals (Phase 1 range: 0–10).
+    /// Additive confidence score from gate signals (range: 0–10).
     pub confidence_score: i8,
 }
 

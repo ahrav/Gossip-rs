@@ -66,25 +66,19 @@ fn root_rec(span_start: u32, span_end: u32) -> FindingRec {
 }
 
 #[test]
-fn normalize_findings_for_diff_uses_normalized_end_for_overlap_filter() {
+fn normalize_findings_for_diff_base64_within_overlap_passes_filter() {
     let engine = test_engine();
     let overlap = engine.required_overlap() as u64;
 
-    let mut decoded_len = 1u64;
-    let (min_encoded, decoded_len) = loop {
-        let min_encoded = (decoded_len * 4).div_ceil(3);
-        if min_encoded <= overlap && min_encoded + 3 > overlap {
-            break (min_encoded, decoded_len);
-        }
-        decoded_len = decoded_len.saturating_add(1);
-        assert!(decoded_len < 4096);
-    };
+    // The engine pre-normalizes Base64 root_hint_end to the padding-free
+    // minimum before emission. A finding whose hint_len fits within the
+    // overlap window passes the filter.
+    let decoded_len = 1u64;
+    let min_encoded = (decoded_len * 4).div_ceil(3);
+    assert!(min_encoded <= overlap);
 
     let root_hint_start: u64 = 100;
-    let actual_encoded = overlap.saturating_add(1);
-    let root_hint_end = root_hint_start.saturating_add(actual_encoded);
-    assert!(actual_encoded > min_encoded);
-    assert!(actual_encoded <= min_encoded.saturating_add(3));
+    let root_hint_end = root_hint_start + min_encoded;
 
     let rec = non_root_rec(
         decoded_len as u32,
@@ -100,23 +94,26 @@ fn normalize_findings_for_diff_uses_normalized_end_for_overlap_filter() {
     let normalized = normalize_findings_for_diff(&engine, &findings);
     assert_eq!(normalized.len(), 1);
     let key = normalized.iter().next().unwrap();
-    assert_eq!(key.root_hint_end, root_hint_start + min_encoded);
+    assert_eq!(key.root_hint_end, root_hint_end);
 }
 
 #[test]
-fn normalize_findings_for_diff_uses_normalized_end_for_coverage_filter() {
+fn normalize_findings_for_diff_base64_not_subsumed_by_wider_root_span() {
     let engine = test_engine();
     let overlap = engine.required_overlap() as u64;
 
+    // The engine pre-normalizes Base64 root_hint_end to the padding-free
+    // minimum before emission. A non-root finding whose hint window does
+    // NOT contain a root span should survive the subsumption filter.
     let decoded_len = 1u64;
     let min_encoded = (decoded_len * 4).div_ceil(3);
     assert!(overlap >= min_encoded);
 
     let root_hint_start: u64 = 0;
-    let actual_encoded = min_encoded.saturating_add(3);
-    let root_hint_end = root_hint_start.saturating_add(actual_encoded);
+    let root_hint_end = root_hint_start + min_encoded;
+
+    // Root span extends beyond the non-root's pre-normalized hint end.
     let root_span_end = (min_encoded + 1) as u32;
-    assert!(root_span_end as u64 <= actual_encoded);
     assert!(root_span_end as u64 > min_encoded);
 
     let root = root_rec(0, root_span_end);

@@ -4990,7 +4990,7 @@ fn chunked_transform_root_hint_matches_reference() {
     let chunked = scan_in_chunks_with_overlap(&engine, &buf, 24, 512);
 
     // Base64 root_hint_end is normalized before emission, so chunked and
-    // single-chunk scans should now agree on the full finding identity.
+    // single-chunk scans agree on the full finding identity.
     assert_eq!(
         reference.len(),
         chunked.len(),
@@ -4999,38 +4999,8 @@ fn chunked_transform_root_hint_matches_reference() {
         chunked.len()
     );
 
-    // Compare findings by the emitted identity-bearing coordinates.
-    #[derive(Debug, PartialEq, Eq, Hash)]
-    struct FullKey {
-        rule_id: u32,
-        span_start: u32,
-        span_end: u32,
-        root_hint_start: u64,
-        root_hint_end: u64,
-    }
-
-    let reference_full: std::collections::HashSet<_> = reference
-        .iter()
-        .map(|r| FullKey {
-            rule_id: r.rule_id,
-            span_start: r.span_start,
-            span_end: r.span_end,
-            root_hint_start: r.root_hint_start,
-            root_hint_end: r.root_hint_end,
-        })
-        .collect();
-
-    let chunked_full: std::collections::HashSet<_> = chunked
-        .iter()
-        .map(|r| FullKey {
-            rule_id: r.rule_id,
-            span_start: r.span_start,
-            span_end: r.span_end,
-            root_hint_start: r.root_hint_start,
-            root_hint_end: r.root_hint_end,
-        })
-        .collect();
-
+    let reference_full = recs_to_full_keys(&reference);
+    let chunked_full = recs_to_full_keys(&chunked);
     assert_eq!(
         reference_full, chunked_full,
         "full finding identity mismatch:\nreference: {:?}\nchunked: {:?}",
