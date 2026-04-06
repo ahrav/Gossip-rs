@@ -551,6 +551,7 @@ pub(super) fn emit_ordered_item_findings(
             rule_id: finding.rule_id,
             rule_name: engine.rule_name(finding.rule_id),
             norm_hash: finding.norm_hash,
+            blob_oid: None,
             commit_id: None,
             change_kind: None,
             confidence_score: finding.confidence_score,

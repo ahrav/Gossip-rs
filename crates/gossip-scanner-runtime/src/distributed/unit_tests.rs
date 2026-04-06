@@ -12,8 +12,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ahash::AHashMap;
-
 use anyhow::{Error as AnyError, anyhow};
 
 // -- Test infrastructure from the sibling test_support module ----------------
@@ -2111,13 +2109,12 @@ fn submit_git_repo_persistence_commits_findings_and_done_ledger() {
     let repo_key = git_repo_key(tmp.path());
     let findings = [GitFindingForPersistence {
         object_path: b"src/lib.rs".to_vec().into_boxed_slice(),
-        commit_id: Some(7),
+        blob_oid: OidBytes::sha1([0x11; 20]),
         blob_offset_start: 10,
         blob_offset_end: 42,
         norm_hash: NormHash::from_digest([0xAB; 32]),
         rule_id: 7,
     }];
-    let commit_oid_map = AHashMap::from_iter([(7, OidBytes::sha1([0x11; 20]))]);
     let input = GitRepoPersistenceInput {
         write_context: write_context(),
         shard_id: &ToxicDigest::of_bytes(b"test-shard"),
@@ -2125,7 +2122,6 @@ fn submit_git_repo_persistence_commits_findings_and_done_ledger() {
         repo_id: 42,
         bytes_scanned: 1024,
         findings: &findings,
-        commit_oid_map: &commit_oid_map,
         tenant_secret_key: tenant_secret_key(),
         rule_fingerprint: &test_rule_fingerprint,
         claim_time: LogicalTime::from_raw(100),
@@ -2181,7 +2177,6 @@ fn submit_git_repo_persistence_clean_scan_skips_findings_sink() {
     let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
     let tmp = tempdir().expect("temp dir for repo key");
     let repo_key = git_repo_key(tmp.path());
-    let commit_oid_map = AHashMap::new();
     let input = GitRepoPersistenceInput {
         write_context: write_context(),
         shard_id: &ToxicDigest::of_bytes(b"clean-scan-shard"),
@@ -2189,7 +2184,6 @@ fn submit_git_repo_persistence_clean_scan_skips_findings_sink() {
         repo_id: 99,
         bytes_scanned: 512,
         findings: &[],
-        commit_oid_map: &commit_oid_map,
         tenant_secret_key: tenant_secret_key(),
         rule_fingerprint: &test_rule_fingerprint,
         claim_time: LogicalTime::from_raw(100),
@@ -2238,7 +2232,6 @@ fn submit_git_repo_persistence_rejects_reversed_timestamps() {
     let persistence = DistributedPersistence::new(findings_sink, done_ledger);
     let tmp = tempdir().expect("temp dir for repo key");
     let repo_key = git_repo_key(tmp.path());
-    let commit_oid_map = AHashMap::new();
     let input = GitRepoPersistenceInput {
         write_context: write_context(),
         shard_id: &ToxicDigest::of_bytes(b"test-shard"),
@@ -2246,7 +2239,6 @@ fn submit_git_repo_persistence_rejects_reversed_timestamps() {
         repo_id: 42,
         bytes_scanned: 1024,
         findings: &[],
-        commit_oid_map: &commit_oid_map,
         tenant_secret_key: tenant_secret_key(),
         rule_fingerprint: &test_rule_fingerprint,
         claim_time: LogicalTime::from_raw(200),

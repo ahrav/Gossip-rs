@@ -212,6 +212,15 @@ pub(crate) fn sort_and_dedupe_findings(findings: &mut Vec<ScoredFinding>) {
     });
 }
 
+#[inline]
+fn encode_blob_oid(oid: &OidBytes) -> [u8; 33] {
+    let mut encoded = [0u8; 33];
+    let len = oid.len() as usize;
+    encoded[0] = oid.len();
+    encoded[1..=len].copy_from_slice(oid.as_slice());
+    encoded
+}
+
 /// Range into the adapter findings arena for a single blob.
 ///
 /// The span indexes into `ScannedBlobs.finding_arena` (or the adapter's
@@ -508,6 +517,7 @@ impl<'a> EngineAdapter<'a> {
         self.scan_blob_into_buf(file_id, path, bytes)?;
         self.stream_findings(
             path,
+            &candidate.oid,
             candidate.ctx.commit_id,
             candidate.ctx.change_kind.as_str(),
         );
@@ -544,7 +554,7 @@ impl<'a> EngineAdapter<'a> {
     /// When `commit_id` is out of range (>= `commit_graph.len()`), a
     /// `Diagnostic` event at warn level is emitted instead of `CommitMeta`.
     /// Findings are still emitted regardless.
-    fn stream_findings(&self, path: &[u8], commit_id: u32, change_kind: &str) {
+    fn stream_findings(&self, path: &[u8], blob_oid: &OidBytes, commit_id: u32, change_kind: &str) {
         if !self.findings_buf.is_empty() {
             if (commit_id as usize) < self.commit_graph.len() {
                 if self.commit_meta_seen.test_and_set(commit_id as usize) {
@@ -574,6 +584,7 @@ impl<'a> EngineAdapter<'a> {
                 rule_id: f.key.rule_id,
                 rule_name: self.engine.rule_name(f.key.rule_id),
                 norm_hash: f.key.norm_hash,
+                blob_oid: Some(encode_blob_oid(blob_oid)),
                 commit_id: Some(commit_id),
                 change_kind: Some(change_kind),
                 confidence_score: f.confidence_score,
@@ -717,6 +728,7 @@ impl PackObjectSink for EngineAdapter<'_> {
         self.scan_blob_into_buf(file_id, path, bytes)?;
         self.stream_findings(
             path,
+            &candidate.oid,
             candidate.ctx.commit_id,
             candidate.ctx.change_kind.as_str(),
         );

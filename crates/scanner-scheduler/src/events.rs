@@ -55,6 +55,12 @@ pub struct FindingEvent<'a> {
     /// sinks can derive durable finding identity without a parallel side
     /// channel.
     pub norm_hash: [u8; 32],
+    /// Encoded Git blob object ID for the scanned payload.
+    ///
+    /// `None` means the finding did not come from the Git scan path. When
+    /// present, byte 0 stores the raw OID length (20 for SHA-1, 32 for
+    /// SHA-256) and bytes 1..=32 store the zero-padded raw OID bytes.
+    pub blob_oid: Option<[u8; 33]>,
     /// Commit-graph position for Git findings.
     pub commit_id: Option<u32>,
     /// Git diff classification associated with the finding.
@@ -83,6 +89,7 @@ impl fmt::Debug for FindingEvent<'_> {
             .field("rule_name", &self.rule_name)
             // Secret-derived digests are redacted to keep debug output safe.
             .field("norm_hash", &RedactedNormHash)
+            .field("blob_oid", &self.blob_oid)
             .field("commit_id", &self.commit_id)
             .field("change_kind", &self.change_kind)
             .field("confidence_score", &self.confidence_score)
@@ -398,6 +405,7 @@ mod tests {
             rule_id: 7,
             rule_name: "rule",
             norm_hash: [0xAB; 32],
+            blob_oid: None,
             commit_id: Some(3),
             change_kind: Some("modify"),
             confidence_score: 85,
@@ -420,6 +428,7 @@ mod tests {
             rule_id: 7,
             rule_name: "rule",
             norm_hash: [0xDE; 32],
+            blob_oid: Some([20; 33]),
             commit_id: Some(3),
             change_kind: Some("modify"),
             confidence_score: 85,
