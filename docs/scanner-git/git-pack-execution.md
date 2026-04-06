@@ -69,7 +69,8 @@ flowchart TD
 | `object_store.rs` | Tree/pack object abstraction with cache and spill |
 | `blob_introducer.rs` | ODB-blob unique blob discovery walk |
 | `pack_cache.rs` | Tiered set-associative CLOCK cache for decoded objects |
-| `pack_inflate.rs` | Zlib inflate, entry header parsing, delta application primitives |
+| `pack_inflate.rs` | Streaming zlib inflate, entry header parsing, delta application primitives |
+| `pack_inflate_libdeflate.rs` | Single-shot libdeflate backend for small exact-size non-delta entries |
 | `pack_decode.rs` | Bounded inflate wrappers with size caps |
 | `pack_delta.rs` | Re-export of `apply_delta` with output cap enforcement |
 
@@ -107,7 +108,9 @@ Each entry header encodes a 3-bit type tag and a variable-length size:
 
 Non-delta entries contain zlib-compressed object data. Delta entries contain
 a zlib-compressed delta instruction stream that reconstructs the target
-object from a base object.
+object from a base object. `pack_decode.rs` routes small exact-size
+non-delta payloads through `pack_inflate_libdeflate.rs`; larger non-delta
+payloads and all delta payloads use the flate2/zlib-ng backend.
 
 The entry header is parsed by `PackFile::entry_header_at()` in
 `pack_inflate.rs`. The maximum header size is bounded by
@@ -153,6 +156,7 @@ Three-buffer rotation scheme for zero-allocation decoding:
 | `base_buf` | Holds base object bytes during fallback delta chain resolution |
 | `delta_stack` | Collects `DeltaFrame`s during fallback chain walks |
 | `de` | Owned `flate2::Decompress` instance (reset between inflations) |
+| `libde` | Owned `LibdeflateDecompressor` for single-shot non-delta inflation |
 
 ### DecodeEnv (`pack_exec.rs`)
 
@@ -594,6 +598,7 @@ cross-pack or loose-object fallback I/O.
 | Blob introducer (parallel) | `crates/scanner-git/src/blob_introducer.rs` |
 | Seen sets | `crates/scanner-git/src/blob_introducer.rs` |
 | Pack inflate primitives | `crates/scanner-git/src/pack_inflate.rs` |
+| Libdeflate inflate backend | `crates/scanner-git/src/pack_inflate_libdeflate.rs` |
 | Pack decode limits | `crates/scanner-git/src/pack_decode.rs` |
 | Delta application | `crates/scanner-git/src/pack_delta.rs` |
 | Mmap management | `crates/scanner-git/src/runner_exec.rs` |

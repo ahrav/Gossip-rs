@@ -1,10 +1,112 @@
 //! Criterion benchmarks for pack_inflate hot paths.
 //!
 //! Measures `apply_delta_into` (exercises `decode_copy_params`) and
-//! `inflate_limited` pre-reserve impact.
+//! pack-entry inflation dispatch for small non-delta, threshold, large, and
+//! delta buckets.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use scanner_git::pack_decode::{self, PackDecodeLimits};
 use scanner_git::pack_inflate;
+use scanner_git::pack_inflate::PackFile;
+use scanner_git::{LibdeflateDecompressor, LIBDEFLATE_THRESHOLD_BYTES};
+
+fn patterned_bytes(size: usize) -> Vec<u8> {
+    (0..size).map(|i| (i % 251) as u8).collect()
+}
+
+fn zlib_compress(data: &[u8]) -> Vec<u8> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+// Pack construction helpers below mirror `delta_test_helpers.rs` but live here
+// because `#[cfg(test)]` items are unavailable to external benchmark binaries.
+
+fn encode_entry_header(obj_type: u8, size: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut first = (obj_type << 4) | ((size & 0x0f) as u8);
+    let mut remaining = size >> 4;
+    if remaining > 0 {
+        first |= 0x80;
+    }
+    out.push(first);
+    while remaining > 0 {
+        let mut byte = (remaining & 0x7f) as u8;
+        remaining >>= 7;
+        if remaining > 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+    }
+    out
+}
+
+fn encode_ofs_offset(negative_offset: u64) -> Vec<u8> {
+    let mut value = negative_offset;
+    let mut out = Vec::new();
+    out.push((value & 0x7f) as u8);
+    value >>= 7;
+    while value > 0 {
+        value -= 1;
+        out.push(0x80 | (value & 0x7f) as u8);
+        value >>= 7;
+    }
+    out.reverse();
+    out
+}
+
+fn build_pack(entries: &[Vec<u8>]) -> (Vec<u8>, Vec<u64>) {
+    let mut pack = Vec::new();
+    let mut offsets = Vec::with_capacity(entries.len());
+
+    pack.extend_from_slice(b"PACK");
+    pack.extend_from_slice(&2u32.to_be_bytes());
+    pack.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+
+    for entry in entries {
+        offsets.push(pack.len() as u64);
+        pack.extend_from_slice(entry);
+    }
+
+    pack.extend_from_slice(&[0u8; 20]);
+    (pack, offsets)
+}
+
+fn build_non_delta_case(size: usize) -> (Vec<u8>, u64, Vec<u8>) {
+    let payload = patterned_bytes(size);
+    let compressed = zlib_compress(&payload);
+    let mut entry = encode_entry_header(3, payload.len());
+    entry.extend_from_slice(&compressed);
+    let (pack, offsets) = build_pack(&[entry]);
+    (pack, offsets[0], payload)
+}
+
+fn build_delta_case(size: usize) -> (Vec<u8>, u64, Vec<u8>) {
+    let base = patterned_bytes(size);
+    let delta = patterned_bytes(size);
+
+    let compressed_base = zlib_compress(&base);
+    let compressed_delta = zlib_compress(&delta);
+
+    let mut base_entry = encode_entry_header(3, base.len());
+    base_entry.extend_from_slice(&compressed_base);
+
+    let delta_offset = 12 + base_entry.len() as u64;
+    let negative_offset = delta_offset - 12;
+    let ofs_bytes = encode_ofs_offset(negative_offset);
+
+    let mut delta_entry = encode_entry_header(6, delta.len());
+    delta_entry.extend_from_slice(&ofs_bytes);
+    delta_entry.extend_from_slice(&compressed_delta);
+
+    let (pack, offsets) = build_pack(&[base_entry, delta_entry]);
+    (pack, offsets[1], delta)
+}
 
 /// Build a LEB128 varint encoding of `value`.
 fn push_varint(mut value: usize, out: &mut Vec<u8>) {
@@ -186,40 +288,204 @@ fn bench_apply_delta(c: &mut Criterion) {
         b.iter(|| {
             pack_inflate::apply_delta(black_box(&base), black_box(&delta), &mut out, result_len)
                 .unwrap();
-            black_box(out.len());
+            black_box(out.as_slice());
         });
     });
 
     group.finish();
 }
 
-fn bench_inflate_limited(c: &mut Criterion) {
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
-    use std::io::Write;
+fn bench_inflate_entry_payload(c: &mut Criterion) {
+    let mut group = c.benchmark_group("inflate_entry_payload");
+    let limits = PackDecodeLimits::new(
+        64,
+        LIBDEFLATE_THRESHOLD_BYTES + 4096,
+        LIBDEFLATE_THRESHOLD_BYTES + 4096,
+    );
 
-    let mut group = c.benchmark_group("inflate_limited");
+    for (name, pack_bytes, offset, payload_len) in [
+        {
+            let (pack, offset, payload) = build_non_delta_case(8 * 1024);
+            ("small_nondelta", pack, offset, payload.len())
+        },
+        {
+            let (pack, offset, payload) = build_non_delta_case(LIBDEFLATE_THRESHOLD_BYTES);
+            ("threshold_nondelta", pack, offset, payload.len())
+        },
+        {
+            let (pack, offset, payload) = build_non_delta_case(LIBDEFLATE_THRESHOLD_BYTES + 1);
+            ("large_nondelta", pack, offset, payload.len())
+        },
+        {
+            let (pack, offset, payload) = build_delta_case(64 * 1024);
+            ("delta_payload", pack, offset, payload.len())
+        },
+    ] {
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let header = pack_decode::entry_header_at(&pack, offset, &limits).expect("parse header");
 
-    // Create a zlib-compressed payload of known size.
-    for &size in &[1024usize, 16384, 65536] {
-        let original = vec![0x42u8; size];
+        group.throughput(Throughput::Bytes(payload_len as u64));
+        group.bench_function(BenchmarkId::new("bucket", name), |b| {
+            let mut de = flate2::Decompress::new(true);
+            let mut libde = LibdeflateDecompressor::new();
+            let mut out = Vec::new();
+            b.iter(|| {
+                let consumed = pack_decode::inflate_entry_payload_with(
+                    &mut de,
+                    Some(&mut libde),
+                    black_box(&pack),
+                    black_box(&header),
+                    &mut out,
+                    &limits,
+                )
+                .unwrap();
+                black_box(consumed);
+                black_box(out.as_slice());
+            });
+        });
+    }
 
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&original).unwrap();
-        let compressed = encoder.finish().unwrap();
+    group.finish();
+}
 
-        group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("uniform", size),
-            &compressed,
-            |b, compressed| {
-                let mut out = Vec::new();
-                b.iter(|| {
-                    pack_inflate::inflate_limited(black_box(compressed), &mut out, size).unwrap();
-                    black_box(out.len());
-                });
-            },
-        );
+fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
+    let mut group = c.benchmark_group("inflate_entry_payload_compare");
+    let limits = PackDecodeLimits::new(
+        64,
+        LIBDEFLATE_THRESHOLD_BYTES + 4096,
+        LIBDEFLATE_THRESHOLD_BYTES + 4096,
+    );
+
+    for (name, size) in [
+        ("small_nondelta", 8 * 1024),
+        ("threshold_nondelta", LIBDEFLATE_THRESHOLD_BYTES),
+    ] {
+        let (pack_bytes, offset, payload) = build_non_delta_case(size);
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let header = pack_decode::entry_header_at(&pack, offset, &limits).expect("parse header");
+        let input = pack.slice_from(header.data_start);
+
+        group.throughput(Throughput::Bytes(payload.len() as u64));
+        group.bench_function(BenchmarkId::new("dispatch", name), |b| {
+            let mut de = flate2::Decompress::new(true);
+            let mut libde = LibdeflateDecompressor::new();
+            let mut out = Vec::new();
+            b.iter(|| {
+                let consumed = pack_decode::inflate_entry_payload_with(
+                    &mut de,
+                    Some(&mut libde),
+                    black_box(&pack),
+                    black_box(&header),
+                    &mut out,
+                    &limits,
+                )
+                .unwrap();
+                black_box(consumed);
+                black_box(out.as_slice());
+            });
+        });
+
+        group.bench_function(BenchmarkId::new("flate2_control", name), |b| {
+            let mut de = flate2::Decompress::new(true);
+            let mut out = Vec::new();
+            b.iter(|| {
+                let consumed = pack_inflate::inflate_exact_with(
+                    &mut de,
+                    black_box(input),
+                    &mut out,
+                    payload.len(),
+                )
+                .unwrap();
+                black_box(consumed);
+                black_box(out.as_slice());
+            });
+        });
+    }
+
+    {
+        let (pack_bytes, offset, payload) = build_non_delta_case(LIBDEFLATE_THRESHOLD_BYTES + 1);
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let header = pack_decode::entry_header_at(&pack, offset, &limits).expect("parse header");
+        let input = pack.slice_from(header.data_start);
+
+        group.throughput(Throughput::Bytes(payload.len() as u64));
+        group.bench_function(BenchmarkId::new("dispatch", "large_nondelta"), |b| {
+            let mut de = flate2::Decompress::new(true);
+            let mut libde = LibdeflateDecompressor::new();
+            let mut out = Vec::new();
+            b.iter(|| {
+                let consumed = pack_decode::inflate_entry_payload_with(
+                    &mut de,
+                    Some(&mut libde),
+                    black_box(&pack),
+                    black_box(&header),
+                    &mut out,
+                    &limits,
+                )
+                .unwrap();
+                black_box(consumed);
+                black_box(out.as_slice());
+            });
+        });
+
+        group.bench_function(BenchmarkId::new("flate2_control", "large_nondelta"), |b| {
+            let mut de = flate2::Decompress::new(true);
+            let mut out = Vec::new();
+            b.iter(|| {
+                let consumed = pack_inflate::inflate_exact_with(
+                    &mut de,
+                    black_box(input),
+                    &mut out,
+                    payload.len(),
+                )
+                .unwrap();
+                black_box(consumed);
+                black_box(out.as_slice());
+            });
+        });
+    }
+
+    {
+        let (pack_bytes, offset, payload) = build_delta_case(64 * 1024);
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let header = pack_decode::entry_header_at(&pack, offset, &limits).expect("parse header");
+        let input = pack.slice_from(header.data_start);
+
+        group.throughput(Throughput::Bytes(payload.len() as u64));
+        group.bench_function(BenchmarkId::new("dispatch", "delta_payload"), |b| {
+            let mut de = flate2::Decompress::new(true);
+            let mut libde = LibdeflateDecompressor::new();
+            let mut out = Vec::new();
+            b.iter(|| {
+                let consumed = pack_decode::inflate_entry_payload_with(
+                    &mut de,
+                    Some(&mut libde),
+                    black_box(&pack),
+                    black_box(&header),
+                    &mut out,
+                    &limits,
+                )
+                .unwrap();
+                black_box(consumed);
+                black_box(out.as_slice());
+            });
+        });
+
+        group.bench_function(BenchmarkId::new("flate2_control", "delta_payload"), |b| {
+            let mut de = flate2::Decompress::new(true);
+            let mut out = Vec::new();
+            b.iter(|| {
+                let consumed = pack_inflate::inflate_limited_with(
+                    &mut de,
+                    black_box(input),
+                    &mut out,
+                    payload.len(),
+                )
+                .unwrap();
+                black_box(consumed);
+                black_box(out.as_slice());
+            });
+        });
     }
 
     group.finish();
@@ -246,7 +512,7 @@ fn bench_tls_overhead(c: &mut Criterion) {
         let mut out = Vec::new();
         b.iter(|| {
             pack_inflate::inflate_limited(black_box(&compressed), &mut out, 64).unwrap();
-            black_box(out.len());
+            black_box(out.as_slice());
         });
     });
 
@@ -257,7 +523,7 @@ fn bench_tls_overhead(c: &mut Criterion) {
         b.iter(|| {
             pack_inflate::inflate_limited_with(&mut de, black_box(&compressed), &mut out, 64)
                 .unwrap();
-            black_box(out.len());
+            black_box(out.as_slice());
         });
     });
 
@@ -268,7 +534,8 @@ criterion_group!(
     benches,
     bench_apply_delta_into,
     bench_apply_delta,
-    bench_inflate_limited,
+    bench_inflate_entry_payload,
+    bench_inflate_entry_payload_compare,
     bench_tls_overhead,
 );
 criterion_main!(benches);
