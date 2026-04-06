@@ -1,10 +1,11 @@
-use super::{CachelineBoundary, ScanScratch, normalize_root_hint_end_for_dedup};
+use super::{CachelineBoundary, RootSpanMapCtx, ScanScratch, normalize_root_hint_end_for_dedup};
 use crate::api::{
-    DecodeStep, FileId, FindingRec, RuleSpec, STEP_ROOT, StepId, TransformConfig, TransformId,
-    Tuning,
+    DecodeStep, FileId, FindingRec, Gate, RuleSpec, STEP_ROOT, StepId, TransformConfig,
+    TransformId, TransformMode, Tuning,
 };
 use crate::engine::Engine;
 use regex::bytes::Regex;
+use rstest::rstest;
 
 #[test]
 fn scanscratch_cold_region_is_cacheline_aligned() {
@@ -93,6 +94,20 @@ fn simple_rule() -> RuleSpec {
     }
 }
 
+fn base64_test_transform_config() -> TransformConfig {
+    TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::None,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }
+}
+
 fn new_test_scratch() -> ScanScratch {
     let engine = Engine::new(
         vec![simple_rule()],
@@ -132,6 +147,36 @@ fn engine_normalize_none_transform_not_snapped() {
     let rec = make_rec(StepId(1), 200, 213, 1000, 1019);
     let result = normalize_root_hint_end_for_dedup(&rec, None);
     assert_eq!(result, 1019);
+}
+
+/// Boundary-value coverage for the Base64 snap window.
+///
+/// The snap condition is:
+///   `actual_encoded > min_encoded && actual_encoded <= min_encoded + 3`
+///
+/// For decoded_len=13 (span 200..213): min_encoded = ceil(13*4/3) = 18.
+/// Parameterize over actual_encoded offsets relative to min to hit every
+/// branch boundary.
+#[rstest]
+#[case::exact_no_snap(1000, 1018, false, "actual == min: no snap (strict >)")]
+#[case::plus_one_snap(1000, 1019, true, "actual == min+1: snap")]
+#[case::plus_two_snap(1000, 1020, true, "actual == min+2: interior snap")]
+#[case::plus_three_snap(1000, 1021, true, "actual == min+3: far boundary snap")]
+#[case::plus_four_no_snap(1000, 1022, false, "actual == min+4: beyond window")]
+fn normalize_base64_snap_window_boundaries(
+    #[case] root_hint_start: u64,
+    #[case] root_hint_end: u64,
+    #[case] expect_snap: bool,
+    #[case] label: &str,
+) {
+    let rec = make_rec(StepId(1), 200, 213, root_hint_start, root_hint_end);
+    let result = normalize_root_hint_end_for_dedup(&rec, Some(TransformId::Base64));
+    let expected = if expect_snap {
+        root_hint_start + 18 // snapped to min_encoded
+    } else {
+        root_hint_end // unchanged
+    };
+    assert_eq!(result, expected, "{label}");
 }
 
 #[test]
@@ -591,5 +636,200 @@ fn higher_confidence_retained_on_reverse_insert() {
     assert_eq!(
         hashes[0], hash_high,
         "norm_hash must remain the high-confidence finding's hash"
+    );
+}
+
+#[test]
+fn transform_finding_storage_normalizes_base64_root_hint_end() {
+    let mut scratch = new_test_scratch();
+    scratch.update_chunk_overlap(FileId(0), 0, 4096);
+
+    let transform = base64_test_transform_config();
+    let encoded = b"U0VDUkVUQUJDREVGR0g=".to_vec();
+    scratch.root_span_map_ctx = Some(RootSpanMapCtx::new(&transform, &encoded, 1000, 0));
+
+    let transform_step = scratch.step_arena.push(
+        STEP_ROOT,
+        DecodeStep::Transform {
+            transform_idx: 0,
+            parent_span: 0..encoded.len(),
+        },
+    );
+    let rec = make_rec(transform_step, 200, 213, 1000, 1019);
+
+    scratch.push_finding_with_drop_hint(rec, [0xCC; 32], 1024, false);
+
+    assert_eq!(scratch.pending_findings_len(), 1);
+    assert_eq!(
+        scratch.findings()[0].root_hint_end,
+        1018,
+        "emitted finding should store the normalized base64 root hint end"
+    );
+    assert_eq!(
+        scratch.drop_hint_end()[0],
+        1024,
+        "drop hint sidecar must remain unchanged by root hint normalization"
+    );
+}
+
+#[test]
+fn same_scan_base64_transform_replacement_keeps_normalized_root_hint_end() {
+    let mut scratch = new_test_scratch();
+    scratch.update_chunk_overlap(FileId(0), 0, 4096);
+
+    let raw_rec = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0,
+        span_start: 0,
+        span_end: 0,
+        root_hint_start: 1000,
+        root_hint_end: 1018,
+        dedupe_with_span: false,
+        step_id: STEP_ROOT,
+        confidence_score: 0,
+    };
+    scratch.push_finding_with_drop_hint(raw_rec, [0x11; 32], raw_rec.root_hint_end, false);
+
+    let transform = base64_test_transform_config();
+    let encoded = b"U0VDUkVUQUJDREVGR0g=".to_vec();
+    scratch.root_span_map_ctx = Some(RootSpanMapCtx::new(&transform, &encoded, 1000, 0));
+
+    let transform_step = scratch.step_arena.push(
+        STEP_ROOT,
+        DecodeStep::Transform {
+            transform_idx: 0,
+            parent_span: 0..encoded.len(),
+        },
+    );
+    let transform_rec = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0,
+        span_start: 5,
+        span_end: 18,
+        root_hint_start: 1000,
+        root_hint_end: 1019,
+        dedupe_with_span: false,
+        step_id: transform_step,
+        confidence_score: 0,
+    };
+
+    scratch.push_finding_with_drop_hint(
+        transform_rec,
+        [0x22; 32],
+        transform_rec.root_hint_end,
+        false,
+    );
+
+    assert_eq!(scratch.pending_findings_len(), 1);
+    assert_ne!(
+        scratch.findings()[0].step_id,
+        STEP_ROOT,
+        "transform finding should replace the RAW duplicate"
+    );
+    assert_eq!(
+        scratch.findings()[0].root_hint_end,
+        1018,
+        "replacement path must keep the normalized base64 root hint end"
+    );
+
+    let mut findings = Vec::with_capacity(1);
+    let mut hashes = Vec::with_capacity(1);
+    scratch.drain_findings_with_hashes(&mut findings, &mut hashes);
+    assert_eq!(
+        hashes[0], [0x22; 32],
+        "norm_hash must be updated to the transform finding's hash"
+    );
+}
+
+#[test]
+fn same_scan_transform_to_transform_replacement_uses_confidence_tiebreak() {
+    let mut scratch = new_test_scratch();
+    scratch.update_chunk_overlap(FileId(0), 0, 4096);
+
+    let transform = base64_test_transform_config();
+    let encoded = b"U0VDUkVUQUJDREVGR0g=".to_vec();
+    scratch.root_span_map_ctx = Some(RootSpanMapCtx::new(&transform, &encoded, 1000, 0));
+
+    let transform_step = scratch.step_arena.push(
+        STEP_ROOT,
+        DecodeStep::Transform {
+            transform_idx: 0,
+            parent_span: 0..encoded.len(),
+        },
+    );
+
+    // First transform finding: root_hint_end=1019 normalizes to 1018, low confidence.
+    let rec1 = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0,
+        span_start: 200,
+        span_end: 213,
+        root_hint_start: 1000,
+        root_hint_end: 1019,
+        dedupe_with_span: false,
+        step_id: transform_step,
+        confidence_score: 2,
+    };
+    scratch.push_finding_with_drop_hint(rec1, [0xAA; 32], 1024, false);
+
+    // Second transform finding: root_hint_end=1020 also normalizes to 1018, higher confidence.
+    let rec2 = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0,
+        span_start: 200,
+        span_end: 213,
+        root_hint_start: 1000,
+        root_hint_end: 1020,
+        dedupe_with_span: false,
+        step_id: transform_step,
+        confidence_score: 7,
+    };
+    scratch.push_finding_with_drop_hint(rec2, [0xBB; 32], 1024, false);
+
+    assert_eq!(
+        scratch.pending_findings_len(),
+        1,
+        "transform duplicates must dedup"
+    );
+    assert_eq!(
+        scratch.findings()[0].root_hint_end,
+        1018,
+        "surviving finding must have normalized root_hint_end"
+    );
+    assert_eq!(
+        scratch.findings()[0].confidence_score,
+        7,
+        "higher confidence finding must win the tiebreak"
+    );
+
+    let mut findings = Vec::with_capacity(1);
+    let mut hashes = Vec::with_capacity(1);
+    scratch.drain_findings_with_hashes(&mut findings, &mut hashes);
+    assert_eq!(
+        hashes[0], [0xBB; 32],
+        "norm_hash must reflect the higher-confidence finding"
+    );
+}
+
+#[test]
+fn normalization_skipped_without_root_span_map_ctx() {
+    let mut scratch = new_test_scratch();
+    scratch.update_chunk_overlap(FileId(0), 0, 4096);
+    // No root_span_map_ctx — leaf_transform resolves to None, so the
+    // normalize function returns root_hint_end unchanged even for a
+    // non-root step.
+    let step = scratch.step_arena.push(
+        STEP_ROOT,
+        DecodeStep::Transform {
+            transform_idx: 0,
+            parent_span: 0..20,
+        },
+    );
+    let rec = make_rec(step, 200, 213, 1000, 1019);
+    scratch.push_finding_with_drop_hint(rec, [0xAA; 32], 1024, false);
+    assert_eq!(
+        scratch.findings()[0].root_hint_end,
+        1019,
+        "without root_span_map_ctx, root_hint_end must remain un-normalized"
     );
 }

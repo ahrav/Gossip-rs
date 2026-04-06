@@ -81,6 +81,9 @@ use super::{
 /// value) instead, because the engine populates those with blob-absolute
 /// coordinates via `base_offset + match_span.start` (root findings) or
 /// `base_offset + RootSpanMapCtx::map_span(decoded_span).start` (transform findings).
+/// For Base64-derived transform findings, `root_hint_end` already arrives
+/// padding-normalized from the engine; persistence adapters should forward it
+/// directly instead of re-normalizing it.
 ///
 /// # Invariants
 ///

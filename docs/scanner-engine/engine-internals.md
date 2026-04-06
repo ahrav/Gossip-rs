@@ -132,7 +132,7 @@ The 32-byte size is chosen to align with the AEGIS-128L absorption rate (2 x 128
 - **`seen_findings`** (per-file): Suppresses cross-chunk repeats within the same file. Reset on file transitions.
 - **`seen_findings_scan`** (per-scan): Enables within-scan replacement (e.g., preferring transform findings over raw findings) without re-emitting earlier chunks.
 
-For transform-derived findings, span coordinates are zeroed when a precise root-span mapping is available (to handle varying decoded offsets across chunks). When mapping is unavailable, the decoded span is included to avoid collapsing distinct matches. Base64 `root_hint_end` values are normalized to the padding-free minimum (snapped by up to 3 bytes) to handle encoding length variance.
+For transform-derived findings, span coordinates are zeroed when a precise root-span mapping is available (to handle varying decoded offsets across chunks). When mapping is unavailable, the decoded span is included to avoid collapsing distinct matches. Base64 `root_hint_end` values are normalized to the padding-free minimum (snapped by up to 3 bytes) to handle encoding length variance, and the emitted `FindingRec` carries that snapped value downstream.
 
 The variant discriminator (8-bit) distinguishes UTF-16 LE/BE findings that share the same span and root hint, preventing false dedup suppression.
 
