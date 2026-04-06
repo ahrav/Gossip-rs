@@ -298,6 +298,28 @@ impl PackCacheTier {
         false
     }
 
+    /// Like [`prefetch_slot`](Self::prefetch_slot) but brings slot data
+    /// into L2 instead of L1, reducing L1 pollution for speculative
+    /// prefetch paths where the data may not be consumed.
+    #[inline(always)]
+    fn prefetch_slot_l2(&self, offset: u64) -> bool {
+        if self.sets == 0 {
+            return false;
+        }
+
+        let set = self.set_index(offset);
+        let base = set * WAYS;
+        for way in 0..WAYS {
+            let idx = base + way;
+            let slot = &self.slots[idx];
+            if slot.valid && slot.offset == offset {
+                crate::pack_exec::prefetch_read_l2(self.slot_data_ptr(idx));
+                return true;
+            }
+        }
+        false
+    }
+
     /// Inserts bytes for an offset into the cache.
     ///
     /// If an entry with the same offset already exists in the set, it is
@@ -639,6 +661,15 @@ impl PackCache {
     #[inline(always)]
     pub fn prefetch_slot(&self, offset: u64) -> bool {
         self.small.prefetch_slot(offset) || self.large.prefetch_slot(offset)
+    }
+
+    /// Like [`prefetch_slot`](Self::prefetch_slot) but brings slot data into
+    /// L2 instead of L1. Used by the two-stage prefetch pipeline for
+    /// speculative cache-base warming where the data is conditional on a
+    /// delta hit — L2 avoids polluting L1 when the base is not consumed.
+    #[inline(always)]
+    pub fn prefetch_slot_l2(&self, offset: u64) -> bool {
+        self.small.prefetch_slot_l2(offset) || self.large.prefetch_slot_l2(offset)
     }
 
     /// Inserts bytes for an offset into the cache.

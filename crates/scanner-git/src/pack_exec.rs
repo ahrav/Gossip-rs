@@ -44,6 +44,7 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::fmt;
+use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -921,14 +922,16 @@ pub(crate) fn prefetch_read(ptr: *const u8) {
 }
 
 #[inline(always)]
-fn prefetch_read_l2(ptr: *const u8) {
+pub(crate) fn prefetch_read_l2(ptr: *const u8) {
     prefetch_read_with_locality(ptr, PrefetchLocality::L2);
 }
 
 #[inline(always)]
 fn prefetch_read_with_locality(ptr: *const u8, locality: PrefetchLocality) {
     #[cfg(all(target_arch = "x86_64", not(miri)))]
-    {
+    // SAFETY: `_mm_prefetch` is an advisory cache hint and does not dereference `ptr`.
+    // The `unsafe` is required by `#[target_feature]`, not by any memory safety concern.
+    unsafe {
         match locality {
             PrefetchLocality::L1 => {
                 core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
@@ -944,14 +947,26 @@ fn prefetch_read_with_locality(ptr: *const u8, locality: PrefetchLocality) {
         return;
     }
     #[cfg(all(target_arch = "aarch64", not(miri)))]
-    // SAFETY: `prfm` is an advisory prefetch hint and does not dereference `ptr`.
+    // SAFETY: `prfm` is an advisory prefetch hint and does not dereference
+    // `ptr`. The ARM Architecture Reference Manual (C6.2.215) specifies that
+    // address-translation faults on `PRFM` are silently suppressed (treated
+    // as NOP). `readonly` tells LLVM the asm block has no observable
+    // side effects, allowing it to reorder surrounding loads freely.
     unsafe {
         match locality {
             PrefetchLocality::L1 => {
-                core::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nostack));
+                core::arch::asm!(
+                    "prfm pldl1keep, [{ptr}]",
+                    ptr = in(reg) ptr,
+                    options(nostack, readonly),
+                );
             }
             PrefetchLocality::L2 => {
-                core::arch::asm!("prfm pldl2keep, [{ptr}]", ptr = in(reg) ptr, options(nostack));
+                core::arch::asm!(
+                    "prfm pldl2keep, [{ptr}]",
+                    ptr = in(reg) ptr,
+                    options(nostack, readonly),
+                );
             }
         }
         return;
@@ -1413,28 +1428,61 @@ fn execute_pack_plan_with_selector_from_header<
     Ok(report)
 }
 
+/// Stage 1 (far lookahead): warm metadata arrays with pointer arithmetic
+/// only — no dependent loads.
+///
+/// Issues L1 prefetch for pack bytes (unconditional hot input), and
+/// warms the metadata cache lines for `need_offsets`, `delta_dep_index`,
+/// `delta_deps`, and `candidate_ranges` so that Stage 2 can resolve
+/// dependent addresses without stalling.
 #[inline(always)]
-fn prefetch_ooo_entry_lookahead(
+fn prefetch_ooo_stage1(
     env: &DecodeEnv<'_>,
     pack_bytes: &[u8],
-    cache: &PackCache,
     candidate_ranges: &[CandidateRange],
     need_idx: usize,
 ) {
+    // Pack bytes: unconditional primary input, bring to L1.
     let offset = env.need_offsets[need_idx] as usize;
-    prefetch_read_l2(pack_bytes.as_ptr().wrapping_add(offset));
-    prefetch_read(std::ptr::from_ref(&env.delta_dep_index[need_idx]).cast::<u8>());
-    prefetch_read(std::ptr::from_ref(&candidate_ranges[need_idx]).cast::<u8>());
+    prefetch_read(pack_bytes.as_ptr().wrapping_add(offset));
 
+    // Warm the metadata entries this index will need in Stage 2.
+    // Pure pointer arithmetic — no data-dependent addresses.
+    prefetch_read(
+        (env.delta_dep_index.as_ptr() as *const u8)
+            .wrapping_add(need_idx.wrapping_mul(size_of::<u32>())),
+    );
+    prefetch_read(
+        (env.need_offsets.as_ptr() as *const u8)
+            .wrapping_add(need_idx.wrapping_mul(size_of::<u64>())),
+    );
+    prefetch_read(
+        (candidate_ranges.as_ptr() as *const u8)
+            .wrapping_add(need_idx.wrapping_mul(size_of::<CandidateRange>())),
+    );
+}
+
+/// Stage 2 (near lookahead): metadata is warm from Stage 1, resolve
+/// dependent loads to issue downstream data prefetches.
+///
+/// By the time Stage 2 runs (NEAR_DIST iterations after Stage 1), the
+/// `delta_dep_index` and `delta_deps` entries for this `need_idx` are
+/// in L1. The function can now read `dep_idx`, follow it to `delta_deps`,
+/// and issue a cache-slot prefetch without serial stalls.
+#[inline(always)]
+fn prefetch_ooo_stage2(env: &DecodeEnv<'_>, cache: &PackCache, need_idx: usize) {
     let dep_idx = env.delta_dep_index[need_idx];
     if dep_idx == NONE_U32 {
         return;
     }
 
+    // Warm the DeltaDepHot entry itself (may be on a different cache
+    // line than the one Stage 1 pre-warmed if dep_idx != need_idx).
     let dep = env.delta_deps[dep_idx as usize];
-    prefetch_read(std::ptr::from_ref(&env.delta_deps[dep_idx as usize]).cast::<u8>());
     if !dep.is_external() {
-        let _ = cache.prefetch_slot(dep.base_offset);
+        // Cache slot data is speculative (only useful if delta base is
+        // cached), so bring to L2 rather than polluting L1.
+        cache.prefetch_slot_l2(dep.base_offset);
     }
 }
 
@@ -1499,11 +1547,12 @@ fn execute_pack_plan_out_of_order_from_header<
                 candidate_ranges[idx],
             )?;
         }
-    } else {
+    } else if LOOKAHEAD < 4 {
+        // Single-stage prefetch: not enough distance for a two-stage pipeline.
         let prefetch_end = order.len().saturating_sub(LOOKAHEAD);
         for i in 0..prefetch_end {
             let ahead_idx = order[i + LOOKAHEAD] as usize;
-            prefetch_ooo_entry_lookahead(&env, pack_bytes, cache, candidate_ranges, ahead_idx);
+            prefetch_ooo_stage1(&env, pack_bytes, candidate_ranges, ahead_idx);
 
             let idx = order[i] as usize;
             execute_offset_range_with_scratch(
@@ -1522,6 +1571,82 @@ fn execute_pack_plan_out_of_order_from_header<
             )?;
         }
         for &idx in &order[prefetch_end..] {
+            let idx = idx as usize;
+            execute_offset_range_with_scratch(
+                &env,
+                plan,
+                paths,
+                cache,
+                external,
+                sink,
+                bufs,
+                &mut report,
+                &mut hot_stats,
+                alloc_guard_enabled,
+                idx,
+                candidate_ranges[idx],
+            )?;
+        }
+    } else {
+        // Two-stage prefetch pipeline:
+        //   Stage 1 (at FAR distance): warm metadata arrays with pointer
+        //     arithmetic only — no dependent loads.
+        //   Stage 2 (at NEAR distance): metadata is warm, resolve dependent
+        //     addresses and issue downstream data prefetches.
+        //
+        // The split gives Stage 1's prefetches (LOOKAHEAD - near_dist)
+        // iterations to complete before Stage 2 reads them.
+        let near_dist = LOOKAHEAD / 2;
+        let far_end = order.len().saturating_sub(LOOKAHEAD);
+        let near_end = order.len().saturating_sub(near_dist);
+
+        // Main body: both stages active.
+        for i in 0..far_end {
+            let far_idx = order[i + LOOKAHEAD] as usize;
+            prefetch_ooo_stage1(&env, pack_bytes, candidate_ranges, far_idx);
+
+            let near_idx = order[i + near_dist] as usize;
+            prefetch_ooo_stage2(&env, cache, near_idx);
+
+            let idx = order[i] as usize;
+            execute_offset_range_with_scratch(
+                &env,
+                plan,
+                paths,
+                cache,
+                external,
+                sink,
+                bufs,
+                &mut report,
+                &mut hot_stats,
+                alloc_guard_enabled,
+                idx,
+                candidate_ranges[idx],
+            )?;
+        }
+        // Near-only: Stage 2 for entries whose Stage 1 already fired.
+        for i in far_end..near_end {
+            let near_idx = order[i + near_dist] as usize;
+            prefetch_ooo_stage2(&env, cache, near_idx);
+
+            let idx = order[i] as usize;
+            execute_offset_range_with_scratch(
+                &env,
+                plan,
+                paths,
+                cache,
+                external,
+                sink,
+                bufs,
+                &mut report,
+                &mut hot_stats,
+                alloc_guard_enabled,
+                idx,
+                candidate_ranges[idx],
+            )?;
+        }
+        // Tail: no prefetch.
+        for &idx in &order[near_end..] {
             let idx = idx as usize;
             execute_offset_range_with_scratch(
                 &env,
@@ -1890,23 +2015,51 @@ fn execute_pack_plan_with_scratch_indices_from_header_parts<
     for &idx in exec_indices {
         expected = expected.saturating_add(candidate_ranges[idx].candidate_count());
     }
-    execute_pack_plan_with_selector_from_header(
-        plan,
-        pack_bytes,
-        pack_header,
-        paths,
-        limits,
-        cache,
-        external,
-        sink,
-        spill_dir,
-        bufs,
-        delta_deps,
-        external_base_oids,
-        expected,
-        exec_indices.iter().copied(),
-        |idx| candidate_ranges[idx],
-    )
+
+    // Route through the two-stage prefetch pipeline when the shard is
+    // large enough to benefit. The conversion from `&[usize]` to
+    // `Vec<u32>` is a one-time O(shard_size) WARM-tier cost amortized
+    // over the per-offset prefetch wins. Tiny shards (< PREFETCH_AHEAD
+    // indices) skip prefetch entirely — the pipeline overhead exceeds
+    // the benefit.
+    if exec_indices.len() >= PREFETCH_AHEAD {
+        let order_u32: Vec<u32> = exec_indices.iter().map(|&i| i as u32).collect();
+        execute_pack_plan_out_of_order_from_header::<PREFETCH_AHEAD, _, _>(
+            plan,
+            pack_bytes,
+            pack_header,
+            paths,
+            limits,
+            cache,
+            external,
+            sink,
+            spill_dir,
+            bufs,
+            delta_deps,
+            external_base_oids,
+            expected,
+            &order_u32,
+            candidate_ranges,
+        )
+    } else {
+        execute_pack_plan_with_selector_from_header(
+            plan,
+            pack_bytes,
+            pack_header,
+            paths,
+            limits,
+            cache,
+            external,
+            sink,
+            spill_dir,
+            bufs,
+            delta_deps,
+            external_base_oids,
+            expected,
+            exec_indices.iter().copied(),
+            |idx| candidate_ranges[idx],
+        )
+    }
 }
 
 /// Executes a shard over explicit indices using precomputed plan-hot delta tables.
@@ -3562,7 +3715,7 @@ mod bench_support {
 
     impl ExternalBaseProvider for NoExternal {
         fn load_base(&mut self, _oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError> {
-            unreachable!("synthetic benchmark does not use external bases")
+            panic!("unexpected external base lookup in bench")
         }
     }
 
@@ -3588,6 +3741,12 @@ mod bench_support {
         SIZES[idx % SIZES.len()]
     }
 
+    /// Depth of additional delta chains appended after the flat depth-1
+    /// deltas. Real git repos commonly have chains of depth 5-20; a depth
+    /// of 3 exercises the recursive base-resolution path without making the
+    /// benchmark prohibitively slow.
+    const CHAIN_DEPTH: usize = 3;
+
     #[must_use]
     pub fn bench_build_prefetch_case(
         base_count: usize,
@@ -3603,6 +3762,8 @@ mod bench_support {
             let base_bytes = patterned_bytes(base_idx, base_size_for(base_idx));
             base_entry_indices.push(builder.add_non_delta(3, &base_bytes));
         }
+
+        // Depth-1 deltas: each points directly at its base.
         for base_idx in 0..base_count {
             let base_size = base_size_for(base_idx);
             let delta = make_copy_delta(base_size, 0, base_size);
@@ -3611,66 +3772,145 @@ mod bench_support {
             }
         }
 
+        let depth1_delta_start = base_count;
+        let depth1_delta_count = base_count * deltas_per_base;
+
+        // Depth-3 chains: for each base, create a chain of CHAIN_DEPTH
+        // dependent deltas where each delta's base is the previous chain
+        // entry. This exercises recursive base resolution.
+        let chain_start = base_count + depth1_delta_count;
+        for base_idx in 0..base_count {
+            let base_size = base_size_for(base_idx);
+            let delta = make_copy_delta(base_size, 0, base_size);
+            let mut prev = base_entry_indices[base_idx];
+            for _ in 0..CHAIN_DEPTH {
+                prev = builder.add_ofs_delta(prev, &delta);
+            }
+        }
+        let chain_entry_count = base_count * CHAIN_DEPTH;
+
         let (pack_bytes, need_offsets) = builder.build();
-        let delta_start = base_count;
-        let delta_count = base_count.saturating_mul(deltas_per_base);
+
+        // Candidates: depth-1 deltas + chain leaf deltas (last entry in
+        // each chain). Only leaf deltas are candidates; intermediate chain
+        // entries are dependency-only.
+        let leaf_candidate_count = base_count;
+        let total_candidate_count = depth1_delta_count + leaf_candidate_count;
 
         let mut paths = ByteArena::with_capacity(64);
         let path_ref = paths.intern(b"bench.bin").expect("path ref");
 
-        let candidates = (0..delta_count)
-            .map(|idx| {
-                let need_idx = delta_start + idx;
-                PackCandidate {
-                    oid: OidBytes::sha1([(idx % 251) as u8; 20]),
-                    ctx: ctx(path_ref),
-                    pack_id: 0,
-                    offset: need_offsets[need_idx],
-                }
-            })
-            .collect::<Vec<_>>();
-        let candidate_offsets = (0..delta_count)
-            .map(|idx| CandidateAtOffset {
-                offset: need_offsets[delta_start + idx],
-                cand_idx: idx as u32,
-            })
-            .collect::<Vec<_>>();
+        let mut candidates = Vec::with_capacity(total_candidate_count);
+        let mut candidate_offsets = Vec::with_capacity(total_candidate_count);
 
-        let delta_deps = (0..delta_count)
-            .map(|idx| {
-                let need_idx = delta_start + idx;
-                let base_idx = idx / deltas_per_base;
+        // Candidates from depth-1 deltas.
+        for idx in 0..depth1_delta_count {
+            let need_idx = depth1_delta_start + idx;
+            let cand_idx = candidates.len();
+            candidates.push(PackCandidate {
+                oid: OidBytes::sha1([(idx % 251) as u8; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: need_offsets[need_idx],
+            });
+            candidate_offsets.push(CandidateAtOffset {
+                offset: need_offsets[need_idx],
+                cand_idx: cand_idx as u32,
+            });
+        }
+
+        // Candidates from chain leaf deltas (last entry per chain).
+        for base_idx in 0..base_count {
+            let leaf_need_idx = chain_start + base_idx * CHAIN_DEPTH + (CHAIN_DEPTH - 1);
+            let cand_idx = candidates.len();
+            let oid_seed = (depth1_delta_count + base_idx) % 251;
+            candidates.push(PackCandidate {
+                oid: OidBytes::sha1([oid_seed as u8; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: need_offsets[leaf_need_idx],
+            });
+            candidate_offsets.push(CandidateAtOffset {
+                offset: need_offsets[leaf_need_idx],
+                cand_idx: cand_idx as u32,
+            });
+        }
+
+        // Sort candidate_offsets by offset for binary search.
+        candidate_offsets.sort_by_key(|c| c.offset);
+
+        // Build delta deps for all delta entries.
+        let total_delta_count = depth1_delta_count + chain_entry_count;
+        let mut delta_deps = Vec::with_capacity(total_delta_count);
+
+        // Depth-1 delta deps.
+        for idx in 0..depth1_delta_count {
+            let need_idx = depth1_delta_start + idx;
+            let base_idx = idx / deltas_per_base;
+            let offset = need_offsets[need_idx];
+            let (data_start, delta_size) = delta_header_meta(&pack_bytes, offset);
+            delta_deps.push(DeltaDep {
+                offset,
+                kind: DeltaKind::Ofs,
+                base: BaseLoc::Offset(need_offsets[base_idx]),
+                data_start,
+                delta_size,
+            });
+        }
+
+        // Chain delta deps: each points at the previous entry in its chain.
+        for base_idx in 0..base_count {
+            for depth in 0..CHAIN_DEPTH {
+                let need_idx = chain_start + base_idx * CHAIN_DEPTH + depth;
+                let base_need_idx = if depth == 0 {
+                    base_entry_indices[base_idx]
+                } else {
+                    chain_start + base_idx * CHAIN_DEPTH + depth - 1
+                };
                 let offset = need_offsets[need_idx];
                 let (data_start, delta_size) = delta_header_meta(&pack_bytes, offset);
-                DeltaDep {
+                delta_deps.push(DeltaDep {
                     offset,
                     kind: DeltaKind::Ofs,
-                    base: BaseLoc::Offset(need_offsets[base_idx]),
+                    base: BaseLoc::Offset(need_offsets[base_need_idx]),
                     data_start,
                     delta_size,
-                }
-            })
-            .collect::<Vec<_>>();
+                });
+            }
+        }
+
         let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
+
+        // Exec order: interleave each base with its depth-1 deltas and
+        // chain entries so the OOO path must jump around the pack.
         let exec_order = match shape {
             PackExecBenchShape::Sequential => None,
             PackExecBenchShape::OutOfOrder => {
                 let mut order = Vec::with_capacity(need_offsets.len());
                 for base_idx in 0..base_count {
                     order.push(base_idx as u32);
-                    let delta_base = delta_start + base_idx * deltas_per_base;
-                    for delta_idx in 0..deltas_per_base {
-                        order.push((delta_base + delta_idx) as u32);
+                    // Depth-1 deltas for this base.
+                    let d1_base = depth1_delta_start + base_idx * deltas_per_base;
+                    for d in 0..deltas_per_base {
+                        order.push((d1_base + d) as u32);
+                    }
+                    // Chain entries for this base (all depths, in order).
+                    let chain_base = chain_start + base_idx * CHAIN_DEPTH;
+                    for d in 0..CHAIN_DEPTH {
+                        order.push((chain_base + d) as u32);
                     }
                 }
                 Some(order)
             }
         };
+
         let candidate_span = candidate_offsets
             .last()
             .zip(candidate_offsets.first())
             .map_or(0, |(last, first)| last.offset.saturating_sub(first.offset));
 
+        let total_need_count = base_count + depth1_delta_count + chain_entry_count;
+        let forward_deps = u32::from(exec_order.is_some());
         let plan = PackPlan {
             pack_id: 0,
             oid_len: 20,
@@ -3680,12 +3920,12 @@ mod bench_support {
             need_offsets,
             delta_deps,
             delta_dep_index,
-            exec_order: exec_order.clone(),
+            exec_order,
             stats: PackPlanStats {
-                candidate_count: delta_count as u32,
-                need_count: (base_count + delta_count) as u32,
+                candidate_count: total_candidate_count as u32,
+                need_count: total_need_count as u32,
                 external_bases: 0,
-                forward_deps: u32::from(exec_order.is_some()),
+                forward_deps,
                 candidate_span,
                 ..PackPlanStats::empty()
             },
@@ -3699,34 +3939,43 @@ mod bench_support {
         }
     }
 
-    fn bench_execute_sequential_case(case: &PackExecBenchCase) -> Result<u64, PackExecError> {
-        let mut cache = PackCache::new(0);
+    /// Executes the sequential (offset-order) path with caller-owned scratch
+    /// and cache. Resets both before execution to ensure clean state without
+    /// reallocating.
+    fn bench_execute_sequential_case(
+        case: &PackExecBenchCase,
+        cache: &mut PackCache,
+        scratch: &mut PackExecScratch,
+    ) -> Result<u64, PackExecError> {
+        cache.reset();
         let mut external = NoExternal;
         let mut sink = BenchSink::default();
-        let mut scratch = PackExecScratch::default();
         let spill_dir = std::env::temp_dir();
         execute_pack_plan_with_scratch(
             &case.plan,
             &case.pack_bytes,
             &case.paths,
             &case.limits,
-            &mut cache,
+            cache,
             &mut external,
             &mut sink,
             &spill_dir,
-            &mut scratch,
+            scratch,
         )?;
         Ok(sink.bytes_emitted)
     }
 
+    /// Executes the OOO prefetch path with caller-owned scratch and cache.
+    /// Resets cache before execution to ensure clean state per iteration.
     fn bench_execute_prefetch_case_inner<const LOOKAHEAD: usize>(
         case: &PackExecBenchCase,
+        cache: &mut PackCache,
+        scratch: &mut PackExecScratch,
     ) -> Result<u64, PackExecError> {
+        cache.reset();
         let pack_header = parse_pack_header_for_plan(&case.plan, &case.pack_bytes)?;
-        let mut cache = PackCache::new(0);
         let mut external = NoExternal;
         let mut sink = BenchSink::default();
-        let mut scratch = PackExecScratch::default();
         let spill_dir = std::env::temp_dir();
 
         scratch.prepare(&case.plan, &case.limits);
@@ -3737,7 +3986,7 @@ mod bench_support {
             pack_header,
             &case.paths,
             &case.limits,
-            &mut cache,
+            cache,
             &mut external,
             &mut sink,
             &spill_dir,
@@ -3751,18 +4000,23 @@ mod bench_support {
         Ok(sink.bytes_emitted)
     }
 
+    /// Dispatches to sequential or OOO prefetch execution based on the plan's
+    /// exec_order. Accepts pre-allocated `cache` and `scratch` to avoid
+    /// per-iteration allocation overhead (~600 KiB).
     pub fn bench_execute_prefetch_case(
         case: &PackExecBenchCase,
         lookahead: usize,
+        cache: &mut PackCache,
+        scratch: &mut PackExecScratch,
     ) -> Result<u64, PackExecError> {
         if case.plan.exec_order().is_none() {
-            return bench_execute_sequential_case(case);
+            return bench_execute_sequential_case(case, cache, scratch);
         }
         match lookahead {
-            0 => bench_execute_prefetch_case_inner::<0>(case),
-            2 => bench_execute_prefetch_case_inner::<2>(case),
-            4 => bench_execute_prefetch_case_inner::<4>(case),
-            8 => bench_execute_prefetch_case_inner::<8>(case),
+            0 => bench_execute_prefetch_case_inner::<0>(case, cache, scratch),
+            2 => bench_execute_prefetch_case_inner::<2>(case, cache, scratch),
+            4 => bench_execute_prefetch_case_inner::<4>(case, cache, scratch),
+            8 => bench_execute_prefetch_case_inner::<8>(case, cache, scratch),
             _ => panic!("unsupported lookahead {lookahead}; expected one of 0, 2, 4, 8"),
         }
     }
@@ -4141,30 +4395,6 @@ mod tests {
             let last = offsets.last().unwrap().offset;
             last.saturating_sub(first)
         }
-    }
-
-    fn build_delta_dep_index(need_offsets: &[u64], delta_deps: &[DeltaDep]) -> Vec<u32> {
-        let mut index = vec![NONE_U32; need_offsets.len()];
-        if delta_deps.is_empty() {
-            return index;
-        }
-        let mut dep_idx = 0usize;
-        for (need_idx, &offset) in need_offsets.iter().enumerate() {
-            while dep_idx < delta_deps.len() && delta_deps[dep_idx].offset < offset {
-                dep_idx += 1;
-            }
-            if dep_idx < delta_deps.len() && delta_deps[dep_idx].offset == offset {
-                index[need_idx] = dep_idx as u32;
-                dep_idx += 1;
-            }
-        }
-        index
-    }
-
-    fn delta_header_meta(pack: &[u8], offset: u64) -> (u64, u64) {
-        let parsed = PackFile::parse(pack, 20).expect("pack parse");
-        let header = parsed.entry_header_at(offset, 64).expect("entry header");
-        (header.data_start as u64, header.size)
     }
 
     fn build_plan(
