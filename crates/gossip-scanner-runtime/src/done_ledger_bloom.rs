@@ -418,8 +418,10 @@ where
     /// before the caller invokes [`CommitHandle::wait`]. If `wait` subsequently
     /// fails the filter is disabled for writes that were never durable — a
     /// performance-only penalty (extra backend lookups, never incorrect results).
-    /// Both current backends use synchronous [`ReadyCommitHandle`], so `wait`
-    /// cannot fail after `batch_upsert` succeeds.
+    /// The PostgreSQL backend uses synchronous [`ReadyCommitHandle`] where
+    /// `wait` cannot fail after `batch_upsert` succeeds; the in-memory backend
+    /// can simulate deferred or failing waits in fault-injection mode, but the
+    /// early invalidation remains a safe performance fallback in that case.
     fn batch_upsert(
         &self,
         records: &[DoneLedgerRecord],
@@ -854,6 +856,73 @@ mod tests {
         }
     }
 
+    /// DoneLedger that wraps [`TrackingDoneLedger`] with a configurable
+    /// `count_done_hashes` override for testing the count pre-check path.
+    #[derive(Clone, Debug)]
+    struct CountingDoneLedger {
+        inner: TrackingDoneLedger,
+        /// `Some(Ok(n))` returns a count, `Some(Err(()))` injects a failure,
+        /// `None` would delegate to default (not used here).
+        count_value: Option<Result<usize, ()>>,
+    }
+
+    impl CountingDoneLedger {
+        fn with_count(inner: TrackingDoneLedger, count: usize) -> Self {
+            Self {
+                inner,
+                count_value: Some(Ok(count)),
+            }
+        }
+
+        fn with_count_error(inner: TrackingDoneLedger) -> Self {
+            Self {
+                inner,
+                count_value: Some(Err(())),
+            }
+        }
+    }
+
+    impl DoneLedger for CountingDoneLedger {
+        type Error = io::Error;
+        type CommitHandle = ReadyCommitHandle<DoneLedgerCommitReceipt, io::Error>;
+
+        fn batch_get(
+            &self,
+            tenant_id: TenantId,
+            policy_hash: PolicyHash,
+            ovid_hashes: &[OvidHash],
+        ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            self.inner.batch_get(tenant_id, policy_hash, ovid_hashes)
+        }
+
+        fn batch_upsert(
+            &self,
+            records: &[DoneLedgerRecord],
+        ) -> Result<Self::CommitHandle, Self::Error> {
+            self.inner.batch_upsert(records)
+        }
+
+        fn list_done_hashes(
+            &self,
+            tenant_id: TenantId,
+            policy_hash: PolicyHash,
+        ) -> Result<Vec<OvidHash>, Self::Error> {
+            self.inner.list_done_hashes(tenant_id, policy_hash)
+        }
+
+        fn count_done_hashes(
+            &self,
+            _tenant_id: TenantId,
+            _policy_hash: PolicyHash,
+        ) -> Result<Option<usize>, Self::Error> {
+            match self.count_value {
+                Some(Ok(n)) => Ok(Some(n)),
+                Some(Err(())) => Err(io::Error::other("injected count failure")),
+                None => Ok(None),
+            }
+        }
+    }
+
     #[test]
     fn from_ledger_enables_filter_above_threshold() {
         let tenant_id = tenant(131);
@@ -897,6 +966,83 @@ mod tests {
         );
 
         assert!(!wrapped.has_filter());
+    }
+
+    #[test]
+    fn from_ledger_skips_enumeration_when_count_below_threshold() {
+        let tenant_id = tenant(161);
+        let policy_hash = policy(162);
+        let inner = TrackingDoneLedger::empty();
+        let counting = CountingDoneLedger::with_count(inner.clone(), 5);
+
+        let wrapped =
+            BloomFilteredDoneLedger::from_ledger(counting, tenant_id, policy_hash, "test");
+
+        assert!(!wrapped.has_filter());
+        assert!(
+            inner.list_done_hashes_calls().is_empty(),
+            "count pre-check should skip list_done_hashes for below-threshold counts"
+        );
+    }
+
+    #[test]
+    fn from_ledger_skips_enumeration_when_count_exceeds_cap() {
+        let tenant_id = tenant(171);
+        let policy_hash = policy(172);
+        let inner = TrackingDoneLedger::empty();
+        let counting = CountingDoneLedger::with_count(inner.clone(), 30_000_000);
+
+        let wrapped =
+            BloomFilteredDoneLedger::from_ledger(counting, tenant_id, policy_hash, "test");
+
+        assert!(!wrapped.has_filter());
+        assert!(
+            inner.list_done_hashes_calls().is_empty(),
+            "count pre-check should skip list_done_hashes for over-cap counts"
+        );
+    }
+
+    #[test]
+    fn from_ledger_enumerates_when_count_is_viable() {
+        let tenant_id = tenant(181);
+        let policy_hash = policy(182);
+        let mut records = Vec::new();
+        for seed in 0..DoneLedgerBloomFilter::MIN_THRESHOLD as u64 {
+            records.push(scanned_record(tenant_id, policy_hash, ovid(seed)));
+        }
+        let inner = TrackingDoneLedger::with_records(records);
+        let counting =
+            CountingDoneLedger::with_count(inner.clone(), DoneLedgerBloomFilter::MIN_THRESHOLD);
+
+        let wrapped =
+            BloomFilteredDoneLedger::from_ledger(counting, tenant_id, policy_hash, "test");
+
+        assert!(wrapped.has_filter());
+        assert_eq!(
+            inner.list_done_hashes_calls().len(),
+            1,
+            "viable count should proceed to list_done_hashes"
+        );
+    }
+
+    #[test]
+    fn from_ledger_falls_through_on_count_error() {
+        let tenant_id = tenant(191);
+        let policy_hash = policy(192);
+        let inner =
+            TrackingDoneLedger::with_records([scanned_record(tenant_id, policy_hash, ovid(193))]);
+        let counting = CountingDoneLedger::with_count_error(inner.clone());
+
+        let wrapped =
+            BloomFilteredDoneLedger::from_ledger(counting, tenant_id, policy_hash, "test");
+
+        // Count error is non-fatal: falls through to enumeration.
+        assert!(!wrapped.has_filter());
+        assert_eq!(
+            inner.list_done_hashes_calls().len(),
+            1,
+            "count error should fall through to list_done_hashes"
+        );
     }
 
     #[test]
