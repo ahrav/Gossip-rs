@@ -736,6 +736,7 @@ impl Default for DecodeBufs {
     fn default() -> Self {
         Self {
             de: flate2::Decompress::new(true),
+            libde: crate::pack_inflate_libdeflate::LibdeflateDecompressor::new(),
             inflate_buf: Vec::new(),
             result_buf: Vec::new(),
             base_buf: Vec::new(),
@@ -1140,6 +1141,7 @@ struct DecodeEnv<'a> {
 /// the decode call chain without TLS overhead or reentrancy concerns.
 struct DecodeBufs {
     de: flate2::Decompress,
+    libde: crate::pack_inflate_libdeflate::LibdeflateDecompressor,
     inflate_buf: Vec<u8>,
     result_buf: Vec<u8>,
     base_buf: Vec<u8>,
@@ -2308,6 +2310,7 @@ fn resolve_external_and_apply_delta<B: ExternalBaseProvider>(
 #[allow(clippy::too_many_arguments)]
 fn resolve_and_apply_delta<B: ExternalBaseProvider>(
     de: &mut flate2::Decompress,
+    libde: &mut crate::pack_inflate_libdeflate::LibdeflateDecompressor,
     env: &DecodeEnv<'_>,
     offset: u64,
     base_offset: u64,
@@ -2335,6 +2338,7 @@ fn resolve_and_apply_delta<B: ExternalBaseProvider>(
             let (result, resolve_nanos) = perf::time(|| {
                 decode_base_from_pack(
                     de,
+                    libde,
                     env,
                     base_offset,
                     cache,
@@ -2469,6 +2473,7 @@ fn decode_offset<B: ExternalBaseProvider>(
 
         return resolve_and_apply_delta(
             &mut bufs.de,
+            &mut bufs.libde,
             env,
             offset,
             dep.base_offset,
@@ -2512,6 +2517,7 @@ fn decode_offset<B: ExternalBaseProvider>(
                 let (inflate_res, nanos) = perf::time(|| {
                     inflate_entry_payload_with(
                         &mut bufs.de,
+                        Some(&mut bufs.libde),
                         env.pack,
                         &header,
                         &mut bufs.result_buf,
@@ -2572,6 +2578,7 @@ fn decode_offset<B: ExternalBaseProvider>(
         }
         EntryKind::OfsDelta { base_offset } => resolve_and_apply_delta(
             &mut bufs.de,
+            &mut bufs.libde,
             env,
             offset,
             base_offset,
@@ -2591,6 +2598,7 @@ fn decode_offset<B: ExternalBaseProvider>(
                 if !dep.is_external() {
                     return resolve_and_apply_delta(
                         &mut bufs.de,
+                        &mut bufs.libde,
                         env,
                         offset,
                         dep.base_offset,
@@ -3061,6 +3069,7 @@ fn walk_delta_chain_to_root(
 #[allow(clippy::too_many_arguments)]
 fn materialize_pack_root_base(
     de: &mut flate2::Decompress,
+    libde: &mut crate::pack_inflate_libdeflate::LibdeflateDecompressor,
     env: &DecodeEnv<'_>,
     root_offset: u64,
     kind: ObjectKind,
@@ -3084,8 +3093,9 @@ fn materialize_pack_root_base(
             data_start,
             kind: EntryKind::NonDelta { kind },
         };
-        let (inflate_res, nanos) =
-            perf::time(|| inflate_entry_payload_with(de, env.pack, &header, base_buf, env.limits));
+        let (inflate_res, nanos) = perf::time(|| {
+            inflate_entry_payload_with(de, Some(libde), env.pack, &header, base_buf, env.limits)
+        });
         if let Err(err) = inflate_res {
             return Err(SkipReason::Decode(err));
         }
@@ -3128,6 +3138,7 @@ fn materialize_pack_root_base(
 #[allow(clippy::too_many_arguments)]
 fn materialize_root_base<B: ExternalBaseProvider>(
     de: &mut flate2::Decompress,
+    libde: &mut crate::pack_inflate_libdeflate::LibdeflateDecompressor,
     env: &DecodeEnv<'_>,
     root: ChainRoot,
     cache: &mut PackCache,
@@ -3143,7 +3154,7 @@ fn materialize_root_base<B: ExternalBaseProvider>(
             size,
             data_start,
         } => materialize_pack_root_base(
-            de, env, offset, kind, size, data_start, cache, base_buf, hot_stats, stats,
+            de, libde, env, offset, kind, size, data_start, cache, base_buf, hot_stats, stats,
         ),
         ChainRoot::External { oid } => {
             load_external_root_base(env, oid, external, base_buf, hot_stats, stats)
@@ -3193,6 +3204,7 @@ fn materialize_root_base<B: ExternalBaseProvider>(
 #[allow(clippy::too_many_arguments)]
 fn decode_base_from_pack<'b, B: ExternalBaseProvider>(
     de: &mut flate2::Decompress,
+    libde: &mut crate::pack_inflate_libdeflate::LibdeflateDecompressor,
     env: &DecodeEnv<'_>,
     offset: u64,
     cache: &mut PackCache,
@@ -3216,6 +3228,7 @@ fn decode_base_from_pack<'b, B: ExternalBaseProvider>(
     let root = walk_delta_chain_to_root(env, offset, delta_stack, &mut report.stats)?;
     let (base_kind, base_spill) = match materialize_root_base(
         de,
+        libde,
         env,
         root,
         cache,

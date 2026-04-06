@@ -16,7 +16,7 @@ flowchart TD
     MIDX -->|"OID → (pack_id, offset)"| PLAN["Pack Planner<br/>pack_plan.rs"]
     PLAN -->|"delta closure + exec order"| EXEC["Pack Executor<br/>pack_exec.rs"]
     EXEC -->|"offset → bytes"| IO["Pack I/O<br/>pack_io.rs, pack_reader.rs"]
-    IO -->|"compressed bytes"| INFLATE["Zlib Inflate<br/>pack_inflate.rs, pack_decode.rs"]
+    IO -->|"compressed bytes"| INFLATE["Inflate Dispatch<br/>pack_inflate.rs, pack_decode.rs,<br/>pack_inflate_libdeflate.rs"]
     INFLATE -->|"inflated payload"| DELTA["Delta Application<br/>pack_inflate.rs, pack_delta.rs"]
     DELTA -->|"materialized object"| CACHE["Pack Cache<br/>pack_cache.rs"]
 ```
@@ -27,7 +27,9 @@ flowchart TD
    building a sorted `need_offsets` array and optional DFS execution order.
 3. **Pack execution** drives the decode loop, dispatching by entry type.
 4. **I/O** provides mmap-backed or slice-backed byte access to pack files.
-5. **Zlib inflation** decompresses pack entry payloads with hard output caps.
+5. **Inflate dispatch** decompresses pack entry payloads with hard output caps,
+   routing small exact-size non-delta entries through libdeflate and leaving
+   large or delta payloads on the streaming flate2 path.
 6. **Delta application** reconstructs target objects from base + delta
    instruction streams.
 7. **Caching** stores decoded objects in a tiered set-associative CLOCK
@@ -257,8 +259,9 @@ four entry points with different allocation and lifetime strategies:
 |----------|------|--------------|--------|----------|
 | `inflate_limited_with` | `pack_inflate.rs` | Caller-owned `Decompress` | `Vec` spare capacity, hard `max_out` cap | Pack executor hot path |
 | `inflate_limited` | `pack_inflate.rs` | Thread-local `InflateScratch` | Same as above | Convenience for single-threaded callers |
-| `inflate_exact_with` | `pack_inflate.rs` | Caller-owned | Exact `expected` bytes or error | Non-delta entries with known size |
+| `inflate_exact_with` | `pack_inflate.rs` | Caller-owned | Exact `expected` bytes or error | Large non-delta entries with known size |
 | `inflate_stream` | `pack_inflate.rs` | Thread-local | Chunked callback, exact `expected` total | Large objects that should not be buffered |
+| `inflate_nondelta_exact` | `pack_inflate_libdeflate.rs` | Thread-local libdeflate decompressor | Exact `expected` bytes plus compressed bytes consumed | Small non-delta entries with known size |
 
 ### Buffer Management
 
@@ -275,8 +278,14 @@ capped so total output never exceeds `max_out`:
 
 The thread-local `InflateScratch` (`pack_inflate.rs`) bundles a
 `Decompress` instance and a 64 KiB scratch buffer into a single
-`RefCell`, halving the TLS lookup cost. Reentrant callers must use the
-`_with` variants that accept a caller-owned `Decompress`.
+`RefCell`, halving the TLS lookup cost. Small non-delta entry decoding
+also uses a thread-local libdeflate decompressor in
+`pack_inflate_libdeflate.rs`. Reentrant callers can still use
+`inflate_limited_with` and `inflate_exact_with`, but
+`inflate_entry_payload` may panic on same-thread reentrancy because it
+borrows the flate2 TLS scratch (`InflateScratch`) before dispatching.
+`inflate_entry_payload_with` avoids the flate2 TLS borrow but may still
+panic when `libde` is `None` and the libdeflate TLS fallback is selected.
 
 ### Bounded Decode Wrappers
 
@@ -286,7 +295,9 @@ The thread-local `InflateScratch` (`pack_inflate.rs`) bundles a
   rejects non-delta entries exceeding `max_object_bytes` and delta entries
   exceeding `max_delta_bytes` before any inflation occurs.
 - `inflate_entry_payload_with` (`pack_decode.rs`) inflates non-delta
-  entries with an exact-size contract and delta entries with a hard cap.
+  entries with an exact-size contract, routing payloads at or below
+  `LIBDEFLATE_THRESHOLD_BYTES` through libdeflate and leaving larger
+  non-delta or delta entries on the flate2 path.
 
 ## Caching
 
@@ -477,6 +488,7 @@ When an OID is not found in any pack (MIDX miss), `PackIo::load_loose_object`
 | Pack header/entry parsing | `pack_inflate.rs` |
 | Zlib inflate (bounded) | `pack_inflate.rs` |
 | Thread-local inflate scratch | `pack_inflate.rs` |
+| Libdeflate inflate backend | `pack_inflate_libdeflate.rs` |
 | Delta application | `pack_inflate.rs` |
 | Delta copy decoding | `pack_inflate.rs` |
 | Delta re-export | `pack_delta.rs` |

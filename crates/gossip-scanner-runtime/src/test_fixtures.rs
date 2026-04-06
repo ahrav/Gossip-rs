@@ -137,16 +137,16 @@ pub(crate) fn wait_until(mut predicate: impl FnMut() -> bool) {
 #[cfg(test)]
 pub(crate) fn finding(
     rule_id: u32,
-    span_start: u64,
-    span_end: u64,
+    window_start: u64,
+    window_end: u64,
     hash_seed: u8,
 ) -> FsFindingRecord {
     FsFindingRecord {
         rule_id,
-        root_hint_start: span_start,
-        root_hint_end: span_end,
-        span_start,
-        span_end,
+        blob_offset_start: window_start,
+        blob_offset_end: window_end,
+        window_start,
+        window_end,
         norm_hash: [hash_seed; 32],
         confidence_score: 7,
     }

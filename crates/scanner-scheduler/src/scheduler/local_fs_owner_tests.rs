@@ -1,6 +1,9 @@
 use super::*;
 use crate::Engine;
-use crate::api::{FileId, RuleSpec, TransformConfig, Tuning, ValidatorKind};
+use crate::api::{
+    AnchorPolicy, FileId, Gate, RuleSpec, TransformConfig, TransformId, TransformMode, Tuning,
+    ValidatorKind,
+};
 use crate::archive::PartialReason;
 use crate::events::VecEventOutput;
 use crate::scheduler::engine_stub::{FindingRec, MockEngine, MockRule, RuleId};
@@ -106,7 +109,7 @@ impl EngineScratch for DuplicateDropScratch {
 
     fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
         self.findings
-            .retain(|f| f.finding.root_hint_end >= new_bytes_start);
+            .retain(|f| f.finding.blob_offset_end > new_bytes_start);
     }
 
     fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
@@ -147,10 +150,10 @@ impl ScanEngine for DuplicateDropEngine {
         let finding = FindingWithHash::new(
             FindingRec {
                 rule_id: RuleId(0),
-                root_hint_start: 0,
-                root_hint_end: 6,
-                span_start: 0,
-                span_end: 6,
+                blob_offset_start: 0,
+                blob_offset_end: 6,
+                window_start: 0,
+                window_end: 6,
                 confidence_score: 0,
             },
             [0xAB; 32],
@@ -524,10 +527,10 @@ fn archive_extension_scans_when_disabled() {
 fn finding(rule: u16, start: u64, end: u64) -> FindingRec {
     FindingRec {
         rule_id: RuleId(rule),
-        root_hint_start: start,
-        root_hint_end: end,
-        span_start: start,
-        span_end: end,
+        blob_offset_start: start,
+        blob_offset_end: end,
+        window_start: start,
+        window_end: end,
         confidence_score: 0,
     }
 }
@@ -549,7 +552,7 @@ fn dedupe_single_element() {
     let mut v = vec![hashed(finding(0, 10, 16))];
     dedupe_findings_cross_rule(&mut v, |_, _| std::cmp::Ordering::Equal);
     assert_eq!(v.len(), 1);
-    assert_eq!(v[0].finding.root_hint_start, 10);
+    assert_eq!(v[0].finding.blob_offset_start, 10);
 }
 
 #[test]
@@ -803,10 +806,10 @@ fn cross_rule_dedupe_prefers_higher_confidence() {
         FindingWithHash::new(
             FindingRec {
                 rule_id: RuleId(0),
-                root_hint_start: 10,
-                root_hint_end: 16,
-                span_start: 10,
-                span_end: 16,
+                blob_offset_start: 10,
+                blob_offset_end: 16,
+                window_start: 10,
+                window_end: 16,
                 confidence_score: 2,
             },
             [0xDD; 32],
@@ -814,10 +817,10 @@ fn cross_rule_dedupe_prefers_higher_confidence() {
         FindingWithHash::new(
             FindingRec {
                 rule_id: RuleId(1),
-                root_hint_start: 10,
-                root_hint_end: 16,
-                span_start: 10,
-                span_end: 16,
+                blob_offset_start: 10,
+                blob_offset_end: 16,
+                window_start: 10,
+                window_end: 16,
                 confidence_score: 7,
             },
             [0xDD; 32],
@@ -836,10 +839,10 @@ fn cross_rule_dedupe_tie_breaks_by_rule_name_then_rule_id() {
         FindingWithHash::new(
             FindingRec {
                 rule_id: RuleId(0),
-                root_hint_start: 20,
-                root_hint_end: 26,
-                span_start: 20,
-                span_end: 26,
+                blob_offset_start: 20,
+                blob_offset_end: 26,
+                window_start: 20,
+                window_end: 26,
                 confidence_score: 5,
             },
             [0xEF; 32],
@@ -847,10 +850,10 @@ fn cross_rule_dedupe_tie_breaks_by_rule_name_then_rule_id() {
         FindingWithHash::new(
             FindingRec {
                 rule_id: RuleId(2),
-                root_hint_start: 20,
-                root_hint_end: 26,
-                span_start: 20,
-                span_end: 26,
+                blob_offset_start: 20,
+                blob_offset_end: 26,
+                window_start: 20,
+                window_end: 26,
                 confidence_score: 5,
             },
             [0xEF; 32],
@@ -858,10 +861,10 @@ fn cross_rule_dedupe_tie_breaks_by_rule_name_then_rule_id() {
         FindingWithHash::new(
             FindingRec {
                 rule_id: RuleId(1),
-                root_hint_start: 20,
-                root_hint_end: 26,
-                span_start: 20,
-                span_end: 26,
+                blob_offset_start: 20,
+                blob_offset_end: 26,
+                window_start: 20,
+                window_end: 26,
                 confidence_score: 5,
             },
             [0xEF; 32],
@@ -882,10 +885,10 @@ fn cross_rule_dedupe_tie_breaks_by_rule_name_then_rule_id() {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SpanModeFinding {
     rule_id: u32,
-    root_hint_start: u64,
-    root_hint_end: u64,
-    span_start: u64,
-    span_end: u64,
+    blob_offset_start: u64,
+    blob_offset_end: u64,
+    window_start: u64,
+    window_end: u64,
     dedupe_with_span: bool,
     confidence_score: i8,
     norm_hash: [u8; 32],
@@ -897,19 +900,19 @@ impl FindingRecord for SpanModeFinding {
     }
 
     fn root_hint_start(&self) -> u64 {
-        self.root_hint_start
+        self.blob_offset_start
     }
 
     fn root_hint_end(&self) -> u64 {
-        self.root_hint_end
+        self.blob_offset_end
     }
 
     fn span_start(&self) -> u64 {
-        self.span_start
+        self.window_start
     }
 
     fn span_end(&self) -> u64 {
-        self.span_end
+        self.window_end
     }
 
     fn dedupe_with_span(&self) -> bool {
@@ -932,20 +935,20 @@ fn cross_rule_dedupe_zeros_span_when_dedupe_with_span_is_false() {
     let mut v = vec![
         SpanModeFinding {
             rule_id: 0,
-            root_hint_start: 100,
-            root_hint_end: 120,
-            span_start: 100,
-            span_end: 110,
+            blob_offset_start: 100,
+            blob_offset_end: 120,
+            window_start: 100,
+            window_end: 110,
             dedupe_with_span: false,
             confidence_score: 1,
             norm_hash: [0x11; 32],
         },
         SpanModeFinding {
             rule_id: 1,
-            root_hint_start: 100,
-            root_hint_end: 120,
-            span_start: 111,
-            span_end: 120,
+            blob_offset_start: 100,
+            blob_offset_end: 120,
+            window_start: 111,
+            window_end: 120,
             dedupe_with_span: false,
             confidence_score: 2,
             norm_hash: [0x11; 32],
@@ -965,20 +968,20 @@ fn cross_rule_dedupe_preserves_distinct_spans_when_dedupe_with_span_is_true() {
     let mut v = vec![
         SpanModeFinding {
             rule_id: 0,
-            root_hint_start: 100,
-            root_hint_end: 120,
-            span_start: 100,
-            span_end: 110,
+            blob_offset_start: 100,
+            blob_offset_end: 120,
+            window_start: 100,
+            window_end: 110,
             dedupe_with_span: true,
             confidence_score: 1,
             norm_hash: [0x22; 32],
         },
         SpanModeFinding {
             rule_id: 1,
-            root_hint_start: 100,
-            root_hint_end: 120,
-            span_start: 111,
-            span_end: 120,
+            blob_offset_start: 100,
+            blob_offset_end: 120,
+            window_start: 111,
+            window_end: 120,
             dedupe_with_span: true,
             confidence_score: 2,
             norm_hash: [0x22; 32],
@@ -998,20 +1001,20 @@ fn cross_rule_dedupe_mixed_span_modes_form_separate_groups() {
     let mut v = vec![
         SpanModeFinding {
             rule_id: 0,
-            root_hint_start: 100,
-            root_hint_end: 120,
-            span_start: 100,
-            span_end: 110,
+            blob_offset_start: 100,
+            blob_offset_end: 120,
+            window_start: 100,
+            window_end: 110,
             dedupe_with_span: false,
             confidence_score: 5,
             norm_hash: [0x33; 32],
         },
         SpanModeFinding {
             rule_id: 1,
-            root_hint_start: 100,
-            root_hint_end: 120,
-            span_start: 105,
-            span_end: 115,
+            blob_offset_start: 100,
+            blob_offset_end: 120,
+            window_start: 105,
+            window_end: 115,
             dedupe_with_span: true,
             confidence_score: 8,
             norm_hash: [0x33; 32],
@@ -1035,7 +1038,7 @@ fn overlap_dedup_no_double_report() {
     // Place SECRET so it falls entirely within the overlap region between
     // chunk 1 and chunk 2. With chunk_size=64 and overlap=16, SECRET at
     // offset 50 spans [50..56]. In chunk 2 (overlap carry from [48..64]),
-    // drop_prefix_findings(64) drops it since root_hint_end=56 < 64.
+    // drop_prefix_findings(64) drops it since blob_offset_end=56 < 64.
     let engine = Arc::new(test_engine());
     let sink = Arc::new(VecEventOutput::new());
 
@@ -1089,6 +1092,73 @@ fn file_exactly_chunk_size() {
         output_str.matches("secret").count(),
         1,
         "single chunk should find SECRET"
+    );
+}
+
+/// Multi-chunk scans must emit findings whose persistence identity
+/// coordinates are blob-absolute. `FsFindingRecord.blob_offset_start` is the
+/// coordinate consumed by `PersistenceFinding::blob_offset_start` for `OccurrenceId`
+/// derivation — if it were window-local, a finding found in chunk N would
+/// report an offset relative to the Nth chunk buffer instead of the file.
+#[test]
+fn multi_chunk_fs_scan_root_hint_offsets_are_file_absolute() {
+    use crate::store::InMemoryStoreProducer;
+
+    let engine = Arc::new(Engine::new(
+        vec![real_simple_rule()],
+        Vec::<TransformConfig>::new(),
+        real_test_tuning(64),
+    ));
+    let sink = Arc::new(VecEventOutput::new());
+    let producer = Arc::new(InMemoryStoreProducer::default());
+
+    // chunk_size=64, overlap=32 for real engine. Place SECRET at absolute
+    // file offset 100 so it lands past the first chunk boundary, making
+    // chunk-local vs file-absolute distinguishable. The rule's regex is
+    // `SECRET[A-Z0-9]{8}`, so we follow SECRET with 8 'B' characters and
+    // the full match is "SECRETBBBBBBBB" at file-absolute 100..114.
+    let mut data = vec![b'A'; 100];
+    data.extend_from_slice(b"SECRET"); // abs offset 100..106
+    data.resize(200, b'B');
+
+    let mut tmp = NamedTempFile::new().unwrap();
+    tmp.write_all(&data).unwrap();
+    tmp.flush().unwrap();
+    let path = tmp.path().to_path_buf();
+    let size = tmp.as_file().metadata().unwrap().len();
+
+    let source = VecFileSource::new(vec![LocalFile { path, size }]);
+    let mut cfg = small_config_with_sink(sink);
+    cfg.store_producer = Some(producer.clone());
+    let report = scan_local(engine, source, cfg);
+
+    assert!(
+        report.metrics.chunks_scanned >= 2,
+        "test must exercise multi-chunk path; chunks_scanned = {}",
+        report.metrics.chunks_scanned
+    );
+    assert_eq!(
+        report.metrics.findings_emitted, 1,
+        "expected exactly one SECRET finding"
+    );
+
+    let batches = producer.batches();
+    let records: Vec<_> = batches.iter().flat_map(|b| b.findings.iter()).collect();
+    assert_eq!(records.len(), 1, "expected one persisted finding record");
+    let rec = &records[0];
+
+    // The identity-bearing `blob_offset_start/end` must be the absolute file
+    // offset of the full "SECRETBBBBBBBB" match (100..114), not a
+    // window-local offset relative to the chunk buffer containing the secret.
+    assert_eq!(
+        rec.blob_offset_start, 100,
+        "blob_offset_start must be file-absolute (got {})",
+        rec.blob_offset_start
+    );
+    assert_eq!(
+        rec.blob_offset_end, 114,
+        "blob_offset_end must be file-absolute (got {})",
+        rec.blob_offset_end
     );
 }
 
@@ -1269,10 +1339,10 @@ fn run_loss_record_failure_increments_counters_and_emits_diagnostic() {
 fn build_persistence_batch_maps_all_fields() {
     let finding = FindingRec {
         rule_id: RuleId(42),
-        root_hint_start: 100,
-        root_hint_end: 200,
-        span_start: 110,
-        span_end: 190,
+        blob_offset_start: 100,
+        blob_offset_end: 200,
+        window_start: 110,
+        window_end: 190,
         confidence_score: 0,
     };
     let hash = [0xDE; 32];
@@ -1285,10 +1355,10 @@ fn build_persistence_batch_maps_all_fields() {
     assert_eq!(out.len(), 1);
     let rec = &out[0];
     assert_eq!(rec.rule_id, 42);
-    assert_eq!(rec.root_hint_start, 100);
-    assert_eq!(rec.root_hint_end, 200);
-    assert_eq!(rec.span_start, 110);
-    assert_eq!(rec.span_end, 190);
+    assert_eq!(rec.blob_offset_start, 100);
+    assert_eq!(rec.blob_offset_end, 200);
+    assert_eq!(rec.window_start, 110);
+    assert_eq!(rec.window_end, 190);
     assert_eq!(rec.norm_hash, [0xDE; 32]);
 }
 
@@ -1697,5 +1767,126 @@ fn multi_chunk_file_with_partial_findings_emits_only_finding_batches() {
         report.metrics.findings_emitted > 0,
         "expected findings_emitted > 0, got {}",
         report.metrics.findings_emitted
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Transform-derived finding: blob-absolute root-hint offsets
+// ---------------------------------------------------------------------------
+
+/// Build a rule that matches `TOK_` followed by 8 alphanumeric characters,
+/// with a base64 transform so the engine decodes base64-encoded spans before
+/// scanning them.
+fn transform_tok_rule() -> RuleSpec {
+    RuleSpec {
+        name: "tok",
+        anchors: &[b"TOK_"],
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: None,
+        local_context: None,
+        secret_group: Some(1),
+        min_confidence: None,
+        offline_validation: None,
+        uuid_format_secret: false,
+        re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
+    }
+}
+
+fn base64_transform() -> TransformConfig {
+    TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 16,
+        max_spans_per_buffer: 4,
+        max_encoded_len: 1024,
+        max_decoded_bytes: 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }
+}
+
+/// Transform-derived findings (e.g., a secret found inside a base64-decoded
+/// span) must carry blob-absolute `blob_offset_start`/`blob_offset_end`
+/// values on the persisted `FsFindingRecord`, pointing back to the encoded
+/// span in the original file rather than offsets into the decoded buffer.
+///
+/// The engine's `RootSpanMapCtx::map_span` maps decoded-buffer match
+/// coordinates back to root-file coordinates. This test verifies that the
+/// FS scanner round-trips those root-file coordinates through to
+/// persistence.
+#[test]
+fn transform_derived_fs_finding_has_blob_absolute_root_hints() {
+    use crate::store::InMemoryStoreProducer;
+
+    let engine = Arc::new(Engine::new_with_anchor_policy(
+        vec![transform_tok_rule()],
+        vec![base64_transform()],
+        real_test_tuning(64),
+        AnchorPolicy::ManualOnly,
+    ));
+    let sink = Arc::new(VecEventOutput::new());
+    let producer = Arc::new(InMemoryStoreProducer::default());
+
+    // "TOK_ABCDEFGH" base64-encodes to "VE9LX0FCQ0RFRkdI" (16 bytes).
+    // Place padding before the encoded token so its absolute file offset
+    // is well past zero, making blob-absolute vs decoded-buffer-relative
+    // distinguishable.
+    let prefix = b"nothing interesting here ";
+    let encoded = b"VE9LX0FCQ0RFRkdI";
+    let suffix = b" trailing text that pads the file out";
+
+    let expected_encoded_start = prefix.len() as u64;
+    let expected_encoded_end = expected_encoded_start + encoded.len() as u64;
+
+    let mut data = Vec::new();
+    data.extend_from_slice(prefix);
+    data.extend_from_slice(encoded);
+    data.extend_from_slice(suffix);
+
+    let mut tmp = NamedTempFile::new().unwrap();
+    tmp.write_all(&data).unwrap();
+    tmp.flush().unwrap();
+    let path = tmp.path().to_path_buf();
+    let size = tmp.as_file().metadata().unwrap().len();
+
+    let source = VecFileSource::new(vec![LocalFile { path, size }]);
+    let mut cfg = small_config_with_sink(sink);
+    cfg.chunk_size = 1024; // single chunk — isolate transform offset mapping
+    cfg.store_producer = Some(producer.clone());
+    cfg.skip_binary = false;
+
+    let report = scan_local(engine, source, cfg);
+
+    assert_eq!(
+        report.metrics.findings_emitted, 1,
+        "expected exactly one transform-derived finding"
+    );
+
+    let batches = producer.batches();
+    let records: Vec<_> = batches.iter().flat_map(|b| b.findings.iter()).collect();
+    assert_eq!(records.len(), 1, "expected one persisted finding record");
+    let rec = &records[0];
+
+    // `blob_offset_start`/`blob_offset_end` must point to the base64-encoded
+    // span in the original file, not the decoded-buffer-relative match
+    // position. A decoded-buffer-relative offset would start near 0 (the
+    // match is at the beginning of the decoded output), while the correct
+    // blob-absolute offset starts at the encoded span's position in the file.
+    assert_eq!(
+        rec.blob_offset_start, expected_encoded_start,
+        "blob_offset_start must be blob-absolute (encoded span start in file), got {}",
+        rec.blob_offset_start
+    );
+    assert_eq!(
+        rec.blob_offset_end, expected_encoded_end,
+        "blob_offset_end must be blob-absolute (encoded span end in file), got {}",
+        rec.blob_offset_end
     );
 }

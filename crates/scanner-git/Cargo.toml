@@ -18,7 +18,7 @@ scanner-engine = { workspace = true, features = ["test-support"] }
 scanner-scheduler.workspace = true
 gossip-stdx.workspace = true
 gossip-contracts.workspace = true
-ahash = "0.8"
+ahash.workspace = true
 blake3 = "1.5"
 bytemuck = { version = "1", features = ["derive"] }
 crc32fast = "1.4"
@@ -27,6 +27,7 @@ gix-commitgraph = "0.34"
 gix-hash = { version = "0.22", features = ["sha256"] }
 gix-ref = "0.60"
 libc = "0.2"
+libdeflate-sys = "1.25.2"
 memchr = "2.8"
 memmap2 = "0.9"
 regex = "1.12"
@@ -94,6 +95,7 @@ required-features = ["bench"]
 [[bench]]
 name = "pack_inflate_perf"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "path_policy"

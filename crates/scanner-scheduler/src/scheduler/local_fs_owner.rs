@@ -545,10 +545,10 @@ fn build_persistence_batch<F: FindingWithHashRecord>(
     for finding in findings {
         out.push(FsFindingRecord {
             rule_id: finding.rule_id(),
-            root_hint_start: finding.root_hint_start(),
-            root_hint_end: finding.root_hint_end(),
-            span_start: finding.span_start(),
-            span_end: finding.span_end(),
+            blob_offset_start: finding.root_hint_start(),
+            blob_offset_end: finding.root_hint_end(),
+            window_start: finding.span_start(),
+            window_end: finding.span_end(),
             norm_hash: *finding.norm_hash(),
             confidence_score: finding.confidence_score(),
         });

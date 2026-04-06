@@ -5,13 +5,14 @@
 //! derivation, the suffix protocol state machine, persistence submission, and
 //! advance-shard boundary validation.
 
-use std::collections::HashMap;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use ahash::AHashMap;
 
 use anyhow::{Error as AnyError, anyhow};
 
@@ -906,10 +907,10 @@ fn upsert_findings_maps_runtime_records_into_fs_findings() {
         item.findings,
         vec![FsFindingRecord {
             rule_id: 7,
-            root_hint_start: 10,
-            root_hint_end: 20,
-            span_start: 10,
-            span_end: 20,
+            blob_offset_start: 10,
+            blob_offset_end: 20,
+            window_start: 10,
+            window_end: 20,
             norm_hash: [0x55; 32],
             confidence_score: 6,
         }]
@@ -1059,8 +1060,8 @@ fn upsert_findings_accumulates_across_multiple_batches() {
     assert_eq!(item.findings.len(), 2, "both batches should accumulate");
     assert_eq!(item.findings[0].rule_id, 7);
     assert_eq!(item.findings[1].rule_id, 8);
-    assert_eq!(item.findings[1].span_start, 30);
-    assert_eq!(item.findings[1].span_end, 40);
+    assert_eq!(item.findings[1].blob_offset_start, 30);
+    assert_eq!(item.findings[1].blob_offset_end, 40);
     drop(guard);
 
     pipeline.shutdown().expect("worker should join");
@@ -1185,10 +1186,10 @@ fn translate_in_flight_uses_item_key_surrogate_version_when_version_is_missing()
     };
     let findings = vec![FsFindingRecord {
         rule_id: 7,
-        root_hint_start: 10,
-        root_hint_end: 20,
-        span_start: 10,
-        span_end: 20,
+        blob_offset_start: 10,
+        blob_offset_end: 20,
+        window_start: 10,
+        window_end: 20,
         norm_hash: [0x55; 32],
         confidence_score: 6,
     }];
@@ -2111,12 +2112,12 @@ fn submit_git_repo_persistence_commits_findings_and_done_ledger() {
     let findings = [GitFindingForPersistence {
         object_path: b"src/lib.rs".to_vec().into_boxed_slice(),
         commit_id: Some(7),
-        span_start: 10,
-        span_end: 42,
+        blob_offset_start: 10,
+        blob_offset_end: 42,
         norm_hash: NormHash::from_digest([0xAB; 32]),
         rule_id: 7,
     }];
-    let commit_oid_map = HashMap::from([(7, OidBytes::sha1([0x11; 20]))]);
+    let commit_oid_map = AHashMap::from_iter([(7, OidBytes::sha1([0x11; 20]))]);
     let input = GitRepoPersistenceInput {
         write_context: write_context(),
         shard_id: &ToxicDigest::of_bytes(b"test-shard"),
@@ -2180,7 +2181,7 @@ fn submit_git_repo_persistence_clean_scan_skips_findings_sink() {
     let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
     let tmp = tempdir().expect("temp dir for repo key");
     let repo_key = git_repo_key(tmp.path());
-    let commit_oid_map = HashMap::new();
+    let commit_oid_map = AHashMap::new();
     let input = GitRepoPersistenceInput {
         write_context: write_context(),
         shard_id: &ToxicDigest::of_bytes(b"clean-scan-shard"),
@@ -2237,7 +2238,7 @@ fn submit_git_repo_persistence_rejects_reversed_timestamps() {
     let persistence = DistributedPersistence::new(findings_sink, done_ledger);
     let tmp = tempdir().expect("temp dir for repo key");
     let repo_key = git_repo_key(tmp.path());
-    let commit_oid_map = HashMap::new();
+    let commit_oid_map = AHashMap::new();
     let input = GitRepoPersistenceInput {
         write_context: write_context(),
         shard_id: &ToxicDigest::of_bytes(b"test-shard"),

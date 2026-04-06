@@ -16,7 +16,7 @@ undocumented_unsafe_blocks = "warn"
 
 [dependencies]
 aegis = "0.9"
-ahash = "0.8"
+ahash.workspace = true
 base64 = "0.22"
 blake3 = "1.5"
 bytemuck = { version = "1", features = ["derive"] }

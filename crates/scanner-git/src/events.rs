@@ -129,6 +129,7 @@ impl EventOutput for VecEventSink {
         let mut line = Vec::with_capacity(256);
         match event {
             CoreEvent::Finding(f) => {
+                // Coordinate semantics: see `FindingEvent` field docs.
                 line.extend_from_slice(b"{\"type\":\"finding\"");
 
                 line.extend_from_slice(b",\"source\":");

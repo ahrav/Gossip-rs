@@ -51,7 +51,7 @@ thread_local! {
 /// poison pattern instead of whatever the allocator left behind.
 /// No-op in release builds.
 #[inline(always)]
-fn poison_spare_capacity(buf: &mut Vec<u8>) {
+pub(crate) fn poison_spare_capacity(buf: &mut Vec<u8>) {
     #[cfg(debug_assertions)]
     {
         for slot in buf.spare_capacity_mut() {
@@ -83,6 +83,17 @@ where
         let s = &mut *scratch;
         f(&mut s.de, &mut s.buf)
     })
+}
+
+/// Borrows the thread-local `Decompress` for the duration of `f`.
+///
+/// Used by `pack_decode::inflate_entry_payload` to delegate to
+/// `inflate_entry_payload_with` without duplicating routing logic.
+pub(crate) fn with_tls_decompress<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut Decompress) -> R,
+{
+    with_inflate_scratch(|de, _buf| f(de))
 }
 
 /// Parsed object kind for non-delta entries.
