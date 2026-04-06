@@ -279,7 +279,7 @@ After the retry budget is exhausted, the shard is parked with
 
 > **Note:** The sequence diagram below shows a **target design** where a full
 > circuit breaker state machine (Closed/Open/HalfOpen) mediates connector calls.
-> The current implementation uses a `RetryBudget` with `BackendError` classification
+> The current implementation uses a `RetryBudget` with `ErrorClass` classification
 > in `scanner-scheduler/src/scheduler/failure.rs`. The parking outcome (`ParkReason::TooManyErrors`) is the same;
 > the intermediate states (Open, HalfOpen, probe) are aspirational.
 
