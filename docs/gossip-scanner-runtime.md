@@ -156,6 +156,13 @@ OVIDs while shard completion remains repo-scoped. This keeps Git findings
 on the same findings-first, done-ledger-second durable ordering as
 filesystem scans.
 
+Version identity is content-addressed: `ObjectVersionId` derives from the
+blob OID alone via `ObjectVersionId::from_version_bytes`. The same file
+content across different commits produces the same version, while a content
+change (even at the same path) produces a new version. This aligns
+deduplication with Git's own content-addressing model — identical blobs are
+a single observation regardless of how many commits reference them.
+
 The distributed module exports the concrete worker-loop types and helpers:
 `WorkerIdentity`, `ShardLease`, `DistributedPersistence`,
 `DistributedRuntimeConfig`, `DistributedRunReport`, and

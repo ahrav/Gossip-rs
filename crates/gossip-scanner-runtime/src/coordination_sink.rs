@@ -168,17 +168,6 @@ fn sentinel_to_option(id: u32) -> Option<u32> {
     (id != scanner_git::SENTINEL_ID).then_some(id)
 }
 
-fn decode_blob_oid(raw: [u8; 33]) -> Option<OidBytes> {
-    let len = raw[0] as usize;
-    if len != OidBytes::SHA1_LEN as usize && len != OidBytes::SHA256_LEN as usize {
-        return None;
-    }
-    if raw[(len + 1)..].iter().any(|&byte| byte != 0) {
-        return None;
-    }
-    OidBytes::try_from_slice(&raw[1..=len])
-}
-
 /// Persistence-ready representation of one Git finding observed during scan
 /// execution.
 ///
@@ -215,8 +204,9 @@ pub(crate) struct GitFindingForPersistence {
     pub(crate) rule_id: u32,
 }
 
-// Layout budget (64-bit): Box<[u8]>=16, OidBytes≈40 with alignment, 2×u64=16,
-// NormHash=32, u32+pad=8 -> typically 112 bytes.
+// Layout budget (64-bit): Box<[u8]>=16, OidBytes=34 (+alignment padding),
+// 2*u64=16, NormHash=32, u32+pad=8. Exact size depends on field ordering
+// chosen by the compiler; the ceiling accommodates alignment padding.
 const _: () = assert!(std::mem::size_of::<GitFindingForPersistence>() <= 128);
 
 impl fmt::Debug for GitFindingForPersistence {
@@ -441,9 +431,9 @@ impl FindingsCaptureSink {
 impl EventOutput for FindingsCaptureSink {
     fn emit_core(&self, event: CoreEvent<'_>) {
         if let CoreEvent::Finding(finding) = &event {
-            self.finding_count.fetch_add(1, Ordering::Relaxed);
-            match finding.blob_oid.and_then(decode_blob_oid) {
+            match finding.blob_oid.and_then(OidBytes::decode_from_wire) {
                 Some(blob_oid) => {
+                    self.finding_count.fetch_add(1, Ordering::Relaxed);
                     let record = GitFindingForPersistence {
                         object_path: finding.object_path.into(),
                         blob_oid,
@@ -546,12 +536,8 @@ mod tests {
         (sink, recorder)
     }
 
-    fn encoded_blob_oid(oid: OidBytes) -> [u8; 33] {
-        let mut raw = [0u8; 33];
-        let len = oid.len() as usize;
-        raw[0] = oid.len();
-        raw[1..=len].copy_from_slice(oid.as_slice());
-        raw
+    fn encoded_blob_oid(oid: OidBytes) -> [u8; OidBytes::WIRE_LEN] {
+        oid.encode_to_wire()
     }
 
     fn finding_event() -> CoreEvent<'static> {
@@ -757,7 +743,11 @@ mod tests {
             confidence_score: 10,
         }));
 
-        assert_eq!(sink.detected_finding_count(), 1);
+        assert_eq!(
+            sink.detected_finding_count(),
+            0,
+            "invalid blob OID must not increment finding counter"
+        );
         assert!(
             sink.take_captured_findings().is_empty(),
             "invalid blob OIDs must be skipped during persistence capture"

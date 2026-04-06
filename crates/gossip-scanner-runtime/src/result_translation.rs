@@ -648,6 +648,17 @@ where
     Ok(acc.into_layers())
 }
 
+/// Translate Git findings into three-layer persistence rows.
+///
+/// Each finding's occurrence identity is derived from the blob OID carried in
+/// `GitFindingForPersistence::blob_oid` via `git_blob_version_id`. This means
+/// two findings at the same byte offset in different blobs produce distinct
+/// `OccurrenceId` values.
+///
+/// The done-ledger row, by contrast, uses the repo-scoped `OvidHash` produced
+/// by `git_repo_ovid_inputs(repo_id)` (passed by the caller in
+/// `translate_git_item_result`). This split keeps done-ledger cardinality at
+/// one row per repo while giving each finding blob-level identity.
 fn translate_git_findings<R>(
     write_context: WriteContext,
     tenant_secret_key: &TenantSecretKey,
@@ -1843,10 +1854,16 @@ mod tests {
             root_hint_len in 1..1000u64,
             fs_span_offset in 0..1000u64,
             object_path in prop::collection::vec(1u8..=127, 1..64),
-            blob_oid_bytes in proptest::array::uniform20(0u8..),
+            use_sha256 in proptest::bool::ANY,
+            blob_oid_bytes_20 in proptest::array::uniform20(0u8..),
+            blob_oid_bytes_32 in proptest::array::uniform32(0u8..),
         ) {
             let root_hint_end = root_hint_start.saturating_add(root_hint_len);
-            let blob_oid = OidBytes::sha1(blob_oid_bytes);
+            let blob_oid = if use_sha256 {
+                OidBytes::sha256(blob_oid_bytes_32)
+            } else {
+                OidBytes::sha1(blob_oid_bytes_20)
+            };
             // FS records carry an independent buffer-local span. Derive one
             // from the proptest-generated offset so cases include both
             // span == root_hint and span != root_hint.

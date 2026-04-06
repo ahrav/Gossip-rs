@@ -212,15 +212,6 @@ pub(crate) fn sort_and_dedupe_findings(findings: &mut Vec<ScoredFinding>) {
     });
 }
 
-#[inline]
-fn encode_blob_oid(oid: &OidBytes) -> [u8; 33] {
-    let mut encoded = [0u8; 33];
-    let len = oid.len() as usize;
-    encoded[0] = oid.len();
-    encoded[1..=len].copy_from_slice(oid.as_slice());
-    encoded
-}
-
 /// Range into the adapter findings arena for a single blob.
 ///
 /// The span indexes into `ScannedBlobs.finding_arena` (or the adapter's
@@ -575,6 +566,7 @@ impl<'a> EngineAdapter<'a> {
                 }));
             }
         }
+        let encoded_blob_oid = Some(blob_oid.encode_to_wire());
         for f in &self.findings_buf {
             self.event_sink.emit(ScanEvent::Finding(FindingEvent {
                 source: SourceKind::Git,
@@ -584,7 +576,7 @@ impl<'a> EngineAdapter<'a> {
                 rule_id: f.key.rule_id,
                 rule_name: self.engine.rule_name(f.key.rule_id),
                 norm_hash: f.key.norm_hash,
-                blob_oid: Some(encode_blob_oid(blob_oid)),
+                blob_oid: encoded_blob_oid,
                 commit_id: Some(commit_id),
                 change_kind: Some(change_kind),
                 confidence_score: f.confidence_score,
