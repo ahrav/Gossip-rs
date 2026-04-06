@@ -114,13 +114,6 @@ The module provides seven core capabilities:
 | File              | Role                                                                                         |
 | ----------------- | -------------------------------------------------------------------------------------------- |
 | `lib.rs`          | Module root and public re-exports                                                            |
-| `keyspace.rs`     | Deterministic keyspace layout with typed exact-key wrappers                                  |
-| `codec.rs`        | Explicit binary codec for persisting coordination records                                    |
-| `config.rs`       | Configuration types for the etcd backend                                                     |
-| `error.rs`        | Error types specific to the etcd backend                                                     |
-| `sim_coordinator.rs` | Simulator-backed coordinator for tests                                                       |
-| `sim_etcd_kv.rs`  | Simulator-backed etcd key-value store                                                        |
-| `test_support.rs` | Shared test utilities for the etcd backend                                                   |
 | `behavioral_conformance.rs` | Real-etcd behavioral conformance scenarios that mirror the shared coordination harness using protocol operations plus persisted read-back oracles |
 | `backend.rs`      | Module root for the `backend/` directory; shared free functions (key comparison, CAS delay, shard capacity counting) |
 | `backend/coordinator.rs` | `EtcdCoordinator` (sync wrapper with owned Tokio runtime) and `AsyncEtcdCoordinator` (async core): shared low-level etcd RPC wrappers, CAS retry logic, data-access helpers (load/scan run and shard records), and inherent methods (`list_active_runs_into`, `gc_stale_initializing_runs_into`) |
