@@ -5,13 +5,14 @@
 //! derivation, the suffix protocol state machine, persistence submission, and
 //! advance-shard boundary validation.
 
-use std::collections::HashMap;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use ahash::AHashMap;
 
 use anyhow::{Error as AnyError, anyhow};
 
@@ -2116,7 +2117,7 @@ fn submit_git_repo_persistence_commits_findings_and_done_ledger() {
         norm_hash: NormHash::from_digest([0xAB; 32]),
         rule_id: 7,
     }];
-    let commit_oid_map = HashMap::from([(7, OidBytes::sha1([0x11; 20]))]);
+    let commit_oid_map = AHashMap::from_iter([(7, OidBytes::sha1([0x11; 20]))]);
     let input = GitRepoPersistenceInput {
         write_context: write_context(),
         shard_id: &ToxicDigest::of_bytes(b"test-shard"),
@@ -2180,7 +2181,7 @@ fn submit_git_repo_persistence_clean_scan_skips_findings_sink() {
     let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
     let tmp = tempdir().expect("temp dir for repo key");
     let repo_key = git_repo_key(tmp.path());
-    let commit_oid_map = HashMap::new();
+    let commit_oid_map = AHashMap::new();
     let input = GitRepoPersistenceInput {
         write_context: write_context(),
         shard_id: &ToxicDigest::of_bytes(b"clean-scan-shard"),
@@ -2237,7 +2238,7 @@ fn submit_git_repo_persistence_rejects_reversed_timestamps() {
     let persistence = DistributedPersistence::new(findings_sink, done_ledger);
     let tmp = tempdir().expect("temp dir for repo key");
     let repo_key = git_repo_key(tmp.path());
-    let commit_oid_map = HashMap::new();
+    let commit_oid_map = AHashMap::new();
     let input = GitRepoPersistenceInput {
         write_context: write_context(),
         shard_id: &ToxicDigest::of_bytes(b"test-shard"),
