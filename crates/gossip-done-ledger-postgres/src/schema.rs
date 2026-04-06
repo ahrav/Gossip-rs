@@ -91,6 +91,19 @@ WHERE tenant_id = $1
   AND status = ANY($3::smallint[])
 "#;
 
+/// Count terminal done-ledger keys for one tenant+policy scope without
+/// materializing the full key set.
+///
+/// Uses the same filter as [`LIST_DONE_HASHES_SQL`] but returns only the
+/// row count. Callers use this to check a memory budget before committing
+/// to the full `list_done_hashes` enumeration.
+pub const COUNT_DONE_HASHES_SQL: &str = r#"
+SELECT count(*) FROM done_ledger_entries
+WHERE tenant_id = $1
+  AND policy_hash = $2
+  AND status = ANY($3::smallint[])
+"#;
+
 /// Bulk monotonic done-ledger UPSERT used by [`crate::DoneLedgerPg`].
 ///
 /// Accepts 12 array parameters (one per column) and uses `unnest()` to
@@ -330,6 +343,10 @@ mod tests {
         assert!(
             LIST_DONE_HASHES_SQL.contains(DONE_LEDGER_ENTRIES_TABLE),
             "LIST_DONE_HASHES_SQL must reference the DONE_LEDGER_ENTRIES_TABLE constant value"
+        );
+        assert!(
+            COUNT_DONE_HASHES_SQL.contains(DONE_LEDGER_ENTRIES_TABLE),
+            "COUNT_DONE_HASHES_SQL must reference the DONE_LEDGER_ENTRIES_TABLE constant value"
         );
     }
 }

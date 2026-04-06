@@ -616,7 +616,7 @@ impl DoneLedgerRecord {
     /// # Checks
     ///
     /// - `ScannedClean`: `findings_count == 0` **and** `error_code` is `None`.
-    /// - `ScannedWithFindings`: `findings_count > 0`.
+    /// - `ScannedWithFindings`: `findings_count > 0` **and** `error_code` is `None`.
     /// - `FailedRetryable` / `FailedPermanent` / `Skipped`: `error_code` is `Some`.
     pub fn validate(&self) -> Result<(), PersistenceInputError> {
         let status_name = match self.status {
@@ -836,6 +836,26 @@ pub trait DoneLedger: Send + Sync {
     ) -> Result<Vec<OvidHash>, Self::Error> {
         let _ = (tenant_id, policy_hash);
         Ok(Vec::new())
+    }
+
+    /// Return the number of terminal [`OvidHash`] keys in one tenant+policy
+    /// scope without materializing the full key set.
+    ///
+    /// Callers (e.g. the Bloom prefilter) use this to decide whether
+    /// `list_done_hashes` would fit within a memory budget before committing
+    /// to the full enumeration.
+    ///
+    /// The default returns `Ok(None)`, meaning the backend does not support
+    /// cheap counting and callers should fall through to `list_done_hashes`.
+    /// Backends backed by a database (e.g. PostgreSQL) should override with
+    /// an efficient `SELECT count(*)` query.
+    fn count_done_hashes(
+        &self,
+        tenant_id: TenantId,
+        policy_hash: PolicyHash,
+    ) -> Result<Option<usize>, Self::Error> {
+        let _ = (tenant_id, policy_hash);
+        Ok(None)
     }
 
     /// Submit a batch of done-ledger records for durable upsert, applying

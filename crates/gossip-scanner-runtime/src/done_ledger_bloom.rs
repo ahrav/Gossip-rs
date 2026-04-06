@@ -70,6 +70,16 @@ pub(crate) struct BloomFilteredDoneLedger<D> {
     inner: D,
     /// Shared across clones so the immutable bitset is never deep-copied.
     filter: Option<Arc<DoneLedgerBloomFilter>>,
+    /// Monotonic latch: transitions `false` to `true` exactly once, never reverts.
+    ///
+    /// The `Release` store in `batch_upsert` / `Acquire` load in `batch_get`
+    /// pair is safe under the assumption that data written by the inner
+    /// backend's `batch_upsert` is visible to subsequent `batch_get` calls on
+    /// any clone *before* `batch_upsert` returns `Ok(handle)`. Both the
+    /// in-memory and PostgreSQL backends satisfy this (synchronous
+    /// [`ReadyCommitHandle`]). Backends with deferred visibility (data not
+    /// readable until [`CommitHandle::wait`]) would require invalidation to be
+    /// deferred to the commit handle.
     invalidate_prefilter: Arc<AtomicBool>,
 }
 
@@ -170,6 +180,22 @@ impl DoneLedgerBloomFilter {
         bits.checked_add(7)?.checked_div(8)
     }
 
+    /// Return `true` when `count` falls within the viable range for Bloom
+    /// construction: at or above [`MIN_THRESHOLD`](Self::MIN_THRESHOLD) and
+    /// with estimated memory at or below [`MAX_BYTES`](Self::MAX_BYTES).
+    ///
+    /// Used by [`BloomFilteredDoneLedger::from_ledger`] to pre-check before
+    /// materializing the full key set.
+    pub(crate) fn is_viable_count(count: usize) -> bool {
+        if count < Self::MIN_THRESHOLD {
+            return false;
+        }
+        match Self::estimated_memory_bytes(count) {
+            Some(bytes) => bytes <= Self::MAX_BYTES,
+            None => false,
+        }
+    }
+
     fn estimated_num_bits(expected_items: usize) -> Option<usize> {
         let items = expected_items as f64;
         let bits = (-items * Self::TARGET_FPR.ln() / (LN_2 * LN_2)).ceil();
@@ -211,17 +237,17 @@ impl<D> BloomFilteredDoneLedger<D> {
     /// Build a decorator by bulk-loading terminal hashes from the inner
     /// done-ledger.
     ///
-    /// Calls [`DoneLedger::list_done_hashes`] once, then delegates to
-    /// [`from_hashes`](Self::from_hashes). When the scope is too small for a
-    /// useful Bloom filter, the estimated memory would exceed the cap, or
-    /// enumeration fails, the result is a passthrough wrapper.
+    /// Calls [`DoneLedger::count_done_hashes`] first when the backend
+    /// supports cheap counting. If the scope falls outside the viable range
+    /// (`< MIN_THRESHOLD` or estimated filter memory `> MAX_BYTES`), the
+    /// decorator skips `list_done_hashes` entirely and returns a passthrough
+    /// wrapper — avoiding the potentially multi-gigabyte transient allocation.
     ///
-    /// # Allocation note
-    ///
-    /// `list_done_hashes` materializes the full key set into a `Vec<OvidHash>`.
-    /// For scopes with tens of millions of terminal keys the transient
-    /// allocation can reach gigabytes. A streaming or count-first `DoneLedger`
-    /// method would allow pre-checking before materialization.
+    /// When the backend returns `Ok(None)` for the count (no cheap counting),
+    /// the method falls through to [`DoneLedger::list_done_hashes`] and
+    /// delegates to [`from_hashes`](Self::from_hashes). When the scope is too
+    /// small for a useful Bloom filter, the estimated memory would exceed the
+    /// cap, or enumeration fails, the result is a passthrough wrapper.
     pub(crate) fn from_ledger(
         done_ledger: D,
         tenant_id: TenantId,
@@ -232,6 +258,40 @@ impl<D> BloomFilteredDoneLedger<D> {
         D: DoneLedger,
         D::Error: std::error::Error + Send + Sync + 'static,
     {
+        // Pre-check: if the backend supports cheap counting, bail out early
+        // when the scope is outside the viable range. This avoids a
+        // potentially multi-GiB transient allocation for scopes that would
+        // be rejected by from_hashes anyway.
+        match done_ledger.count_done_hashes(tenant_id, policy_hash) {
+            Ok(Some(count)) => {
+                if !DoneLedgerBloomFilter::is_viable_count(count) {
+                    tracing::debug!(
+                        worker_kind,
+                        bloom_prefilter = "skipped",
+                        done_hash_count = count,
+                        min_threshold = DoneLedgerBloomFilter::MIN_THRESHOLD,
+                        max_bytes = DoneLedgerBloomFilter::MAX_BYTES,
+                        "done-ledger Bloom prefilter skipped via count pre-check; \
+                         using passthrough mode"
+                    );
+                    return Self::passthrough(done_ledger);
+                }
+            }
+            Ok(None) => {
+                // Backend does not support cheap counting; fall through to
+                // full enumeration.
+            }
+            Err(error) => {
+                tracing::debug!(
+                    worker_kind,
+                    bloom_prefilter = "count_error",
+                    error = %error,
+                    "done-ledger count pre-check failed; falling through to enumeration"
+                );
+                // Non-fatal: proceed with the full list_done_hashes path.
+            }
+        }
+
         match done_ledger.list_done_hashes(tenant_id, policy_hash) {
             Ok(done_hashes) => {
                 let decorated = Self::from_hashes(done_ledger, &done_hashes);
@@ -256,11 +316,14 @@ impl<D> BloomFilteredDoneLedger<D> {
                 decorated
             }
             Err(error) => {
-                tracing::warn!(
+                tracing::error!(
                     worker_kind,
+                    %tenant_id,
+                    %policy_hash,
                     bloom_prefilter = "error",
                     error = %error,
-                    "done-ledger Bloom prefilter unavailable; using passthrough mode"
+                    "done-ledger Bloom prefilter unavailable; \
+                     worker will proceed without prefiltering for this entire run"
                 );
                 Self::passthrough(done_ledger)
             }
@@ -326,11 +389,14 @@ where
                 positive_indices.len(),
                 "BloomFilteredDoneLedger inner batch_get violated positional contract"
             );
-            tracing::warn!(
+            tracing::error!(
+                %tenant_id,
+                %policy_hash,
                 expected = positive_indices.len(),
                 actual = delegated.len(),
-                "inner DoneLedger batch_get returned wrong-length Vec; \
-                 falling back to unfiltered call"
+                original_batch_size = ovid_hashes.len(),
+                "inner DoneLedger batch_get violated positional contract; \
+                 Bloom prefilter permanently disabled for this scope"
             );
             // Permanently disable prefiltering so subsequent calls delegate
             // directly instead of repeating the detect-and-retry cycle.
@@ -347,6 +413,13 @@ where
 
     /// Delegates writes directly and disables prefiltering for later reads once
     /// the inner backend accepts a non-empty batch.
+    ///
+    /// The invalidation bit is set after `inner.batch_upsert` returns `Ok` but
+    /// before the caller invokes [`CommitHandle::wait`]. If `wait` subsequently
+    /// fails the filter is disabled for writes that were never durable — a
+    /// performance-only penalty (extra backend lookups, never incorrect results).
+    /// Both current backends use synchronous [`ReadyCommitHandle`], so `wait`
+    /// cannot fail after `batch_upsert` succeeds.
     fn batch_upsert(
         &self,
         records: &[DoneLedgerRecord],
@@ -365,6 +438,15 @@ where
         policy_hash: PolicyHash,
     ) -> Result<Vec<OvidHash>, Self::Error> {
         self.inner.list_done_hashes(tenant_id, policy_hash)
+    }
+
+    /// Delegates terminal-key counting without consulting the Bloom filter.
+    fn count_done_hashes(
+        &self,
+        tenant_id: TenantId,
+        policy_hash: PolicyHash,
+    ) -> Result<Option<usize>, Self::Error> {
+        self.inner.count_done_hashes(tenant_id, policy_hash)
     }
 }
 
@@ -853,6 +935,20 @@ mod tests {
     }
 
     #[test]
+    fn is_viable_count_matches_new_decisions() {
+        // Below threshold: not viable.
+        assert!(!DoneLedgerBloomFilter::is_viable_count(
+            DoneLedgerBloomFilter::MIN_THRESHOLD - 1
+        ));
+        // At threshold: viable.
+        assert!(DoneLedgerBloomFilter::is_viable_count(
+            DoneLedgerBloomFilter::MIN_THRESHOLD
+        ));
+        // Above cap: not viable.
+        assert!(!DoneLedgerBloomFilter::is_viable_count(30_000_000));
+    }
+
+    #[test]
     fn raw_u64_hasher_write_panics() {
         use std::hash::Hasher as _;
 
@@ -1163,6 +1259,35 @@ mod tests {
         assert!(
             tracking.batch_get_calls().is_empty(),
             "Bloom-negative key should not reach inner after failed upsert"
+        );
+    }
+
+    #[test]
+    fn empty_batch_upsert_does_not_invalidate_prefilter() {
+        let tenant_id = tenant(161);
+        let policy_hash = policy(162);
+        let done_hashes = activated_hashes(&[ovid(163)]);
+        let filter = built_filter(&done_hashes);
+        let negative = first_negative_hash(&filter, 80_000_000);
+        let inner = TrackingDoneLedger::empty();
+        let wrapped = BloomFilteredDoneLedger::from_hashes(inner.clone(), &done_hashes);
+
+        // Empty batch_upsert should succeed without invalidating the filter.
+        let handle = wrapped
+            .batch_upsert(&[])
+            .expect("empty batch_upsert should succeed");
+        handle
+            .wait()
+            .expect("empty batch_upsert handle should resolve");
+
+        // Bloom-negative key must still be filtered, proving filter is active.
+        let results = wrapped
+            .batch_get(tenant_id, policy_hash, &[negative])
+            .expect("batch_get after empty upsert should succeed");
+        assert_eq!(results, vec![None]);
+        assert!(
+            inner.batch_get_calls().is_empty(),
+            "Bloom-negative key should not reach inner after empty batch_upsert"
         );
     }
 

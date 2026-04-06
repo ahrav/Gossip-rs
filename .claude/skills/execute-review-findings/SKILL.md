@@ -274,10 +274,12 @@ During execution, agents may discover work that is out of scope for the current 
 but needs tracking — adjacent bugs, deeper refactors, missing test coverage in neighboring
 code, etc.
 
-**All follow-up tasks MUST be created via `/task-forge`.** Do not use bare `bd create` for
-follow-ups. `/task-forge` composes `/create-task` with parallel enrichment agents that
+**Non-trivial follow-up tasks MUST be created via `/task-forge`.** Do not use bare `bd create` for
+non-trivial follow-ups. `/task-forge` composes `/create-task` with parallel enrichment agents that
 produce testing strategy, implementation guidance, and documentation requirements — so the
 follow-up is immediately implementation-ready without re-research.
+
+Trivial follow-ups (single-line fixes, typo corrections) may use `/create-task` directly.
 
 **Rules:**
 1. If an agent's resolution steps reveal a related issue that is NOT part of the current
@@ -408,10 +410,10 @@ After all waves complete, present:
 
 ### Follow-Up Tasks (via /task-forge)
 
-| Task ID | Summary | Discovered During | Priority |
-|---------|---------|-------------------|----------|
-| beads-aaa | Add test coverage for ScratchPool::reset() | F2 execution | P2 |
-| beads-bbb | Refactor shared validation logic | F5 execution | P3 |
+| Task ID | Summary | Discovered During | Priority (1-4) |
+|---------|---------|-------------------|----------------|
+| beads-aaa | Add test coverage for ScratchPool::reset() | F2 execution | 2 |
+| beads-bbb | Refactor shared validation logic | F5 execution | 3 |
 ```
 
 ## Anti-Patterns

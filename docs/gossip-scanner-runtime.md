@@ -134,7 +134,7 @@ prefiltering and
 `OrderedContentRuntime::execute_scan_misses` (which bridges runtime
 `ScanBudgets` into connector read budgets, scans each item through the
 shared chunked engine path, preserves retryable versus permanent read
-failures, and returns ordered non-durable outcomes) on top of that validated
+failures, and returns ordered non-durable outcomes) within that validated
 page loop.
 
 Git scans build the same runtime engine family, bridge git/core events

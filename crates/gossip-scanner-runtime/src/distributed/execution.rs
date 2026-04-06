@@ -1103,14 +1103,24 @@ where
     F::Error: std::error::Error + Send + Sync + 'static,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
-    // Build the prefilter once per worker invocation. If the scope is too
-    // small, too large, or enumeration fails, the wrapper degrades to
-    // passthrough mode with original done-ledger behavior.
+    // Build the prefilter once per worker invocation. The filter is
+    // immutable after construction and shared across all shard leases.
+    // The first successful batch_upsert (end of the first scanned page)
+    // permanently disables prefiltering so subsequent reads delegate
+    // directly to the inner backend. This one-shot design is intentional:
+    // the Bloom filter covers the initial deduplication burst when the
+    // done-ledger population is largest relative to new items, while
+    // avoiding the complexity of per-write filter mutation or per-shard
+    // reconstruction.
     let persistence = decorate_persistence_with_bloom(
         persistence,
         identity.tenant,
         identity.policy_hash,
         "filesystem",
+    );
+    tracing::debug!(
+        bloom_prefilter_active = persistence.done_ledger.has_filter(),
+        "worker bloom prefilter status"
     );
     let mut scratch = Box::new(AcquireScratch::new());
     let mut report = DistributedRunReport::default();
@@ -1199,11 +1209,10 @@ where
     F::Error: std::error::Error + Send + Sync + 'static,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
-    // Git workers share the same tenant+policy done-ledger scope, so the
-    // decorator keeps worker startup behavior uniform while still degrading
-    // cleanly to passthrough mode.
-    let persistence =
-        decorate_persistence_with_bloom(persistence, identity.tenant, identity.policy_hash, "git");
+    // The git path is write-only against the done-ledger (batch_upsert in
+    // submit_git_repo_persistence); it never calls batch_get. Bloom
+    // decoration would force an eager list_done_hashes enumeration at
+    // startup with no read-path benefit, so we skip it entirely.
     let mut scratch = Box::new(AcquireScratch::new());
     let mut report = DistributedRunReport::default();
 
