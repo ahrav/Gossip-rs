@@ -22,8 +22,10 @@ use gossip_contracts::{
 };
 use gossip_coordination::{
     AcquireResultView, AcquireScratch, CheckpointError, ClaimError, CompleteError,
-    CoordinationFacade, OpKind, ParkError, ParkReason,
+    CoordinationFacade, OpKind,
 };
+#[cfg(test)]
+use gossip_coordination::{ParkError, ParkReason};
 use gossip_frontier::decode_connector_extra;
 use gossip_orchestrator::{FilesystemPathKind, FilesystemShardPayload, GitShardPayload};
 
@@ -730,6 +732,7 @@ where
 /// helper is intended for best-effort cleanup after a permanent lease failure:
 /// callers should log any returned [`ParkError`] but preserve the original
 /// failure that triggered the park attempt.
+#[cfg(test)]
 pub(super) fn park_shard_on_error<C, L>(
     coordinator: &mut C,
     tenant: TenantId,

@@ -765,19 +765,6 @@ pub enum ScanRuntimeError {
     /// A connector input parameter was invalid.
     #[error("{0}")]
     ConnectorInput(#[source] ConnectorInputError),
-    /// Commit OID map reached capacity, preventing consistent findings
-    /// translation. The shard should be parked to prevent re-claim loops.
-    #[error(
-        "git repo-frontier shard '{shard_id}': commit OID map saturated at {entry_limit} entries; {detail}"
-    )]
-    CommitOidMapSaturated {
-        /// Redacted shard identifier for log correlation.
-        shard_id: String,
-        /// Maximum number of entries the OID map supports.
-        entry_limit: usize,
-        /// Human-readable context about how saturation was detected.
-        detail: String,
-    },
     /// The family runtime returned an execution error.
     #[error("runtime execution failed: {0}")]
     Driver(#[source] anyhow::Error),

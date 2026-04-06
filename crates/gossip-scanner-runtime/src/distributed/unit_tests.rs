@@ -29,10 +29,7 @@ use super::commit_bridge::{
     drain_commit_stage, emit_ordered_summary, resolve_filesystem_lease_results,
     wait_for_submitted_commits,
 };
-use super::execution::{
-    GitRepoPersistenceInput, oid_map_saturation_error, should_park_git_repo_failure,
-    submit_git_repo_persistence,
-};
+use super::execution::{GitRepoPersistenceInput, submit_git_repo_persistence};
 use super::lease_ops::{
     ArmedLeaseDeadline, CLAIM_RACE_RETRY_DELAY, EMPTY_RANGE_SENTINEL_KEY, LeaseUncertaintySignal,
     advance_shard, build_lease_from_acquire, claim_retry_delay, deterministic_op_id,
@@ -2832,60 +2829,4 @@ fn park_shard_on_error_idempotent_replay() {
     let summaries = shard_summaries(&coordinator);
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].status(), ShardStatus::Parked);
-}
-
-// ============================================================================
-// should_park_git_repo_failure tests
-// ============================================================================
-
-#[test]
-fn should_park_git_repo_failure_detects_saturation() {
-    let error = oid_map_saturation_error(&ToxicDigest::of_bytes(b"test-shard"), "test detail");
-    assert!(
-        should_park_git_repo_failure(&error),
-        "OID-map saturation error must be classified as park-worthy"
-    );
-}
-
-#[test]
-fn should_park_git_repo_failure_rejects_non_saturation_errors() {
-    // Driver with a non-saturation inner error.
-    let driver =
-        DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(AnyError::msg("generic")));
-    assert!(
-        !should_park_git_repo_failure(&driver),
-        "generic Driver error must not trigger parking"
-    );
-
-    // A Driver error whose message matches the saturation display string must
-    // still be rejected — classification is variant-based, not string-based.
-    let lookalike = DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(AnyError::msg(
-        "commit OID map saturated",
-    )));
-    assert!(
-        !should_park_git_repo_failure(&lookalike),
-        "message-equivalent Driver error must not trigger parking"
-    );
-
-    let coordinator = DistributedRuntimeError::Coordinator(AnyError::msg("coord"));
-    assert!(
-        !should_park_git_repo_failure(&coordinator),
-        "Coordinator error must not trigger parking"
-    );
-
-    let durability = DistributedRuntimeError::Durability(AnyError::msg("durability"));
-    assert!(
-        !should_park_git_repo_failure(&durability),
-        "Durability error must not trigger parking"
-    );
-
-    let lease_uncertain =
-        DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::DeadlineElapsed {
-            deadline: LogicalTime::from_raw(10),
-            observed: LogicalTime::from_raw(11),
-        });
-    assert!(
-        !should_park_git_repo_failure(&lease_uncertain),
-        "LeaseUncertain error must not trigger parking"
-    );
 }
