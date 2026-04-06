@@ -37,9 +37,11 @@ thread_local! {
         RefCell::new(LibdeflateDecompressor::new());
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 enum LibdeflateError {
+    #[error("libdeflate: bad data")]
     BadData,
+    #[error("libdeflate: insufficient output space")]
     InsufficientSpace,
 }
 
@@ -105,7 +107,7 @@ impl LibdeflateDecompressor {
         } else if result == libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE {
             Err(LibdeflateError::InsufficientSpace)
         } else {
-            panic!("libdeflate_zlib_decompress_ex returned an unknown error type");
+            Err(LibdeflateError::BadData)
         }
     }
 }

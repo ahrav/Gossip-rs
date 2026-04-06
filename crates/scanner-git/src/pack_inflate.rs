@@ -85,6 +85,20 @@ where
     })
 }
 
+/// Borrows the thread-local `Decompress` for the duration of `f`.
+///
+/// Used by `pack_decode::inflate_entry_payload` to delegate to
+/// `inflate_entry_payload_with` without duplicating routing logic.
+pub(crate) fn with_tls_decompress<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut Decompress) -> R,
+{
+    INFLATE_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        f(&mut scratch.de)
+    })
+}
+
 /// Parsed object kind for non-delta entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectKind {

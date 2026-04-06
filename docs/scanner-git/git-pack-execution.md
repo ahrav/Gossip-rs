@@ -597,6 +597,7 @@ cross-pack or loose-object fallback I/O.
 | Blob introducer (parallel) | `crates/scanner-git/src/blob_introducer.rs` |
 | Seen sets | `crates/scanner-git/src/blob_introducer.rs` |
 | Pack inflate primitives | `crates/scanner-git/src/pack_inflate.rs` |
+| Libdeflate inflate backend | `crates/scanner-git/src/pack_inflate_libdeflate.rs` |
 | Pack decode limits | `crates/scanner-git/src/pack_decode.rs` |
 | Delta application | `crates/scanner-git/src/pack_delta.rs` |
 | Mmap management | `crates/scanner-git/src/runner_exec.rs` |

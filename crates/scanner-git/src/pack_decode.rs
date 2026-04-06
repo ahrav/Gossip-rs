@@ -14,8 +14,7 @@
 use crate::pack_inflate_libdeflate;
 
 use super::pack_inflate::{
-    inflate_exact, inflate_exact_with, inflate_limited, inflate_limited_with, EntryHeader,
-    EntryKind, PackFile,
+    inflate_exact_with, inflate_limited, inflate_limited_with, EntryHeader, EntryKind, PackFile,
 };
 use super::pack_inflate::{InflateError, PackParseError};
 
@@ -224,33 +223,9 @@ pub fn inflate_entry_payload(
     out: &mut Vec<u8>,
     limits: &PackDecodeLimits,
 ) -> Result<usize, PackDecodeError> {
-    if pack_inflate_libdeflate::use_libdeflate_for_header(header) {
-        return pack_inflate_libdeflate::inflate_nondelta_exact(
-            pack.slice_from(header.data_start),
-            // Safe truncation: `use_libdeflate_for_header` gates on size <= 256 KB,
-            // which fits in any `usize`.
-            header.size as usize,
-            out,
-        );
-    }
-
-    match header.kind {
-        EntryKind::NonDelta { .. } => {
-            // Safe truncation: `entry_header_at` rejects sizes above
-            // `max_object_bytes` (a `usize`), so `header.size` fits.
-            let expected = header.size as usize;
-            let consumed = inflate_exact(pack.slice_from(header.data_start), out, expected)?;
-            Ok(consumed)
-        }
-        EntryKind::OfsDelta { .. } | EntryKind::RefDelta { .. } => {
-            let consumed = inflate_limited(
-                pack.slice_from(header.data_start),
-                out,
-                limits.max_delta_bytes,
-            )?;
-            Ok(consumed)
-        }
-    }
+    super::pack_inflate::with_tls_decompress(|de| {
+        inflate_entry_payload_with(de, None, pack, header, out, limits)
+    })
 }
 
 #[cfg(test)]
@@ -475,6 +450,51 @@ mod tests {
 
         let consumed =
             inflate_entry_payload_with(&mut de, None, &pack, &header, &mut out, &limits).unwrap();
+
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn undersized_header_nondelta_returns_backend_error() {
+        // Compress a payload larger than the declared header size.
+        // libdeflate gets an output buffer sized to declared_size (4 bytes),
+        // but the actual stream decompresses to more bytes → InsufficientSpace,
+        // which maps to Backend because the header/data mismatch is treated
+        // as corrupt pack data.
+        let payload = b"this payload is much larger than the declared size in header";
+        let compressed = zlib_compress(payload);
+        let (pack_bytes, offset) = single_entry_pack(non_delta_entry(4, &compressed));
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+        let mut out = Vec::new();
+        let mut de = Decompress::new(true);
+
+        // Verify this routes through libdeflate (declared size 4 <= threshold)
+        assert!(crate::pack_inflate_libdeflate::use_libdeflate_for_header(
+            &header
+        ));
+
+        let err = inflate_entry_payload_with(&mut de, None, &pack, &header, &mut out, &limits)
+            .expect_err("expected backend error from undersized header");
+
+        assert_eq!(err, PackDecodeError::Inflate(InflateError::Backend));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn tls_variant_roundtrip_matches_with_variant() {
+        let payload = b"non-trivial payload for TLS inflate_entry_payload roundtrip".to_vec();
+        let compressed = zlib_compress(&payload);
+        let (pack_bytes, offset) = single_entry_pack(non_delta_entry(payload.len(), &compressed));
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+        let mut out = Vec::new();
+
+        let consumed =
+            inflate_entry_payload(&pack, &header, &mut out, &limits).expect("inflate entry");
 
         assert_eq!(consumed, compressed.len());
         assert_eq!(out, payload);

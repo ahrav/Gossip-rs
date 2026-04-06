@@ -486,6 +486,7 @@ When an OID is not found in any pack (MIDX miss), `PackIo::load_loose_object`
 | Pack header/entry parsing | `pack_inflate.rs` |
 | Zlib inflate (bounded) | `pack_inflate.rs` |
 | Thread-local inflate scratch | `pack_inflate.rs` |
+| Libdeflate inflate backend | `pack_inflate_libdeflate.rs` |
 | Delta application | `pack_inflate.rs` |
 | Delta copy decoding | `pack_inflate.rs` |
 | Delta re-export | `pack_delta.rs` |
