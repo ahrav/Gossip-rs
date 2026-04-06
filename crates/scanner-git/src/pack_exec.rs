@@ -1250,12 +1250,12 @@ struct DecodeBufs {
 //       ..._range_from_header                      — + pre-parsed header
 //       ..._range_hot_deps                         — + shared PackPlanHotDeps
 //
-// All variants eventually funnel through the internal
-// `execute_pack_plan_with_selector_from_header`, which is parameterized by
-// an index iterator and a candidate-range lookup closure.
+// Most variants funnel through `execute_pack_plan_with_selector_from_header`,
+// parameterized by an index iterator and a candidate-range lookup closure.
+// The out-of-order path uses `execute_pack_plan_out_of_order_from_header`
+// with const-generic LOOKAHEAD and a two-stage software-prefetch pipeline.
 //
-// When adding a new entry point, wire it through the selector core to
-// keep per-offset decode logic in one place.
+// Both share per-offset decode logic via `execute_offset_range_with_scratch`.
 // ---------------------------------------------------------------------------
 
 /// Executes a pack plan against a `PackReader`.
@@ -1529,9 +1529,8 @@ fn execute_pack_plan_out_of_order_from_header<
         delta_dep_index: &plan.delta_dep_index,
     };
 
-    if LOOKAHEAD == 0 {
-        for &idx in order {
-            let idx = idx as usize;
+    macro_rules! process {
+        ($idx:expr) => {
             execute_offset_range_with_scratch(
                 &env,
                 plan,
@@ -1543,9 +1542,15 @@ fn execute_pack_plan_out_of_order_from_header<
                 &mut report,
                 &mut hot_stats,
                 alloc_guard_enabled,
-                idx,
-                candidate_ranges[idx],
-            )?;
+                $idx,
+                candidate_ranges[$idx],
+            )?
+        };
+    }
+
+    if LOOKAHEAD == 0 {
+        for &idx in order {
+            process!(idx as usize);
         }
     } else if LOOKAHEAD < 4 {
         // Single-stage prefetch: not enough distance for a two-stage pipeline.
@@ -1555,37 +1560,10 @@ fn execute_pack_plan_out_of_order_from_header<
             prefetch_ooo_stage1(&env, pack_bytes, candidate_ranges, ahead_idx);
 
             let idx = order[i] as usize;
-            execute_offset_range_with_scratch(
-                &env,
-                plan,
-                paths,
-                cache,
-                external,
-                sink,
-                bufs,
-                &mut report,
-                &mut hot_stats,
-                alloc_guard_enabled,
-                idx,
-                candidate_ranges[idx],
-            )?;
+            process!(idx);
         }
         for &idx in &order[prefetch_end..] {
-            let idx = idx as usize;
-            execute_offset_range_with_scratch(
-                &env,
-                plan,
-                paths,
-                cache,
-                external,
-                sink,
-                bufs,
-                &mut report,
-                &mut hot_stats,
-                alloc_guard_enabled,
-                idx,
-                candidate_ranges[idx],
-            )?;
+            process!(idx as usize);
         }
     } else {
         // Two-stage prefetch pipeline:
@@ -1609,20 +1587,7 @@ fn execute_pack_plan_out_of_order_from_header<
             prefetch_ooo_stage2(&env, cache, near_idx);
 
             let idx = order[i] as usize;
-            execute_offset_range_with_scratch(
-                &env,
-                plan,
-                paths,
-                cache,
-                external,
-                sink,
-                bufs,
-                &mut report,
-                &mut hot_stats,
-                alloc_guard_enabled,
-                idx,
-                candidate_ranges[idx],
-            )?;
+            process!(idx);
         }
         // Near-only: Stage 2 for entries whose Stage 1 already fired.
         for i in far_end..near_end {
@@ -1630,38 +1595,11 @@ fn execute_pack_plan_out_of_order_from_header<
             prefetch_ooo_stage2(&env, cache, near_idx);
 
             let idx = order[i] as usize;
-            execute_offset_range_with_scratch(
-                &env,
-                plan,
-                paths,
-                cache,
-                external,
-                sink,
-                bufs,
-                &mut report,
-                &mut hot_stats,
-                alloc_guard_enabled,
-                idx,
-                candidate_ranges[idx],
-            )?;
+            process!(idx);
         }
         // Tail: no prefetch.
         for &idx in &order[near_end..] {
-            let idx = idx as usize;
-            execute_offset_range_with_scratch(
-                &env,
-                plan,
-                paths,
-                cache,
-                external,
-                sink,
-                bufs,
-                &mut report,
-                &mut hot_stats,
-                alloc_guard_enabled,
-                idx,
-                candidate_ranges[idx],
-            )?;
+            process!(idx as usize);
         }
     }
 
@@ -2353,23 +2291,7 @@ pub fn build_candidate_ranges(plan: &PackPlan, ranges: &mut Vec<CandidateRange>)
 }
 
 #[cfg(any(test, feature = "bench"))]
-fn build_delta_dep_index(need_offsets: &[u64], delta_deps: &[DeltaDep]) -> Vec<u32> {
-    let mut index = vec![NONE_U32; need_offsets.len()];
-    if delta_deps.is_empty() {
-        return index;
-    }
-    let mut dep_idx = 0usize;
-    for (need_idx, &offset) in need_offsets.iter().enumerate() {
-        while dep_idx < delta_deps.len() && delta_deps[dep_idx].offset < offset {
-            dep_idx += 1;
-        }
-        if dep_idx < delta_deps.len() && delta_deps[dep_idx].offset == offset {
-            index[need_idx] = dep_idx as u32;
-            dep_idx += 1;
-        }
-    }
-    index
-}
+use super::pack_plan::build_delta_dep_index;
 
 #[cfg(any(test, feature = "bench"))]
 fn delta_header_meta(pack: &[u8], offset: u64) -> (u64, u64) {
@@ -4607,6 +4529,10 @@ mod tests {
             &mut sink_prefetch,
         );
 
+        assert!(
+            !sink_no_prefetch.blobs.is_empty(),
+            "baseline must emit at least one blob"
+        );
         assert_eq!(sink_prefetch.blobs, sink_no_prefetch.blobs);
         assert_eq!(report_prefetch.skips.len(), report_no_prefetch.skips.len());
         assert_eq!(
@@ -4616,6 +4542,7 @@ mod tests {
     }
 
     #[rstest]
+    #[case(0)]
     #[case(1)]
     #[case(2)]
     #[case(PREFETCH_AHEAD)]
@@ -4676,6 +4603,219 @@ mod tests {
 
         assert_perf_u32(report.stats.emitted_candidates, plan_len as u32);
         assert_eq!(sink.emitted.len(), plan_len);
+    }
+
+    /// Verifies that the out-of-order executor with LOOKAHEAD=0 produces
+    /// byte-identical output to the sequential `execute_pack_plan` path.
+    #[test]
+    fn ooo_lookahead_zero_matches_sequential_path() {
+        let entries: &[(ObjectKind, &[u8])] = &[
+            (ObjectKind::Blob, b"alpha"),
+            (ObjectKind::Blob, b"bravo"),
+            (ObjectKind::Blob, b"charlie"),
+            (ObjectKind::Blob, b"delta"),
+        ];
+        let (pack, offsets) = build_pack(entries);
+        let n = entries.len();
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidates: Vec<PackCandidate> = offsets
+            .iter()
+            .enumerate()
+            .map(|(idx, &offset)| PackCandidate {
+                oid: OidBytes::sha1([idx as u8; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset,
+            })
+            .collect();
+        let candidate_offsets: Vec<CandidateAtOffset> = offsets
+            .iter()
+            .enumerate()
+            .map(|(idx, &offset)| CandidateAtOffset {
+                offset,
+                cand_idx: idx as u32,
+            })
+            .collect();
+
+        let limits = PackDecodeLimits::new(64, 1024, 1024);
+
+        // Sequential path: exec_order = None.
+        let plan_seq = build_plan(
+            offsets.clone(),
+            candidates.clone(),
+            candidate_offsets.clone(),
+            None,
+        );
+        let mut cache_seq = PackCache::new(0);
+        let mut sink_seq = CollectingSink::default();
+        let _report_seq = exec_plan(
+            &plan_seq,
+            &pack,
+            &arena,
+            &limits,
+            &mut cache_seq,
+            &mut NoExternal,
+            &mut sink_seq,
+        );
+
+        // OOO path with LOOKAHEAD=0: exec_order = identity permutation.
+        let identity_order: Vec<u32> = (0..n as u32).collect();
+        let plan_ooo = build_plan(offsets, candidates, candidate_offsets, Some(identity_order));
+        let mut cache_ooo = PackCache::new(0);
+        let mut sink_ooo = CollectingSink::default();
+        let _report_ooo = exec_plan_with_ooo_lookahead::<0, _, _>(
+            &plan_ooo,
+            &pack,
+            &arena,
+            &limits,
+            &mut cache_ooo,
+            &mut NoExternal,
+            &mut sink_ooo,
+        );
+
+        assert!(
+            !sink_seq.blobs.is_empty(),
+            "sequential path must emit blobs"
+        );
+        assert_eq!(sink_ooo.blobs, sink_seq.blobs);
+    }
+
+    /// Exercises out-of-order execution with a REF delta whose base is
+    /// resolved via an external provider, verifying that the OOO path
+    /// handles `BaseLoc::External` correctly.
+    #[test]
+    fn ooo_ref_delta_with_external_base() {
+        let base_bytes = b"external-base-content";
+        let result_bytes = b"DELTA_OUTPUT_XYZ";
+        let delta_payload = build_insert_delta(result_bytes, base_bytes.len());
+        let base_oid = OidBytes::sha1([0xAA; 20]);
+
+        // Build a minimal pack with one non-delta filler + one REF delta.
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&2u32.to_be_bytes());
+
+        // Entry 0: non-delta filler (gives the OOO order something to permute).
+        let filler_offset = pack.len() as u64;
+        pack.extend_from_slice(&encode_entry_header_kind(ObjectKind::Blob, 5));
+        pack.extend_from_slice(&zlib_compress(b"hello"));
+
+        // Entry 1: REF delta referencing the external base OID.
+        let delta_offset = pack.len() as u64;
+        let mut delta_entry = encode_entry_header(7, delta_payload.len());
+        delta_entry.extend_from_slice(base_oid.as_slice());
+        delta_entry.extend_from_slice(&zlib_compress(&delta_payload));
+        pack.extend_from_slice(&delta_entry);
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+
+        let filler_candidate = PackCandidate {
+            oid: OidBytes::sha1([0x11; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset: filler_offset,
+        };
+        let delta_candidate = PackCandidate {
+            oid: OidBytes::sha1([0x22; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset: delta_offset,
+        };
+
+        let need_offsets = vec![filler_offset, delta_offset];
+        let (data_start, delta_size) = delta_header_meta(&pack, delta_offset);
+        let delta_deps = vec![DeltaDep {
+            offset: delta_offset,
+            kind: DeltaKind::Ref,
+            base: BaseLoc::External { oid: base_oid },
+            data_start,
+            delta_size,
+        }];
+        let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
+
+        // OOO order: process the delta first, then the filler.
+        let plan = PackPlan {
+            pack_id: 0,
+            oid_len: 20,
+            max_delta_depth: 16,
+            candidates: vec![filler_candidate, delta_candidate],
+            candidate_offsets: vec![
+                CandidateAtOffset {
+                    offset: filler_offset,
+                    cand_idx: 0,
+                },
+                CandidateAtOffset {
+                    offset: delta_offset,
+                    cand_idx: 1,
+                },
+            ],
+            need_offsets,
+            delta_deps,
+            delta_dep_index,
+            exec_order: Some(vec![1, 0]),
+            stats: PackPlanStats {
+                candidate_count: 2,
+                need_count: 2,
+                external_bases: 1,
+                forward_deps: 1,
+                candidate_span: delta_offset - filler_offset,
+                ..PackPlanStats::empty()
+            },
+        };
+
+        struct TestExternalProvider {
+            oid: OidBytes,
+            bytes: Vec<u8>,
+        }
+        impl ExternalBaseProvider for TestExternalProvider {
+            fn load_base(&mut self, oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError> {
+                if *oid == self.oid {
+                    Ok(Some(ExternalBase {
+                        kind: ObjectKind::Blob,
+                        bytes: self.bytes.clone(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = TestExternalProvider {
+            oid: base_oid,
+            bytes: base_bytes.to_vec(),
+        };
+        let mut sink = CollectingSink::default();
+        let limits = PackDecodeLimits::new(64, 1024, 1024);
+
+        let report = exec_plan_with_ooo_lookahead::<PREFETCH_AHEAD, _, _>(
+            &plan,
+            &pack,
+            &arena,
+            &limits,
+            &mut cache,
+            &mut external,
+            &mut sink,
+        );
+
+        assert_perf_u32(report.stats.emitted_candidates, 2);
+        assert_eq!(
+            sink.blobs
+                .get(&OidBytes::sha1([0x22; 20]))
+                .map(|b| b.as_slice()),
+            Some(result_bytes.as_slice()),
+        );
+        assert_eq!(
+            sink.blobs
+                .get(&OidBytes::sha1([0x11; 20]))
+                .map(|b| b.as_slice()),
+            Some(b"hello".as_slice()),
+        );
     }
 
     #[test]

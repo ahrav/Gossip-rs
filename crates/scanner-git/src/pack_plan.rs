@@ -615,7 +615,7 @@ fn build_delta_deps(
 /// Both inputs are sorted by offset, so a single forward-only merge cursor
 /// produces the mapping in O(n + m) without hashing. Entries with no
 /// matching dependency get [`NONE_U32`].
-fn build_delta_dep_index(need_offsets: &[u64], delta_deps: &[DeltaDep]) -> Vec<u32> {
+pub(crate) fn build_delta_dep_index(need_offsets: &[u64], delta_deps: &[DeltaDep]) -> Vec<u32> {
     let mut index = vec![NONE_U32; need_offsets.len()];
     if delta_deps.is_empty() {
         return index;

@@ -1,6 +1,6 @@
 //! Shared test helpers for building synthetic delta instructions and pack
 //! entries. Used by both `pack_inflate` and `object_store` test suites.
-#![allow(dead_code)]
+#![cfg_attr(feature = "bench", allow(dead_code))]
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;

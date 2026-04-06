@@ -955,6 +955,8 @@ mod tests {
         assert!(cache.prefetch_slot(offset));
         assert_eq!(cache.small.slots[idx].clock, 0);
         assert_eq!(cache.pending_dependency_hint, Some(offset));
+        assert_eq!(cache.small.slots[idx].dependency_guard, 0);
+        assert!(cache.small.slots[idx].valid);
     }
 
     #[test]
@@ -971,6 +973,32 @@ mod tests {
         let mut cache = PackCache::new(64 * 1024);
         let data = vec![0xCDu8; 32];
         let offset = 300;
+        assert!(cache.insert(offset, ObjectKind::Blob, &data));
+
+        assert!(cache.prefetch_slot(offset));
+    }
+
+    #[test]
+    fn prefetch_slot_returns_true_for_large_tier_entry() {
+        let small = PackCacheTier::new_with_slot_and_policy(
+            256 * 1024,
+            DEFAULT_SMALL_SLOT_SIZE,
+            EvictionPolicy::Clock,
+        );
+        let large = PackCacheTier::new_with_slot_and_policy(
+            16 * 1024 * 1024,
+            DEFAULT_LARGE_SLOT_SIZE,
+            EvictionPolicy::Clock,
+        );
+        let mut cache = PackCache {
+            small,
+            large,
+            pending_dependency_hint: None,
+        };
+        // 128 KiB exceeds DEFAULT_SMALL_SLOT_SIZE (64 KiB), so the entry
+        // routes to the large tier.
+        let data = vec![0xDDu8; 128 * 1024];
+        let offset = 500;
         assert!(cache.insert(offset, ObjectKind::Blob, &data));
 
         assert!(cache.prefetch_slot(offset));

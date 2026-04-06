@@ -627,10 +627,52 @@ jobs:
           --features aegis-pure-rust,test-support
           -- simd_classify offline_validate set_associative_cache
 
-      # scanner-git: all tests call Vectorscan FFI (via
-      # demo_engine_with_anchor_mode); no miri-safe test modules exist yet.
-      # TODO: add #[cfg(not(miri))] guards to engine_adapter_tests and
-      # introduce miri-safe unit tests for pure-Rust logic.
+      # scanner-git: most tests touch Vectorscan FFI, but the prefetch
+      # helpers and pack-cache probe logic are pure Rust with #[cfg(miri)]
+      # fallbacks.  Filter to only those test names.
+      - name: Miri — scanner-git (pure-Rust prefetch paths)
+        run: >-
+          cargo +nightly miri test -p scanner-git --all-features
+          -- prefetch_read
+
+  # ── Miri — scanner-git on push/PR when unsafe code changes ──────────
+  miri-scanner-git-unsafe:
+    name: Miri scanner-git (unsafe change)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    env:
+      RUSTC_WRAPPER: ""
+      MIRIFLAGS: >-
+        -Zmiri-strict-provenance
+        -Zmiri-symbolic-alignment-check
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect unsafe changes in scanner-git
+        id: unsafe_check
+        env:
+          GH_EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if git diff "$BASE_SHA"...HEAD -- 'crates/scanner-git/src/**/*.rs' | grep -q '^\+.*unsafe'; then
+            echo "has_unsafe=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: ./.github/actions/setup-rust
+        if: steps.unsafe_check.outputs.has_unsafe == 'true'
+        with:
+          toolchain: nightly
+          components: miri
+          shared-key: nightly-linux-miri
+
+      - name: Miri — scanner-git (pure-Rust prefetch paths)
+        if: steps.unsafe_check.outputs.has_unsafe == 'true'
+        run: >-
+          cargo +nightly miri test -p scanner-git --all-features
+          -- prefetch_read
 
   # ── Kani (nightly only) ──────────────────────────────────────────────
   kani:
