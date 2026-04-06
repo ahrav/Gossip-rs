@@ -329,6 +329,7 @@ fn bench_inflate_entry_payload(c: &mut Criterion) {
             b.iter(|| {
                 let consumed = pack_decode::inflate_entry_payload_with(
                     &mut de,
+                    None,
                     black_box(&pack),
                     black_box(&header),
                     &mut out,
@@ -368,6 +369,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
             b.iter(|| {
                 let consumed = pack_decode::inflate_entry_payload_with(
                     &mut de,
+                    None,
                     black_box(&pack),
                     black_box(&header),
                     &mut out,
@@ -409,6 +411,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
             b.iter(|| {
                 let consumed = pack_decode::inflate_entry_payload_with(
                     &mut de,
+                    None,
                     black_box(&pack),
                     black_box(&header),
                     &mut out,
@@ -450,6 +453,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
             b.iter(|| {
                 let consumed = pack_decode::inflate_entry_payload_with(
                     &mut de,
+                    None,
                     black_box(&pack),
                     black_box(&header),
                     &mut out,

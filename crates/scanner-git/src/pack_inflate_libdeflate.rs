@@ -8,10 +8,11 @@
 //!
 //! # Safety boundary
 //!
-//! The only unsafe surface here is the private `LibdeflateDecompressor`
-//! wrapper, which owns a single libdeflate decompressor pointer and never
-//! exposes it outside this module. Callers interact only through safe
-//! functions that pass borrowed input and output slices into libdeflate and
+//! The unsafe surface is the `LibdeflateDecompressor` wrapper, which owns a
+//! single libdeflate decompressor pointer. The wrapper is `pub(crate)` so
+//! callers in `pack_exec` can store it alongside `flate2::Decompress` in
+//! `DecodeBufs`, bypassing TLS on the hot path. All public methods remain
+//! safe — they pass borrowed input and output slices into libdeflate and
 //! convert libdeflate's result codes into crate-local decode errors.
 
 use std::cell::RefCell;
@@ -43,12 +44,12 @@ enum LibdeflateError {
     ShortOutput,
 }
 
-struct LibdeflateDecompressor {
+pub struct LibdeflateDecompressor {
     raw: NonNull<libdeflate_decompressor>,
 }
 
 impl LibdeflateDecompressor {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         // SAFETY: `libdeflate_alloc_decompressor` returns either a valid
         // decompressor pointer or null on allocation failure. The null case is
         // handled explicitly below, and the resulting non-null pointer is freed
@@ -108,6 +109,7 @@ impl Drop for LibdeflateDecompressor {
     }
 }
 
+#[inline]
 fn with_decompressor<F, R>(f: F) -> R
 where
     F: FnOnce(&mut LibdeflateDecompressor) -> R,
@@ -129,10 +131,27 @@ pub(crate) fn use_libdeflate_for_header(header: &EntryHeader) -> bool {
         && header.size <= LIBDEFLATE_THRESHOLD_BYTES as u64
 }
 
-/// Inflate an exact-size non-delta zlib payload with libdeflate.
+/// Inflate an exact-size non-delta zlib payload using a caller-provided
+/// `LibdeflateDecompressor`, bypassing TLS.
 ///
 /// Returns the number of compressed bytes consumed through the end of the
-/// first zlib stream.
+/// first zlib stream. Callers in the hot execution loop store a
+/// decompressor in `DecodeBufs` and pass it here to avoid thread-local
+/// overhead on every inflate call.
+pub(crate) fn inflate_nondelta_exact_with(
+    libde: &mut LibdeflateDecompressor,
+    pack_slice: &[u8],
+    expected: usize,
+    out: &mut Vec<u8>,
+) -> Result<usize, PackDecodeError> {
+    inflate_nondelta_exact_core(libde, pack_slice, expected, out)
+}
+
+/// Inflate an exact-size non-delta zlib payload using the thread-local
+/// `LibdeflateDecompressor`.
+///
+/// Convenience wrapper around [`inflate_nondelta_exact_with`] for callers
+/// that don't maintain their own decompressor.
 ///
 /// # Panics
 /// Panics on same-thread reentrancy because the per-thread decompressor is
@@ -142,28 +161,45 @@ pub(crate) fn inflate_nondelta_exact(
     expected: usize,
     out: &mut Vec<u8>,
 ) -> Result<usize, PackDecodeError> {
-    out.clear();
-    out.resize(expected, 0);
+    with_decompressor(|libde| inflate_nondelta_exact_core(libde, pack_slice, expected, out))
+}
 
-    match with_decompressor(|de| de.zlib_decompress_exact(pack_slice, out.as_mut_slice())) {
+fn inflate_nondelta_exact_core(
+    libde: &mut LibdeflateDecompressor,
+    pack_slice: &[u8],
+    expected: usize,
+    out: &mut Vec<u8>,
+) -> Result<usize, PackDecodeError> {
+    out.clear();
+    out.reserve(expected);
+    crate::pack_inflate::poison_spare_capacity(out);
+
+    let spare = &mut out.spare_capacity_mut()[..expected];
+    // SAFETY: `reserve(expected)` guarantees `capacity() >= expected` and
+    // `clear()` set `len()` to 0, so the slice is in-bounds. The cast from
+    // `MaybeUninit<u8>` to `u8` is sound because libdeflate treats the
+    // output buffer as write-only.
+    let buf = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), expected) };
+
+    match libde.zlib_decompress_exact(pack_slice, buf) {
         Ok((actual_in, actual_out)) => {
             if actual_out == expected {
+                // SAFETY: libdeflate initialized exactly `expected` bytes
+                // into the spare capacity.
+                unsafe { out.set_len(expected) };
                 Ok(actual_in)
             } else {
-                out.truncate(actual_out);
+                // Partial decompression — expose what was written.
+                // SAFETY: libdeflate initialized exactly `actual_out` bytes.
+                unsafe { out.set_len(actual_out) };
                 Err(PackDecodeError::Inflate(InflateError::TruncatedInput))
             }
         }
-        Err(LibdeflateError::BadData) => {
-            out.clear();
-            Err(PackDecodeError::Inflate(InflateError::Backend))
-        }
+        Err(LibdeflateError::BadData) => Err(PackDecodeError::Inflate(InflateError::Backend)),
         Err(LibdeflateError::InsufficientSpace) => {
-            out.clear();
             Err(PackDecodeError::Inflate(InflateError::LimitExceeded))
         }
         Err(LibdeflateError::ShortOutput) => {
-            out.clear();
             Err(PackDecodeError::Inflate(InflateError::TruncatedInput))
         }
     }

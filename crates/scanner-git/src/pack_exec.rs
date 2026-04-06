@@ -736,6 +736,7 @@ impl Default for DecodeBufs {
     fn default() -> Self {
         Self {
             de: flate2::Decompress::new(true),
+            libde: crate::pack_inflate_libdeflate::LibdeflateDecompressor::new(),
             inflate_buf: Vec::new(),
             result_buf: Vec::new(),
             base_buf: Vec::new(),
@@ -1140,6 +1141,7 @@ struct DecodeEnv<'a> {
 /// the decode call chain without TLS overhead or reentrancy concerns.
 struct DecodeBufs {
     de: flate2::Decompress,
+    libde: crate::pack_inflate_libdeflate::LibdeflateDecompressor,
     inflate_buf: Vec<u8>,
     result_buf: Vec<u8>,
     base_buf: Vec<u8>,
@@ -2512,6 +2514,7 @@ fn decode_offset<B: ExternalBaseProvider>(
                 let (inflate_res, nanos) = perf::time(|| {
                     inflate_entry_payload_with(
                         &mut bufs.de,
+                        Some(&mut bufs.libde),
                         env.pack,
                         &header,
                         &mut bufs.result_buf,
@@ -3084,8 +3087,9 @@ fn materialize_pack_root_base(
             data_start,
             kind: EntryKind::NonDelta { kind },
         };
-        let (inflate_res, nanos) =
-            perf::time(|| inflate_entry_payload_with(de, env.pack, &header, base_buf, env.limits));
+        let (inflate_res, nanos) = perf::time(|| {
+            inflate_entry_payload_with(de, None, env.pack, &header, base_buf, env.limits)
+        });
         if let Err(err) = inflate_res {
             return Err(SkipReason::Decode(err));
         }

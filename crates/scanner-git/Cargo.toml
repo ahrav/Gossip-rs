@@ -27,6 +27,7 @@ gix-commitgraph = "0.34"
 gix-hash = { version = "0.22", features = ["sha256"] }
 gix-ref = "0.60"
 libc = "0.2"
+libdeflate-sys = "1.25.2"
 memchr = "2.8"
 memmap2 = "0.9"
 regex = "1.12"

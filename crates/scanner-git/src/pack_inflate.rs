@@ -51,7 +51,7 @@ thread_local! {
 /// poison pattern instead of whatever the allocator left behind.
 /// No-op in release builds.
 #[inline(always)]
-fn poison_spare_capacity(buf: &mut Vec<u8>) {
+pub(crate) fn poison_spare_capacity(buf: &mut Vec<u8>) {
     #[cfg(debug_assertions)]
     {
         for slot in buf.spare_capacity_mut() {

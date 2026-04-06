@@ -104,21 +104,24 @@ pub fn entry_header_at(
     Ok(header)
 }
 
-/// Inflates the payload for an entry header using a caller-provided
-/// `Decompress`, bypassing TLS.
+/// Inflates the payload for an entry header using caller-provided
+/// decompressors, bypassing TLS.
 ///
 /// Callers are expected to pass a header parsed from `pack` (typically via
 /// [`entry_header_at`]) so `data_start`, `kind`, and `size` match the bytes at
 /// that offset.
 ///
 /// Non-delta entries (`EntryKind::NonDelta`) are inflated with an exact-size
-/// contract of `header.size` bytes. Small non-delta entries route through the
-/// thread-local libdeflate backend; larger non-delta entries continue to use
-/// the caller-provided `Decompress`. Delta entries (`EntryKind::OfsDelta` and
+/// contract of `header.size` bytes. Small non-delta entries route through
+/// the libdeflate backend; larger non-delta entries continue to use the
+/// caller-provided `Decompress`. Delta entries (`EntryKind::OfsDelta` and
 /// `EntryKind::RefDelta`) are inflated as raw delta streams with a hard cap
 /// of `limits.max_delta_bytes`.
-/// The caller-provided `Decompress` is bypassed entirely when the libdeflate
-/// fast path is selected.
+///
+/// When `libde` is `Some`, the libdeflate fast path uses the provided
+/// decompressor directly. When `None`, the thread-local libdeflate
+/// decompressor is used as a fallback. The caller-provided `Decompress` is
+/// bypassed entirely when the libdeflate fast path is selected.
 ///
 /// This function does not enforce `limits.max_object_bytes` for non-delta
 /// entries and does not parse delta varints/result sizes; those checks happen
@@ -144,22 +147,25 @@ pub fn entry_header_at(
 /// # Panics
 /// Panics if `header.data_start` is out of bounds for `pack` (bounds check in
 /// `PackFile::slice_from`).
-/// May panic if called reentrantly on the same thread while inflating a small
-/// non-delta entry because the libdeflate fast path uses thread-local scratch
-/// guarded by `RefCell`.
+/// When `libde` is `None`, may panic on same-thread reentrancy because the
+/// thread-local libdeflate decompressor is guarded by `RefCell`.
 pub fn inflate_entry_payload_with(
     de: &mut Decompress,
+    libde: Option<&mut pack_inflate_libdeflate::LibdeflateDecompressor>,
     pack: &PackFile<'_>,
     header: &EntryHeader,
     out: &mut Vec<u8>,
     limits: &PackDecodeLimits,
 ) -> Result<usize, PackDecodeError> {
     if pack_inflate_libdeflate::use_libdeflate_for_header(header) {
-        return pack_inflate_libdeflate::inflate_nondelta_exact(
-            pack.slice_from(header.data_start),
-            header.size as usize,
-            out,
-        );
+        let slice = pack.slice_from(header.data_start);
+        let expected = header.size as usize;
+        return match libde {
+            Some(libde) => {
+                pack_inflate_libdeflate::inflate_nondelta_exact_with(libde, slice, expected, out)
+            }
+            None => pack_inflate_libdeflate::inflate_nondelta_exact(slice, expected, out),
+        };
     }
 
     match header.kind {
@@ -323,7 +329,7 @@ mod tests {
         let mut de = Decompress::new(true);
 
         let consumed =
-            inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits).unwrap();
+            inflate_entry_payload_with(&mut de, None, &pack, &header, &mut out, &limits).unwrap();
 
         assert_eq!(consumed, compressed.len());
         assert_eq!(out, payload);
@@ -341,7 +347,7 @@ mod tests {
         let mut out = Vec::new();
         let mut de = Decompress::new(true);
 
-        let err = inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits)
+        let err = inflate_entry_payload_with(&mut de, None, &pack, &header, &mut out, &limits)
             .expect_err("expected truncated exact-size decode");
 
         assert_eq!(err, PackDecodeError::Inflate(InflateError::TruncatedInput));
@@ -357,7 +363,7 @@ mod tests {
         let mut out = Vec::from("stale");
         let mut de = Decompress::new(true);
 
-        let err = inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits)
+        let err = inflate_entry_payload_with(&mut de, None, &pack, &header, &mut out, &limits)
             .expect_err("expected corrupt stream error");
 
         assert_eq!(err, PackDecodeError::Inflate(InflateError::Backend));
@@ -377,7 +383,7 @@ mod tests {
 
         assert!(pack_inflate_libdeflate::use_libdeflate_for_header(&header));
         let consumed =
-            inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits).unwrap();
+            inflate_entry_payload_with(&mut de, None, &pack, &header, &mut out, &limits).unwrap();
 
         assert_eq!(consumed, compressed.len());
         assert_eq!(out, payload);
@@ -396,7 +402,7 @@ mod tests {
 
         assert!(!pack_inflate_libdeflate::use_libdeflate_for_header(&header));
         let consumed =
-            inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits).unwrap();
+            inflate_entry_payload_with(&mut de, None, &pack, &header, &mut out, &limits).unwrap();
 
         assert_eq!(consumed, compressed.len());
         assert_eq!(out, payload);
@@ -420,7 +426,7 @@ mod tests {
 
         assert!(!pack_inflate_libdeflate::use_libdeflate_for_header(&header));
         let consumed =
-            inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits).unwrap();
+            inflate_entry_payload_with(&mut de, None, &pack, &header, &mut out, &limits).unwrap();
 
         assert_eq!(consumed, compressed_delta.len());
         assert_eq!(out, delta);
@@ -459,7 +465,7 @@ mod tests {
         let mut de = Decompress::new(true);
 
         let consumed =
-            inflate_entry_payload_with(&mut de, &pack, &header, &mut out, &limits).unwrap();
+            inflate_entry_payload_with(&mut de, None, &pack, &header, &mut out, &limits).unwrap();
 
         assert_eq!(consumed, compressed.len());
         assert_eq!(out, payload);
