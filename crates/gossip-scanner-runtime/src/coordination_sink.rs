@@ -478,8 +478,10 @@ impl EventOutput for FindingsCaptureSink {
                     tracing::error!(
                         source = %finding.source.as_str(),
                         object_path_len = finding.object_path.len(),
+                        commit_id = ?finding.commit_id,
                         "finding missing blob_oid; non-Git findings must not \
-                         flow through FindingsCaptureSink"
+                         flow through FindingsCaptureSink — integrity check \
+                         will reject this scan"
                     );
                 }
             }
@@ -823,7 +825,7 @@ mod tests {
         sink.emit_core(finding_event());
         sink.emit_core(finding_event());
 
-        // One invalid finding with no blob OID at all.
+        // One invalid finding with no blob OID at all (outer `None` arm).
         sink.emit_core(CoreEvent::Finding(FindingEvent {
             source: SourceKind::Git,
             object_path: b"/tmp/no-oid.txt",
@@ -838,10 +840,28 @@ mod tests {
             confidence_score: 50,
         }));
 
+        // One invalid finding with a wire payload that fails decode (inner
+        // `Some(raw)` arm where `decode_from_wire` returns `None`).
+        let mut bad_wire = [0u8; 33];
+        bad_wire[0] = 21; // Invalid length prefix — neither 20 (SHA-1) nor 32 (SHA-256).
+        sink.emit_core(CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Git,
+            object_path: b"/tmp/bad-wire.txt",
+            start: 0,
+            end: 8,
+            rule_id: 2,
+            rule_name: "test",
+            norm_hash: [0xEE; 32],
+            blob_oid: Some(bad_wire),
+            commit_id: Some(100),
+            change_kind: Some("modify"),
+            confidence_score: 30,
+        }));
+
         assert_eq!(
             sink.detected_finding_count(),
-            3,
-            "all three findings must be counted regardless of blob_oid validity"
+            4,
+            "all four findings must be counted regardless of blob_oid validity"
         );
         assert_eq!(
             sink.take_captured_findings().len(),

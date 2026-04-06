@@ -877,8 +877,9 @@ with a deterministic `OpId`.
    store and `FindingsCaptureSink` to retain persistence-ready finding payloads
    with decoded blob OIDs; findings with malformed or missing blob OIDs are
    counted but excluded from capture, causing the post-scan integrity check
-   (detected count vs captured payload count) to reject the scan before
-   translation,
+   (detected count vs captured payload count) to terminate the worker loop
+   with a runtime error before translation — the coordinator will re-offer
+   the shard to the next available worker,
 5. if `execute_repo` finishes with `FinalizeOutcome::Complete`, translates the
    captured findings into per-object persistence rows through
    `translate_git_item_result`, then durably records findings and the repo-level
