@@ -79,7 +79,7 @@ where
         Ok(done_hashes) => {
             let decorated = BloomFilteredDoneLedger::from_hashes(done_ledger, &done_hashes);
             if decorated.has_filter() {
-                tracing::debug!(
+                tracing::info!(
                     worker_kind,
                     bloom_prefilter = "active",
                     done_hashes = done_hashes.len(),
@@ -108,6 +108,30 @@ where
             BloomFilteredDoneLedger::passthrough(done_ledger)
         }
     }
+}
+
+/// Wrap the done-ledger inside `persistence` in a [`BloomFilteredDoneLedger`]
+/// so Bloom-negative keys are pruned before the backing store sees them.
+fn decorate_persistence_with_bloom<F, D>(
+    persistence: DistributedPersistence<F, D>,
+    tenant_id: TenantId,
+    policy_hash: PolicyHash,
+    worker_kind: &'static str,
+) -> DistributedPersistence<F, BloomFilteredDoneLedger<D>>
+where
+    F: Clone + Send + Sync,
+    D: DoneLedger + Clone + Send + Sync,
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    DistributedPersistence::new(
+        persistence.findings_sink,
+        decorate_done_ledger_with_bloom(
+            persistence.done_ledger,
+            tenant_id,
+            policy_hash,
+            worker_kind,
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1221,22 +1245,14 @@ where
     F::Error: std::error::Error + Send + Sync + 'static,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
-    let DistributedPersistence {
-        findings_sink,
-        done_ledger,
-    } = persistence;
     // Build the prefilter once per worker invocation. If the scope is too
     // small, too large, or enumeration fails, the wrapper degrades to
-    // passthrough mode and the runtime keeps the original done-ledger
-    // behavior.
-    let persistence = DistributedPersistence::new(
-        findings_sink,
-        decorate_done_ledger_with_bloom(
-            done_ledger,
-            identity.tenant,
-            identity.policy_hash,
-            "filesystem",
-        ),
+    // passthrough mode with original done-ledger behavior.
+    let persistence = decorate_persistence_with_bloom(
+        persistence,
+        identity.tenant,
+        identity.policy_hash,
+        "filesystem",
     );
     let mut scratch = Box::new(AcquireScratch::new());
     let mut report = DistributedRunReport::default();
@@ -1328,17 +1344,11 @@ where
     F::Error: std::error::Error + Send + Sync + 'static,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
-    let DistributedPersistence {
-        findings_sink,
-        done_ledger,
-    } = persistence;
-    // Git workers share the same tenant+policy done-ledger scope as the
-    // filesystem path, so constructing the decorator here keeps worker startup
-    // behavior uniform while still degrading cleanly to passthrough mode.
-    let persistence = DistributedPersistence::new(
-        findings_sink,
-        decorate_done_ledger_with_bloom(done_ledger, identity.tenant, identity.policy_hash, "git"),
-    );
+    // Git workers share the same tenant+policy done-ledger scope, so the
+    // decorator keeps worker startup behavior uniform while still degrading
+    // cleanly to passthrough mode.
+    let persistence =
+        decorate_persistence_with_bloom(persistence, identity.tenant, identity.policy_hash, "git");
     let mut scratch = Box::new(AcquireScratch::new());
     let mut report = DistributedRunReport::default();
 

@@ -599,6 +599,84 @@ mod tests {
         }
     }
 
+    /// DoneLedger that delegates reads but always fails writes.
+    #[derive(Clone, Debug)]
+    struct FailingUpsertDoneLedger {
+        inner: TrackingDoneLedger,
+    }
+
+    impl DoneLedger for FailingUpsertDoneLedger {
+        type Error = io::Error;
+        type CommitHandle = ReadyCommitHandle<DoneLedgerCommitReceipt, io::Error>;
+
+        fn batch_get(
+            &self,
+            tenant_id: TenantId,
+            policy_hash: PolicyHash,
+            ovid_hashes: &[OvidHash],
+        ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            self.inner.batch_get(tenant_id, policy_hash, ovid_hashes)
+        }
+
+        fn batch_upsert(
+            &self,
+            _records: &[DoneLedgerRecord],
+        ) -> Result<Self::CommitHandle, Self::Error> {
+            Err(io::Error::other("injected batch_upsert failure"))
+        }
+    }
+
+    /// DoneLedger whose first `batch_get` returns a wrong-length result.
+    /// Only compiled in release mode because its sole consumer is gated on
+    /// `#[cfg(not(debug_assertions))]`.
+    #[cfg(not(debug_assertions))]
+    #[derive(Clone, Debug)]
+    struct WrongLengthDoneLedger {
+        inner: TrackingDoneLedger,
+        call_count: Arc<Mutex<u64>>,
+    }
+
+    #[cfg(not(debug_assertions))]
+    impl WrongLengthDoneLedger {
+        fn new(inner: TrackingDoneLedger) -> Self {
+            Self {
+                inner,
+                call_count: Arc::new(Mutex::new(0)),
+            }
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    impl DoneLedger for WrongLengthDoneLedger {
+        type Error = io::Error;
+        type CommitHandle = ReadyCommitHandle<DoneLedgerCommitReceipt, io::Error>;
+
+        fn batch_get(
+            &self,
+            tenant_id: TenantId,
+            policy_hash: PolicyHash,
+            ovid_hashes: &[OvidHash],
+        ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            let mut count = self.call_count.lock().expect("call_count lock");
+            *count += 1;
+            if *count == 1 {
+                // First call (Bloom-positive subset): return wrong length to
+                // trigger the decorator's fallback path.
+                Ok(Vec::new())
+            } else {
+                // Fallback call with the full original slice.
+                self.inner.batch_get(tenant_id, policy_hash, ovid_hashes)
+            }
+        }
+
+        fn batch_upsert(
+            &self,
+            records: &[DoneLedgerRecord],
+        ) -> Result<Self::CommitHandle, Self::Error> {
+            self.inner.batch_upsert(records)
+        }
+    }
+
     #[test]
     fn empty_filter_returns_false() {
         let filter = DoneLedgerBloomFilter::new(DoneLedgerBloomFilter::MIN_THRESHOLD)
@@ -906,6 +984,78 @@ mod tests {
             .expect_err("Bloom-positive delegated failure should propagate");
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn failed_batch_upsert_does_not_invalidate_prefilter() {
+        let tenant_id = tenant(111);
+        let policy_hash = policy(112);
+        let positive = ovid(113);
+        let done_hashes = activated_hashes(&[positive]);
+        let filter = built_filter(&done_hashes);
+        let negative = first_negative_hash(&filter, 60_000_000);
+
+        let tracking = TrackingDoneLedger::empty();
+        let inner = FailingUpsertDoneLedger {
+            inner: tracking.clone(),
+        };
+        let wrapped = BloomFilteredDoneLedger::from_hashes(inner, &done_hashes);
+
+        let record = scanned_record(tenant_id, policy_hash, positive);
+        let error = wrapped
+            .batch_upsert(std::slice::from_ref(&record))
+            .expect_err("failing inner upsert should propagate");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+
+        // Bloom-negative key must still be filtered without reaching inner,
+        // proving the invalidation bit was not set by the failed upsert.
+        let results = wrapped
+            .batch_get(tenant_id, policy_hash, &[negative])
+            .expect("batch_get after failed upsert should succeed");
+        assert_eq!(results, vec![None]);
+        assert!(
+            tracking.batch_get_calls().is_empty(),
+            "Bloom-negative key should not reach inner after failed upsert"
+        );
+    }
+
+    /// Exercises the release-mode safety net: when the inner `batch_get`
+    /// returns a wrong-length Vec, the decorator falls back to delegating
+    /// the full original slice. Gated to release-only because the
+    /// `debug_assert_eq!` in the production code fires first in debug builds.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn wrong_length_inner_falls_back_to_full_delegation() {
+        let tenant_id = tenant(121);
+        let policy_hash = policy(122);
+        let positive_a = ovid(123);
+        let positive_b = ovid(124);
+        let done_hashes = activated_hashes(&[positive_a, positive_b]);
+        let filter = built_filter(&done_hashes);
+        let negative = first_negative_hash(&filter, 70_000_000);
+
+        let tracking = TrackingDoneLedger::with_records([
+            scanned_record(tenant_id, policy_hash, positive_a),
+            scanned_record(tenant_id, policy_hash, positive_b),
+        ]);
+        let inner = WrongLengthDoneLedger::new(tracking);
+        let wrapped = BloomFilteredDoneLedger::from_hashes(inner, &done_hashes);
+
+        // Mixed query forces the partial-positive scatter/gather path.
+        let results = wrapped
+            .batch_get(tenant_id, policy_hash, &[positive_a, negative, positive_b])
+            .expect("fallback batch_get should succeed");
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0].as_ref().map(|r| r.key().ovid_hash()),
+            Some(positive_a)
+        );
+        assert!(results[1].is_none());
+        assert_eq!(
+            results[2].as_ref().map(|r| r.key().ovid_hash()),
+            Some(positive_b)
+        );
     }
 
     #[test]

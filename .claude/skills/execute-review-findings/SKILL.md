@@ -268,6 +268,36 @@ NIT and INFO findings are skipped by default (see Phase 1 severity filter).
 
 5. **Close completed tasks**: `bd close <id>` for each successfully resolved finding.
 
+### Follow-Up Task Creation
+
+During execution, agents may discover work that is out of scope for the current finding
+but needs tracking — adjacent bugs, deeper refactors, missing test coverage in neighboring
+code, etc.
+
+**All follow-up tasks MUST be created via `/task-forge`.** Do not use bare `bd create` for
+follow-ups. `/task-forge` composes `/create-task` with parallel enrichment agents that
+produce testing strategy, implementation guidance, and documentation requirements — so the
+follow-up is immediately implementation-ready without re-research.
+
+**Rules:**
+1. If an agent's resolution steps reveal a related issue that is NOT part of the current
+   finding, it is a follow-up. Do not scope-creep the current task.
+2. Collect all follow-up intents during wave execution. After the wave's quality gate passes,
+   dispatch `/task-forge` for each follow-up.
+3. The `/task-forge` invocation must include the context discovered during execution — what
+   was found, where, and why it matters. Do not create vague follow-ups.
+4. Follow-up tasks are listed in the Phase 6 summary report under a dedicated "Follow-Up
+   Tasks" section with their beads IDs and one-line summaries.
+
+**Example:**
+```
+While fixing F2 (bounds check in scratch.rs), the agent noticed that the adjacent
+`reset()` method has no test coverage and silently drops pending writes.
+
+→ Dispatch /task-forge: "Add test coverage for ScratchPool::reset() — verify pending
+  writes are flushed or explicitly discarded before reset completes"
+```
+
 ### Quality Gate Between Waves
 
 Before moving to the next wave, run:
@@ -375,6 +405,13 @@ After all waves complete, present:
 - BLOCKs: N (list if any)
 - WARNs: N
 - Verdict: PASS / PASS WITH WARNINGS / FAIL
+
+### Follow-Up Tasks (via /task-forge)
+
+| Task ID | Summary | Discovered During | Priority |
+|---------|---------|-------------------|----------|
+| beads-aaa | Add test coverage for ScratchPool::reset() | F2 execution | P2 |
+| beads-bbb | Refactor shared validation logic | F5 execution | P3 |
 ```
 
 ## Anti-Patterns
@@ -391,6 +428,8 @@ After all waves complete, present:
 | Writing a new standalone test when rstest cases exist | Test proliferation, maintenance burden, inconsistent patterns | Add a `#[case]` to the existing rstest instead |
 | Ignoring existing proptest coverage for a bug | Duplicates coverage, misses the property violation | Tighten the property assertion or add a targeted `prop_assert` |
 | Skipping doc-verify after fixes | Fixes can invalidate doc comments, creating silent drift | Always run Phase 5 doc-verify on modified files |
+| Creating follow-up tasks with bare `bd create` | Missing test strategy, implementation guidance, and doc requirements — next agent must re-research | Always use `/task-forge` for follow-up tasks discovered during execution |
+| Scope-creeping a finding to include adjacent issues | Findings lose focus, partial completion harder to track | File a `/task-forge` follow-up and keep the current task scoped |
 
 ## Configuration
 
@@ -407,6 +446,7 @@ After all waves complete, present:
 ## Related Skills
 
 - `/review-dispatch` — produces the findings this skill consumes
+- `/task-forge` — **mandatory** for all follow-up tasks discovered during execution
 - `/pr-comment-response` — TDD verify-first pattern for individual PR comments
 - `/bench-compare` — baseline/comparison benchmarks for performance findings
 - `/test-strategy` — choose appropriate test type (unit, property, fuzz, Kani)
