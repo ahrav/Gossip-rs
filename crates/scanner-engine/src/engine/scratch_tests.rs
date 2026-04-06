@@ -149,6 +149,35 @@ fn engine_normalize_none_transform_not_snapped() {
     assert_eq!(result, 1019);
 }
 
+/// Boundary-value coverage for the Base64 snap window.
+///
+/// The snap condition is:
+///   `actual_encoded > min_encoded && actual_encoded <= min_encoded + 3`
+///
+/// For decoded_len=13 (span 200..213): min_encoded = ceil(13*4/3) = 18.
+/// Parameterize over actual_encoded offsets relative to min to hit every
+/// branch boundary.
+#[rstest]
+#[case::exact_no_snap(1000, 1018, false, "actual == min: no snap (strict >)")]
+#[case::plus_one_snap(1000, 1019, true, "actual == min+1: snap")]
+#[case::plus_three_snap(1000, 1021, true, "actual == min+3: far boundary snap")]
+#[case::plus_four_no_snap(1000, 1022, false, "actual == min+4: beyond window")]
+fn normalize_base64_snap_window_boundaries(
+    #[case] root_hint_start: u64,
+    #[case] root_hint_end: u64,
+    #[case] expect_snap: bool,
+    #[case] label: &str,
+) {
+    let rec = make_rec(StepId(1), 200, 213, root_hint_start, root_hint_end);
+    let result = normalize_root_hint_end_for_dedup(&rec, Some(TransformId::Base64));
+    let expected = if expect_snap {
+        root_hint_start + 18 // snapped to min_encoded
+    } else {
+        root_hint_end // unchanged
+    };
+    assert_eq!(result, expected, "{label}");
+}
+
 #[test]
 fn drain_findings_with_hashes_preserves_alignment_and_order() {
     let mut scratch = new_test_scratch();
