@@ -282,8 +282,10 @@ The thread-local `InflateScratch` (`pack_inflate.rs`) bundles a
 also uses a thread-local libdeflate decompressor in
 `pack_inflate_libdeflate.rs`. Reentrant callers can still use
 `inflate_limited_with` and `inflate_exact_with`, but
-`inflate_entry_payload` and `inflate_entry_payload_with` may panic on
-same-thread reentrancy when the libdeflate fast path is selected.
+`inflate_entry_payload` may panic on same-thread reentrancy because it
+borrows the flate2 TLS scratch (`InflateScratch`) before dispatching.
+`inflate_entry_payload_with` avoids the flate2 TLS borrow but may still
+panic when `libde` is `None` and the libdeflate TLS fallback is selected.
 
 ### Bounded Decode Wrappers
 

@@ -93,10 +93,7 @@ pub(crate) fn with_tls_decompress<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Decompress) -> R,
 {
-    INFLATE_SCRATCH.with(|scratch| {
-        let mut scratch = scratch.borrow_mut();
-        f(&mut scratch.de)
-    })
+    with_inflate_scratch(|de, _buf| f(de))
 }
 
 /// Parsed object kind for non-delta entries.

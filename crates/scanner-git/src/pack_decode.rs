@@ -457,12 +457,12 @@ mod tests {
     }
 
     #[test]
-    fn undersized_header_nondelta_returns_backend_error() {
+    fn undersized_header_nondelta_returns_limit_exceeded() {
         // Compress a payload larger than the declared header size.
         // libdeflate gets an output buffer sized to declared_size (4 bytes),
-        // but the actual stream decompresses to more bytes → InsufficientSpace,
-        // which maps to Backend because the header/data mismatch is treated
-        // as corrupt pack data.
+        // but the actual stream decompresses to more bytes. This is a
+        // size-limit violation (decompressed data exceeds declared size),
+        // not a backend driver error.
         let payload = b"this payload is much larger than the declared size in header";
         let compressed = zlib_compress(payload);
         let (pack_bytes, offset) = single_entry_pack(non_delta_entry(4, &compressed));
@@ -478,9 +478,9 @@ mod tests {
         ));
 
         let err = inflate_entry_payload_with(&mut de, None, &pack, &header, &mut out, &limits)
-            .expect_err("expected backend error from undersized header");
+            .expect_err("expected limit-exceeded error from undersized header");
 
-        assert_eq!(err, PackDecodeError::Inflate(InflateError::Backend));
+        assert_eq!(err, PackDecodeError::Inflate(InflateError::LimitExceeded));
         assert!(out.is_empty());
     }
 

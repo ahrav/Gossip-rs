@@ -60,8 +60,18 @@ impl std::fmt::Debug for LibdeflateDecompressor {
     }
 }
 
+impl Default for LibdeflateDecompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LibdeflateDecompressor {
-    pub(crate) fn new() -> Self {
+    /// Allocates a new libdeflate decompressor.
+    ///
+    /// # Panics
+    /// Panics if the underlying C allocator returns null.
+    pub fn new() -> Self {
         // SAFETY: `libdeflate_alloc_decompressor` returns either a valid
         // decompressor pointer or null on allocation failure. The null case is
         // handled explicitly below, and the resulting non-null pointer is freed
@@ -225,10 +235,11 @@ fn inflate_nondelta_exact_core(
         }
         Err(LibdeflateError::InsufficientSpace) => {
             // The output buffer is sized exactly to the header-declared size.
-            // InsufficientSpace means the actual data exceeds the declared
-            // size, indicating corrupt pack data.
+            // InsufficientSpace means the decompressed stream exceeds the
+            // declared size, which is a size-limit violation (not a backend
+            // driver error).
             out.clear();
-            Err(PackDecodeError::Inflate(InflateError::Backend))
+            Err(PackDecodeError::Inflate(InflateError::LimitExceeded))
         }
     }
 }
