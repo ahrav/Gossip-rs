@@ -48,8 +48,11 @@ use tempfile::tempdir;
 use crate::{
     CancellationToken, ScanBudgets, ScanRuntimeError, build_runtime_engine,
     commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput},
-    coordination_sink::{CoordinationEventRecorder, MirrorErrorClass, StageSignal},
+    coordination_sink::{
+        CoordinationEventRecorder, FindingsCaptureSink, MirrorErrorClass, StageSignal,
+    },
     git_mirror::LocalMirrorManager,
+    test_fixtures::{init_git_repo, run_git_in},
 };
 
 // ============================================================================
@@ -1630,6 +1633,30 @@ fn run_worker_returns_missing_run_as_coordinator_error() {
 // Git repo worker tests
 // ============================================================================
 
+fn create_git_repo_fixture_with_secret_history(commit_count: usize) -> tempfile::TempDir {
+    assert!(
+        commit_count > 0,
+        "secret-history fixture requires at least one commit"
+    );
+
+    let dir = tempdir().expect("tempdir");
+    init_git_repo(
+        dir.path(),
+        "distributed-runtime-tests@example.com",
+        "Distributed Runtime Tests",
+    );
+
+    for commit in 0..commit_count {
+        let contents = format!("{}\ncommit-{commit}\n", secret_fixture());
+        fs::write(dir.path().join("secret.txt"), contents).expect("write fixture");
+        run_git_in(dir.path(), &["add", "."]);
+        let message = format!("fixture-{commit}");
+        run_git_in(dir.path(), &["commit", "-q", "-m", message.as_str()]);
+    }
+
+    dir
+}
+
 #[test]
 fn run_git_repo_worker_completes_singleton_repo_frontier_shard() {
     let repo = create_clean_git_repo_fixture();
@@ -2492,6 +2519,81 @@ fn run_git_repo_worker_budget_validation_includes_shard_context() {
     assert!(
         msg.contains("len=") && msg.contains("hash="),
         "budget validation error should include redacted shard context: {msg}"
+    );
+}
+
+#[test]
+fn run_git_repo_worker_fails_fast_when_commit_oid_map_saturates() {
+    let repo = create_git_repo_fixture_with_secret_history(
+        FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES + 1,
+    );
+    let mirror_root = tempdir().expect("mirror root");
+    let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+    let backend = TestGitBackend::default();
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let mut coordinator =
+        setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+    let err = run_git_repo_worker(
+        &mut coordinator,
+        &mut mirrors,
+        git_worker_identity(repo.path()),
+        backend,
+        DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
+        DistributedRuntimeConfig::default(),
+    )
+    .expect_err("OID-map saturation should fail the repo worker");
+
+    assert!(
+        matches!(
+            err,
+            DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(_))
+        ),
+        "expected Runtime(Driver), got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("commit OID map saturated"),
+        "error should identify OID-map saturation: {msg}"
+    );
+    assert_eq!(
+        run_progress(&coordinator).done(),
+        0,
+        "saturation must not advance the shard"
+    );
+    assert_ne!(
+        shard_summaries(&coordinator)[0].status(),
+        ShardStatus::Done,
+        "saturation must leave the shard uncompleted for inspection"
+    );
+    assert!(
+        findings_sink
+            .findings_snapshot()
+            .expect("findings snapshot")
+            .is_empty(),
+        "translated findings must not persist after saturation"
+    );
+    assert!(
+        findings_sink
+            .occurrences_snapshot()
+            .expect("occurrences snapshot")
+            .is_empty(),
+        "occurrence writes must not occur after saturation"
+    );
+    assert!(
+        findings_sink
+            .observations_snapshot()
+            .expect("observations snapshot")
+            .is_empty(),
+        "observation writes must not occur after saturation"
+    );
+    assert!(
+        done_ledger
+            .snapshot()
+            .expect("done-ledger snapshot")
+            .is_empty(),
+        "done-ledger writes must not occur after saturation"
     );
 }
 

@@ -472,18 +472,18 @@ impl CommitSink for ReceiptCommitSink {
         batch.validate()?;
 
         // The CommitSink surface provides only start/end offsets.
-        // Root-hint fields are unavailable through this bridge, so both
-        // root_hint_start/end mirror span_start/end. This is safe because
-        // root-hint fields never participate in persistence identity
-        // derivation (see the module-level doc in
-        // result_translation.rs).
+        // Window fields mirror blob offsets when no chunker-specific
+        // context is available. The blob-absolute offsets are the
+        // identity-bearing coordinates consumed by
+        // `PersistenceFinding::blob_offset_start/blob_offset_end` for
+        // `OccurrenceId` derivation.
         item.findings
             .extend(batch.findings.iter().map(|finding| FsFindingRecord {
                 rule_id: finding.rule_id,
-                root_hint_start: finding.start,
-                root_hint_end: finding.end,
-                span_start: finding.start,
-                span_end: finding.end,
+                blob_offset_start: finding.start,
+                blob_offset_end: finding.end,
+                window_start: finding.start,
+                window_end: finding.end,
                 norm_hash: finding.norm_hash,
                 confidence_score: finding.confidence_score,
             }));
@@ -546,8 +546,8 @@ pub(super) fn emit_ordered_item_findings(
         out.emit_core(CoreEvent::Finding(FindingEvent {
             source: SourceKind::Fs,
             object_path: execution.item().item_key().as_bytes(),
-            start: finding.root_hint_start,
-            end: finding.root_hint_end,
+            start: finding.blob_offset_start,
+            end: finding.blob_offset_end,
             rule_id: finding.rule_id,
             rule_name: engine.rule_name(finding.rule_id),
             norm_hash: finding.norm_hash,

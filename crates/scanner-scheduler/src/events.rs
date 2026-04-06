@@ -25,27 +25,25 @@ pub enum CoreEvent<'a> {
 }
 
 /// Structured finding payload written by scheduler event sinks.
+///
+/// `start` and `end` carry blob-absolute root-hint coordinates in
+/// root-file coordinates. For raw (non-transform) findings these typically
+/// coincide with the exact match bounds. On derived paths they remain the
+/// engine's best available root hint and may be broader than the
+/// transformed match span.
+///
+/// Both scan paths populate them from the engine's
+/// `FindingRec::root_hint_start` and `root_hint_end`. Event sinks surface
+/// these offsets directly, and persistence identity derivation consumes
+/// the same coordinates.
 pub struct FindingEvent<'a> {
     /// Source family that emitted this finding.
     pub source: SourceKind,
     /// Source-relative object path for the scanned payload.
     pub object_path: &'a [u8],
-    /// Byte offset marking the start of the finding region (inclusive).
-    ///
-    /// Both scan paths populate this from root-hint offsets (`root_hint_start`),
-    /// which delimit the broader context region containing the match. The FS
-    /// path reads `root_hint_start` directly from the engine finding record;
-    /// the Git path reads it via `FindingKey.start`, which is itself derived
-    /// from `root_hint_start` at scan time.
-    ///
-    /// Persistence identity derivation uses the finding record's `span_start`
-    /// and `span_end` fields (the exact match location) rather than these
-    /// root-hint event fields.
+    /// Inclusive blob-absolute byte offset marking the start of the finding.
     pub start: u64,
-    /// Byte offset marking the end of the finding region (exclusive).
-    ///
-    /// Same source semantics as [`start`](Self::start): populated from
-    /// `root_hint_end` in both scan paths. Not used for persistence identity.
+    /// Exclusive blob-absolute byte offset marking the end of the finding.
     pub end: u64,
     /// Numeric identifier of the matching detection rule.
     pub rule_id: u32,

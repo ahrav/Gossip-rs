@@ -34,21 +34,34 @@ use std::{fmt, sync::Mutex};
 /// Persistence-ready representation of one FS finding.
 ///
 /// This is the post-dedupe, backend-agnostic record emitted by the scheduler.
-/// All offsets are absolute byte positions within the scanned object (file or
-/// archive entry). The `norm_hash` is the BLAKE3 digest of the normalized
-/// secret value, used for cross-run deduplication by the persistence backend.
+/// The `norm_hash` is the BLAKE3 digest of the normalized secret value, used
+/// for cross-run deduplication by the persistence backend.
+///
+/// # Coordinate spaces
+///
+/// This record carries offsets in two coordinate spaces:
+///
+/// - **`blob_offset_start/end`** — blob-absolute offsets in root-file
+///   coordinates, stable across chunker alignment changes. These are the
+///   identity-bearing coordinates consumed by [`PersistenceFinding`] for
+///   `OccurrenceId` derivation.
+///
+/// - **`window_start/end`** — buffer-local offsets within the engine's
+///   current scan window (chunk). These shift depending on where the chunker
+///   splits the input and are used only for engine-internal bookkeeping
+///   (e.g., the local-FS commit-sink bridge).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FsFindingRecord {
     /// Engine rule identifier that matched.
     pub rule_id: u32,
-    /// Start of the root-buffer region that contains the match (inclusive).
-    pub root_hint_start: u64,
-    /// End of the root-buffer region that contains the match (exclusive).
-    pub root_hint_end: u64,
-    /// Start of the matched span within the (possibly decoded) buffer.
-    pub span_start: u64,
-    /// End of the matched span within the (possibly decoded) buffer.
-    pub span_end: u64,
+    /// Inclusive blob-absolute byte offset of the match in root-file coordinates.
+    pub blob_offset_start: u64,
+    /// Exclusive blob-absolute byte offset of the match in root-file coordinates.
+    pub blob_offset_end: u64,
+    /// Start of the matched span within the engine's current scan window (buffer-local).
+    pub window_start: u64,
+    /// End of the matched span within the engine's current scan window (buffer-local).
+    pub window_end: u64,
     /// BLAKE3 digest of the normalized secret value (32 bytes).
     pub norm_hash: NormHash,
     /// Additive confidence score from gate signals (Phase 1 range: 0–10).
@@ -59,10 +72,10 @@ impl fmt::Debug for FsFindingRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FsFindingRecord")
             .field("rule_id", &self.rule_id)
-            .field("root_hint_start", &self.root_hint_start)
-            .field("root_hint_end", &self.root_hint_end)
-            .field("span_start", &self.span_start)
-            .field("span_end", &self.span_end)
+            .field("blob_offset_start", &self.blob_offset_start)
+            .field("blob_offset_end", &self.blob_offset_end)
+            .field("window_start", &self.window_start)
+            .field("window_end", &self.window_end)
             .field("norm_hash", &"[redacted]")
             .field("confidence_score", &self.confidence_score)
             .finish()
@@ -359,10 +372,10 @@ mod tests {
         let producer = InMemoryStoreProducer::default();
         let rec = FsFindingRecord {
             rule_id: 1,
-            root_hint_start: 10,
-            root_hint_end: 20,
-            span_start: 12,
-            span_end: 18,
+            blob_offset_start: 10,
+            blob_offset_end: 20,
+            window_start: 12,
+            window_end: 18,
             norm_hash: [0xAA; 32],
             confidence_score: 0,
         };
@@ -445,10 +458,10 @@ mod tests {
     fn fs_finding_record_debug_redacts_norm_hash() {
         let finding = FsFindingRecord {
             rule_id: 7,
-            root_hint_start: 0,
-            root_hint_end: 12,
-            span_start: 3,
-            span_end: 9,
+            blob_offset_start: 0,
+            blob_offset_end: 12,
+            window_start: 3,
+            window_end: 9,
             norm_hash: [0xEE; 32],
             confidence_score: 5,
         };
