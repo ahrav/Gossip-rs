@@ -12,8 +12,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ahash::AHashMap;
-
 use anyhow::{Error as AnyError, anyhow};
 
 // -- Test infrastructure from the sibling test_support module ----------------
@@ -31,10 +29,7 @@ use super::commit_bridge::{
     drain_commit_stage, emit_ordered_summary, resolve_filesystem_lease_results,
     wait_for_submitted_commits,
 };
-use super::execution::{
-    GitRepoPersistenceInput, oid_map_saturation_error, should_park_git_repo_failure,
-    submit_git_repo_persistence,
-};
+use super::execution::{GitRepoPersistenceInput, submit_git_repo_persistence};
 use super::lease_ops::{
     ArmedLeaseDeadline, CLAIM_RACE_RETRY_DELAY, EMPTY_RANGE_SENTINEL_KEY, LeaseUncertaintySignal,
     advance_shard, build_lease_from_acquire, claim_retry_delay, deterministic_op_id,
@@ -2114,13 +2109,12 @@ fn submit_git_repo_persistence_commits_findings_and_done_ledger() {
     let repo_key = git_repo_key(tmp.path());
     let findings = [GitFindingForPersistence {
         object_path: b"src/lib.rs".to_vec().into_boxed_slice(),
-        commit_id: Some(7),
+        blob_oid: OidBytes::sha1([0x11; 20]),
         blob_offset_start: 10,
         blob_offset_end: 42,
         norm_hash: NormHash::from_digest([0xAB; 32]),
         rule_id: 7,
     }];
-    let commit_oid_map = AHashMap::from_iter([(7, OidBytes::sha1([0x11; 20]))]);
     let input = GitRepoPersistenceInput {
         write_context: write_context(),
         shard_id: &ToxicDigest::of_bytes(b"test-shard"),
@@ -2128,7 +2122,6 @@ fn submit_git_repo_persistence_commits_findings_and_done_ledger() {
         repo_id: 42,
         bytes_scanned: 1024,
         findings: &findings,
-        commit_oid_map: &commit_oid_map,
         tenant_secret_key: tenant_secret_key(),
         rule_fingerprint: &test_rule_fingerprint,
         claim_time: LogicalTime::from_raw(100),
@@ -2184,7 +2177,6 @@ fn submit_git_repo_persistence_clean_scan_skips_findings_sink() {
     let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
     let tmp = tempdir().expect("temp dir for repo key");
     let repo_key = git_repo_key(tmp.path());
-    let commit_oid_map = AHashMap::new();
     let input = GitRepoPersistenceInput {
         write_context: write_context(),
         shard_id: &ToxicDigest::of_bytes(b"clean-scan-shard"),
@@ -2192,7 +2184,6 @@ fn submit_git_repo_persistence_clean_scan_skips_findings_sink() {
         repo_id: 99,
         bytes_scanned: 512,
         findings: &[],
-        commit_oid_map: &commit_oid_map,
         tenant_secret_key: tenant_secret_key(),
         rule_fingerprint: &test_rule_fingerprint,
         claim_time: LogicalTime::from_raw(100),
@@ -2241,7 +2232,6 @@ fn submit_git_repo_persistence_rejects_reversed_timestamps() {
     let persistence = DistributedPersistence::new(findings_sink, done_ledger);
     let tmp = tempdir().expect("temp dir for repo key");
     let repo_key = git_repo_key(tmp.path());
-    let commit_oid_map = AHashMap::new();
     let input = GitRepoPersistenceInput {
         write_context: write_context(),
         shard_id: &ToxicDigest::of_bytes(b"test-shard"),
@@ -2249,7 +2239,6 @@ fn submit_git_repo_persistence_rejects_reversed_timestamps() {
         repo_id: 42,
         bytes_scanned: 1024,
         findings: &[],
-        commit_oid_map: &commit_oid_map,
         tenant_secret_key: tenant_secret_key(),
         rule_fingerprint: &test_rule_fingerprint,
         claim_time: LogicalTime::from_raw(200),
@@ -2840,60 +2829,4 @@ fn park_shard_on_error_idempotent_replay() {
     let summaries = shard_summaries(&coordinator);
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].status(), ShardStatus::Parked);
-}
-
-// ============================================================================
-// should_park_git_repo_failure tests
-// ============================================================================
-
-#[test]
-fn should_park_git_repo_failure_detects_saturation() {
-    let error = oid_map_saturation_error(&ToxicDigest::of_bytes(b"test-shard"), "test detail");
-    assert!(
-        should_park_git_repo_failure(&error),
-        "OID-map saturation error must be classified as park-worthy"
-    );
-}
-
-#[test]
-fn should_park_git_repo_failure_rejects_non_saturation_errors() {
-    // Driver with a non-saturation inner error.
-    let driver =
-        DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(AnyError::msg("generic")));
-    assert!(
-        !should_park_git_repo_failure(&driver),
-        "generic Driver error must not trigger parking"
-    );
-
-    // A Driver error whose message matches the saturation display string must
-    // still be rejected — classification is variant-based, not string-based.
-    let lookalike = DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(AnyError::msg(
-        "commit OID map saturated",
-    )));
-    assert!(
-        !should_park_git_repo_failure(&lookalike),
-        "message-equivalent Driver error must not trigger parking"
-    );
-
-    let coordinator = DistributedRuntimeError::Coordinator(AnyError::msg("coord"));
-    assert!(
-        !should_park_git_repo_failure(&coordinator),
-        "Coordinator error must not trigger parking"
-    );
-
-    let durability = DistributedRuntimeError::Durability(AnyError::msg("durability"));
-    assert!(
-        !should_park_git_repo_failure(&durability),
-        "Durability error must not trigger parking"
-    );
-
-    let lease_uncertain =
-        DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::DeadlineElapsed {
-            deadline: LogicalTime::from_raw(10),
-            observed: LogicalTime::from_raw(11),
-        });
-    assert!(
-        !should_park_git_repo_failure(&lease_uncertain),
-        "LeaseUncertain error must not trigger parking"
-    );
 }

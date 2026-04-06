@@ -145,6 +145,7 @@ pub(super) fn emit_findings<E: ScanEngine, F: FindingWithHashRecord>(
                 rule_id: rec.rule_id(),
                 rule_name: engine.rule_name(rec.rule_id()),
                 norm_hash: *rec.norm_hash(),
+                blob_oid: None,
                 commit_id: None,
                 change_kind: None,
                 confidence_score: rec.confidence_score(),

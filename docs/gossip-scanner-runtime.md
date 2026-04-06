@@ -143,19 +143,25 @@ When the caller owns durable Git state, `git_persistence::GitPersistenceAdapter`
 implements `scanner-git`'s ref-watermark, seen-blob, and finalize seams and
 plugs into `git_repo::run_runtime_git_scan_with_stores`. Distributed
 repo-frontier execution wraps the event sink with `FindingsCaptureSink`, lifts
-Git `FindingEvent` values into `GitFindingForPersistence` while building a
-sparse commit-ordinal-to-OID map from `GitEvent::CommitMeta` events. If the
-next distinct commit_id would exceed the safety ceiling, the sink marks itself
-saturated and cancels the shared scan token — a full map (len == MAX) with no
-overflow is not considered saturated because all OIDs are present for
-translation. `translate_git_item_result`
-then derives stable item identity from `(connector_instance, object_path)` and
-strong version identity from `(commit_oid, object_path)` for each finding while
-keeping the done-ledger row repo-scoped via `repo_id`. Persistence uses
+Git `FindingEvent` values into `GitFindingForPersistence` by decoding the
+embedded blob OID carried on each finding. Malformed or missing blob OIDs are
+skipped during capture, and the repo worker rejects the lease before
+persistence if the captured payload count diverges from the detected finding
+count. `translate_git_item_result` then derives stable item identity from
+`(connector_instance, object_path)` and strong version identity from the blob
+OID for each finding while keeping the done-ledger row repo-scoped via
+`repo_id`. Persistence uses
 an explicit `PageCommit` sequence so Git observations may carry per-object
 OVIDs while shard completion remains repo-scoped. This keeps Git findings
 on the same findings-first, done-ledger-second durable ordering as
 filesystem scans.
+
+Version identity is content-addressed: `ObjectVersionId` derives from the
+blob OID alone via `ObjectVersionId::from_version_bytes`. The same file
+content across different commits produces the same version, while a content
+change (even at the same path) produces a new version. This aligns
+deduplication with Git's own content-addressing model — identical blobs are
+a single observation regardless of how many commits reference them.
 
 The distributed module exports the concrete worker-loop types and helpers:
 `WorkerIdentity`, `ShardLease`, `DistributedPersistence`,
@@ -623,8 +629,8 @@ finding IDs, occurrence IDs, observation IDs, and done-ledger key.
 `translate_findings` is generic over `gossip_contracts::persistence::PersistenceFinding`
 and handles filesystem items via `FsFindingRef`. Repo-frontier Git scans use a
 dedicated `translate_git_findings` that derives per-object stable identity (via
-`ItemIdentityKey`) and strong version identity (via commit OID + object path)
-for each finding before calling the shared `push_finding_layers` helper. Both
+`ItemIdentityKey`) and strong version identity (via blob OID) for each finding
+before calling the shared `push_finding_layers` helper. Both
 paths share the same finding/occurrence/observation derivation logic, keeping
 source-specific metadata out of persistence identity without forcing the
 scheduler crate to depend on `gossip-contracts`.
@@ -869,11 +875,13 @@ with a deterministic `OpId`.
 4. executes the mirror-backed Git scan through `GitRepoRuntime::execute_repo`,
    using `GitPersistenceAdapter` as the scanner-git seen/watermark/finalize
    store and `FindingsCaptureSink` to retain persistence-ready finding payloads
-   plus the sparse commit-ordinal-to-OID map; if a new commit_id overflows the
-   map ceiling, `FindingsCaptureSink` cancels the shared scan token, the lease
-   returns a non-retryable saturation error before translation, and the outer
-   worker parks the shard so the coordinator does not re-offer a repository
-   that cannot translate findings consistently,
+   with decoded blob OIDs plus the sparse commit-ordinal-to-OID map; malformed
+   finding metadata is skipped during capture and later rejected by the worker's
+   detected-vs-captured integrity check before translation; if a new commit_id
+   overflows the map ceiling, `FindingsCaptureSink` cancels the shared scan
+   token, the lease returns a non-retryable saturation error before translation,
+   and the outer worker parks the shard so the coordinator does not re-offer a
+   repository that cannot translate findings consistently,
 5. if `execute_repo` finishes with `FinalizeOutcome::Complete`, translates the
    captured findings into per-object persistence rows through
    `translate_git_item_result`, then durably records findings and the repo-level
