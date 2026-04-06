@@ -679,6 +679,12 @@ fn normalize_root_hint_end_for_dedup(rec: &FindingRec, leaf_transform: Option<Tr
     if leaf_transform != Some(TransformId::Base64) {
         return rec.root_hint_end;
     }
+    debug_assert!(
+        rec.span_end > rec.span_start,
+        "zero-length decoded match in Base64 normalize: span_start={} span_end={}",
+        rec.span_start,
+        rec.span_end,
+    );
     let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
     // Base64 encodes 3 bytes → 4 chars; inverse: min_encoded = ⌈decoded × 4/3⌉.
     let min_encoded = (decoded_len * 4).div_ceil(3);
@@ -1730,7 +1736,9 @@ impl ScanScratch {
     ///    content that aids triage).
     /// 2. RAW findings never replace an existing transform finding.
     /// 3. Among same-type duplicates, the finding with the larger
-    ///    `root_hint_end` wins (wider context window).
+    ///    `root_hint_end` wins (wider context window). For Base64 findings,
+    ///    pre-normalization typically equalizes `root_hint_end`, so the
+    ///    confidence tiebreak at step 4 is the effective discriminator.
     #[cold]
     fn replace_same_scan_duplicate(
         &mut self,
@@ -1781,7 +1789,9 @@ impl ScanScratch {
                 // Dedup replacement priority (highest wins):
                 //   1. Transform > RAW (decoded content aids triage).
                 //   2. Among same type, prefer wider context (larger root_hint_end).
-                //   3. Equal span: keep the higher confidence_score.
+                //   3. Equal root_hint_end: keep the higher confidence_score.
+                //      (Pre-normalization equalizes Base64 root_hint_end, so this
+                //      tiebreak is the typical discriminator for transform duplicates.)
                 let should_replace = if rec.step_id != STEP_ROOT && existing.step_id == STEP_ROOT {
                     true
                 } else if rec.step_id == STEP_ROOT && existing.step_id != STEP_ROOT {

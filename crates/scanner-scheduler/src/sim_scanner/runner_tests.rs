@@ -1,4 +1,8 @@
-use super::{CollectedFindings, normalize_findings_for_diff};
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::{
+    CollectedFindings, FailureKind, FindingKey, check_strict_non_root, normalize_findings_for_diff,
+};
 use crate::api::{FileId, FindingRec, STEP_ROOT, StepId, TransformId};
 use crate::archive::ArchiveConfig;
 use crate::sim_scanner::generator::build_engine_from_suite;
@@ -86,10 +90,7 @@ fn normalize_findings_for_diff_base64_within_overlap_passes_filter() {
         root_hint_end,
         StepId::from_raw(0),
     );
-    let findings = CollectedFindings {
-        recs: vec![rec],
-        leaf_transforms: vec![Some(TransformId::Base64)],
-    };
+    let findings = CollectedFindings { recs: vec![rec] };
 
     let normalized = normalize_findings_for_diff(&engine, &findings);
     assert_eq!(normalized.len(), 1);
@@ -125,7 +126,6 @@ fn normalize_findings_for_diff_base64_not_subsumed_by_wider_root_span() {
     );
     let findings = CollectedFindings {
         recs: vec![root, non_root],
-        leaf_transforms: vec![None, Some(TransformId::Base64)],
     };
 
     let normalized = normalize_findings_for_diff(&engine, &findings);
@@ -151,13 +151,129 @@ fn normalize_findings_for_diff_skips_base64_padding_for_non_base64() {
     let root_hint_start = 50;
     let root_hint_end = root_hint_start + 3;
     let rec = non_root_rec(1, root_hint_start, root_hint_end, StepId::from_raw(2));
-    let findings = CollectedFindings {
-        recs: vec![rec],
-        leaf_transforms: vec![Some(TransformId::UrlPercent)],
-    };
+    let findings = CollectedFindings { recs: vec![rec] };
 
     let normalized = normalize_findings_for_diff(&engine, &findings);
     assert_eq!(normalized.len(), 1);
     let key = normalized.iter().next().unwrap();
     assert_eq!(key.root_hint_end, root_hint_end);
+}
+
+// ---------------------------------------------------------------------------
+// check_strict_non_root tests
+// ---------------------------------------------------------------------------
+
+/// Helper: build a non-root `FindingKey` with zeroed spans (as produced by
+/// `normalize_findings_for_diff` for non-root findings).
+fn non_root_key(file_id: u32, rule_id: u32, root_hint_end: u64) -> FindingKey {
+    FindingKey {
+        file_id,
+        rule_id,
+        span_start: 0,
+        span_end: 0,
+        root_hint_start: 0,
+        root_hint_end,
+    }
+}
+
+#[test]
+fn strict_non_root_exact_match_succeeds() {
+    // When the observed non-root set contains the exact root_hint_end the
+    // expected finding requires, the check passes.
+    let expected_root = BTreeSet::new();
+    let expected_non_root = vec![non_root_key(0, 0, 100)];
+    let mut observed_non_root = BTreeMap::new();
+    observed_non_root
+        .entry((0u32, 0u32))
+        .or_insert_with(BTreeSet::new)
+        .insert(100u64);
+
+    let result = check_strict_non_root(
+        &expected_root,
+        expected_non_root,
+        &mut observed_non_root,
+        1,
+        1,
+        0,
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn strict_non_root_near_miss_is_rejected() {
+    // An observed root_hint_end that is close (within the old +/-3 tolerance)
+    // but not an exact match must be rejected. This validates that the
+    // exact-match requirement catches near-misses that a tolerance window
+    // would have silently accepted.
+    let expected_root = BTreeSet::new();
+    let expected_non_root = vec![non_root_key(0, 0, 100)];
+    let mut observed_non_root = BTreeMap::new();
+    observed_non_root
+        .entry((0u32, 0u32))
+        .or_insert_with(BTreeSet::new)
+        .insert(102u64); // off by 2 -- within old +/-3, but not exact
+
+    let result = check_strict_non_root(
+        &expected_root,
+        expected_non_root,
+        &mut observed_non_root,
+        1,
+        1,
+        0,
+    );
+    assert!(result.is_err());
+    let report = result.unwrap_err();
+    assert!(matches!(report.kind, FailureKind::OracleMismatch));
+}
+
+#[test]
+fn strict_non_root_missing_file_rule_pair_is_rejected() {
+    // When the observed set has no entry at all for the expected
+    // (file_id, rule_id) pair, the check must fail.
+    let expected_root = BTreeSet::new();
+    let expected_non_root = vec![non_root_key(0, 0, 100)];
+    let mut observed_non_root: BTreeMap<(u32, u32), BTreeSet<u64>> = BTreeMap::new();
+
+    let result = check_strict_non_root(
+        &expected_root,
+        expected_non_root,
+        &mut observed_non_root,
+        0,
+        1,
+        0,
+    );
+    assert!(result.is_err());
+    let report = result.unwrap_err();
+    assert!(matches!(report.kind, FailureKind::OracleMismatch));
+}
+
+#[test]
+fn strict_non_root_redundant_with_root_span_is_skipped() {
+    // When an expected non-root finding's root_hint_end is within +/-3 bytes
+    // of a root finding's span_end for the same (file_id, rule_id), the
+    // non-root finding is treated as redundant and not required in the
+    // observed set.
+    let mut expected_root = BTreeSet::new();
+    expected_root.insert(FindingKey {
+        file_id: 0,
+        rule_id: 0,
+        span_start: 10,
+        span_end: 101, // within +/-3 of root_hint_end=100
+        root_hint_start: 10,
+        root_hint_end: 101,
+    });
+    let expected_non_root = vec![non_root_key(0, 0, 100)];
+    // Observed set is empty -- the non-root finding should be skipped as
+    // redundant, so the check passes despite no observed match.
+    let mut observed_non_root: BTreeMap<(u32, u32), BTreeSet<u64>> = BTreeMap::new();
+
+    let result = check_strict_non_root(
+        &expected_root,
+        expected_non_root,
+        &mut observed_non_root,
+        0,
+        1,
+        0,
+    );
+    assert!(result.is_ok());
 }

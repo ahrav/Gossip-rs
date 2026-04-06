@@ -622,14 +622,10 @@ impl From<&FindingRec> for FindingKey {
     }
 }
 
-/// Findings plus leaf transform metadata for differential normalization.
-///
-/// `leaf_transforms` is aligned with `recs` by index. Entries are `None` for
-/// root findings or chains that contain no transform steps (e.g., UTF-16 only).
+/// Collected findings for differential normalization.
 #[derive(Clone, Debug)]
 struct CollectedFindings {
     recs: Vec<FindingRec>,
-    leaf_transforms: Vec<Option<TransformId>>,
 }
 
 /// Output collector that enforces a no-duplicates invariant.
@@ -638,55 +634,19 @@ struct CollectedFindings {
 /// findings are detected.
 struct OutputCollector {
     findings: Vec<FindingRec>,
-    leaf_transforms: Vec<Option<TransformId>>,
     seen: BTreeSet<FindingKey>,
-}
-
-fn leaf_transform_id(
-    engine: &Engine,
-    scratch: &mut ScanScratch,
-    rec: &FindingRec,
-) -> Option<TransformId> {
-    // Leaf transform is the last transform step in the decode chain (if any).
-    if rec.step_id == STEP_ROOT {
-        return None;
-    }
-    let steps = scratch.materialize_decode_steps(rec.step_id);
-    steps.iter().rev().find_map(|step| match step {
-        DecodeStep::Transform { transform_idx, .. } => Some(engine.transform_id(*transform_idx)),
-        DecodeStep::Utf16Window { .. } => None,
-    })
-}
-
-fn append_leaf_transforms(
-    engine: &Engine,
-    scratch: &mut ScanScratch,
-    recs: &[FindingRec],
-    out: &mut Vec<Option<TransformId>>,
-) {
-    out.reserve(recs.len());
-    for rec in recs {
-        out.push(leaf_transform_id(engine, scratch, rec));
-    }
 }
 
 impl OutputCollector {
     fn new() -> Self {
         Self {
             findings: Vec::new(),
-            leaf_transforms: Vec::new(),
             seen: BTreeSet::new(),
         }
     }
 
     /// Append a batch of findings, rejecting duplicates by normalized key.
-    fn append(
-        &mut self,
-        batch: &mut Vec<FindingRec>,
-        engine: &Engine,
-        scratch: &mut ScanScratch,
-        step: u64,
-    ) -> Result<(), FailureReport> {
+    fn append(&mut self, batch: &mut Vec<FindingRec>, step: u64) -> Result<(), FailureReport> {
         let mut local_seen: BTreeSet<FindingKey> = BTreeSet::new();
         for rec in batch.drain(..) {
             let key = FindingKey::from(&rec);
@@ -715,9 +675,7 @@ impl OutputCollector {
                     step,
                 });
             }
-            let leaf_transform = leaf_transform_id(engine, scratch, &rec);
             self.findings.push(rec);
-            self.leaf_transforms.push(leaf_transform);
         }
         Ok(())
     }
@@ -726,7 +684,6 @@ impl OutputCollector {
     fn finish(self) -> CollectedFindings {
         CollectedFindings {
             recs: self.findings,
-            leaf_transforms: self.leaf_transforms,
         }
     }
 }
@@ -1167,7 +1124,7 @@ impl FileScanState {
                 }
             }
         }
-        output.append(&mut self.batch, engine, &mut self.scratch, step)?;
+        output.append(&mut self.batch, step)?;
 
         let total_len = chunk.len();
         let keep = overlap.min(total_len);
@@ -1312,8 +1269,7 @@ impl ArchiveEntrySink for SimArchiveSink<'_> {
                 }
             }
         }
-        self.output
-            .append(self.batch, self.engine, self.scratch, self.step)?;
+        self.output.append(self.batch, self.step)?;
 
         let prefix = chunk.new_bytes_start.saturating_sub(chunk.base_offset) as usize;
         let new_end = prefix.saturating_add(chunk.new_bytes_len);
@@ -1818,7 +1774,6 @@ fn normalize_findings_for_diff(
     engine: &Engine,
     findings: &CollectedFindings,
 ) -> BTreeSet<FindingKey> {
-    debug_assert_eq!(findings.recs.len(), findings.leaf_transforms.len());
     let overlap = engine.required_overlap() as u64;
     let mut root_spans: BTreeMap<(u32, u32), Vec<(u64, u64)>> = BTreeMap::new();
     for rec in &findings.recs {
@@ -2086,52 +2041,14 @@ fn oracle_differential(
 
     let strict_non_root = std::env::var_os("SCANNER_SIM_STRICT_NON_ROOT").is_some();
     if strict_non_root {
-        let mut expected_root_ends: BTreeMap<(u32, u32), BTreeSet<u64>> = BTreeMap::new();
-        for key in &expected_root {
-            expected_root_ends
-                .entry((key.file_id, key.rule_id))
-                .or_default()
-                .insert(key.span_end as u64);
-        }
-
-        // Allow small padding drift for transform findings (e.g., base64 `=` omission)
-        // where chunking can produce equivalent decoded content with root_hint_end
-        // differing by a few bytes.
-        for exp in expected_non_root {
-            // If a root finding already ends at this offset, treat the transform
-            // finding as redundant (chunked scans may drop it).
-            if let Some(root_ends) = expected_root_ends.get(&(exp.file_id, exp.rule_id)) {
-                let lo = exp.root_hint_end.saturating_sub(3);
-                let hi = exp.root_hint_end.saturating_add(3);
-                if root_ends.range(lo..=hi).next().is_some() {
-                    continue;
-                }
-            }
-
-            let Some(ends) = observed_non_root.get_mut(&(exp.file_id, exp.rule_id)) else {
-                let message = format!(
-                    "differential mismatch (sim {}, reference {}), missing {:?}",
-                    observed_len, expected_len, exp
-                );
-                return Err(FailureReport {
-                    kind: FailureKind::OracleMismatch,
-                    message,
-                    step,
-                });
-            };
-            if ends.remove(&exp.root_hint_end) {
-                continue;
-            }
-            let message = format!(
-                "differential mismatch (sim {}, reference {}), missing {:?}",
-                observed_len, expected_len, exp
-            );
-            return Err(FailureReport {
-                kind: FailureKind::OracleMismatch,
-                message,
-                step,
-            });
-        }
+        check_strict_non_root(
+            &expected_root,
+            expected_non_root,
+            &mut observed_non_root,
+            observed_len,
+            expected_len,
+            step,
+        )?;
     }
 
     let mut expected_spans: BTreeMap<(u32, u32), Vec<SpanU32>> = BTreeMap::new();
@@ -2159,6 +2076,77 @@ fn oracle_differential(
         let message = format!(
             "differential mismatch (sim {}, reference {}), extra {:?}",
             observed_len, expected_len, extra
+        );
+        return Err(FailureReport {
+            kind: FailureKind::OracleMismatch,
+            message,
+            step,
+        });
+    }
+
+    Ok(())
+}
+
+/// Match expected non-root findings against observed non-root findings using
+/// exact `root_hint_end` equality.
+///
+/// Expected non-root findings that overlap (within +/-3 bytes) a root
+/// finding's `span_end` for the same `(file_id, rule_id)` are treated as
+/// redundant and skipped, because the chunked scan may legitimately drop them
+/// when a root finding already covers the same region.
+///
+/// For remaining expected non-root findings, the observed set must contain an
+/// entry with the exact same `root_hint_end`. A near-miss (e.g., off by 2
+/// bytes) is an error.
+fn check_strict_non_root(
+    expected_root: &BTreeSet<FindingKey>,
+    expected_non_root: Vec<FindingKey>,
+    observed_non_root: &mut BTreeMap<(u32, u32), BTreeSet<u64>>,
+    observed_len: usize,
+    expected_len: usize,
+    step: u64,
+) -> Result<(), FailureReport> {
+    let mut expected_root_ends: BTreeMap<(u32, u32), BTreeSet<u64>> = BTreeMap::new();
+    for key in expected_root {
+        expected_root_ends
+            .entry((key.file_id, key.rule_id))
+            .or_default()
+            .insert(key.span_end as u64);
+    }
+
+    // A root finding's span_end may land within +/-3 bytes of a transform
+    // finding's normalized root_hint_end (the root span includes Base64
+    // padding bytes that normalization strips). Treat such overlap as
+    // redundancy -- the chunked scan may legitimately drop the transform
+    // finding when a root finding already covers the same region.
+    for exp in expected_non_root {
+        // If a root finding already ends at this offset, treat the transform
+        // finding as redundant (chunked scans may drop it).
+        if let Some(root_ends) = expected_root_ends.get(&(exp.file_id, exp.rule_id)) {
+            let lo = exp.root_hint_end.saturating_sub(3);
+            let hi = exp.root_hint_end.saturating_add(3);
+            if root_ends.range(lo..=hi).next().is_some() {
+                continue;
+            }
+        }
+
+        let Some(ends) = observed_non_root.get_mut(&(exp.file_id, exp.rule_id)) else {
+            let message = format!(
+                "differential mismatch (sim {}, reference {}), missing {:?}",
+                observed_len, expected_len, exp
+            );
+            return Err(FailureReport {
+                kind: FailureKind::OracleMismatch,
+                message,
+                step,
+            });
+        };
+        if ends.remove(&exp.root_hint_end) {
+            continue;
+        }
+        let message = format!(
+            "differential mismatch (sim {}, reference {}), missing {:?}",
+            observed_len, expected_len, exp
         );
         return Err(FailureReport {
             kind: FailureKind::OracleMismatch,
@@ -2327,7 +2315,6 @@ fn reference_findings_observed(
 ) -> Result<CollectedFindings, String> {
     let mut scratch = engine.new_scratch();
     let mut out = Vec::with_capacity(engine.max_findings_per_chunk());
-    let mut out_transforms = Vec::with_capacity(engine.max_findings_per_chunk());
     let mut batch = Vec::with_capacity(engine.max_findings_per_chunk());
 
     for summary in summaries {
@@ -2343,20 +2330,22 @@ fn reference_findings_observed(
         }
         engine.scan_chunk_into(&summary.observed, summary.file_id, 0, &mut scratch);
         scratch.drain_findings_into(&mut batch);
-        append_leaf_transforms(engine, &mut scratch, &batch, &mut out_transforms);
         out.append(&mut batch);
     }
 
-    Ok(CollectedFindings {
-        recs: out,
-        leaf_transforms: out_transforms,
-    })
+    Ok(CollectedFindings { recs: out })
 }
 
 /// Compare an observed finding span against expected encoded bounds.
 ///
 /// Tolerances are representation-specific:
-/// - Base64 allows up to 2 trailing bytes to accommodate optional `=` padding.
+/// - Base64 allows up to 3 trailing bytes beyond the normalized
+///   `root_hint_end`. Standard padding accounts for at most 2 `=` chars,
+///   but when `base64_allow_space_ws` is enabled the encoded region may
+///   include embedded whitespace that pushes the raw length up to
+///   `min_encoded + 3`. The engine's `normalize_root_hint_end_for_dedup`
+///   snaps within this same [+1, +3] window, so the oracle tolerance must
+///   match.
 /// - UTF-16 variants allow +/-1 byte drift at each edge due to chunk boundary
 ///   alignment when mapping between byte and code-unit views.
 fn span_matches_expected(span: SpanU32, start: u64, end: u64, repr: &SecretRepr) -> bool {
@@ -2366,7 +2355,7 @@ fn span_matches_expected(span: SpanU32, start: u64, end: u64, repr: &SecretRepr)
         return true;
     }
     if matches!(repr, SecretRepr::Base64) && span_start >= start && span_end > end {
-        return span_end.saturating_sub(end) <= 2;
+        return span_end.saturating_sub(end) <= 3;
     }
     if matches!(repr, SecretRepr::Utf16Le | SecretRepr::Utf16Be) {
         let start_diff = span_start.abs_diff(start);

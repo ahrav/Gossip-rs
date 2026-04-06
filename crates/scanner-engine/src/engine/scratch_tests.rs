@@ -160,6 +160,7 @@ fn engine_normalize_none_transform_not_snapped() {
 #[rstest]
 #[case::exact_no_snap(1000, 1018, false, "actual == min: no snap (strict >)")]
 #[case::plus_one_snap(1000, 1019, true, "actual == min+1: snap")]
+#[case::plus_two_snap(1000, 1020, true, "actual == min+2: interior snap")]
 #[case::plus_three_snap(1000, 1021, true, "actual == min+3: far boundary snap")]
 #[case::plus_four_no_snap(1000, 1022, false, "actual == min+4: beyond window")]
 fn normalize_base64_snap_window_boundaries(
@@ -737,6 +738,76 @@ fn same_scan_base64_transform_replacement_keeps_normalized_root_hint_end() {
     assert_eq!(
         hashes[0], [0x22; 32],
         "norm_hash must be updated to the transform finding's hash"
+    );
+}
+
+#[test]
+fn same_scan_transform_to_transform_replacement_uses_confidence_tiebreak() {
+    let mut scratch = new_test_scratch();
+    scratch.update_chunk_overlap(FileId(0), 0, 4096);
+
+    let transform = base64_test_transform_config();
+    let encoded = b"U0VDUkVUQUJDREVGR0g=".to_vec();
+    scratch.root_span_map_ctx = Some(RootSpanMapCtx::new(&transform, &encoded, 1000, 0));
+
+    let transform_step = scratch.step_arena.push(
+        STEP_ROOT,
+        DecodeStep::Transform {
+            transform_idx: 0,
+            parent_span: 0..encoded.len(),
+        },
+    );
+
+    // First transform finding: root_hint_end=1019 normalizes to 1018, low confidence.
+    let rec1 = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0,
+        span_start: 200,
+        span_end: 213,
+        root_hint_start: 1000,
+        root_hint_end: 1019,
+        dedupe_with_span: false,
+        step_id: transform_step,
+        confidence_score: 2,
+    };
+    scratch.push_finding_with_drop_hint(rec1, [0xAA; 32], 1024, false);
+
+    // Second transform finding: root_hint_end=1020 also normalizes to 1018, higher confidence.
+    let rec2 = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0,
+        span_start: 200,
+        span_end: 213,
+        root_hint_start: 1000,
+        root_hint_end: 1020,
+        dedupe_with_span: false,
+        step_id: transform_step,
+        confidence_score: 7,
+    };
+    scratch.push_finding_with_drop_hint(rec2, [0xBB; 32], 1024, false);
+
+    assert_eq!(
+        scratch.pending_findings_len(),
+        1,
+        "transform duplicates must dedup"
+    );
+    assert_eq!(
+        scratch.findings()[0].root_hint_end,
+        1018,
+        "surviving finding must have normalized root_hint_end"
+    );
+    assert_eq!(
+        scratch.findings()[0].confidence_score,
+        7,
+        "higher confidence finding must win the tiebreak"
+    );
+
+    let mut findings = Vec::with_capacity(1);
+    let mut hashes = Vec::with_capacity(1);
+    scratch.drain_findings_with_hashes(&mut findings, &mut hashes);
+    assert_eq!(
+        hashes[0], [0xBB; 32],
+        "norm_hash must reflect the higher-confidence finding"
     );
 }
 
