@@ -2646,6 +2646,14 @@ fn run_git_repo_worker_does_not_reclaim_commit_oid_saturated_shard() {
 
     assert_eq!(report.leases_seen, 0);
     assert_eq!(report.shards_scanned, 0);
+
+    // Shard must still be parked after the second worker run — the worker
+    // must not have changed the shard's state as a side-effect.
+    assert_eq!(
+        shard_summaries(&coordinator)[0].status(),
+        ShardStatus::Parked,
+        "parked shard must remain parked after a no-op worker run"
+    );
 }
 
 /// Mirror sync failure must be fail-fast: the shard must not be advanced

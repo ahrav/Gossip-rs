@@ -913,9 +913,7 @@ where
                 );
                 return Err(oid_map_saturation_error(
                     stage_sink.redacted_shard_id(),
-                    &format!(
-                        "scan error superseded by OID-map saturation (original: {err})"
-                    ),
+                    &format!("scan error superseded by OID-map saturation (original: {err})"),
                 ));
             }
             return Err(err);
@@ -1309,7 +1307,10 @@ where
                 if should_park_git_repo_failure(&error) {
                     // OID-map saturation is intrinsic to the mirrored
                     // repository state, so reclaiming the shard would
-                    // reproduce the same translation failure.
+                    // reproduce the same translation failure. Best-effort:
+                    // the lease may have expired between the scan error and
+                    // this call, in which case `ParkError` is logged and the
+                    // shard becomes reclaimable after lease expiry.
                     match park_shard_on_error(
                         coordinator,
                         identity.tenant,
