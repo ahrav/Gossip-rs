@@ -1940,8 +1940,18 @@ fn run_git_repo_worker_fails_cleanly_on_persistence_error() {
     assert_eq!(summaries.len(), 1);
     assert_ne!(
         summaries[0].status(),
+        ShardStatus::Done,
+        "persistence failures must not advance the shard"
+    );
+    assert_ne!(
+        summaries[0].status(),
         ShardStatus::Parked,
         "transient persistence failures must not park the shard"
+    );
+    assert_eq!(
+        run_progress(&coordinator).done(),
+        0,
+        "no shards should be done after a persistence failure"
     );
 }
 
@@ -2906,10 +2916,12 @@ fn run_git_repo_worker_preserves_saturation_error_when_park_fails() {
 
     // The original saturation error must propagate unchanged even though the
     // best-effort park failed.
-    let msg = err.to_string();
     assert!(
-        msg.contains("commit OID map saturated"),
-        "error should identify OID-map saturation, got: {msg}"
+        matches!(
+            err,
+            DistributedRuntimeError::Runtime(ScanRuntimeError::CommitOidMapSaturated { .. })
+        ),
+        "expected Runtime(CommitOidMapSaturated), got: {err:?}"
     );
 
     // The shard must NOT be parked because `park_shard` was rejected by the
@@ -2917,10 +2929,10 @@ fn run_git_repo_worker_preserves_saturation_error_when_park_fails() {
     let coordinator = &wrapper.inner;
     let summaries = shard_summaries(coordinator);
     assert_eq!(summaries.len(), 1);
-    assert_ne!(
+    assert_eq!(
         summaries[0].status(),
-        ShardStatus::Parked,
-        "shard must not be parked when the park call itself failed"
+        ShardStatus::Active,
+        "failed park must leave the leased shard active"
     );
 }
 

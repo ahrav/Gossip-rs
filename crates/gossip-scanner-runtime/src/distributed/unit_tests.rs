@@ -2865,6 +2865,16 @@ fn should_park_git_repo_failure_rejects_non_saturation_errors() {
         "generic Driver error must not trigger parking"
     );
 
+    // A Driver error whose message matches the saturation display string must
+    // still be rejected — classification is variant-based, not string-based.
+    let lookalike = DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(AnyError::msg(
+        "commit OID map saturated",
+    )));
+    assert!(
+        !should_park_git_repo_failure(&lookalike),
+        "message-equivalent Driver error must not trigger parking"
+    );
+
     let coordinator = DistributedRuntimeError::Coordinator(AnyError::msg("coord"));
     assert!(
         !should_park_git_repo_failure(&coordinator),
