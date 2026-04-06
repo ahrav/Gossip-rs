@@ -1209,10 +1209,13 @@ where
     F::Error: std::error::Error + Send + Sync + 'static,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
-    // The git path is write-only against the done-ledger (batch_upsert in
-    // submit_git_repo_persistence); it never calls batch_get. Bloom
-    // decoration would force an eager list_done_hashes enumeration at
-    // startup with no read-path benefit, so we skip it entirely.
+    // Apply the same Bloom decorator as the filesystem path so every source
+    // type inherits prefiltering uniformly. The count-first gate in
+    // `from_ledger` ensures negligible startup cost: git done-ledger scopes
+    // are well below MIN_THRESHOLD, so the decorator degrades to passthrough
+    // without calling list_done_hashes.
+    let persistence =
+        decorate_persistence_with_bloom(persistence, identity.tenant, identity.policy_hash, "git");
     let mut scratch = Box::new(AcquireScratch::new());
     let mut report = DistributedRunReport::default();
 
