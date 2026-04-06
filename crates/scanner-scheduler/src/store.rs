@@ -57,6 +57,9 @@ pub struct FsFindingRecord {
     /// Inclusive blob-absolute byte offset of the match in root-file coordinates.
     pub blob_offset_start: u64,
     /// Exclusive blob-absolute byte offset of the match in root-file coordinates.
+    ///
+    /// Base64-derived values arrive pre-normalized from engine emission so
+    /// persistence identity is stable across chunk alignment.
     pub blob_offset_end: u64,
     /// Start of the matched span within the engine's current scan window (buffer-local).
     pub window_start: u64,

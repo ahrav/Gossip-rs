@@ -84,18 +84,19 @@ commit pipeline writes them durably.
 
 ### FsFindingRecord
 
-Backend-agnostic representation of one post-dedupe finding. All offsets are
-absolute byte positions within the scanned object.
+Backend-agnostic representation of one post-dedupe finding. Blob offsets are
+absolute byte positions within the scanned object, and Base64-derived
+`blob_offset_end` values arrive pre-normalized from engine emission.
 
 ```text
 ┌──────────────────────────────────────┐
 │         FsFindingRecord              │
 ├──────────────────────────────────────┤
 │  rule_id: u32                        │  ◄── engine rule that matched
-│  root_hint_start: u64                │  ◄── dedup region start
-│  root_hint_end: u64                  │  ◄── dedup region end (excl.)
-│  span_start: u64                     │  ◄── matched span start
-│  span_end: u64                       │  ◄── matched span end (excl.)
+│  blob_offset_start: u64              │  ◄── occurrence start
+│  blob_offset_end: u64                │  ◄── occurrence end (excl.)
+│  window_start: u64                   │  ◄── matched span start in chunk
+│  window_end: u64                     │  ◄── matched span end in chunk
 │  norm_hash: NormHash                 │  ◄── BLAKE3 of extracted secret bytes
 │  confidence_score: i8                │  ◄── additive 0–10 from gate signals
 └──────────────────────────────────────┘

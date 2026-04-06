@@ -661,7 +661,7 @@ pub struct ScanScratch {
     pub(super) base64_stats: Base64DecodeStats,
 }
 
-/// Normalize `root_hint_end` for dedup key construction.
+/// Normalize `root_hint_end` for dedup key construction and emitted findings.
 ///
 /// Only Base64 transforms have 4/3 padding rules that cause the encoded-region
 /// length to vary by up to 3 bytes for identical decoded content. Other
@@ -669,7 +669,8 @@ pub struct ScanScratch {
 /// normalized.
 ///
 /// For Base64 non-root findings, snaps `root_hint_end` to the padding-free
-/// minimum if the actual encoded length exceeds it by 1–3 bytes.
+/// minimum if the actual encoded length exceeds it by 1–3 bytes so dedup and
+/// downstream occurrence identity stay stable across chunk alignments.
 #[inline(always)]
 fn normalize_root_hint_end_for_dedup(rec: &FindingRec, leaf_transform: Option<TransformId>) -> u64 {
     if rec.step_id == STEP_ROOT {

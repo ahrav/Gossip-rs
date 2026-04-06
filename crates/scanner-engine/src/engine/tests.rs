@@ -4989,11 +4989,8 @@ fn chunked_transform_root_hint_matches_reference() {
     let reference = scan_one_chunk_records(&engine, &buf);
     let chunked = scan_in_chunks_with_overlap(&engine, &buf, 24, 512);
 
-    // Compare findings by essential properties: rule_id, decoded span, and root_hint_start.
-    // root_hint_end may differ slightly for base64 due to padding tolerance when chunked
-    // scanning finds the secret via a truncated base64 span before seeing the complete span.
-    // This is acceptable: the decoded content is identical, and root_hint_start correctly
-    // identifies where the encoded secret begins.
+    // Base64 root_hint_end is normalized before emission, so chunked and
+    // single-chunk scans should now agree on the full finding identity.
     assert_eq!(
         reference.len(),
         chunked.len(),
@@ -5002,58 +4999,114 @@ fn chunked_transform_root_hint_matches_reference() {
         chunked.len()
     );
 
-    // Build comparison keys that don't include root_hint_end (may differ for base64 padding)
+    // Compare findings by the emitted identity-bearing coordinates.
     #[derive(Debug, PartialEq, Eq, Hash)]
-    struct CoreKey {
+    struct FullKey {
         rule_id: u32,
         span_start: u32,
         span_end: u32,
         root_hint_start: u64,
+        root_hint_end: u64,
     }
 
-    let reference_core: std::collections::HashSet<_> = reference
+    let reference_full: std::collections::HashSet<_> = reference
         .iter()
-        .map(|r| CoreKey {
+        .map(|r| FullKey {
             rule_id: r.rule_id,
             span_start: r.span_start,
             span_end: r.span_end,
             root_hint_start: r.root_hint_start,
+            root_hint_end: r.root_hint_end,
         })
         .collect();
 
-    let chunked_core: std::collections::HashSet<_> = chunked
+    let chunked_full: std::collections::HashSet<_> = chunked
         .iter()
-        .map(|r| CoreKey {
+        .map(|r| FullKey {
             rule_id: r.rule_id,
             span_start: r.span_start,
             span_end: r.span_end,
             root_hint_start: r.root_hint_start,
+            root_hint_end: r.root_hint_end,
         })
         .collect();
 
     assert_eq!(
-        reference_core, chunked_core,
-        "core keys mismatch:\nreference: {:?}\nchunked: {:?}",
-        reference_core, chunked_core
+        reference_full, chunked_full,
+        "full finding identity mismatch:\nreference: {:?}\nchunked: {:?}",
+        reference_full, chunked_full
+    );
+}
+
+#[test]
+fn base64_root_hint_end_stable_across_chunk_sizes() {
+    let rule = RuleSpec {
+        radius: 64,
+        ..base_rule("tok0", &[b"TOK0_"], Regex::new("TOK0_[A-Z0-9]{8}").unwrap())
+    };
+    let transforms = vec![TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = false;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], transforms, tuning, AnchorPolicy::ManualOnly);
+
+    let token = b"TOK0_ABCDEFGH";
+    let encoded = b64_encode(token).into_bytes();
+    let mut buf = vec![b'A'; 511];
+    buf[510] = b' ';
+    buf.extend_from_slice(&encoded);
+    buf.push(b' ');
+    buf.extend(std::iter::repeat_n(b'B', 600));
+
+    let mut reference_keys: Vec<_> = scan_one_chunk_records(&engine, &buf)
+        .into_iter()
+        .filter(|rec| rec.step_id != STEP_ROOT)
+        .map(|rec| {
+            (
+                rec.rule_id,
+                rec.span_start,
+                rec.span_end,
+                rec.root_hint_start,
+                rec.root_hint_end,
+            )
+        })
+        .collect();
+    reference_keys.sort_unstable();
+    assert!(
+        !reference_keys.is_empty(),
+        "reference scan must find at least one base64-derived finding"
     );
 
-    // Verify root_hint_end is within base64 padding tolerance (up to 3 chars difference)
-    for r_rec in &reference {
-        let c_rec = chunked
-            .iter()
-            .find(|c| {
-                c.rule_id == r_rec.rule_id
-                    && c.span_start == r_rec.span_start
-                    && c.root_hint_start == r_rec.root_hint_start
+    for chunk_size in [64usize, 128, 256, 512] {
+        let mut chunked_keys: Vec<_> = scan_in_chunks(&engine, &buf, chunk_size)
+            .into_iter()
+            .filter(|rec| rec.step_id != STEP_ROOT)
+            .map(|rec| {
+                (
+                    rec.rule_id,
+                    rec.span_start,
+                    rec.span_end,
+                    rec.root_hint_start,
+                    rec.root_hint_end,
+                )
             })
-            .expect("matching chunked finding");
-        let diff = r_rec.root_hint_end.abs_diff(c_rec.root_hint_end);
-        assert!(
-            diff <= 3,
-            "root_hint_end difference {} exceeds base64 padding tolerance for rule {} at {}",
-            diff,
-            r_rec.rule_id,
-            r_rec.root_hint_start
+            .collect();
+        chunked_keys.sort_unstable();
+
+        assert_eq!(
+            chunked_keys, reference_keys,
+            "base64 finding identity changed for chunk size {chunk_size}"
         );
     }
 }
