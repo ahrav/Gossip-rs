@@ -81,6 +81,7 @@ where
             if decorated.has_filter() {
                 tracing::debug!(
                     worker_kind,
+                    bloom_prefilter = "active",
                     done_hashes = done_hashes.len(),
                     filter_bytes = decorated.filter_memory_bytes().unwrap_or_default(),
                     "done-ledger Bloom prefilter enabled"
@@ -88,6 +89,7 @@ where
             } else {
                 tracing::debug!(
                     worker_kind,
+                    bloom_prefilter = "inactive",
                     done_hashes = done_hashes.len(),
                     min_threshold = DoneLedgerBloomFilter::MIN_THRESHOLD,
                     max_bytes = DoneLedgerBloomFilter::MAX_BYTES,
@@ -99,6 +101,7 @@ where
         Err(error) => {
             tracing::warn!(
                 worker_kind,
+                bloom_prefilter = "error",
                 error = %error,
                 "done-ledger Bloom prefilter unavailable; using passthrough mode"
             );

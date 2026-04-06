@@ -36,6 +36,8 @@ use gossip_contracts::{
 };
 
 type RawU64BuildHasher = BuildHasherDefault<RawU64Hasher>;
+// 512-bit blocks: widest SIMD path in fastbloom (two u64x4 sparse-hash rounds
+// per `contains` call).
 type InnerBloomFilter = BloomFilter<512, RawU64BuildHasher>;
 
 /// In-memory Bloom filter keyed by [`OvidHash`].
@@ -66,7 +68,8 @@ pub(crate) struct DoneLedgerBloomFilter {
 #[derive(Clone)]
 pub(crate) struct BloomFilteredDoneLedger<D> {
     inner: D,
-    filter: Option<DoneLedgerBloomFilter>,
+    /// Shared across clones so the immutable bitset is never deep-copied.
+    filter: Option<Arc<DoneLedgerBloomFilter>>,
     invalidate_prefilter: Arc<AtomicBool>,
 }
 
@@ -187,7 +190,7 @@ impl<D> BloomFilteredDoneLedger<D> {
             for hash in done_hashes {
                 filter.insert(hash);
             }
-            filter
+            Arc::new(filter)
         });
         Self {
             inner,
@@ -210,9 +213,7 @@ impl<D> BloomFilteredDoneLedger<D> {
     }
 
     pub(crate) fn filter_memory_bytes(&self) -> Option<usize> {
-        self.filter
-            .as_ref()
-            .map(DoneLedgerBloomFilter::memory_bytes)
+        self.filter.as_ref().map(|f| f.memory_bytes())
     }
 }
 
@@ -241,8 +242,8 @@ where
             return Ok(Vec::new());
         }
 
-        let mut positive_indices = Vec::new();
-        let mut positive_hashes = Vec::new();
+        let mut positive_indices = Vec::with_capacity(ovid_hashes.len());
+        let mut positive_hashes = Vec::with_capacity(ovid_hashes.len());
         for (index, hash) in ovid_hashes.iter().copied().enumerate() {
             if filter.maybe_contains(&hash) {
                 positive_indices.push(index);
@@ -266,6 +267,12 @@ where
                 positive_indices.len(),
                 "BloomFilteredDoneLedger inner batch_get violated positional contract"
             );
+            tracing::warn!(
+                expected = positive_indices.len(),
+                actual = delegated.len(),
+                "inner DoneLedger batch_get returned wrong-length Vec; \
+                 falling back to unfiltered call"
+            );
             return self.inner.batch_get(tenant_id, policy_hash, ovid_hashes);
         }
 
@@ -277,13 +284,15 @@ where
     }
 
     /// Delegates writes directly and disables prefiltering for later reads once
-    /// the inner backend accepts a batch.
+    /// the inner backend accepts a non-empty batch.
     fn batch_upsert(
         &self,
         records: &[DoneLedgerRecord],
     ) -> Result<Self::CommitHandle, Self::Error> {
         let handle = self.inner.batch_upsert(records)?;
-        self.invalidate_prefilter.store(true, Ordering::Release);
+        if !records.is_empty() {
+            self.invalidate_prefilter.store(true, Ordering::Release);
+        }
         Ok(handle)
     }
 
@@ -438,7 +447,7 @@ mod tests {
         let mut seed = 1_000_000_u64;
         while hashes.len() < DoneLedgerBloomFilter::MIN_THRESHOLD {
             let hash = ovid(seed);
-            seed = seed.saturating_add(1);
+            seed = seed.wrapping_add(1);
             if seen.insert(hash) {
                 hashes.push(hash);
             }
@@ -462,7 +471,7 @@ mod tests {
             if !filter.maybe_contains(&candidate) {
                 return candidate;
             }
-            seed = seed.saturating_add(1);
+            seed = seed.wrapping_add(1);
         }
     }
 
