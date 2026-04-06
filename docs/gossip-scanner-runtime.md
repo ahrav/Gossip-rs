@@ -870,8 +870,10 @@ with a deterministic `OpId`.
    using `GitPersistenceAdapter` as the scanner-git seen/watermark/finalize
    store and `FindingsCaptureSink` to retain persistence-ready finding payloads
    plus the sparse commit-ordinal-to-OID map; if a new commit_id overflows the
-   map ceiling, `FindingsCaptureSink` cancels the shared scan token and the
-   worker returns an error before translation,
+   map ceiling, `FindingsCaptureSink` cancels the shared scan token, the lease
+   returns a non-retryable saturation error before translation, and the outer
+   worker parks the shard so the coordinator does not re-offer a repository
+   that cannot translate findings consistently,
 5. if `execute_repo` finishes with `FinalizeOutcome::Complete`, translates the
    captured findings into per-object persistence rows through
    `translate_git_item_result`, then durably records findings and the repo-level
@@ -930,6 +932,7 @@ The runtime tests focus on the behavior that exists today:
   cursor preservation
 - repo-frontier partial-finalize suppression of outer checkpoint progress
 - repo-frontier receipt replay determinism and checkpoint-buffer idempotency
+- repo-frontier OID-map saturation parking and parked-shard re-claim suppression
 
 These tests exercise the live local runtime paths for valid filesystem and
 git sources and verify the distributed worker loop (lease construction,

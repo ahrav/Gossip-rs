@@ -27,7 +27,7 @@ use gossip_contracts::{
         DoneLedgerCommitReceipt, FindingsCommitReceipt, FindingsSink, PageCommit, WriteContext,
     },
 };
-use gossip_coordination::{AcquireScratch, CoordinationFacade, CursorSemantics};
+use gossip_coordination::{AcquireScratch, CoordinationFacade, CursorSemantics, ParkReason};
 use scanner_git::{FinalizeOutcome, GitEventOutput};
 use scanner_scheduler::events::EventOutput;
 
@@ -39,7 +39,7 @@ use super::commit_bridge::{
 use super::lease_ops::{
     ArmedLeaseDeadline, LeaseUncertaintySignal, advance_shard, claim_next_git_lease,
     claim_next_lease, emit_lease_uncertainty, ensure_post_drain_lease_trust, mirror_error_class,
-    select_shard_completion, watch_lease_deadline,
+    park_shard_on_error, select_shard_completion, watch_lease_deadline,
 };
 use super::types::{
     DistributedPersistence, DistributedRunReport, DistributedRuntimeConfig,
@@ -1085,19 +1085,47 @@ where
     Ok((execution.report, completion, stage_metrics))
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "git repo-frontier shard '{shard_id}': commit OID map saturated at {entry_limit} entries; {detail}"
+)]
+struct CommitOidMapSaturationError {
+    shard_id: String,
+    entry_limit: usize,
+    detail: String,
+}
+
+impl CommitOidMapSaturationError {
+    fn new(redacted_shard_id: &ToxicDigest, detail: impl Into<String>) -> Self {
+        Self {
+            shard_id: redacted_shard_id.to_string(),
+            entry_limit: FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES,
+            detail: detail.into(),
+        }
+    }
+}
+
 /// Construct a non-retryable runtime error for OID-map saturation.
 ///
 /// Centralizes the error shape so the error-path and success-path saturation
-/// checks produce the same `Driver` variant with consistent formatting.
+/// checks produce the same `Driver` variant with consistent formatting. The
+/// stable inner error type lets the outer worker classify saturation without
+/// parsing the display string.
 fn oid_map_saturation_error(
     redacted_shard_id: &ToxicDigest,
     detail: &str,
 ) -> DistributedRuntimeError {
-    DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(anyhow!(
-        "git repo-frontier shard '{redacted_shard_id}': commit OID map saturated \
-         at {} entries; {detail}",
-        FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES,
+    DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(AnyError::new(
+        CommitOidMapSaturationError::new(redacted_shard_id, detail),
     )))
+}
+
+fn should_park_git_repo_failure(error: &DistributedRuntimeError) -> bool {
+    matches!(
+        error,
+        DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(source))
+            if source.downcast_ref::<CommitOidMapSaturationError>().is_some()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1216,7 +1244,10 @@ where
 /// Claims singleton repo-frontier shards, mirrors and executes the target
 /// repository, then advances the shard from the durable finalize receipt.
 /// The outer claim-execute-advance loop structure mirrors [`run_worker`]; both
-/// share the generic claim-retry core and shard-advance helper.
+/// share the generic claim-retry core and shard-advance helper. Commit-OID-map
+/// saturation parks the claimed shard before returning so the coordinator does
+/// not re-offer a repository that will deterministically fail translation
+/// again; other lease-execution failures leave shard state unchanged.
 pub fn run_git_repo_worker<C, M, B, F, D>(
     coordinator: &mut C,
     mirrors: &mut M,
@@ -1277,6 +1308,27 @@ where
             Err(error) => {
                 if let DistributedRuntimeError::LeaseUncertain(reason) = &error {
                     emit_lease_uncertainty(stage_sink.as_ref(), *reason);
+                }
+                if should_park_git_repo_failure(&error) {
+                    // OID-map saturation is intrinsic to the mirrored
+                    // repository state, so reclaiming the shard would
+                    // reproduce the same translation failure.
+                    match park_shard_on_error(
+                        coordinator,
+                        identity.tenant,
+                        &lease,
+                        ParkReason::Poisoned,
+                    ) {
+                        Ok(()) => tracing::info!(
+                            shard_id = %stage_sink.redacted_shard_id(),
+                            "parked shard after commit OID map saturation",
+                        ),
+                        Err(park_error) => tracing::warn!(
+                            shard_id = %stage_sink.redacted_shard_id(),
+                            park_error = %park_error,
+                            "failed to park shard after commit OID map saturation; shard will become claimable again after lease expiry",
+                        ),
+                    }
                 }
                 tracing::warn!(
                     error = %error,

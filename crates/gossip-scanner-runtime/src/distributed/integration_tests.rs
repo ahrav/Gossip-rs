@@ -1935,6 +1935,14 @@ fn run_git_repo_worker_fails_cleanly_on_persistence_error() {
         0,
         "no batch should have succeeded before the injected failure"
     );
+
+    let summaries = shard_summaries(&coordinator);
+    assert_eq!(summaries.len(), 1);
+    assert_ne!(
+        summaries[0].status(),
+        ShardStatus::Parked,
+        "transient persistence failures must not park the shard"
+    );
 }
 
 /// Git events remain observable when the repo-frontier worker persists
@@ -2562,10 +2570,10 @@ fn run_git_repo_worker_fails_fast_when_commit_oid_map_saturates() {
         0,
         "saturation must not advance the shard"
     );
-    assert_ne!(
+    assert_eq!(
         shard_summaries(&coordinator)[0].status(),
-        ShardStatus::Done,
-        "saturation must leave the shard uncompleted for inspection"
+        ShardStatus::Parked,
+        "saturation must park the shard to prevent a re-claim loop"
     );
     assert!(
         findings_sink
@@ -2597,6 +2605,49 @@ fn run_git_repo_worker_fails_fast_when_commit_oid_map_saturates() {
     );
 }
 
+#[test]
+fn run_git_repo_worker_does_not_reclaim_commit_oid_saturated_shard() {
+    let repo = create_git_repo_fixture_with_secret_history(
+        FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES + 1,
+    );
+    let mirror_root = tempdir().expect("mirror root");
+    let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+    let backend = TestGitBackend::default();
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let mut coordinator =
+        setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+    let _err = run_git_repo_worker(
+        &mut coordinator,
+        &mut mirrors,
+        git_worker_identity(repo.path()),
+        backend.clone(),
+        DistributedPersistence::new(findings_sink, done_ledger),
+        DistributedRuntimeConfig::default(),
+    )
+    .expect_err("OID-map saturation should fail the repo worker");
+
+    assert_eq!(
+        shard_summaries(&coordinator)[0].status(),
+        ShardStatus::Parked,
+        "saturation must park the shard before the next claim attempt"
+    );
+
+    let report = run_git_repo_worker(
+        &mut coordinator,
+        &mut mirrors,
+        git_worker_identity(repo.path()),
+        backend,
+        DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+        DistributedRuntimeConfig::default(),
+    )
+    .expect("parked shard must not be claimable again");
+
+    assert_eq!(report.leases_seen, 0);
+    assert_eq!(report.shards_scanned, 0);
+}
+
 /// Mirror sync failure must be fail-fast: the shard must not be advanced
 /// in the coordinator and no persistence writes should occur.
 #[test]
@@ -2625,6 +2676,11 @@ fn run_git_repo_worker_mirror_failure_does_not_advance_shard_or_persist() {
         summaries[0].status(),
         ShardStatus::Done,
         "shard should not be advanced after mirror sync failure"
+    );
+    assert_ne!(
+        summaries[0].status(),
+        ShardStatus::Parked,
+        "mirror sync failures must not park the shard"
     );
 
     // No persistence writes should have occurred.
