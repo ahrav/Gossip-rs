@@ -395,12 +395,16 @@ pub(crate) struct FindingsCaptureSink {
     /// Lease-deadline expiry and OID-map saturation both drive the same token
     /// so scanner-git winds down cooperatively through one cancellation path.
     cancel: CancellationToken,
-    /// One-shot flag recording that the commit-OID map reached its ceiling.
+    /// One-shot flag recording that a new commit_id was rejected because the
+    /// map was already at `MAX_COMMIT_OID_MAP_ENTRIES` capacity. Set via
+    /// `swap` so only the first overflowing thread fires the cancellation.
     ///
-    /// `emit_git` polls this flag with `Relaxed` ordering before taking the
-    /// map mutex because a stale `false` only costs one redundant lock
-    /// acquisition. Readers should query it after the scan thread joins, which
-    /// provides the happens-before edge for the final value.
+    /// Both the saturating store in `emit_git` and the fast-path load use
+    /// `Relaxed` ordering. A stale `false` costs one redundant lock
+    /// acquisition — in the worst case, the racing thread enters the mutex,
+    /// discovers the map is full, and takes the overflow path itself. A stale
+    /// `true` is harmless (the map is already frozen). Post-join readers rely
+    /// on the thread-join happens-before edge for the final value.
     oid_map_saturated: AtomicBool,
 }
 
@@ -465,10 +469,11 @@ impl FindingsCaptureSink {
         self.finding_count.load(Ordering::Relaxed)
     }
 
-    /// Returns true once the commit-OID map reached its safety ceiling.
+    /// Returns true if a commit_id was rejected because the map was full.
     ///
-    /// Intended to be called after the scan thread has joined, so the final
-    /// flag value is visible without stronger ordering than `Relaxed`.
+    /// A full map (len == MAX) that was never asked to store a surplus entry
+    /// does NOT count as saturated — all OIDs are present and translation can
+    /// proceed. Saturation means at least one OID is missing.
     pub(crate) fn is_oid_map_saturated(&self) -> bool {
         self.oid_map_saturated.load(Ordering::Relaxed)
     }
@@ -495,12 +500,17 @@ impl FindingsCaptureSink {
     /// internal map empty via `std::mem::take`. Poisoned locks are recovered
     /// so the caller can still translate Git findings deterministically.
     pub(crate) fn drain_commit_oid_map(&self) -> AHashMap<u32, OidBytes> {
-        std::mem::take(
-            &mut *self
-                .commit_oid_map
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner()),
-        )
+        let mut guard = match self.commit_oid_map.lock() {
+            Ok(guard) => guard,
+            Err(poison) => {
+                tracing::error!(
+                    "commit_oid_map mutex poisoned; a scan worker panicked \
+                     while holding the lock — recovered map may be incomplete"
+                );
+                poison.into_inner()
+            }
+        };
+        std::mem::take(&mut *guard)
     }
 }
 
@@ -548,33 +558,53 @@ impl GitEventOutput for FindingsCaptureSink {
         // Only commit metadata contributes to Git finding identity. Once the
         // map saturates, skip the mutex entirely because the shared
         // cancellation token is already stopping scanner-git cooperatively.
+        //
+        // The Relaxed guard is intentionally racy: a thread that loaded
+        // `false` before the saturating `swap` was published may still enter
+        // the mutex. That thread will either (a) update an existing key via
+        // the Occupied branch — a benign idempotent overwrite — or (b) hit
+        // the Vacant overflow branch and call `swap` itself, which returns
+        // `true` (already set) and skips the duplicate cancel. Both paths
+        // are harmless because the shard is aborted regardless.
         if let GitEvent::CommitMeta(ref meta) = event
             && !self.oid_map_saturated.load(Ordering::Relaxed)
         {
-            let mut map = self
-                .commit_oid_map
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
+            let mut map = match self.commit_oid_map.lock() {
+                Ok(guard) => guard,
+                Err(poison) => {
+                    tracing::error!(
+                        "commit_oid_map mutex poisoned during emit_git; \
+                         a scan worker panicked while holding the lock — \
+                         subsequent OID mappings may be unreliable"
+                    );
+                    poison.into_inner()
+                }
+            };
             let pre_len = map.len();
-            match map.entry(meta.commit_id) {
+            let overflowed = match map.entry(meta.commit_id) {
                 Entry::Occupied(mut e) => {
                     e.insert(meta.commit_oid);
+                    false
                 }
                 Entry::Vacant(e) if pre_len < Self::MAX_COMMIT_OID_MAP_ENTRIES => {
                     e.insert(meta.commit_oid);
+                    false
                 }
-                Entry::Vacant(_) => {}
-            }
-            if pre_len < Self::MAX_COMMIT_OID_MAP_ENTRIES
-                && map.len() == Self::MAX_COMMIT_OID_MAP_ENTRIES
-            {
-                // Publish saturation before cancelling so later events
-                // can take the mutex-free fast path immediately.
-                self.oid_map_saturated.store(true, Ordering::Relaxed);
+                // Map is at capacity and this commit_id is new — the scan has
+                // more distinct finding-bearing commits than the safety ceiling
+                // allows. Signal saturation so the caller aborts before
+                // translation produces incomplete OID lookups.
+                Entry::Vacant(_) => true,
+            };
+            // Drop the lock before signalling so waiters can make progress
+            // without contending on the mutex.
+            drop(map);
+            if overflowed && !self.oid_map_saturated.swap(true, Ordering::Relaxed) {
                 self.cancel.cancel();
                 tracing::warn!(
                     max = Self::MAX_COMMIT_OID_MAP_ENTRIES,
-                    "commit OID map saturated; cancelling scan to prevent consistency violation in findings translation"
+                    "commit OID map saturated; cancelling scan to prevent \
+                     consistency violation in findings translation"
                 );
             }
         }
@@ -1007,7 +1037,8 @@ mod tests {
     #[test]
     fn findings_capture_sink_commit_oid_map_enforces_capacity_ceiling() {
         // MAX_COMMIT_OID_MAP_ENTRIES is 8 under #[cfg(test)]. Insert exactly 8
-        // entries to fill the map, then 2 more after saturation fires.
+        // entries to fill the map (no saturation), then 2 more that overflow
+        // the ceiling (first overflow triggers saturation; second is dropped).
         let (sink, recorder, cancel) = make_sink_and_recorder();
 
         let max = FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES;
@@ -1019,6 +1050,10 @@ mod tests {
                 identity: None,
             }));
         }
+        assert!(
+            !cancel.is_cancelled(),
+            "filling the map to capacity must not cancel (all OIDs present)"
+        );
         for i in max as u32..max as u32 + 2 {
             sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
                 commit_id: i,
@@ -1030,11 +1065,11 @@ mod tests {
 
         assert!(
             cancel.is_cancelled(),
-            "capacity ceiling should cancel the scan"
+            "overflow beyond ceiling should cancel the scan"
         );
         assert!(
             sink.is_oid_map_saturated(),
-            "capacity ceiling should set the saturation flag"
+            "overflow beyond ceiling should set the saturation flag"
         );
 
         let map = sink.drain_commit_oid_map();
@@ -1060,6 +1095,37 @@ mod tests {
             forwarded.len(),
             total_events,
             "all events must be forwarded regardless of saturation"
+        );
+    }
+
+    #[test]
+    fn exactly_max_distinct_commits_should_not_saturate() {
+        // Proof: a repo with exactly MAX distinct finding-bearing commits has
+        // a complete OID map. Saturation should fire only when a NEW entry
+        // cannot be inserted (overflow), not when the last slot is filled.
+        let (sink, _recorder, cancel) = make_sink_and_recorder();
+        let max = FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES;
+
+        for i in 0..max as u32 {
+            sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+                commit_id: i,
+                commit_oid: scanner_git::OidBytes::sha1([i as u8 + 1; 20]),
+                timestamp: 1_700_000_000 + u64::from(i),
+                identity: None,
+            }));
+        }
+
+        let map = sink.drain_commit_oid_map();
+        assert_eq!(map.len(), max, "map should contain exactly MAX entries");
+        // If saturation is correct, a full-but-not-overflowed map should NOT
+        // trigger cancellation — all OIDs are present for translation.
+        assert!(
+            !cancel.is_cancelled(),
+            "exactly MAX distinct commits must NOT cancel (all OIDs are present)"
+        );
+        assert!(
+            !sink.is_oid_map_saturated(),
+            "exactly MAX distinct commits must NOT set saturation (map is complete)"
         );
     }
 
@@ -1090,8 +1156,9 @@ mod tests {
     #[test]
     fn commit_oid_map_update_existing_key_near_capacity() {
         // Verify that updating an existing key at MAX-1 occupancy does not
-        // spuriously trigger saturation, and that a subsequent new-key insert
-        // at the actual boundary fires cancellation correctly.
+        // spuriously trigger saturation, and that filling the last slot with
+        // a genuinely new key also does NOT trigger saturation (all OIDs are
+        // present). Saturation fires only on the first rejected insert.
         let (sink, _recorder, cancel) = make_sink_and_recorder();
         let max = FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES;
 
@@ -1114,9 +1181,8 @@ mod tests {
             "below-capacity inserts must not set the saturation flag"
         );
 
-        // Re-insert ID 0 with a different OID. This exercises the
-        // Entry::Occupied path when pre_len == MAX-1; the map size must
-        // stay at MAX-1 because no new key was added.
+        // Re-insert ID 0 with a different OID. Exercises the Occupied path
+        // when the map has MAX-1 entries; map size stays at MAX-1.
         let updated_oid = scanner_git::OidBytes::sha256([0xFF; 32]);
         sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
             commit_id: 0,
@@ -1135,7 +1201,7 @@ mod tests {
         );
 
         // Insert the final new key (ID = max-1) to push the map to exactly
-        // MAX entries. This crosses the capacity boundary and fires saturation.
+        // MAX entries. The map is now full but complete — no saturation yet.
         sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
             commit_id: max as u32 - 1,
             commit_oid: scanner_git::OidBytes::sha1([max as u8; 20]),
@@ -1144,24 +1210,45 @@ mod tests {
         }));
 
         assert!(
+            !cancel.is_cancelled(),
+            "filling the last slot must not cancel (all OIDs present)"
+        );
+        assert!(
+            !sink.is_oid_map_saturated(),
+            "filling the last slot must not set saturation (map is complete)"
+        );
+
+        // Now insert one MORE distinct key that overflows the ceiling.
+        sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+            commit_id: max as u32,
+            commit_oid: scanner_git::OidBytes::sha1([max as u8 + 1; 20]),
+            timestamp: 1_700_000_101,
+            identity: None,
+        }));
+
+        assert!(
             cancel.is_cancelled(),
-            "reaching capacity must cancel the scan"
+            "overflowing the ceiling must cancel the scan"
         );
         assert!(
             sink.is_oid_map_saturated(),
-            "reaching capacity must set the saturation flag"
+            "overflowing the ceiling must set the saturation flag"
         );
 
         let map = sink.drain_commit_oid_map();
         assert_eq!(
             map.len(),
             max,
-            "map must contain exactly MAX_COMMIT_OID_MAP_ENTRIES entries"
+            "map must contain exactly MAX entries (overflow entry rejected)"
         );
         assert_eq!(
             map.get(&0),
             Some(&updated_oid),
             "ID 0 must reflect the updated OID, not the original"
+        );
+        assert!(
+            !map.contains_key(&(max as u32)),
+            "overflow entry must not appear in the map"
         );
     }
 
@@ -1170,7 +1257,8 @@ mod tests {
         let (sink, _recorder, cancel) = make_sink_and_recorder();
         let max = FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES;
 
-        for i in 0..max as u32 {
+        // Fill to MAX, then overflow with one extra to trigger saturation.
+        for i in 0..max as u32 + 1 {
             sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
                 commit_id: i,
                 commit_oid: scanner_git::OidBytes::sha1([i as u8 + 1; 20]),
@@ -1179,13 +1267,10 @@ mod tests {
             }));
         }
 
-        assert!(
-            cancel.is_cancelled(),
-            "reaching capacity should cancel once"
-        );
+        assert!(cancel.is_cancelled(), "overflow should cancel the scan");
         assert!(
             sink.is_oid_map_saturated(),
-            "reaching capacity should set the saturation flag"
+            "overflow should set the saturation flag"
         );
 
         // Once saturated, later commit metadata stays on the fast path and does

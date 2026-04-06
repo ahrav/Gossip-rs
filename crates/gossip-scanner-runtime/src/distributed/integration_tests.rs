@@ -2575,6 +2575,20 @@ fn run_git_repo_worker_fails_fast_when_commit_oid_map_saturates() {
         "translated findings must not persist after saturation"
     );
     assert!(
+        findings_sink
+            .occurrences_snapshot()
+            .expect("occurrences snapshot")
+            .is_empty(),
+        "occurrence writes must not occur after saturation"
+    );
+    assert!(
+        findings_sink
+            .observations_snapshot()
+            .expect("observations snapshot")
+            .is_empty(),
+        "observation writes must not occur after saturation"
+    );
+    assert!(
         done_ledger
             .snapshot()
             .expect("done-ledger snapshot")
