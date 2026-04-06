@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn findings_capture_sink_skips_invalid_blob_oid_payloads() {
-        let (sink, _recorder) = make_sink_and_recorder();
+        let (sink, recorder) = make_sink_and_recorder();
 
         let mut raw = [0u8; 33];
         raw[0] = 21;
@@ -751,6 +751,47 @@ mod tests {
         assert!(
             sink.take_captured_findings().is_empty(),
             "invalid blob OIDs must be skipped during persistence capture"
+        );
+        let forwarded = recorder.core_events.lock().unwrap();
+        assert_eq!(
+            forwarded.len(),
+            1,
+            "inner sink must receive the event even when blob_oid is invalid"
+        );
+    }
+
+    #[test]
+    fn findings_capture_sink_skips_none_blob_oid_and_forwards_event() {
+        let (sink, recorder) = make_sink_and_recorder();
+
+        sink.emit_core(CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Git,
+            object_path: b"/tmp/no-oid.txt",
+            start: 0,
+            end: 10,
+            rule_id: 1,
+            rule_name: "test",
+            norm_hash: [0xCC; 32],
+            blob_oid: None,
+            commit_id: Some(5),
+            change_kind: Some("add"),
+            confidence_score: 50,
+        }));
+
+        assert_eq!(
+            sink.detected_finding_count(),
+            0,
+            "finding with None blob_oid must not increment the counter"
+        );
+        assert!(
+            sink.take_captured_findings().is_empty(),
+            "finding with None blob_oid must not be captured for persistence"
+        );
+        let forwarded = recorder.core_events.lock().unwrap();
+        assert_eq!(
+            forwarded.len(),
+            1,
+            "inner sink must receive the event regardless of blob_oid validity"
         );
     }
 
