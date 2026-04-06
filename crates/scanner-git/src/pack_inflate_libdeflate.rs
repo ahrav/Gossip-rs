@@ -37,6 +37,10 @@ thread_local! {
         RefCell::new(LibdeflateDecompressor::new());
 }
 
+/// Failure modes from libdeflate's zlib decompression.
+///
+/// `SHORT_OUTPUT` is absent because `zlib_decompress_ex` does not return
+/// it when `actual_out_nbytes_ret` is non-null.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 enum LibdeflateError {
     #[error("libdeflate: bad data")]
@@ -107,6 +111,10 @@ impl LibdeflateDecompressor {
         } else if result == libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE {
             Err(LibdeflateError::InsufficientSpace)
         } else {
+            debug_assert!(
+                false,
+                "libdeflate returned unexpected result code: {result}"
+            );
             Err(LibdeflateError::BadData)
         }
     }
@@ -119,6 +127,12 @@ impl Drop for LibdeflateDecompressor {
         unsafe { libdeflate_free_decompressor(self.raw.as_ptr()) };
     }
 }
+
+// SAFETY: The libdeflate decompressor is a self-contained heap allocation
+// with no thread-local or global mutable state. Moving it between threads
+// is safe. Concurrent use from multiple threads is NOT safe, which is
+// enforced by the `&mut self` borrow on `zlib_decompress_exact`.
+unsafe impl Send for LibdeflateDecompressor {}
 
 #[inline]
 fn with_decompressor<F, R>(f: F) -> R

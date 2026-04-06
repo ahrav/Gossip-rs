@@ -398,6 +398,7 @@ pub use scanner_engine::{
 pub use work_items::WorkItems;
 
 // ── Benchmark support ───────────────────────────────────────────────────
+#[cfg(feature = "bench")]
 #[doc(hidden)]
 pub use pack_inflate_libdeflate::LIBDEFLATE_THRESHOLD_BYTES;
 #[cfg(feature = "bench")]

@@ -95,6 +95,7 @@ required-features = ["bench"]
 [[bench]]
 name = "pack_inflate_perf"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "path_policy"

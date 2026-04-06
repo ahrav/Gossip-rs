@@ -234,7 +234,8 @@ mod tests {
     use crate::delta_test_helpers::{
         encode_entry_header, make_add_delta, zlib_compress, SyntheticPackBuilder,
     };
-    use crate::pack_inflate_libdeflate::LIBDEFLATE_THRESHOLD_BYTES;
+    use crate::object_id::OidBytes;
+    use crate::pack_inflate_libdeflate::{LibdeflateDecompressor, LIBDEFLATE_THRESHOLD_BYTES};
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
@@ -498,5 +499,126 @@ mod tests {
 
         assert_eq!(consumed, compressed.len());
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn caller_provided_libde_roundtrip() {
+        let mut libde = LibdeflateDecompressor::new();
+        let payload = b"roundtrip through caller-provided libdeflate decompressor".to_vec();
+        let compressed = zlib_compress(&payload);
+        let (pack_bytes, offset) = single_entry_pack(non_delta_entry(payload.len(), &compressed));
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+        let mut out = Vec::new();
+        let mut de = Decompress::new(true);
+
+        let consumed = inflate_entry_payload_with(
+            &mut de,
+            Some(&mut libde),
+            &pack,
+            &header,
+            &mut out,
+            &limits,
+        )
+        .expect("inflate with caller-provided libde");
+
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn caller_provided_libde_corrupt_returns_backend_error() {
+        let mut libde = LibdeflateDecompressor::new();
+        let (pack_bytes, offset) = single_entry_pack(non_delta_entry(8, b"\x78\x9c\xff\xff"));
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+        let mut out = Vec::new();
+        let mut de = Decompress::new(true);
+
+        let err = inflate_entry_payload_with(
+            &mut de,
+            Some(&mut libde),
+            &pack,
+            &header,
+            &mut out,
+            &limits,
+        )
+        .expect_err("expected backend error from corrupt zlib data");
+
+        assert_eq!(err, PackDecodeError::Inflate(InflateError::Backend));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn ref_delta_routes_through_flate2() {
+        let base = b"base payload for ref-delta";
+        let delta = make_add_delta(base.len(), b"REF");
+        let base_oid = OidBytes::sha1([0xAA; 20]);
+
+        let mut builder = SyntheticPackBuilder::new();
+        builder.add_non_delta(3, base);
+        let delta_idx = builder.add_ref_delta(base_oid, &delta);
+        let (pack_bytes, offsets) = builder.build();
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header =
+            entry_header_at(&pack, offsets[delta_idx], &limits).expect("parse ref-delta header");
+
+        assert!(
+            !pack_inflate_libdeflate::use_libdeflate_for_header(&header),
+            "REF_DELTA entries must bypass libdeflate"
+        );
+    }
+
+    #[test]
+    fn all_nondelta_object_kinds_route_through_libdeflate() {
+        // Type bytes: 1=Commit, 2=Tree, 3=Blob, 4=Tag.
+        for type_byte in 1u8..=4 {
+            let payload = b"kind routing payload";
+            let compressed = zlib_compress(payload);
+            let mut entry = encode_entry_header(type_byte, payload.len());
+            entry.extend_from_slice(&compressed);
+            let (pack_bytes, offset) = single_entry_pack(entry);
+            let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+            let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+            let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+
+            assert!(
+                pack_inflate_libdeflate::use_libdeflate_for_header(&header),
+                "non-delta type byte {type_byte} should route through libdeflate"
+            );
+        }
+    }
+
+    #[test]
+    fn libdeflate_decompressor_reuse_across_payloads() {
+        let mut libde = LibdeflateDecompressor::new();
+
+        let payload_a = b"first payload for reuse test".to_vec();
+        let compressed_a = zlib_compress(&payload_a);
+        let mut out = Vec::new();
+        let consumed_a = pack_inflate_libdeflate::inflate_nondelta_exact_with(
+            &mut libde,
+            &compressed_a,
+            payload_a.len(),
+            &mut out,
+        )
+        .expect("first inflate");
+        assert_eq!(consumed_a, compressed_a.len());
+        assert_eq!(out, payload_a);
+
+        let payload_b = b"second, different payload for reuse".to_vec();
+        let compressed_b = zlib_compress(&payload_b);
+        let consumed_b = pack_inflate_libdeflate::inflate_nondelta_exact_with(
+            &mut libde,
+            &compressed_b,
+            payload_b.len(),
+            &mut out,
+        )
+        .expect("second inflate reusing same decompressor");
+        assert_eq!(consumed_b, compressed_b.len());
+        assert_eq!(out, payload_b);
     }
 }
