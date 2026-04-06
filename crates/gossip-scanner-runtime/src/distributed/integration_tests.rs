@@ -38,8 +38,8 @@ use gossip_contracts::{
     persistence::DoneLedgerStatus,
 };
 use gossip_coordination::{
-    CoordinationBackend, CursorSemantics, CursorUpdate as CoordCursorUpdate, RunConfig,
-    RunManagement, ShardStatus,
+    CoordinationBackend, CursorSemantics, CursorUpdate as CoordCursorUpdate, ParkError, RunConfig,
+    RunManagement, ShardClaiming, ShardStatus,
 };
 use gossip_persistence_inmemory::{CompletionOrder, InMemoryDoneLedger, InMemoryFindingsSink};
 use scanner_scheduler::events::NullEventOutput;
@@ -1935,6 +1935,24 @@ fn run_git_repo_worker_fails_cleanly_on_persistence_error() {
         0,
         "no batch should have succeeded before the injected failure"
     );
+
+    let summaries = shard_summaries(&coordinator);
+    assert_eq!(summaries.len(), 1);
+    assert_ne!(
+        summaries[0].status(),
+        ShardStatus::Done,
+        "persistence failures must not advance the shard"
+    );
+    assert_ne!(
+        summaries[0].status(),
+        ShardStatus::Parked,
+        "transient persistence failures must not park the shard"
+    );
+    assert_eq!(
+        run_progress(&coordinator).done(),
+        0,
+        "no shards should be done after a persistence failure"
+    );
 }
 
 /// Git events remain observable when the repo-frontier worker persists
@@ -2548,9 +2566,9 @@ fn run_git_repo_worker_fails_fast_when_commit_oid_map_saturates() {
     assert!(
         matches!(
             err,
-            DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(_))
+            DistributedRuntimeError::Runtime(ScanRuntimeError::CommitOidMapSaturated { .. })
         ),
-        "expected Runtime(Driver), got: {err:?}"
+        "expected Runtime(CommitOidMapSaturated), got: {err:?}"
     );
     let msg = err.to_string();
     assert!(
@@ -2562,10 +2580,10 @@ fn run_git_repo_worker_fails_fast_when_commit_oid_map_saturates() {
         0,
         "saturation must not advance the shard"
     );
-    assert_ne!(
+    assert_eq!(
         shard_summaries(&coordinator)[0].status(),
-        ShardStatus::Done,
-        "saturation must leave the shard uncompleted for inspection"
+        ShardStatus::Parked,
+        "saturation must park the shard to prevent a re-claim loop"
     );
     assert!(
         findings_sink
@@ -2597,6 +2615,327 @@ fn run_git_repo_worker_fails_fast_when_commit_oid_map_saturates() {
     );
 }
 
+#[test]
+fn run_git_repo_worker_does_not_reclaim_commit_oid_saturated_shard() {
+    let repo = create_git_repo_fixture_with_secret_history(
+        FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES + 1,
+    );
+    let mirror_root = tempdir().expect("mirror root");
+    let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+    let backend = TestGitBackend::default();
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let mut coordinator =
+        setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+    let _err = run_git_repo_worker(
+        &mut coordinator,
+        &mut mirrors,
+        git_worker_identity(repo.path()),
+        backend.clone(),
+        DistributedPersistence::new(findings_sink, done_ledger),
+        DistributedRuntimeConfig::default(),
+    )
+    .expect_err("OID-map saturation should fail the repo worker");
+
+    assert_eq!(
+        shard_summaries(&coordinator)[0].status(),
+        ShardStatus::Parked,
+        "saturation must park the shard before the next claim attempt"
+    );
+
+    let report = run_git_repo_worker(
+        &mut coordinator,
+        &mut mirrors,
+        git_worker_identity(repo.path()),
+        backend,
+        DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+        DistributedRuntimeConfig::default(),
+    )
+    .unwrap_or_else(|e| {
+        panic!("second worker run should return Ok (shard is parked, no claim possible), got: {e}")
+    });
+
+    assert_eq!(report.leases_seen, 0);
+    assert_eq!(report.shards_scanned, 0);
+
+    // Shard must still be parked after the second worker run — the worker
+    // must not have changed the shard's state as a side-effect.
+    assert_eq!(
+        shard_summaries(&coordinator)[0].status(),
+        ShardStatus::Parked,
+        "parked shard must remain parked after a no-op worker run"
+    );
+}
+
+/// Thin coordinator wrapper that delegates all operations to the inner
+/// `InMemoryCoordinator` except `park_shard`, which always returns
+/// `ParkError::BackendError`.
+struct ParkFailingCoordinator {
+    inner: gossip_coordination::InMemoryCoordinator,
+}
+
+impl CoordinationBackend for ParkFailingCoordinator {
+    fn acquire_and_restore_into<'a>(
+        &mut self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        key: gossip_coordination::ShardKey,
+        worker: gossip_coordination::WorkerId,
+        out: &'a mut gossip_coordination::AcquireScratch,
+    ) -> Result<gossip_coordination::AcquireResultView<'a>, gossip_coordination::AcquireError> {
+        self.inner
+            .acquire_and_restore_into(now, tenant, key, worker, out)
+    }
+
+    fn renew(
+        &mut self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        lease: &gossip_coordination::Lease,
+    ) -> Result<gossip_coordination::RenewResult, gossip_coordination::RenewError> {
+        self.inner.renew(now, tenant, lease)
+    }
+
+    fn checkpoint(
+        &mut self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        lease: &gossip_coordination::Lease,
+        new_cursor: &gossip_coordination::CursorUpdate<'_>,
+        op_id: gossip_coordination::OpId,
+    ) -> Result<gossip_coordination::IdempotentOutcome<()>, gossip_coordination::CheckpointError>
+    {
+        self.inner.checkpoint(now, tenant, lease, new_cursor, op_id)
+    }
+
+    fn complete(
+        &mut self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        lease: &gossip_coordination::Lease,
+        final_cursor: &gossip_coordination::CursorUpdate<'_>,
+        op_id: gossip_coordination::OpId,
+    ) -> Result<gossip_coordination::IdempotentOutcome<()>, gossip_coordination::CompleteError>
+    {
+        self.inner.complete(now, tenant, lease, final_cursor, op_id)
+    }
+
+    fn park_shard(
+        &mut self,
+        _now: gossip_coordination::LogicalTime,
+        _tenant: gossip_coordination::TenantId,
+        _lease: &gossip_coordination::Lease,
+        _reason: gossip_coordination::ParkReason,
+        _op_id: gossip_coordination::OpId,
+    ) -> Result<gossip_coordination::IdempotentOutcome<()>, ParkError> {
+        Err(ParkError::BackendError(
+            gossip_coordination::InfraError::transient("park_shard", "injected park failure"),
+        ))
+    }
+
+    fn split_replace(
+        &mut self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        lease: &gossip_coordination::Lease,
+        plan: gossip_coordination::SplitReplacePlan<'_>,
+        op_id: gossip_coordination::OpId,
+    ) -> Result<
+        gossip_coordination::IdempotentOutcome<gossip_coordination::SplitReplaceResult>,
+        gossip_coordination::SplitReplaceError,
+    > {
+        self.inner.split_replace(now, tenant, lease, plan, op_id)
+    }
+
+    fn split_residual(
+        &mut self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        lease: &gossip_coordination::Lease,
+        plan: gossip_coordination::SplitResidualPlan<'_>,
+        op_id: gossip_coordination::OpId,
+    ) -> Result<
+        gossip_coordination::IdempotentOutcome<gossip_coordination::SplitResidualResult>,
+        gossip_coordination::SplitResidualError,
+    > {
+        self.inner.split_residual(now, tenant, lease, plan, op_id)
+    }
+}
+
+impl RunManagement for ParkFailingCoordinator {
+    fn create_run(
+        &mut self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        run: gossip_coordination::RunId,
+        config: RunConfig,
+    ) -> Result<gossip_coordination::RunRecord, gossip_coordination::CreateRunError> {
+        self.inner.create_run(now, tenant, run, config)
+    }
+
+    fn register_shards(
+        &mut self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        run: gossip_coordination::RunId,
+        shards: &[gossip_coordination::InitialShardInput<'_>],
+        op_id: gossip_coordination::OpId,
+    ) -> Result<
+        gossip_coordination::IdempotentOutcome<Vec<ShardId>>,
+        gossip_coordination::RegisterShardsError,
+    > {
+        self.inner.register_shards(now, tenant, run, shards, op_id)
+    }
+
+    fn get_run(
+        &self,
+        tenant: gossip_coordination::TenantId,
+        run: gossip_coordination::RunId,
+    ) -> Result<gossip_coordination::RunRecord, gossip_coordination::GetRunError> {
+        self.inner.get_run(tenant, run)
+    }
+
+    fn get_run_progress(
+        &self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        run: gossip_coordination::RunId,
+    ) -> Result<gossip_coordination::RunProgress, gossip_coordination::GetRunError> {
+        self.inner.get_run_progress(now, tenant, run)
+    }
+
+    fn list_shards_into(
+        &self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        run: gossip_coordination::RunId,
+        filter: gossip_coordination::ShardFilter,
+        out: &mut Vec<gossip_coordination::ShardSummary>,
+    ) -> Result<(), gossip_coordination::GetRunError> {
+        self.inner.list_shards_into(now, tenant, run, filter, out)
+    }
+
+    fn collect_claim_candidates_into(
+        &self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        run: gossip_coordination::RunId,
+        candidates: &mut Vec<ShardId>,
+    ) -> Result<Option<gossip_coordination::LogicalTime>, gossip_coordination::GetRunError> {
+        self.inner
+            .collect_claim_candidates_into(now, tenant, run, candidates)
+    }
+
+    fn complete_run(
+        &mut self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        run: gossip_coordination::RunId,
+        op_id: gossip_coordination::OpId,
+    ) -> Result<gossip_coordination::IdempotentOutcome<()>, gossip_coordination::RunTransitionError>
+    {
+        self.inner.complete_run(now, tenant, run, op_id)
+    }
+
+    fn fail_run(
+        &mut self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        run: gossip_coordination::RunId,
+        op_id: gossip_coordination::OpId,
+    ) -> Result<gossip_coordination::IdempotentOutcome<()>, gossip_coordination::RunTransitionError>
+    {
+        self.inner.fail_run(now, tenant, run, op_id)
+    }
+
+    fn cancel_run(
+        &mut self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        run: gossip_coordination::RunId,
+        op_id: gossip_coordination::OpId,
+    ) -> Result<gossip_coordination::IdempotentOutcome<()>, gossip_coordination::RunTransitionError>
+    {
+        self.inner.cancel_run(now, tenant, run, op_id)
+    }
+
+    fn unpark_shard(
+        &mut self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        key: gossip_coordination::ShardKey,
+        op_id: gossip_coordination::OpId,
+    ) -> Result<gossip_coordination::IdempotentOutcome<()>, gossip_coordination::UnparkError> {
+        self.inner.unpark_shard(now, tenant, key, op_id)
+    }
+}
+
+impl ShardClaiming for ParkFailingCoordinator {
+    fn claim_next_available<'a>(
+        &mut self,
+        now: gossip_coordination::LogicalTime,
+        tenant: gossip_coordination::TenantId,
+        run: gossip_coordination::RunId,
+        worker: gossip_coordination::WorkerId,
+        out: &'a mut gossip_coordination::AcquireScratch,
+    ) -> Result<gossip_coordination::AcquireResultView<'a>, gossip_coordination::ClaimError> {
+        self.inner
+            .claim_next_available(now, tenant, run, worker, out)
+    }
+}
+
+/// When OID-map saturation triggers a park attempt but the coordinator
+/// rejects the park (e.g., transient backend error), the original
+/// saturation error must still propagate to the caller. The shard must
+/// NOT be in `Parked` status because the park operation itself failed.
+#[test]
+fn run_git_repo_worker_preserves_saturation_error_when_park_fails() {
+    let repo = create_git_repo_fixture_with_secret_history(
+        FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES + 1,
+    );
+    let mirror_root = tempdir().expect("mirror root");
+    let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+    let backend = TestGitBackend::default();
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+
+    let coordinator =
+        setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+    let mut wrapper = ParkFailingCoordinator { inner: coordinator };
+
+    let err = run_git_repo_worker(
+        &mut wrapper,
+        &mut mirrors,
+        git_worker_identity(repo.path()),
+        backend,
+        DistributedPersistence::new(findings_sink, done_ledger),
+        DistributedRuntimeConfig::default(),
+    )
+    .expect_err("OID-map saturation with failing park should still return an error");
+
+    // The original saturation error must propagate unchanged even though the
+    // best-effort park failed.
+    assert!(
+        matches!(
+            err,
+            DistributedRuntimeError::Runtime(ScanRuntimeError::CommitOidMapSaturated { .. })
+        ),
+        "expected Runtime(CommitOidMapSaturated), got: {err:?}"
+    );
+
+    // The shard must NOT be parked because `park_shard` was rejected by the
+    // coordinator wrapper. It remains Active (the lease is still live).
+    let coordinator = &wrapper.inner;
+    let summaries = shard_summaries(coordinator);
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(
+        summaries[0].status(),
+        ShardStatus::Active,
+        "failed park must leave the leased shard active"
+    );
+}
+
 /// Mirror sync failure must be fail-fast: the shard must not be advanced
 /// in the coordinator and no persistence writes should occur.
 #[test]
@@ -2625,6 +2964,11 @@ fn run_git_repo_worker_mirror_failure_does_not_advance_shard_or_persist() {
         summaries[0].status(),
         ShardStatus::Done,
         "shard should not be advanced after mirror sync failure"
+    );
+    assert_ne!(
+        summaries[0].status(),
+        ShardStatus::Parked,
+        "mirror sync failures must not park the shard"
     );
 
     // No persistence writes should have occurred.
