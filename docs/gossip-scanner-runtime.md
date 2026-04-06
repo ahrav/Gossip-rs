@@ -144,10 +144,10 @@ implements `scanner-git`'s ref-watermark, seen-blob, and finalize seams and
 plugs into `git_repo::run_runtime_git_scan_with_stores`. Distributed
 repo-frontier execution wraps the event sink with `FindingsCaptureSink`, lifts
 Git `FindingEvent` values into `GitFindingForPersistence` by decoding the
-embedded blob OID carried on each finding. Malformed or missing blob OIDs are
-skipped during capture, and the repo worker rejects the lease before
-persistence if the captured payload count diverges from the detected finding
-count. `translate_git_item_result` then derives stable item identity from
+embedded blob OID carried on each finding. Findings with malformed or missing
+blob OIDs are counted but excluded from the captured payload vec; the post-scan
+integrity check (detected count vs captured count) rejects the scan before
+persistence when any finding could not be captured. `translate_git_item_result` then derives stable item identity from
 `(connector_instance, object_path)` and strong version identity from the blob
 OID for each finding while keeping the done-ledger row repo-scoped via
 `repo_id`. Persistence uses
@@ -875,13 +875,10 @@ with a deterministic `OpId`.
 4. executes the mirror-backed Git scan through `GitRepoRuntime::execute_repo`,
    using `GitPersistenceAdapter` as the scanner-git seen/watermark/finalize
    store and `FindingsCaptureSink` to retain persistence-ready finding payloads
-   with decoded blob OIDs plus the sparse commit-ordinal-to-OID map; malformed
-   finding metadata is skipped during capture and later rejected by the worker's
-   detected-vs-captured integrity check before translation; if a new commit_id
-   overflows the map ceiling, `FindingsCaptureSink` cancels the shared scan
-   token, the lease returns a non-retryable saturation error before translation,
-   and the outer worker parks the shard so the coordinator does not re-offer a
-   repository that cannot translate findings consistently,
+   with decoded blob OIDs; findings with malformed or missing blob OIDs are
+   counted but excluded from capture, causing the post-scan integrity check
+   (detected count vs captured payload count) to reject the scan before
+   translation,
 5. if `execute_repo` finishes with `FinalizeOutcome::Complete`, translates the
    captured findings into per-object persistence rows through
    `translate_git_item_result`, then durably records findings and the repo-level
@@ -940,7 +937,6 @@ The runtime tests focus on the behavior that exists today:
   cursor preservation
 - repo-frontier partial-finalize suppression of outer checkpoint progress
 - repo-frontier receipt replay determinism and checkpoint-buffer idempotency
-- repo-frontier OID-map saturation parking and parked-shard re-claim suppression
 
 These tests exercise the live local runtime paths for valid filesystem and
 git sources and verify the distributed worker loop (lease construction,

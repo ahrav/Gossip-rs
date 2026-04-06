@@ -179,7 +179,8 @@ impl OidBytes {
         self.as_slice().iter().all(|&b| b == 0)
     }
 
-    /// Wire-encoded length: 1 byte length prefix + 32 bytes payload.
+    /// Wire-encoded length: 1 byte length prefix + 32 bytes payload
+    /// (OID bytes followed by zero-padding for SHA-1).
     pub const WIRE_LEN: usize = 33;
 
     /// Encode to the fixed-size wire format used by `FindingEvent::blob_oid`.

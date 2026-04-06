@@ -370,6 +370,10 @@ impl GitEventOutput for CoordinationEventSink {
 /// git detections through the same persistence translation path used by
 /// filesystem scans.
 ///
+/// Findings that lack a decodable blob OID are counted but excluded from
+/// the captured payload vec, causing the post-scan integrity check to
+/// reject the scan as data-integrity-compromised.
+///
 /// The counter uses `Relaxed` ordering because it is only
 /// read after the scan thread joins (establishing a happens-before via
 /// `std::thread::scope`), so the final value is always visible to the reader.
@@ -437,34 +441,45 @@ impl EventOutput for FindingsCaptureSink {
             // finding is dropped due to a missing or malformed blob_oid.
             self.finding_count.fetch_add(1, Ordering::Relaxed);
 
-            match finding.blob_oid.and_then(OidBytes::decode_from_wire) {
-                Some(blob_oid) => {
-                    let record = GitFindingForPersistence {
-                        object_path: finding.object_path.into(),
-                        blob_oid,
-                        blob_offset_start: finding.start,
-                        blob_offset_end: finding.end,
-                        norm_hash: NormHash::from_digest(finding.norm_hash),
-                        rule_id: finding.rule_id,
-                    };
-                    match self.captured_findings.lock() {
-                        Ok(mut guard) => guard.push(record),
-                        Err(poison) => {
-                            tracing::error!(
-                                "captured_findings mutex poisoned; recovered guard and \
-                                 committed finding — subsequent lock attempts will also \
-                                 require poison recovery"
-                            );
-                            poison.into_inner().push(record);
+            match finding.blob_oid {
+                Some(raw) => match OidBytes::decode_from_wire(raw) {
+                    Some(blob_oid) => {
+                        let record = GitFindingForPersistence {
+                            object_path: finding.object_path.into(),
+                            blob_oid,
+                            blob_offset_start: finding.start,
+                            blob_offset_end: finding.end,
+                            norm_hash: NormHash::from_digest(finding.norm_hash),
+                            rule_id: finding.rule_id,
+                        };
+                        match self.captured_findings.lock() {
+                            Ok(mut guard) => guard.push(record),
+                            Err(poison) => {
+                                tracing::error!(
+                                    "captured_findings mutex poisoned; recovered guard and \
+                                     committed finding — subsequent lock attempts will also \
+                                     require poison recovery"
+                                );
+                                poison.into_inner().push(record);
+                            }
                         }
                     }
-                }
+                    None => {
+                        tracing::error!(
+                            source = %finding.source.as_str(),
+                            object_path_len = finding.object_path.len(),
+                            commit_id = ?finding.commit_id,
+                            "finding has blob_oid wire payload but decode failed; \
+                             persistence capture skipped — integrity check will reject this scan"
+                        );
+                    }
+                },
                 None => {
                     tracing::error!(
                         source = %finding.source.as_str(),
                         object_path_len = finding.object_path.len(),
-                        commit_id = ?finding.commit_id,
-                        "finding missing or invalid blob_oid; persistence capture skipped"
+                        "finding missing blob_oid; non-Git findings must not \
+                         flow through FindingsCaptureSink"
                     );
                 }
             }
@@ -797,6 +812,41 @@ mod tests {
             forwarded.len(),
             1,
             "inner sink must receive the event regardless of blob_oid validity"
+        );
+    }
+
+    #[test]
+    fn findings_capture_sink_count_diverges_on_mixed_valid_invalid() {
+        let (sink, _recorder) = make_sink_and_recorder();
+
+        // Two valid findings with decodable blob OIDs.
+        sink.emit_core(finding_event());
+        sink.emit_core(finding_event());
+
+        // One invalid finding with no blob OID at all.
+        sink.emit_core(CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Git,
+            object_path: b"/tmp/no-oid.txt",
+            start: 0,
+            end: 10,
+            rule_id: 1,
+            rule_name: "test",
+            norm_hash: [0xDD; 32],
+            blob_oid: None,
+            commit_id: Some(99),
+            change_kind: Some("add"),
+            confidence_score: 50,
+        }));
+
+        assert_eq!(
+            sink.detected_finding_count(),
+            3,
+            "all three findings must be counted regardless of blob_oid validity"
+        );
+        assert_eq!(
+            sink.take_captured_findings().len(),
+            2,
+            "only findings with decodable blob OIDs are captured for persistence"
         );
     }
 
