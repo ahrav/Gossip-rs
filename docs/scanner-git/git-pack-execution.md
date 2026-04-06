@@ -25,7 +25,9 @@ parsing is required for several reasons:
    records base offsets and external OIDs at planning time, and produces
    an `exec_order` permutation when forward delta dependencies exist. The
    executor uses this metadata to skip redundant header parsing on the
-   fast path (`DeltaDepHot.has_header_meta()`).
+   fast path (`DeltaDepHot.has_header_meta()`) and, on the out-of-order
+   path only, to issue advisory software-prefetch hints for upcoming pack
+   offsets and delta metadata.
 5. **Spill-backed large objects** — blobs and delta payloads exceeding
    in-memory limits are streamed into mmap-backed spill files. The sink
    reads from the spill's `as_slice()` without holding the full object in
@@ -240,7 +242,9 @@ Tiered set-associative CLOCK cache for decoded pack objects:
 
 Both tiers are 4-way set-associative. Objects > 2 MiB are not cached.
 Eviction is CLOCK by default, with an opt-in `dependency_clock` variant
-(env var `SCANNER_RS_PACK_CACHE_EVICTION`).
+(env var `SCANNER_RS_PACK_CACHE_EVICTION`). The cache also exposes a
+read-only `prefetch_slot(offset)` probe used by the out-of-order executor
+to warm cached delta bases without mutating CLOCK state or dependency hints.
 
 ### PackExecStrategy (`runner_exec.rs`)
 

@@ -101,7 +101,7 @@ pub mod commit_parse;
 pub mod commit_walk;
 /// Defines hard caps and tunables for commit-graph traversal.
 pub mod commit_walk_limits;
-#[cfg(test)]
+#[cfg(any(test, feature = "bench"))]
 pub(crate) mod delta_test_helpers;
 /// Bridges decoded blob bytes into the scan engine with overlap-safe chunking.
 pub mod engine_adapter;

@@ -17,6 +17,7 @@
 //! (`WAYS × slot_size`).
 
 use super::pack_inflate::ObjectKind;
+use crate::pack_exec::prefetch_read;
 use std::sync::OnceLock;
 
 /// Environment variable controlling optional pack-cache eviction policy.
@@ -275,6 +276,28 @@ impl PackCacheTier {
         None
     }
 
+    /// Prefetches a cached slot by pack offset without mutating eviction state.
+    ///
+    /// Returns `true` when the offset is present in this tier.
+    #[inline(always)]
+    fn prefetch_slot(&self, offset: u64) -> bool {
+        if self.sets == 0 {
+            return false;
+        }
+
+        let set = self.set_index(offset);
+        let base = set * WAYS;
+        for way in 0..WAYS {
+            let idx = base + way;
+            let slot = &self.slots[idx];
+            if slot.valid && slot.offset == offset {
+                prefetch_read(self.slot_data_ptr(idx));
+                return true;
+            }
+        }
+        false
+    }
+
     /// Inserts bytes for an offset into the cache.
     ///
     /// If an entry with the same offset already exists in the set, it is
@@ -421,6 +444,13 @@ impl PackCacheTier {
         slot.clock = 1;
         slot.dependency_guard = 0;
         slot.valid = true;
+    }
+
+    #[inline(always)]
+    fn slot_data_ptr(&self, idx: usize) -> *const u8 {
+        self.storage
+            .as_ptr()
+            .wrapping_add(idx.saturating_mul(self.slot_size as usize))
     }
 
     /// Marks a cached base as dependency-protected if present.
@@ -601,6 +631,16 @@ impl PackCache {
         None
     }
 
+    /// Prefetches cached bytes for `offset` if present, without mutating CLOCK.
+    ///
+    /// Unlike [`Self::get`], this is a read-only probe suitable for speculative
+    /// lookahead on the executor hot path. A hit does not set the CLOCK bit and
+    /// does not alter pending dependency-hint state.
+    #[inline(always)]
+    pub fn prefetch_slot(&self, offset: u64) -> bool {
+        self.small.prefetch_slot(offset) || self.large.prefetch_slot(offset)
+    }
+
     /// Inserts bytes for an offset into the cache.
     ///
     /// Returns true if the entry was cached. Oversize entries are ignored.
@@ -757,6 +797,17 @@ mod tests {
 
     const ENV_POLICY_WORKER_CASE: &str = "SCANNER_RS_PACK_CACHE_POLICY_WORKER_CASE";
 
+    fn small_slot_idx(cache: &PackCache, offset: u64) -> Option<usize> {
+        if cache.small.sets == 0 {
+            return None;
+        }
+        let set = cache.small.set_index(offset);
+        let base = set * WAYS;
+        (0..WAYS)
+            .map(|way| base + way)
+            .find(|&idx| cache.small.slots[idx].valid && cache.small.slots[idx].offset == offset)
+    }
+
     fn run_env_policy_worker(case: &str, env_policy: Option<&str>) {
         let mut cmd = Command::new(std::env::current_exe().expect("test binary path"));
         cmd.arg("--test-threads=1")
@@ -857,6 +908,41 @@ mod tests {
         let hit = cache.get(100).expect("cache hit");
         assert_eq!(hit.kind, ObjectKind::Blob);
         assert_eq!(hit.bytes, data.as_slice());
+    }
+
+    #[test]
+    fn prefetch_slot_returns_without_mutating_clock() {
+        let mut cache = PackCache::new(64 * 1024);
+        let data = vec![0xABu8; 32];
+        let offset = 100;
+        assert!(cache.insert(offset, ObjectKind::Blob, &data));
+
+        let idx = small_slot_idx(&cache, offset).expect("slot inserted");
+        cache.small.slots[idx].clock = 0;
+        cache.pending_dependency_hint = Some(offset);
+
+        assert!(cache.prefetch_slot(offset));
+        assert_eq!(cache.small.slots[idx].clock, 0);
+        assert_eq!(cache.pending_dependency_hint, Some(offset));
+    }
+
+    #[test]
+    fn prefetch_slot_returns_false_on_miss() {
+        let mut cache = PackCache::new(64 * 1024);
+        let data = vec![0xBCu8; 32];
+        assert!(cache.insert(100, ObjectKind::Blob, &data));
+
+        assert!(!cache.prefetch_slot(200));
+    }
+
+    #[test]
+    fn prefetch_slot_returns_true_for_cached_entry() {
+        let mut cache = PackCache::new(64 * 1024);
+        let data = vec![0xCDu8; 32];
+        let offset = 300;
+        assert!(cache.insert(offset, ObjectKind::Blob, &data));
+
+        assert!(cache.prefetch_slot(offset));
     }
 
     #[test]

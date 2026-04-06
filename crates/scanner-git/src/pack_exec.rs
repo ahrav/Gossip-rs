@@ -895,6 +895,73 @@ fn cache_get(cache: &mut PackCache, offset: u64) -> Option<CachedObject<'_>> {
     cache.get(offset)
 }
 
+/// Software-prefetch distance for out-of-order pack execution.
+///
+/// The executor only uses this lookahead on the `exec_order` path where the
+/// hardware prefetcher cannot infer the next pack offset from linear access.
+/// Benchmarks sweep `{0, 2, 4, 8}` and the production default stays with the
+/// best-performing constant.
+const PREFETCH_AHEAD: usize = 4;
+
+#[derive(Clone, Copy)]
+enum PrefetchLocality {
+    L1,
+    L2,
+}
+
+/// Issues a software prefetch hint for the cache line containing `ptr`.
+///
+/// The pointer is never dereferenced. The helper only emits an advisory
+/// prefetch instruction, which hardware may ignore. On x86_64 the stdarch
+/// intrinsic explicitly documents invalid pointers as safe; on AArch64 the
+/// `prfm` instruction is likewise a non-binding memory-system hint.
+#[inline(always)]
+pub(crate) fn prefetch_read(ptr: *const u8) {
+    prefetch_read_with_locality(ptr, PrefetchLocality::L1);
+}
+
+#[inline(always)]
+fn prefetch_read_l2(ptr: *const u8) {
+    prefetch_read_with_locality(ptr, PrefetchLocality::L2);
+}
+
+#[inline(always)]
+fn prefetch_read_with_locality(ptr: *const u8, locality: PrefetchLocality) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    {
+        match locality {
+            PrefetchLocality::L1 => {
+                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
+                    ptr.cast::<i8>(),
+                );
+            }
+            PrefetchLocality::L2 => {
+                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(
+                    ptr.cast::<i8>(),
+                );
+            }
+        }
+        return;
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    // SAFETY: `prfm` is an advisory prefetch hint and does not dereference `ptr`.
+    unsafe {
+        match locality {
+            PrefetchLocality::L1 => {
+                core::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nostack));
+            }
+            PrefetchLocality::L2 => {
+                core::arch::asm!("prfm pldl2keep, [{ptr}]", ptr = in(reg) ptr, options(nostack));
+            }
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (ptr, locality);
+    }
+}
+
 /// Where resolved base bytes live during delta application.
 ///
 /// Small bases are borrowed from the cache or `base_buf` (`Slice`).
@@ -1346,6 +1413,138 @@ fn execute_pack_plan_with_selector_from_header<
     Ok(report)
 }
 
+#[inline(always)]
+fn prefetch_ooo_entry_lookahead(
+    env: &DecodeEnv<'_>,
+    pack_bytes: &[u8],
+    cache: &PackCache,
+    candidate_ranges: &[CandidateRange],
+    need_idx: usize,
+) {
+    let offset = env.need_offsets[need_idx] as usize;
+    prefetch_read_l2(pack_bytes.as_ptr().wrapping_add(offset));
+    prefetch_read(std::ptr::from_ref(&env.delta_dep_index[need_idx]).cast::<u8>());
+    prefetch_read(std::ptr::from_ref(&candidate_ranges[need_idx]).cast::<u8>());
+
+    let dep_idx = env.delta_dep_index[need_idx];
+    if dep_idx == NONE_U32 {
+        return;
+    }
+
+    let dep = env.delta_deps[dep_idx as usize];
+    prefetch_read(std::ptr::from_ref(&env.delta_deps[dep_idx as usize]).cast::<u8>());
+    if !dep.is_external() {
+        let _ = cache.prefetch_slot(dep.base_offset);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_pack_plan_out_of_order_from_header<
+    const LOOKAHEAD: usize,
+    S: PackObjectSink,
+    B: ExternalBaseProvider,
+>(
+    plan: &PackPlan,
+    pack_bytes: &[u8],
+    pack_header: PackHeader,
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+    spill_dir: &Path,
+    bufs: &mut DecodeBufs,
+    delta_deps: &[DeltaDepHot],
+    external_base_oids: &[OidBytes],
+    expected_skip_items: usize,
+    order: &[u32],
+    candidate_ranges: &[CandidateRange],
+) -> Result<PackExecReport, PackExecError> {
+    debug_assert_eq!(candidate_ranges.len(), plan.need_offsets.len());
+
+    let pack = PackFile::from_header(pack_bytes, pack_header);
+    let mut report = PackExecReport::default();
+    let skip_capacity = expected_skip_items.div_ceil(100).max(64);
+    report.skips.reserve(skip_capacity.min(u32::MAX as usize));
+
+    let alloc_guard_enabled = alloc_guard::enabled();
+    let mut hot_stats = PackExecHotStats::default();
+
+    let env = DecodeEnv {
+        pack: &pack,
+        limits,
+        spill_dir,
+        max_delta_depth: plan.max_delta_depth,
+        need_offsets: &plan.need_offsets,
+        delta_deps,
+        external_base_oids,
+        delta_dep_index: &plan.delta_dep_index,
+    };
+
+    if LOOKAHEAD == 0 {
+        for &idx in order {
+            let idx = idx as usize;
+            execute_offset_range_with_scratch(
+                &env,
+                plan,
+                paths,
+                cache,
+                external,
+                sink,
+                bufs,
+                &mut report,
+                &mut hot_stats,
+                alloc_guard_enabled,
+                idx,
+                candidate_ranges[idx],
+            )?;
+        }
+    } else {
+        let prefetch_end = order.len().saturating_sub(LOOKAHEAD);
+        for i in 0..prefetch_end {
+            let ahead_idx = order[i + LOOKAHEAD] as usize;
+            prefetch_ooo_entry_lookahead(&env, pack_bytes, cache, candidate_ranges, ahead_idx);
+
+            let idx = order[i] as usize;
+            execute_offset_range_with_scratch(
+                &env,
+                plan,
+                paths,
+                cache,
+                external,
+                sink,
+                bufs,
+                &mut report,
+                &mut hot_stats,
+                alloc_guard_enabled,
+                idx,
+                candidate_ranges[idx],
+            )?;
+        }
+        for &idx in &order[prefetch_end..] {
+            let idx = idx as usize;
+            execute_offset_range_with_scratch(
+                &env,
+                plan,
+                paths,
+                cache,
+                external,
+                sink,
+                bufs,
+                &mut report,
+                &mut hot_stats,
+                alloc_guard_enabled,
+                idx,
+                candidate_ranges[idx],
+            )?;
+        }
+    }
+
+    sink.finish()?;
+    hot_stats.merge_into(&mut report.stats);
+    Ok(report)
+}
+
 /// Shared per-offset execution path for pack plan executors.
 ///
 /// Decodes one `need_offsets[idx]`, then emits all candidates in `range`.
@@ -1492,7 +1691,8 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
 /// pack header.
 ///
 /// `pack_header` must come from [`parse_pack_header_for_plan`] for the same
-/// `plan` and `pack_bytes`.
+/// `plan` and `pack_bytes`. When `plan.exec_order()` is present, the executor
+/// also issues advisory software-prefetch hints along that out-of-order path.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_pack_plan_with_scratch_from_header<S: PackObjectSink, B: ExternalBaseProvider>(
     plan: &PackPlan,
@@ -1507,14 +1707,14 @@ pub fn execute_pack_plan_with_scratch_from_header<S: PackObjectSink, B: External
     scratch: &mut PackExecScratch,
 ) -> Result<PackExecReport, PackExecError> {
     scratch.prepare(plan, limits);
-    if let Some(order) = plan.exec_order.as_ref() {
+    if let Some(order) = plan.exec_order() {
         // Out-of-order execution: precompute exact candidate ranges by need index.
         build_candidate_ranges(plan, &mut scratch.candidate_ranges);
         let candidate_ranges = scratch.candidate_ranges.as_slice();
         let bufs = &mut scratch.bufs;
         let delta_deps = scratch.delta_deps_hot.as_slice();
         let external_base_oids = scratch.external_base_oids.as_slice();
-        execute_pack_plan_with_selector_from_header(
+        execute_pack_plan_out_of_order_from_header::<PREFETCH_AHEAD, _, _>(
             plan,
             pack_bytes,
             pack_header,
@@ -1528,8 +1728,8 @@ pub fn execute_pack_plan_with_scratch_from_header<S: PackObjectSink, B: External
             delta_deps,
             external_base_oids,
             plan.candidate_offsets.len(),
-            order.iter().copied().map(|idx| idx as usize),
-            |idx| candidate_ranges[idx],
+            order,
+            candidate_ranges,
         )
     } else {
         // Monotone execution: merge candidate offsets with need offsets.
@@ -1997,6 +2197,32 @@ pub fn build_candidate_ranges(plan: &PackPlan, ranges: &mut Vec<CandidateRange>)
     for (need_idx, &offset) in plan.need_offsets.iter().enumerate() {
         ranges[need_idx] = next_candidate_range(&plan.candidate_offsets, offset, &mut cand_idx);
     }
+}
+
+#[cfg(any(test, feature = "bench"))]
+fn build_delta_dep_index(need_offsets: &[u64], delta_deps: &[DeltaDep]) -> Vec<u32> {
+    let mut index = vec![NONE_U32; need_offsets.len()];
+    if delta_deps.is_empty() {
+        return index;
+    }
+    let mut dep_idx = 0usize;
+    for (need_idx, &offset) in need_offsets.iter().enumerate() {
+        while dep_idx < delta_deps.len() && delta_deps[dep_idx].offset < offset {
+            dep_idx += 1;
+        }
+        if dep_idx < delta_deps.len() && delta_deps[dep_idx].offset == offset {
+            index[need_idx] = dep_idx as u32;
+            dep_idx += 1;
+        }
+    }
+    index
+}
+
+#[cfg(any(test, feature = "bench"))]
+fn delta_header_meta(pack: &[u8], offset: u64) -> (u64, u64) {
+    let parsed = PackFile::parse(pack, 20).expect("pack parse");
+    let header = parsed.entry_header_at(offset, 64).expect("entry header");
+    (header.data_start as u64, header.size)
 }
 
 /// Reads and validates an entry header, normalizing parse failures into
@@ -3286,6 +3512,267 @@ enum DeltaDecodeError {
     Delta(DeltaError),
 }
 
+#[cfg(feature = "bench")]
+mod bench_support {
+    use super::*;
+    use crate::byte_arena::{ByteArena, ByteRef};
+    use crate::delta_test_helpers::{make_copy_delta, SyntheticPackBuilder};
+    use crate::pack_plan_model::{BaseLoc, DeltaDep, DeltaKind, PackPlanStats};
+    use crate::tree_candidate::{CandidateContext, ChangeKind};
+
+    #[derive(Clone, Copy, Debug)]
+    pub enum PackExecBenchShape {
+        Sequential,
+        OutOfOrder,
+    }
+
+    pub struct PackExecBenchCase {
+        plan: PackPlan,
+        pack_bytes: Vec<u8>,
+        paths: ByteArena,
+        limits: PackDecodeLimits,
+    }
+
+    impl PackExecBenchCase {
+        #[must_use]
+        pub fn pack_bytes_len(&self) -> usize {
+            self.pack_bytes.len()
+        }
+    }
+
+    #[derive(Default)]
+    struct BenchSink {
+        bytes_emitted: u64,
+    }
+
+    impl PackObjectSink for BenchSink {
+        fn emit(
+            &mut self,
+            _candidate: &PackCandidate,
+            _path: &[u8],
+            bytes: &[u8],
+        ) -> Result<(), PackExecError> {
+            self.bytes_emitted = self.bytes_emitted.saturating_add(bytes.len() as u64);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct NoExternal;
+
+    impl ExternalBaseProvider for NoExternal {
+        fn load_base(&mut self, _oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError> {
+            unreachable!("synthetic benchmark does not use external bases")
+        }
+    }
+
+    fn ctx(path_ref: ByteRef) -> CandidateContext {
+        CandidateContext {
+            commit_id: 1,
+            parent_idx: 0,
+            change_kind: ChangeKind::Add,
+            ctx_flags: 0,
+            cand_flags: 0,
+            path_ref,
+        }
+    }
+
+    fn patterned_bytes(seed: usize, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|idx| ((idx.wrapping_mul(31).wrapping_add(seed.wrapping_mul(17))) % 251) as u8)
+            .collect()
+    }
+
+    fn base_size_for(idx: usize) -> usize {
+        const SIZES: [usize; 4] = [512, 2048, 8192, 16384];
+        SIZES[idx % SIZES.len()]
+    }
+
+    #[must_use]
+    pub fn bench_build_prefetch_case(
+        base_count: usize,
+        deltas_per_base: usize,
+        shape: PackExecBenchShape,
+    ) -> PackExecBenchCase {
+        assert!(base_count > 0, "base_count must be > 0");
+        assert!(deltas_per_base > 0, "deltas_per_base must be > 0");
+
+        let mut builder = SyntheticPackBuilder::new();
+        let mut base_entry_indices = Vec::with_capacity(base_count);
+        for base_idx in 0..base_count {
+            let base_bytes = patterned_bytes(base_idx, base_size_for(base_idx));
+            base_entry_indices.push(builder.add_non_delta(3, &base_bytes));
+        }
+        for base_idx in 0..base_count {
+            let base_size = base_size_for(base_idx);
+            let delta = make_copy_delta(base_size, 0, base_size);
+            for _ in 0..deltas_per_base {
+                builder.add_ofs_delta(base_entry_indices[base_idx], &delta);
+            }
+        }
+
+        let (pack_bytes, need_offsets) = builder.build();
+        let delta_start = base_count;
+        let delta_count = base_count.saturating_mul(deltas_per_base);
+
+        let mut paths = ByteArena::with_capacity(64);
+        let path_ref = paths.intern(b"bench.bin").expect("path ref");
+
+        let candidates = (0..delta_count)
+            .map(|idx| {
+                let need_idx = delta_start + idx;
+                PackCandidate {
+                    oid: OidBytes::sha1([(idx % 251) as u8; 20]),
+                    ctx: ctx(path_ref),
+                    pack_id: 0,
+                    offset: need_offsets[need_idx],
+                }
+            })
+            .collect::<Vec<_>>();
+        let candidate_offsets = (0..delta_count)
+            .map(|idx| CandidateAtOffset {
+                offset: need_offsets[delta_start + idx],
+                cand_idx: idx as u32,
+            })
+            .collect::<Vec<_>>();
+
+        let delta_deps = (0..delta_count)
+            .map(|idx| {
+                let need_idx = delta_start + idx;
+                let base_idx = idx / deltas_per_base;
+                let offset = need_offsets[need_idx];
+                let (data_start, delta_size) = delta_header_meta(&pack_bytes, offset);
+                DeltaDep {
+                    offset,
+                    kind: DeltaKind::Ofs,
+                    base: BaseLoc::Offset(need_offsets[base_idx]),
+                    data_start,
+                    delta_size,
+                }
+            })
+            .collect::<Vec<_>>();
+        let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
+        let exec_order = match shape {
+            PackExecBenchShape::Sequential => None,
+            PackExecBenchShape::OutOfOrder => {
+                let mut order = Vec::with_capacity(need_offsets.len());
+                for base_idx in 0..base_count {
+                    order.push(base_idx as u32);
+                    let delta_base = delta_start + base_idx * deltas_per_base;
+                    for delta_idx in 0..deltas_per_base {
+                        order.push((delta_base + delta_idx) as u32);
+                    }
+                }
+                Some(order)
+            }
+        };
+        let candidate_span = candidate_offsets
+            .last()
+            .zip(candidate_offsets.first())
+            .map_or(0, |(last, first)| last.offset.saturating_sub(first.offset));
+
+        let plan = PackPlan {
+            pack_id: 0,
+            oid_len: 20,
+            max_delta_depth: 16,
+            candidates,
+            candidate_offsets,
+            need_offsets,
+            delta_deps,
+            delta_dep_index,
+            exec_order: exec_order.clone(),
+            stats: PackPlanStats {
+                candidate_count: delta_count as u32,
+                need_count: (base_count + delta_count) as u32,
+                external_bases: 0,
+                forward_deps: u32::from(exec_order.is_some()),
+                candidate_span,
+                ..PackPlanStats::empty()
+            },
+        };
+
+        PackExecBenchCase {
+            plan,
+            pack_bytes,
+            paths,
+            limits: PackDecodeLimits::new(64, 128 * 1024, 128 * 1024),
+        }
+    }
+
+    fn bench_execute_sequential_case(case: &PackExecBenchCase) -> Result<u64, PackExecError> {
+        let mut cache = PackCache::new(0);
+        let mut external = NoExternal;
+        let mut sink = BenchSink::default();
+        let mut scratch = PackExecScratch::default();
+        let spill_dir = std::env::temp_dir();
+        execute_pack_plan_with_scratch(
+            &case.plan,
+            &case.pack_bytes,
+            &case.paths,
+            &case.limits,
+            &mut cache,
+            &mut external,
+            &mut sink,
+            &spill_dir,
+            &mut scratch,
+        )?;
+        Ok(sink.bytes_emitted)
+    }
+
+    fn bench_execute_prefetch_case_inner<const LOOKAHEAD: usize>(
+        case: &PackExecBenchCase,
+    ) -> Result<u64, PackExecError> {
+        let pack_header = parse_pack_header_for_plan(&case.plan, &case.pack_bytes)?;
+        let mut cache = PackCache::new(0);
+        let mut external = NoExternal;
+        let mut sink = BenchSink::default();
+        let mut scratch = PackExecScratch::default();
+        let spill_dir = std::env::temp_dir();
+
+        scratch.prepare(&case.plan, &case.limits);
+        build_candidate_ranges(&case.plan, &mut scratch.candidate_ranges);
+        let _ = execute_pack_plan_out_of_order_from_header::<LOOKAHEAD, _, _>(
+            &case.plan,
+            &case.pack_bytes,
+            pack_header,
+            &case.paths,
+            &case.limits,
+            &mut cache,
+            &mut external,
+            &mut sink,
+            &spill_dir,
+            &mut scratch.bufs,
+            scratch.delta_deps_hot.as_slice(),
+            scratch.external_base_oids.as_slice(),
+            case.plan.candidate_offsets.len(),
+            case.plan.exec_order().expect("out-of-order bench plan"),
+            scratch.candidate_ranges.as_slice(),
+        )?;
+        Ok(sink.bytes_emitted)
+    }
+
+    pub fn bench_execute_prefetch_case(
+        case: &PackExecBenchCase,
+        lookahead: usize,
+    ) -> Result<u64, PackExecError> {
+        if case.plan.exec_order().is_none() {
+            return bench_execute_sequential_case(case);
+        }
+        match lookahead {
+            0 => bench_execute_prefetch_case_inner::<0>(case),
+            2 => bench_execute_prefetch_case_inner::<2>(case),
+            4 => bench_execute_prefetch_case_inner::<4>(case),
+            8 => bench_execute_prefetch_case_inner::<8>(case),
+            _ => panic!("unsupported lookahead {lookahead}; expected one of 0, 2, 4, 8"),
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+pub use bench_support::{
+    bench_build_prefetch_case, bench_execute_prefetch_case, PackExecBenchCase, PackExecBenchShape,
+};
+
 #[cfg(test)]
 mod tests {
     use super::super::delta_test_helpers::{
@@ -3296,6 +3783,7 @@ mod tests {
     use crate::byte_arena::{ByteArena, ByteRef};
     use crate::pack_plan_model::{CandidateAtOffset, DeltaKind, PackPlanStats};
     use crate::tree_candidate::{CandidateContext, ChangeKind};
+    use rstest::rstest;
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -3398,6 +3886,44 @@ mod tests {
             external,
             sink,
             spill_dir.path(),
+        )
+        .unwrap()
+    }
+
+    fn exec_plan_with_ooo_lookahead<
+        const LOOKAHEAD: usize,
+        S: PackObjectSink,
+        B: ExternalBaseProvider,
+    >(
+        plan: &PackPlan,
+        pack: &[u8],
+        arena: &ByteArena,
+        limits: &PackDecodeLimits,
+        cache: &mut PackCache,
+        external: &mut B,
+        sink: &mut S,
+    ) -> PackExecReport {
+        let spill_dir = tempfile::tempdir().expect("spill dir");
+        let pack_header = parse_pack_header_for_plan(plan, pack).expect("pack header");
+        let mut scratch = PackExecScratch::default();
+        scratch.prepare(plan, limits);
+        build_candidate_ranges(plan, &mut scratch.candidate_ranges);
+        execute_pack_plan_out_of_order_from_header::<LOOKAHEAD, _, _>(
+            plan,
+            pack,
+            pack_header,
+            arena,
+            limits,
+            cache,
+            external,
+            sink,
+            spill_dir.path(),
+            &mut scratch.bufs,
+            scratch.delta_deps_hot.as_slice(),
+            scratch.external_base_oids.as_slice(),
+            plan.candidate_offsets.len(),
+            plan.exec_order().expect("out-of-order plan"),
+            scratch.candidate_ranges.as_slice(),
         )
         .unwrap()
     }
@@ -3709,6 +4235,217 @@ mod tests {
             .expect("64-bit usize should represent u32::MAX + 1");
         let result = std::panic::catch_unwind(|| CandidateRange::from_bounds(0, overflow));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn prefetch_read_is_noop_on_valid_and_null_pointers() {
+        let buf = [0u8; 64];
+        prefetch_read(buf.as_ptr());
+        prefetch_read(std::ptr::null());
+        prefetch_read(0xDEAD_BEEFusize as *const u8);
+    }
+
+    #[test]
+    fn prefetch_read_compiles_and_runs() {
+        let buf = [0u8; 128];
+        prefetch_read(buf.as_ptr());
+        prefetch_read(buf.as_ptr().wrapping_add(64));
+        prefetch_read_l2(buf.as_ptr());
+    }
+
+    #[cfg(miri)]
+    #[test]
+    fn prefetch_read_under_miri_is_safe_noop() {
+        let buf = [0u8; 32];
+        prefetch_read(buf.as_ptr());
+        prefetch_read_l2(buf.as_ptr());
+        prefetch_read(std::ptr::dangling::<u8>());
+    }
+
+    #[test]
+    fn hot_loop_with_prefetch_produces_identical_output() {
+        let base_bytes = b"base-bytes";
+        let filler = [
+            (ObjectKind::Blob, b"one".as_slice()),
+            (ObjectKind::Blob, b"two".as_slice()),
+            (ObjectKind::Blob, b"three".as_slice()),
+            (ObjectKind::Blob, b"four".as_slice()),
+        ];
+        let delta_payload =
+            super::super::delta_test_helpers::make_copy_delta(base_bytes.len(), 0, 4);
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&6u32.to_be_bytes());
+
+        let base_offset = pack.len() as u64;
+        pack.extend_from_slice(&encode_entry_header_kind(
+            ObjectKind::Blob,
+            base_bytes.len(),
+        ));
+        pack.extend_from_slice(&zlib_compress(base_bytes));
+
+        let mut need_offsets = vec![base_offset];
+        for (kind, data) in filler {
+            let offset = pack.len() as u64;
+            need_offsets.push(offset);
+            pack.extend_from_slice(&encode_entry_header_kind(kind, data.len()));
+            pack.extend_from_slice(&zlib_compress(data));
+        }
+
+        let delta_offset = pack.len() as u64;
+        need_offsets.push(delta_offset);
+        let mut delta_entry = encode_entry_header(6, delta_payload.len());
+        delta_entry.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
+        delta_entry.extend_from_slice(&zlib_compress(&delta_payload));
+        pack.extend_from_slice(&delta_entry);
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidates = need_offsets
+            .iter()
+            .enumerate()
+            .map(|(idx, &offset)| PackCandidate {
+                oid: OidBytes::sha1([idx as u8; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset,
+            })
+            .collect::<Vec<_>>();
+        let candidate_offsets = need_offsets
+            .iter()
+            .enumerate()
+            .map(|(idx, &offset)| CandidateAtOffset {
+                offset,
+                cand_idx: idx as u32,
+            })
+            .collect::<Vec<_>>();
+        let (data_start, delta_size) = delta_header_meta(&pack, delta_offset);
+        let delta_deps = vec![DeltaDep {
+            offset: delta_offset,
+            kind: DeltaKind::Ofs,
+            base: BaseLoc::Offset(base_offset),
+            data_start,
+            delta_size,
+        }];
+        let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
+        let plan = PackPlan {
+            pack_id: 0,
+            oid_len: 20,
+            max_delta_depth: 16,
+            candidates,
+            candidate_offsets,
+            need_offsets,
+            delta_deps,
+            delta_dep_index,
+            exec_order: Some(vec![0, 2, 4, 1, 3, 5]),
+            stats: PackPlanStats {
+                candidate_count: 6,
+                need_count: 6,
+                external_bases: 0,
+                forward_deps: 1,
+                candidate_span: delta_offset - base_offset,
+                ..PackPlanStats::empty()
+            },
+        };
+
+        let mut cache_no_prefetch = PackCache::new(64 * 1024);
+        let mut cache_prefetch = PackCache::new(64 * 1024);
+        let mut external = NoExternal;
+        let mut sink_no_prefetch = CollectingSink::default();
+        let mut sink_prefetch = CollectingSink::default();
+        let limits = PackDecodeLimits::new(64, 1024, 1024);
+
+        let report_no_prefetch = exec_plan_with_ooo_lookahead::<0, _, _>(
+            &plan,
+            &pack,
+            &arena,
+            &limits,
+            &mut cache_no_prefetch,
+            &mut external,
+            &mut sink_no_prefetch,
+        );
+        let report_prefetch = exec_plan_with_ooo_lookahead::<PREFETCH_AHEAD, _, _>(
+            &plan,
+            &pack,
+            &arena,
+            &limits,
+            &mut cache_prefetch,
+            &mut NoExternal,
+            &mut sink_prefetch,
+        );
+
+        assert_eq!(sink_prefetch.blobs, sink_no_prefetch.blobs);
+        assert_eq!(report_prefetch.skips.len(), report_no_prefetch.skips.len());
+        assert_eq!(
+            report_prefetch.stats.emitted_candidates,
+            report_no_prefetch.stats.emitted_candidates
+        );
+    }
+
+    #[rstest]
+    #[case(1)]
+    #[case(2)]
+    #[case(PREFETCH_AHEAD)]
+    #[case(PREFETCH_AHEAD + 1)]
+    #[case(PREFETCH_AHEAD + 2)]
+    fn prefetch_lookahead_does_not_oob_at_plan_tail(#[case] plan_len: usize) {
+        let entries = (0..plan_len)
+            .map(|idx| {
+                (
+                    ObjectKind::Blob,
+                    vec![idx as u8; idx.saturating_add(1).max(1)],
+                )
+            })
+            .collect::<Vec<_>>();
+        let entry_refs = entries
+            .iter()
+            .map(|(kind, data)| (*kind, data.as_slice()))
+            .collect::<Vec<_>>();
+        let (pack, offsets) = build_pack(&entry_refs);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidates = offsets
+            .iter()
+            .enumerate()
+            .map(|(idx, &offset)| PackCandidate {
+                oid: OidBytes::sha1([idx as u8; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset,
+            })
+            .collect::<Vec<_>>();
+        let candidate_offsets = offsets
+            .iter()
+            .enumerate()
+            .map(|(idx, &offset)| CandidateAtOffset {
+                offset,
+                cand_idx: idx as u32,
+            })
+            .collect::<Vec<_>>();
+        let exec_order = (0..plan_len)
+            .rev()
+            .map(|idx| idx as u32)
+            .collect::<Vec<_>>();
+        let plan = build_plan(offsets, candidates, candidate_offsets, Some(exec_order));
+
+        let mut cache = PackCache::new(0);
+        let mut sink = TestSink::default();
+        let report = exec_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut NoExternal,
+            &mut sink,
+        );
+
+        assert_perf_u32(report.stats.emitted_candidates, plan_len as u32);
+        assert_eq!(sink.emitted.len(), plan_len);
     }
 
     #[test]

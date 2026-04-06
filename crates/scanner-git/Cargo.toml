@@ -98,6 +98,11 @@ harness = false
 required-features = ["bench"]
 
 [[bench]]
+name = "pack_exec_prefetch"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
 name = "path_policy"
 harness = false
 
