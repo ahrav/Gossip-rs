@@ -27,6 +27,8 @@ use std::{
     sync::Arc,
 };
 
+use ahash::AHashMap;
+
 use gossip_contracts::{
     connector::{GIT_CONNECTOR_TAG, Location, ScanItem, VersionId, git::RepoKey},
     identity::{
@@ -553,7 +555,7 @@ pub(crate) fn translate_git_item_result(
     bytes_scanned: u64,
     timing: ScanTiming,
     findings: &[GitFindingForPersistence],
-    commit_oid_map: &HashMap<u32, OidBytes>,
+    commit_oid_map: &AHashMap<u32, OidBytes>,
     rule_fingerprint: &dyn Fn(u32) -> RuleFingerprint,
 ) -> Result<PersistenceTranslation, ResultTranslationError> {
     let done_ledger_item = git_repo_ovid_inputs(repo_id);
@@ -661,7 +663,7 @@ fn translate_git_findings<R>(
     write_context: WriteContext,
     tenant_secret_key: &TenantSecretKey,
     repo_key: &RepoKey,
-    commit_oid_map: &HashMap<u32, OidBytes>,
+    commit_oid_map: &AHashMap<u32, OidBytes>,
     seen_at: LogicalTime,
     findings_input: &[GitFindingForPersistence],
     rule_fingerprint: &R,
@@ -908,7 +910,8 @@ mod tests {
         FsFindingRef, ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
         translate_git_item_result, translate_item_result,
     };
-    use std::collections::HashMap;
+
+    use ahash::AHashMap;
 
     use crate::coordination_sink::GitFindingForPersistence;
     use crate::event_sink::sanitize_path;
@@ -953,8 +956,8 @@ mod tests {
         OidBytes::sha1([0x11; 20])
     }
 
-    fn git_commit_oid_map() -> HashMap<u32, OidBytes> {
-        HashMap::from([(7, git_commit_oid())])
+    fn git_commit_oid_map() -> AHashMap<u32, OidBytes> {
+        AHashMap::from_iter([(7, git_commit_oid())])
     }
 
     fn boxed_path(path: &[u8]) -> Box<[u8]> {
@@ -1898,7 +1901,7 @@ mod tests {
             };
 
             let repo_key = git_repo_key();
-            let commit_oid_map = HashMap::from([(7, commit_oid)]);
+            let commit_oid_map = AHashMap::from_iter([(7, commit_oid)]);
             let item = git_object_scan_item(&repo_key, &object_path, commit_oid);
 
             let fs_t = translate_item_result(
@@ -2067,7 +2070,7 @@ mod tests {
     fn translate_git_item_result_uses_distinct_ovids_for_same_path_different_commits() {
         let commit_oid_a = OidBytes::sha1([0x11; 20]);
         let commit_oid_b = OidBytes::sha1([0x22; 20]);
-        let commit_oid_map = HashMap::from([(7, commit_oid_a), (8, commit_oid_b)]);
+        let commit_oid_map = AHashMap::from_iter([(7, commit_oid_a), (8, commit_oid_b)]);
         let repo_key = git_repo_key();
         let translated = translate_git_item_result(
             write_context(),
