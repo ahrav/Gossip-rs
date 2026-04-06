@@ -911,15 +911,12 @@ where
                     "OID-map saturation supersedes scan error; \
                      original cause preserved in this log entry"
                 );
-                return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
-                    anyhow!(
-                        "git repo-frontier shard '{}': commit OID map saturated \
-                     at {} entries; scan error superseded by OID-map saturation \
-                     (original: {err})",
-                        stage_sink.redacted_shard_id(),
-                        FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES,
+                return Err(oid_map_saturation_error(
+                    stage_sink.redacted_shard_id(),
+                    &format!(
+                        "scan error superseded by OID-map saturation (original: {err})"
                     ),
-                )));
+                ));
             }
             return Err(err);
         }
