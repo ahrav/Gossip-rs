@@ -86,7 +86,7 @@ rule_name ──── derive_rule_fingerprint() ──> RuleFingerprint ──�
 | `SecretHash`               | Tenant-scoped secret identity, derived by keying `NormHash` with `TenantSecretKey`                    |
 | `RuleFingerprint`          | Position-independent identity of the detection rule, derived from the rule name via `derive_rule_fingerprint()` using BLAKE3 derive-key with `RULE_FINGERPRINT_V1` |
 | `FindingId`                | Version-stable finding identity: `(TenantId, StableItemId, RuleFingerprint, SecretHash)`              |
-| `ObjectVersionId`          | Version-specific content identity (commit SHA, S3 ETag, etc.)                                         |
+| `ObjectVersionId`          | Version-specific content identity (Git blob OID, S3 ETag, etc.)                                       |
 | `OccurrenceId`             | Version-specific occurrence: `(FindingId, ObjectVersionId, byte_offset, byte_length)`                 |
 | `ObservationId`            | Policy-scoped detection event: `(TenantId, PolicyHash, OccurrenceId)`                                 |
 

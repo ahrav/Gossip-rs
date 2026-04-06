@@ -1961,6 +1961,20 @@ mod tests {
     }
 
     #[test]
+    fn git_blob_version_id_distinguishes_sha1_from_sha256_with_same_prefix() {
+        let sha1 = OidBytes::sha1([0xAA; 20]);
+        let mut sha256_bytes = [0u8; 32];
+        sha256_bytes[..20].copy_from_slice(&[0xAA; 20]);
+        let sha256 = OidBytes::sha256(sha256_bytes);
+        assert_ne!(
+            git_blob_version_id(sha1),
+            git_blob_version_id(sha256),
+            "SHA-1 and SHA-256 OIDs with identical 20-byte prefix must produce \
+             distinct ObjectVersionId values"
+        );
+    }
+
+    #[test]
     fn translate_git_item_result_uses_distinct_observation_ovids_for_distinct_objects() {
         let translated = translate_git_scanned(&[
             git_finding_with_blob_oid(b"src/lib.rs", git_blob_oid(0x11), 7, 10, 20, 0xAA),
