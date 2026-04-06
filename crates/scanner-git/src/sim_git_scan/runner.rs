@@ -5,7 +5,7 @@
 //! shape (sorted/disjoint sets) and stability across schedule seeds.
 //!
 //! Stage pipeline:
-//! `RepoOpen -> CommitWalk -> TreeDiff -> PackExec -> Finalize`
+//! `RepoOpen -> CommitWalk -> TreeDiff -> SpillDedupe -> PackExec -> Finalize`
 //!
 //! Each stage is executed exactly once per run. Stage outputs are carried in
 //! `RunState` and validated at the end of the run before a `RunReport` is
@@ -17,13 +17,15 @@ use std::sync::atomic::AtomicBool;
 
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
+use tempfile::tempdir;
 
 use crate::sim::executor::{SimExecutor, SimTask, SimTaskId, StepResult};
 use crate::{
-    build_pack_plans, ByteArena, BytesView, CandidateBuffer, CommitGraph, CommitPlanIter,
-    CommitWalkLimits, FinalizeOutcome, OidBytes, PackCache, PackDecodeLimits, PackExecError,
-    PackExecReport, PackPlanConfig, PackReadError, PackReader, PlannedCommit, RefWatermark,
-    StartSetRef, TreeDiffLimits, TreeDiffWalker,
+    build_pack_plans, ByteArena, BytesView, CandidateBuffer, CollectingUniqueBlobSink, CommitGraph,
+    CommitPlanIter, CommitWalkLimits, FinalizeOutcome, FinalizeOutput, FinalizeStats,
+    NeverSeenStore, OidBytes, PackCache, PackDecodeLimits, PackExecError, PackExecReport,
+    PackPlanConfig, PackReadError, PackReader, PersistenceStore, PlannedCommit, RefWatermark,
+    SpillLimits, SpillStats, Spiller, StartSetRef, TreeDiffLimits, TreeDiffWalker,
 };
 
 use super::commit_graph::SimCommitGraph;
@@ -34,6 +36,7 @@ use super::fault::{
 };
 use super::pack_bytes::SimPackBytes;
 use super::pack_io::SimPackIo;
+use super::persist::SimPersistStore;
 use super::scenario::{GitRunConfig, GitScenario};
 use super::start_set::SimStartSet;
 use super::trace::{GitTraceEvent, GitTraceRing};
@@ -65,7 +68,7 @@ impl From<FinalizeOutcome> for SimFinalizeOutcome {
 }
 
 /// Summary report for a successful run.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunReport {
     /// Total steps executed.
     pub steps: u64,
@@ -83,6 +86,13 @@ pub struct RunReport {
     pub skipped_hash: [u8; 32],
     /// Hash of trace events (order-sensitive, bounded to the trace ring).
     pub trace_hash: [u8; 32],
+    /// Raw trace events for corpus regeneration and debugging.
+    ///
+    /// Bounded by the trace ring capacity (`GitRunConfig::trace_capacity`).
+    /// Serialized with `#[serde(default)]` so older corpus files that lack
+    /// this field deserialize cleanly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trace_dump: Vec<GitTraceEvent>,
 }
 
 /// Semantic subset of `RunReport` used for cross-seed stability checks.
@@ -111,7 +121,7 @@ impl From<&RunReport> for RunOutput {
 }
 
 /// Structured failure report captured in artifacts.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureReport {
     /// Failure classification.
     pub kind: FailureKind,
@@ -122,7 +132,7 @@ pub struct FailureReport {
 }
 
 /// Failure classification for deterministic triage.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureKind {
     /// A panic escaped from harness logic.
     Panic,
@@ -209,11 +219,20 @@ impl GitSimRunner {
         }));
         match result {
             Ok(outcome) => outcome,
-            Err(_) => RunOutcome::Failed(FailureReport {
-                kind: FailureKind::Panic,
-                message: "panic in git sim runner".to_string(),
-                step: 0,
-            }),
+            Err(payload) => {
+                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                    format!("panic in git sim runner: {s}")
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    format!("panic in git sim runner: {s}")
+                } else {
+                    "panic in git sim runner (non-string payload)".to_string()
+                };
+                RunOutcome::Failed(FailureReport {
+                    kind: FailureKind::Panic,
+                    message: msg,
+                    step: 0,
+                })
+            }
         }
     }
 
@@ -258,6 +277,7 @@ impl GitSimRunner {
                         StageKind::RepoOpen => stage_repo_open(&mut state),
                         StageKind::CommitWalk => stage_commit_walk(&mut state),
                         StageKind::TreeDiff => stage_tree_diff(&mut state),
+                        StageKind::SpillDedupe => stage_spill_dedupe(&mut state),
                         StageKind::PackExec => stage_pack_exec(&mut state),
                         StageKind::Finalize => stage_finalize(&mut state),
                     };
@@ -278,6 +298,9 @@ impl GitSimRunner {
                                     spawn_stage(&mut executor, &mut tasks, StageKind::TreeDiff);
                                 }
                                 StageKind::TreeDiff => {
+                                    spawn_stage(&mut executor, &mut tasks, StageKind::SpillDedupe);
+                                }
+                                StageKind::SpillDedupe => {
                                     spawn_stage(&mut executor, &mut tasks, StageKind::PackExec);
                                 }
                                 StageKind::PackExec => {
@@ -325,8 +348,9 @@ enum StageKind {
     RepoOpen = 1,
     CommitWalk = 2,
     TreeDiff = 3,
-    PackExec = 4,
-    Finalize = 5,
+    SpillDedupe = 4,
+    PackExec = 5,
+    Finalize = 6,
 }
 
 /// Mutable per-run state threaded through stage execution.
@@ -343,6 +367,9 @@ struct RunState<'a> {
     tree_source: Option<SimTreeSource>,
     plan: Vec<PlannedCommit>,
     candidates: Option<CandidateBuffer>,
+    persist_store: SimPersistStore,
+    spill_stats: Option<SpillStats>,
+    unique_oids: Option<Vec<OidBytes>>,
     scanned: Vec<OidBytes>,
     skipped: Vec<OidBytes>,
     outcome: Option<FinalizeOutcome>,
@@ -350,20 +377,53 @@ struct RunState<'a> {
 
 impl<'a> RunState<'a> {
     fn new(scenario: &'a GitScenario, trace_capacity: u32, fault_plan: GitFaultPlan) -> Self {
+        let (runner_plan, persist_plan) = partition_fault_plan(fault_plan);
         Self {
             scenario,
             trace: GitTraceRing::new(trace_capacity as usize),
-            faults: GitFaultInjector::new(fault_plan),
+            faults: GitFaultInjector::new(runner_plan),
             ref_arena: None,
             refs: Vec::new(),
             commit_graph: None,
             tree_source: None,
             plan: Vec::new(),
             candidates: None,
+            persist_store: SimPersistStore::new(persist_plan),
+            spill_stats: None,
+            unique_oids: None,
             scanned: Vec::new(),
             skipped: Vec::new(),
             outcome: None,
         }
+    }
+}
+
+/// Split a fault plan into runner-owned and persistence-owned partitions.
+///
+/// The runner injector handles artifact I/O faults (`CommitGraph`, `Midx`,
+/// `Pack`, `Other`). The persistence store handles `Persist` and `SeenPersist`
+/// faults via its own internal injector. Partitioning avoids cloning the full
+/// plan into both consumers and makes the ownership boundary explicit.
+fn partition_fault_plan(plan: GitFaultPlan) -> (GitFaultPlan, GitFaultPlan) {
+    let (persist, runner): (Vec<_>, Vec<_>) = plan
+        .resources
+        .into_iter()
+        .partition(|r| is_persist_resource(&r.resource));
+    (
+        GitFaultPlan { resources: runner },
+        GitFaultPlan { resources: persist },
+    )
+}
+
+/// Returns true for resources consumed by `SimPersistStore` rather than
+/// the runner's `GitFaultInjector`. See `partition_fault_plan`.
+fn is_persist_resource(id: &GitResourceId) -> bool {
+    match id {
+        GitResourceId::Persist | GitResourceId::SeenPersist => true,
+        GitResourceId::CommitGraph
+        | GitResourceId::Midx
+        | GitResourceId::Pack { .. }
+        | GitResourceId::Other(_) => false,
     }
 }
 
@@ -557,7 +617,53 @@ fn stage_tree_diff(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     Ok(count)
 }
 
-/// Stage 4: execute pack plans and partition candidates into scanned/skipped.
+/// Stage 4: spill/dedupe tree-diff candidates and persist seen-bitmap deltas.
+///
+/// Uses `NeverSeenStore` (all blobs considered unseen) and `SpillLimits::RESTRICTIVE`
+/// to exercise the full spill pipeline with bounded resource usage. Seen-bitmap
+/// persistence faults are injected through `state.persist_store`.
+fn stage_spill_dedupe(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
+    let (stats, unique_oids) = {
+        let candidates = state
+            .candidates
+            .as_ref()
+            .ok_or_else(|| failure_inv(80, "candidates missing"))?;
+        let oid_len = to_object_format(state.scenario.repo.object_format).oid_len();
+        // The TempDir must outlive the Spiller — the spiller writes run
+        // files to spill_dir.path() and cleans them up on finalize/drop.
+        let spill_dir = tempdir().map_err(|err| failure_inv(81, err))?;
+        let mut spiller = Spiller::new(SpillLimits::RESTRICTIVE, oid_len, spill_dir.path())
+            .map_err(|err| failure_inv(82, err))?;
+
+        for cand in candidates.iter_resolved() {
+            spiller
+                .push(
+                    cand.oid,
+                    cand.path,
+                    cand.commit_id,
+                    cand.parent_idx,
+                    cand.change_kind,
+                    cand.ctx_flags,
+                    cand.cand_flags,
+                )
+                .map_err(|err| failure_inv(83, err))?;
+        }
+
+        let mut sink = CollectingUniqueBlobSink::default();
+        let stats = spiller
+            .finalize(&NeverSeenStore, &state.persist_store, &mut sink)
+            .map_err(|err| failure_inv(84, err))?;
+        let unique_oids = dedupe_sorted(sink.blobs.into_iter().map(|blob| blob.oid).collect());
+        (stats, unique_oids)
+    };
+
+    let item_count = unique_oids.len() as u32;
+    state.spill_stats = Some(stats);
+    state.unique_oids = Some(unique_oids);
+    Ok(item_count)
+}
+
+/// Stage 5: execute pack plans and partition candidates into scanned/skipped.
 ///
 /// Fallback behavior is intentionally deterministic:
 /// - no artifacts => treat semantic candidates as scanned
@@ -567,6 +673,18 @@ fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let Some(candidates) = state.candidates.as_ref() else {
         return Err(failure_inv(30, "candidates missing"));
     };
+    let Some(unique_oids) = state.unique_oids.as_ref() else {
+        return Err(failure_inv(85, "spill dedupe output missing"));
+    };
+    // Valid because stage_spill_dedupe uses NeverSeenStore, so no OIDs are
+    // filtered by the seen store. If a filtering seen store is introduced,
+    // this oracle must be relaxed to a subset check instead of equality.
+    let candidate_oids = collect_unique_candidate_oids(candidates);
+    if candidate_oids != *unique_oids {
+        return Err(failure_oracle(
+            "spill dedupe unique OIDs differ from tree-diff candidate OIDs",
+        ));
+    }
 
     let mut scanned: Vec<OidBytes> = Vec::new();
     let mut skipped: Vec<OidBytes> = Vec::new();
@@ -708,7 +826,12 @@ fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     Ok(state.scanned.len() as u32)
 }
 
-/// Stage 5: derive finalize outcome from collected scanned/skipped sets.
+/// Stage 6: derive finalize outcome and commit persistence.
+///
+/// Builds a minimal `FinalizeOutput` and routes it through the persist
+/// store so that `Persist`-targeted faults in the fault plan are exercised.
+/// Watermark ops are only produced on a `Complete` outcome, matching the
+/// production pipeline's two-phase persistence contract.
 fn stage_finalize(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let skipped_count = state.skipped.len();
     let outcome = if skipped_count == 0 {
@@ -720,6 +843,21 @@ fn stage_finalize(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     if matches!(outcome, FinalizeOutcome::Complete) && skipped_count != 0 {
         return Err(failure_inv(50, "complete with skips"));
     }
+
+    // Build a minimal FinalizeOutput and commit it to the persist store.
+    // This exercises Persist-targeted faults that partition_fault_plan routed
+    // to the SimPersistStore. Data/watermark ops are empty because the
+    // simulation does not model per-blob persistence at this level.
+    let output = FinalizeOutput {
+        data_ops: Vec::new(),
+        watermark_ops: Vec::new(),
+        outcome,
+        stats: FinalizeStats::default(),
+    };
+    state
+        .persist_store
+        .commit_finalize(&output)
+        .map_err(|err| failure_inv(51, err))?;
 
     state.outcome = Some(outcome);
     Ok(skipped_count as u32)
@@ -792,6 +930,17 @@ fn collect_semantic_candidates(candidates: &CandidateBuffer, out: &mut Vec<OidBy
     }
 }
 
+/// Extract, sort, and deduplicate OIDs from a semantic candidate buffer.
+///
+/// The candidate buffer may contain duplicate OIDs (e.g., the same blob
+/// referenced from multiple commits). This function normalizes them into
+/// a canonical sorted-unique set for oracle comparisons.
+fn collect_unique_candidate_oids(candidates: &CandidateBuffer) -> Vec<OidBytes> {
+    let mut oids = Vec::with_capacity(candidates.len());
+    collect_semantic_candidates(candidates, &mut oids);
+    dedupe_sorted(oids)
+}
+
 /// Sort and deduplicate OIDs to normalize set-like outputs.
 ///
 /// Downstream invariants and hashes assume canonical ordering.
@@ -813,7 +962,8 @@ fn build_report(state: &RunState<'_>, steps: u64) -> Result<RunReport, FailureRe
 
     let scanned_hash = hash_oids(&state.scanned);
     let skipped_hash = hash_oids(&state.skipped);
-    let trace_hash = hash_trace(&state.trace.dump());
+    let trace_dump = state.trace.dump();
+    let trace_hash = hash_trace(&trace_dump);
     let skipped_count = state.skipped.len();
 
     Ok(RunReport {
@@ -825,6 +975,7 @@ fn build_report(state: &RunState<'_>, steps: u64) -> Result<RunReport, FailureRe
         scanned_hash,
         skipped_hash,
         trace_hash,
+        trace_dump,
     })
 }
 
@@ -1073,6 +1224,10 @@ fn validate_outputs(state: &RunState<'_>) -> Result<FinalizeOutcome, FailureRepo
     let outcome = state
         .outcome
         .ok_or_else(|| failure_inv(60, "missing finalize outcome"))?;
+    let unique_oids = state
+        .unique_oids
+        .as_ref()
+        .ok_or_else(|| failure_inv(64, "missing spill dedupe output"))?;
 
     // Enforce set semantics: sorted, unique, and disjoint.
     if !is_sorted_unique(&state.scanned) {
@@ -1104,6 +1259,19 @@ fn validate_outputs(state: &RunState<'_>) -> Result<FinalizeOutcome, FailureRepo
                 return Err(failure_oracle("partial outcome with zero skips"));
             }
         }
+    }
+
+    // Conservation check: scanned + skipped must account for every unique OID
+    // from spill dedupe. Valid because NeverSeenStore passes all candidates
+    // through; if a filtering seen store is introduced, this check must be
+    // relaxed to allow for OIDs removed by the seen store.
+    let mut accounted_oids = state.scanned.clone();
+    accounted_oids.extend_from_slice(&state.skipped);
+    let accounted_oids = dedupe_sorted(accounted_oids);
+    if accounted_oids != *unique_oids {
+        return Err(failure_oracle(
+            "spill dedupe OIDs do not match the final scanned/skipped partition",
+        ));
     }
 
     Ok(outcome)
@@ -1151,14 +1319,82 @@ fn failure_oracle<T: std::fmt::Display>(err: T) -> FailureReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim_git_scan::fault::GitResourceFaults;
     use crate::sim_git_scan::scenario::{
         GitBlobSpec, GitCommitSpec, GitObjectFormat, GitOid, GitRefSpec, GitRepoModel, GitScenario,
         GitTreeEntryKind, GitTreeEntrySpec, GitTreeSpec,
     };
+    use crate::sim_git_scan::PersistPhase;
+    use crate::ChangeKind;
 
     fn oid(val: u8) -> GitOid {
         GitOid {
             bytes: vec![val; 20],
+        }
+    }
+
+    /// Two independent root commits whose trees both reference the same blob OID.
+    ///
+    /// TreeDiff emits one candidate per root commit (diffed against empty tree),
+    /// producing two candidates with identical OID `oid(30)`. SpillDedupe must
+    /// deduplicate them down to a single unique OID.
+    fn duplicate_oid_scenario() -> GitScenario {
+        GitScenario {
+            schema_version: super::super::scenario::GIT_SCENARIO_SCHEMA_VERSION,
+            repo: GitRepoModel {
+                object_format: GitObjectFormat::Sha1,
+                refs: vec![
+                    GitRefSpec {
+                        name: b"refs/heads/a".to_vec(),
+                        tip: oid(1),
+                        watermark: None,
+                    },
+                    GitRefSpec {
+                        name: b"refs/heads/b".to_vec(),
+                        tip: oid(2),
+                        watermark: None,
+                    },
+                ],
+                commits: vec![
+                    GitCommitSpec {
+                        oid: oid(1),
+                        parents: Vec::new(),
+                        tree: oid(10),
+                        generation: 1,
+                    },
+                    GitCommitSpec {
+                        oid: oid(2),
+                        parents: Vec::new(),
+                        tree: oid(11),
+                        generation: 1,
+                    },
+                ],
+                trees: vec![
+                    GitTreeSpec {
+                        oid: oid(10),
+                        entries: vec![GitTreeEntrySpec {
+                            name: b"f.txt".to_vec(),
+                            mode: 0o100644,
+                            oid: oid(30),
+                            kind: GitTreeEntryKind::Blob,
+                        }],
+                    },
+                    GitTreeSpec {
+                        oid: oid(11),
+                        entries: vec![GitTreeEntrySpec {
+                            name: b"g.txt".to_vec(),
+                            mode: 0o100644,
+                            oid: oid(30),
+                            kind: GitTreeEntryKind::Blob,
+                        }],
+                    },
+                ],
+                blobs: vec![GitBlobSpec {
+                    oid: oid(30),
+                    bytes: b"shared".to_vec(),
+                }],
+            },
+            artifacts: None,
         }
     }
 
@@ -1240,6 +1476,14 @@ mod tests {
             },
             decision.clone(),
             GitTraceEvent::StageEnter {
+                stage_id: StageKind::SpillDedupe as u16,
+            },
+            GitTraceEvent::StageExit {
+                stage_id: StageKind::SpillDedupe as u16,
+                items: 1,
+            },
+            decision.clone(),
+            GitTraceEvent::StageEnter {
                 stage_id: StageKind::PackExec as u16,
             },
             GitTraceEvent::StageExit {
@@ -1262,6 +1506,186 @@ mod tests {
         assert_eq!(report.candidate_count, 1);
         assert_eq!(report.skipped_count, 0);
         assert_eq!(report.outcome, SimFinalizeOutcome::Complete);
+    }
+
+    #[test]
+    fn spill_dedupe_persists_seen_delta_ops() {
+        let scenario = simple_scenario();
+        let mut state = RunState::new(&scenario, 64, GitFaultPlan::default());
+
+        assert_eq!(stage_repo_open(&mut state).unwrap(), 1);
+        assert_eq!(stage_commit_walk(&mut state).unwrap(), 1);
+        assert_eq!(stage_tree_diff(&mut state).unwrap(), 1);
+        assert_eq!(stage_spill_dedupe(&mut state).unwrap(), 1);
+
+        let seen_ops: Vec<_> = state
+            .persist_store
+            .log()
+            .into_iter()
+            .filter(|op| op.phase == PersistPhase::SeenDelta)
+            .collect();
+        assert_eq!(seen_ops.len(), 1);
+        assert_eq!(seen_ops[0].key, vec![3; 20]);
+
+        let spill_stats = state.spill_stats.as_ref().expect("spill stats");
+        assert_eq!(spill_stats.spill_runs, 0);
+        assert_eq!(spill_stats.spill_bytes, 0);
+        assert_eq!(
+            state.unique_oids.as_deref(),
+            Some(&[OidBytes::sha1([3; 20])][..])
+        );
+    }
+
+    #[test]
+    fn runner_fails_when_seen_persist_fault_is_injected() {
+        let scenario = simple_scenario();
+        let plan = GitFaultPlan {
+            resources: vec![GitResourceFaults {
+                resource: GitResourceId::SeenPersist,
+                reads: vec![super::super::fault::GitReadFault {
+                    fault: Some(GitIoFault::ErrKind { kind: 1 }),
+                    latency_ticks: 0,
+                    corruption: None,
+                }],
+            }],
+        };
+        let cfg = GitRunConfig {
+            workers: 1,
+            max_steps: 0,
+            stability_runs: 1,
+            trace_capacity: 64,
+        };
+        let runner = GitSimRunner::new(cfg, 11);
+        let outcome = runner.run(&scenario, &plan);
+        let failure = match outcome {
+            RunOutcome::Failed(fail) => fail,
+            RunOutcome::Ok { report } => panic!("expected failure, got {report:?}"),
+        };
+
+        assert!(matches!(
+            failure.kind,
+            FailureKind::InvariantViolation { code: 84 }
+        ));
+        assert!(failure.message.contains("seen-persist"));
+    }
+
+    #[test]
+    fn spill_dedupe_handles_zero_candidates() {
+        let scenario = GitScenario {
+            schema_version: super::super::scenario::GIT_SCENARIO_SCHEMA_VERSION,
+            repo: GitRepoModel {
+                object_format: GitObjectFormat::Sha1,
+                refs: vec![GitRefSpec {
+                    name: b"refs/heads/main".to_vec(),
+                    tip: oid(1),
+                    watermark: None,
+                }],
+                commits: vec![GitCommitSpec {
+                    oid: oid(1),
+                    parents: Vec::new(),
+                    tree: oid(2),
+                    generation: 1,
+                }],
+                trees: vec![GitTreeSpec {
+                    oid: oid(2),
+                    entries: Vec::new(),
+                }],
+                blobs: Vec::new(),
+            },
+            artifacts: None,
+        };
+
+        let mut state = RunState::new(&scenario, 64, GitFaultPlan::default());
+
+        assert_eq!(stage_repo_open(&mut state).unwrap(), 1);
+        assert_eq!(stage_commit_walk(&mut state).unwrap(), 1);
+        assert_eq!(stage_tree_diff(&mut state).unwrap(), 0);
+        assert_eq!(stage_spill_dedupe(&mut state).unwrap(), 0);
+
+        let seen_ops: Vec<_> = state
+            .persist_store
+            .log()
+            .into_iter()
+            .filter(|op| op.phase == PersistPhase::SeenDelta)
+            .collect();
+        assert!(seen_ops.is_empty());
+
+        let spill_stats = state.spill_stats.as_ref().expect("spill stats");
+        assert_eq!(spill_stats.candidates_received, 0);
+        assert_eq!(spill_stats.emitted_blobs, 0);
+        assert_eq!(state.unique_oids.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn spill_dedupe_deduplicates_shared_blob_across_refs() {
+        let scenario = duplicate_oid_scenario();
+        let mut state = RunState::new(&scenario, 64, GitFaultPlan::default());
+
+        assert_eq!(stage_repo_open(&mut state).unwrap(), 2);
+        assert_eq!(stage_commit_walk(&mut state).unwrap(), 2);
+        assert_eq!(stage_tree_diff(&mut state).unwrap(), 2);
+        assert_eq!(stage_spill_dedupe(&mut state).unwrap(), 1);
+
+        assert_eq!(
+            state.unique_oids.as_deref(),
+            Some(&[OidBytes::sha1([30; 20])][..])
+        );
+
+        let seen_ops: Vec<_> = state
+            .persist_store
+            .log()
+            .into_iter()
+            .filter(|op| op.phase == PersistPhase::SeenDelta)
+            .collect();
+        assert_eq!(seen_ops.len(), 1);
+        assert_eq!(seen_ops[0].key, vec![30; 20]);
+
+        let spill_stats = state.spill_stats.as_ref().expect("spill stats");
+        assert_eq!(spill_stats.spill_runs, 0);
+    }
+
+    #[test]
+    fn spiller_persists_seen_deltas_through_disk_spill() {
+        let limits = SpillLimits {
+            max_spill_bytes: 512 * 1024 * 1024,
+            seen_batch_max_oids: 256,
+            seen_batch_max_path_bytes: 64 * 1024,
+            max_chunk_candidates: 1,
+            max_chunk_path_bytes: 1024 * 1024,
+            max_spill_runs: 16,
+            max_path_len: 4 * 1024,
+        };
+        let spill_dir = tempdir().unwrap();
+        let mut spiller = Spiller::new(limits, 20, spill_dir.path()).unwrap();
+
+        let oids = [
+            OidBytes::sha1([1; 20]),
+            OidBytes::sha1([2; 20]),
+            OidBytes::sha1([3; 20]),
+        ];
+        let paths: [&[u8]; 3] = [b"a.txt", b"b.txt", b"c.txt"];
+        for (i, (oid, path)) in oids.iter().zip(paths.iter()).enumerate() {
+            spiller
+                .push(*oid, path, i as u32, 0, ChangeKind::Add, 0, 0)
+                .unwrap();
+        }
+
+        let persist_store = SimPersistStore::default();
+        let mut sink = CollectingUniqueBlobSink::default();
+        let stats = spiller
+            .finalize(&NeverSeenStore, &persist_store, &mut sink)
+            .unwrap();
+
+        assert!(stats.spill_runs > 0, "expected at least one spill run");
+        assert!(stats.spill_bytes > 0, "expected nonzero spill bytes");
+        assert_eq!(sink.blobs.len(), 3);
+
+        let seen_ops: Vec<_> = persist_store
+            .log()
+            .into_iter()
+            .filter(|op| op.phase == PersistPhase::SeenDelta)
+            .collect();
+        assert_eq!(seen_ops.len(), 3);
     }
 
     #[test]
@@ -1437,6 +1861,147 @@ mod tests {
         )
         .expect_err("expected pack read error");
         assert!(matches!(err, PackExecError::PackRead(_)));
+    }
+
+    #[test]
+    fn validate_outputs_rejects_mismatched_oid_partition() {
+        let scenario = simple_scenario();
+        let mut state = RunState::new(&scenario, 64, GitFaultPlan::default());
+
+        stage_repo_open(&mut state).unwrap();
+        stage_commit_walk(&mut state).unwrap();
+        stage_tree_diff(&mut state).unwrap();
+        stage_spill_dedupe(&mut state).unwrap();
+        stage_pack_exec(&mut state).unwrap();
+        stage_finalize(&mut state).unwrap();
+
+        // Corrupt unique_oids so the conservation oracle fires.
+        state.unique_oids = Some(vec![OidBytes::sha1([99; 20])]);
+
+        let err = validate_outputs(&state).expect_err("expected oracle mismatch");
+        assert!(matches!(err.kind, FailureKind::OracleMismatch));
+        assert!(err.message.contains("scanned/skipped partition"));
+    }
+
+    #[test]
+    fn pack_exec_rejects_mismatched_spill_oids() {
+        let scenario = simple_scenario();
+        let mut state = RunState::new(&scenario, 64, GitFaultPlan::default());
+
+        stage_repo_open(&mut state).unwrap();
+        stage_commit_walk(&mut state).unwrap();
+        stage_tree_diff(&mut state).unwrap();
+        stage_spill_dedupe(&mut state).unwrap();
+
+        // Corrupt unique_oids so the pack-exec precondition oracle fires.
+        state.unique_oids = Some(vec![OidBytes::sha1([99; 20])]);
+
+        let err = stage_pack_exec(&mut state).expect_err("expected oracle mismatch");
+        assert!(matches!(err.kind, FailureKind::OracleMismatch));
+        assert!(err.message.contains("spill dedupe unique OIDs differ"));
+    }
+
+    #[test]
+    fn partition_fault_plan_splits_resources_correctly() {
+        let plan = GitFaultPlan {
+            resources: vec![
+                GitResourceFaults {
+                    resource: GitResourceId::CommitGraph,
+                    reads: Vec::new(),
+                },
+                GitResourceFaults {
+                    resource: GitResourceId::Persist,
+                    reads: Vec::new(),
+                },
+                GitResourceFaults {
+                    resource: GitResourceId::Pack { pack_id: 0 },
+                    reads: Vec::new(),
+                },
+                GitResourceFaults {
+                    resource: GitResourceId::SeenPersist,
+                    reads: Vec::new(),
+                },
+                GitResourceFaults {
+                    resource: GitResourceId::Midx,
+                    reads: Vec::new(),
+                },
+            ],
+        };
+
+        let (runner, persist) = partition_fault_plan(plan);
+
+        let runner_ids: Vec<_> = runner.resources.iter().map(|r| &r.resource).collect();
+        assert_eq!(
+            runner_ids,
+            vec![
+                &GitResourceId::CommitGraph,
+                &GitResourceId::Pack { pack_id: 0 },
+                &GitResourceId::Midx,
+            ]
+        );
+
+        let persist_ids: Vec<_> = persist.resources.iter().map(|r| &r.resource).collect();
+        assert_eq!(
+            persist_ids,
+            vec![&GitResourceId::Persist, &GitResourceId::SeenPersist,]
+        );
+
+        // Empty plan produces two empty partitions.
+        let (runner_empty, persist_empty) = partition_fault_plan(GitFaultPlan::default());
+        assert!(runner_empty.resources.is_empty());
+        assert!(persist_empty.resources.is_empty());
+    }
+
+    #[test]
+    fn mixed_runner_and_persist_faults_route_correctly() {
+        let scenario = simple_scenario();
+        let plan = GitFaultPlan {
+            resources: vec![
+                GitResourceFaults {
+                    resource: GitResourceId::Pack { pack_id: 0 },
+                    reads: vec![super::super::fault::GitReadFault {
+                        fault: Some(GitIoFault::ErrKind { kind: 1 }),
+                        latency_ticks: 0,
+                        corruption: None,
+                    }],
+                },
+                GitResourceFaults {
+                    resource: GitResourceId::SeenPersist,
+                    reads: vec![super::super::fault::GitReadFault {
+                        fault: Some(GitIoFault::ErrKind { kind: 1 }),
+                        latency_ticks: 0,
+                        corruption: None,
+                    }],
+                },
+            ],
+        };
+
+        let cfg = GitRunConfig {
+            workers: 1,
+            max_steps: 0,
+            stability_runs: 1,
+            trace_capacity: 64,
+        };
+        let runner = GitSimRunner::new(cfg, 42);
+        let outcome = runner.run(&scenario, &plan);
+
+        // SeenPersist fault fires during spill dedupe (stage 4, code 84) before
+        // pack exec, so the pack fault is never consumed.
+        let failure = match outcome {
+            RunOutcome::Failed(fail) => fail,
+            RunOutcome::Ok { report } => panic!("expected failure, got {report:?}"),
+        };
+
+        assert!(
+            matches!(failure.kind, FailureKind::InvariantViolation { code: 84 }),
+            "expected InvariantViolation {{ code: 84 }}, got {:?}",
+            failure.kind
+        );
+        assert!(
+            failure.message.contains("seen-persist"),
+            "expected message containing 'seen-persist', got {:?}",
+            failure.message
+        );
     }
 
     fn build_minimal_midx() -> Vec<u8> {

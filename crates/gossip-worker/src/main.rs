@@ -9,6 +9,7 @@
 //! Connector-mode scans (filesystem and Git) route through the distributed
 //! worker loop. They do not silently downgrade to the local scan path.
 
+use gossip_contracts::connector::ToxicDigest;
 use gossip_scanner_runtime::{
     ScanReport, ScanRuntimeError, distributed::DistributedRunReport, scan_fs, scan_git,
 };
@@ -157,6 +158,7 @@ fn log_distributed_report(cfg: &DistributedWorkerConfig, report: DistributedRunR
             path = %source.path().display(),
             leases_seen = report.leases_seen,
             shards_scanned = report.shards_scanned,
+            total_claim_ms = report.total_claim_ms,
             "distributed scan completed",
         ),
         DistributedSourceSettings::Git(source) => tracing::info!(
@@ -166,9 +168,14 @@ fn log_distributed_report(cfg: &DistributedWorkerConfig, report: DistributedRunR
             tenant = %cfg.tenant(),
             run = %cfg.run(),
             worker = %cfg.worker(),
-            mirror_root = %source.mirror_root().display(),
+            mirror_root = %ToxicDigest::of_bytes(source.mirror_root().as_os_str().as_encoded_bytes()),
             leases_seen = report.leases_seen,
             shards_scanned = report.shards_scanned,
+            total_claim_ms = report.total_claim_ms,
+            total_mirror_sync_ms = report.total_mirror_sync_ms,
+            total_scan_ms = report.total_scan_ms,
+            total_durable_receipt_ms = report.total_durable_receipt_ms,
+            total_checkpoint_ms = report.total_checkpoint_ms,
             "distributed scan completed",
         ),
     }
@@ -241,6 +248,9 @@ mod tests {
     };
     use gossip_worker::production::ProductionStartupSettings;
     use tempfile::tempdir;
+    use tracing::Level;
+
+    use gossip_worker::recorder::test_support::capture_logs;
 
     fn create_git_repo(path: &Path) {
         run_git(path, &["init", "-q"]);
@@ -347,6 +357,46 @@ mod tests {
             )),
             backends,
         )
+    }
+
+    #[test]
+    fn log_distributed_report_redacts_git_mirror_root_and_includes_stage_totals() {
+        let repo = tempdir().expect("repo tempdir");
+        let mirror_root = tempdir().expect("mirror root tempdir");
+        let cfg = test_git_distributed_config(repo.path(), mirror_root.path());
+        let report = DistributedRunReport {
+            leases_seen: 2,
+            shards_scanned: 2,
+            total_claim_ms: 3,
+            total_mirror_sync_ms: 5,
+            total_scan_ms: 7,
+            total_durable_receipt_ms: 11,
+            total_checkpoint_ms: 13,
+        };
+
+        let logs = capture_logs(Level::INFO, || log_distributed_report(&cfg, report));
+
+        assert!(
+            logs.contains("source=\"git\""),
+            "expected git source label: {logs}"
+        );
+        assert!(
+            logs.contains("mirror_root=len="),
+            "mirror_root should be emitted as a digest: {logs}",
+        );
+        assert!(
+            !logs.contains(&mirror_root.path().display().to_string()),
+            "raw mirror_root path must not leak into logs: {logs}",
+        );
+        for field in [
+            "total_claim_ms=3",
+            "total_mirror_sync_ms=5",
+            "total_scan_ms=7",
+            "total_durable_receipt_ms=11",
+            "total_checkpoint_ms=13",
+        ] {
+            assert!(logs.contains(field), "missing {field} from logs: {logs}");
+        }
     }
 
     fn unreachable_production_config(path: &Path) -> DistributedWorkerConfig {

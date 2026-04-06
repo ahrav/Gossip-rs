@@ -5,18 +5,24 @@
 //!
 //! This integration test installs a process-wide [`CountingAllocator`] and
 //! drives the estimator through the same doc-hidden benchmark hook that the
-//! Criterion bench uses. The goal is not to pin an absolute runtime; it is to
-//! catch shape regressions where a 1,000,000-item stream starts allocating
-//! linearly instead of following the expected sublinear compaction pattern.
+//! Criterion bench uses.
 //!
-//! Two invariants matter:
-//! - the workload should still produce a split at this scale; and
-//! - heap traffic should grow with the estimator's logarithmic compaction
+//! # Purpose
+//! Catch shape regressions where a 1,000,000-item stream starts allocating
+//! linearly instead of following the expected sublinear compaction pattern.
+//! The goal is not to pin an absolute runtime.
+//!
+//! # Invariants
+//! - The workload must produce a split at the 1,000,000-item scale.
+//! - Heap traffic must grow with the estimator's logarithmic compaction
 //!   phases rather than with the full stream length.
 //!
-//! The assertion focuses on allocation-producing events because the allocator's
-//! deallocation churn can vary with compaction timing without indicating a
-//! regression in the hot `observe` path.
+//! # Design Trade-offs
+//! - Uses a process-wide allocator guard which restricts this test to isolated
+//!   execution or single-threaded test runners.
+//! - The assertion focuses purely on allocation-producing events (alloc, realloc)
+//!   because deallocation churn can vary with compaction timing without indicating a
+//!   regression in the hot `observe` path.
 
 use gossip_connectors::benchmark_streaming_split_estimator_observe_fixed_size;
 use scanner_scheduler::{CountingAllocator, alloc_stats};
@@ -24,19 +30,37 @@ use scanner_scheduler::{CountingAllocator, alloc_stats};
 #[global_allocator]
 static GLOBAL_ALLOC: CountingAllocator = CountingAllocator;
 
-/// Conservative heap-traffic bound for the fixed-size streaming workload.
+/// Calculates a conservative heap-traffic bound for the fixed-size streaming workload.
 ///
+/// # What it does
+/// Determines the maximum allowed heap allocation operations for a stream of a given length.
+///
+/// # Complexity
 /// The estimator doubles its sampling strides after each compaction, so the
-/// number of refill/compact phases grows roughly with `log2(count)`. This
-/// helper intentionally leaves slack for startup and final estimation; the test
-/// is a regression tripwire, not a proof of the exact constant factor.
+/// number of refill/compact phases grows strictly in `O(log(count))` time.
+///
+/// # Preconditions
+/// - `sample_cap` must reflect the estimator's configured maximum sample capacity.
+/// - `count` is the total number of items observed.
+///
+/// # Guarantees
+/// Leaves intentional slack for startup and final estimation to act as a regression
+/// tripwire rather than attempting a brittle exact-factor proof.
 fn observe_allocation_upper_bound(sample_cap: usize, count: usize) -> u64 {
     let phases = u64::from(count.max(1).ilog2()) + 4;
     (sample_cap as u64) * phases
 }
 
-// Verifies that the fixed-size streaming workload keeps allocator traffic
-// sublinear while still producing a split for one million observations.
+/// Verifies that the fixed-size streaming workload keeps allocator traffic
+/// sublinear while still producing a split for one million observations.
+///
+/// # What it does
+/// Drives the estimator with 1,000,000 items and asserts that heap allocation operations
+/// fall within the conservative upper bound.
+///
+/// # Guarantees
+/// - Asserts that a valid split is generated for the 1M-item stream.
+/// - Asserts that the sum of `allocs` and `reallocs` remains bounded sublinearly.
 #[test]
 fn observe_one_million_items_allocates_sublinearly() {
     let sample_cap = 128usize;
@@ -51,10 +75,7 @@ fn observe_one_million_items_allocates_sublinearly() {
         "million-item stream should still produce a split"
     );
 
-    // Count only allocation-producing events. Deallocation churn can vary with
-    // compaction timing, but regressions in the hot `observe` path show up as
-    // extra alloc/realloc pressure. The helper leaves generous slack so the
-    // test catches shape regressions without pinning a brittle constant factor.
+    // Focus on alloc/realloc because deallocation churn varies independently of hot-path performance.
     let heap_ops = delta.allocs + delta.reallocs;
     let upper_bound = observe_allocation_upper_bound(sample_cap, count);
     assert!(

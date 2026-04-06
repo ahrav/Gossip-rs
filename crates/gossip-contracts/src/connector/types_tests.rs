@@ -1,3 +1,9 @@
+//! Unit tests for connector types and their size/boundary constraints.
+//!
+//! This module verifies that domain primitives (like `ItemKey`, `ItemRef`,
+//! `Cursor`, and `ContentHints`) correctly enforce their maximum size
+//! limits, handle memory pooling safely, and reject invalid states.
+
 use std::sync::Arc;
 
 use gossip_stdx::ByteSlab;
@@ -216,14 +222,12 @@ fn pooled_wrapper_survives_slab_owner_drop() {
     let key = ItemKey::try_from_slot(key_slot, Arc::clone(&shared)).expect("pooled key");
     let iref = ItemRef::try_from_slot(ref_slot, Arc::clone(&shared)).expect("pooled ref");
 
-    // Clone before dropping the original shared reference.
     let key_clone = key.clone();
     let iref_clone = iref.clone();
     drop(key);
     drop(iref);
     drop(shared);
 
-    // Clones must still resolve correctly from the slab.
     assert!(key_clone.is_pooled());
     assert!(iref_clone.is_pooled());
     assert_eq!(key_clone.as_bytes(), b"survivor-key");
@@ -274,12 +278,10 @@ fn owned_and_pooled_satisfy_trait_consistency() {
     let owned_token = TokenBytes::try_from_slice(b"shared-token").unwrap();
     let pooled_token = TokenBytes::try_from_slot(token_slot, Arc::clone(&shared)).unwrap();
 
-    // PartialEq: Owned == Pooled for identical bytes.
     assert_eq!(owned_key, pooled_key);
     assert_eq!(owned_ref, pooled_ref);
     assert_eq!(owned_token, pooled_token);
 
-    // Hash: both variants produce the same hash.
     fn hash_of(val: &impl Hash) -> u64 {
         let mut h = DefaultHasher::new();
         val.hash(&mut h);
@@ -289,11 +291,12 @@ fn owned_and_pooled_satisfy_trait_consistency() {
     assert_eq!(hash_of(&owned_ref), hash_of(&pooled_ref));
     assert_eq!(hash_of(&owned_token), hash_of(&pooled_token));
 
-    // Ord (ItemKey only — ItemRef/TokenBytes are unordered).
     assert_eq!(owned_key.cmp(&pooled_key), std::cmp::Ordering::Equal);
     assert_eq!(pooled_key.cmp(&owned_key), std::cmp::Ordering::Equal);
 }
 
+/// Verifies that `ItemKey` instances correctly implement lexicographic
+/// ordering based on their underlying bytes, including prefix sorting.
 #[test]
 fn item_key_lexicographic_ordering() {
     let a = ItemKey::try_from_vec(vec![0x00]).unwrap();
@@ -307,6 +310,9 @@ fn item_key_lexicographic_ordering() {
     assert_eq!(a.cmp(&a), std::cmp::Ordering::Equal);
 }
 
+/// Verifies that the `Display` and `Debug` implementations for bounded types
+/// produce stable, deterministic output (with hashing) to prevent logging of
+/// unbounded or sensitive raw bytes.
 #[test]
 fn format_output_is_deterministic() {
     let key = ItemKey::try_from_vec(vec![0xDE, 0xAD, 0xBE, 0xEF]).unwrap();

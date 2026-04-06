@@ -336,9 +336,9 @@ mod tests {
             rules_digest: [0xAA; 32],
         };
         let inputs_b = PolicyHashInputs {
-            policy_hash_version: 2, // swapped
+            policy_hash_version: 2,
             id_hash_mode: IdHashMode::KeyedV1,
-            evidence_hash_version: 1, // swapped
+            evidence_hash_version: 1,
             rules_digest: [0xAA; 32],
         };
         assert_ne!(

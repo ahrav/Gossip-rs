@@ -21,8 +21,9 @@ Stages:
 1. Repo open (build simulated start set, commit graph, tree source)
 2. Commit walk (plan commits)
 3. Tree diff (emit candidates)
-4. Pack exec (uses in-memory artifacts when present; falls back to semantic scan)
-5. Finalize (determine complete vs partial outcome)
+4. Spill dedupe (run `Spiller::finalize` with `NeverSeenStore` and `SimPersistStore`)
+5. Pack exec (uses in-memory artifacts when present; falls back to semantic scan)
+6. Finalize (determine complete vs partial outcome)
 
 Stage boundaries emit trace events so failures can be replayed and minimized.
 Each step also records the scheduler decision so trace hashes capture the
@@ -68,9 +69,11 @@ Corruption:
 - `FlipBit { offset, mask }`
 - `Overwrite { offset, bytes }`
 
-Each fault is consumed in read-index order (`0`, `1`, …). When a fault or
-corruption is applied, the runner emits a `FaultInjected` trace event that
-captures the resource id, read index, and fault kind.
+Each fault is consumed in read-index order (`0`, `1`, …). Artifact-read faults
+and corruptions applied directly by the runner emit a `FaultInjected` trace
+event that captures the resource id, read index, and fault kind. Spill-stage
+`SeenPersist` faults surface through the `SpillDedupe` failure path and the
+simulation persistence log.
 
 ## Persistence Safety
 
@@ -81,6 +84,9 @@ order they are issued and enforces the two-phase contract:
 - Watermark ops are written only for `FinalizeOutcome::Complete`.
 - Faults injected on the persistence resource abort the phase and prevent
   watermark writes, preserving partial-run gating.
+- Spill dedupe persists incremental `SeenDelta` batches before pack execution,
+  so randomized simulation runs exercise seen-bitmap persistence and
+  `SeenPersist` fault injection even when finalize persistence is not invoked.
 
 ## Failure Taxonomy
 
@@ -97,11 +103,16 @@ scanner simulation tests. Primary entry points:
 
 ```bash
 # Random Git simulation runs (bounded)
-cargo test --features sim-harness --test simulation git_scan_random
+cargo test -p scanner-engine-integration-tests --features sim-harness,rocksdb --test simulation git_scan_random
 
 # Replay Git simulation corpus
-cargo test --features sim-harness --test simulation git_scan_corpus
+cargo test -p scanner-engine-integration-tests --features sim-harness,rocksdb --test simulation git_scan_corpus
 ```
+
+The `rocksdb` feature is required because `git_scan_shallow_limits` tests in the
+same binary depend on `InMemoryPersistenceStore::with_seen_scope`, which is gated
+on `#[cfg(feature = "rocksdb")]`. The `sim-harness` feature itself does not
+depend on `rocksdb`.
 
 Corpus cases live in `crates/scanner-engine-integration-tests/tests/corpus/git_scan/*.case.json`. Replay failures emit
 artifacts to `crates/scanner-engine-integration-tests/tests/failures/` for triage and minimization.
@@ -121,8 +132,11 @@ The Git simulation tests are included in the `sim-harness` suite. CI should
 run at least:
 
 ```bash
-cargo test --features sim-harness --test simulation
+cargo test -p scanner-engine-integration-tests --features sim-harness,rocksdb --test simulation
 ```
+
+The `rocksdb` feature is included because the `git_scan_shallow_limits` module
+requires it for compilation (see note in the Running Tests section above).
 
 Soak or nightly tiers can increase `SIM_GIT_SCAN_SEED_COUNT` or enable
 `SIM_GIT_SCAN_DEEP=1` for broader coverage.

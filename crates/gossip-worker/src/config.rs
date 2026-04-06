@@ -1909,11 +1909,11 @@ fn parse_nonzero_usize(field: &'static str, raw: &str) -> Result<NonZeroUsize, W
 }
 
 fn parse_tenant_id(field: &'static str, raw: &str) -> Result<TenantId, WorkerConfigError> {
-    Ok(TenantId::from_bytes(parse_hex_32_redacted(field, raw)?))
+    Ok(TenantId::from_bytes(parse_hex_32(field, raw)?))
 }
 
 fn parse_policy_hash(field: &'static str, raw: &str) -> Result<PolicyHash, WorkerConfigError> {
-    Ok(PolicyHash::from_bytes(parse_hex_32_redacted(field, raw)?))
+    Ok(PolicyHash::from_bytes(parse_hex_32(field, raw)?))
 }
 
 fn parse_tenant_secret_key(
@@ -1955,7 +1955,6 @@ fn parse_worker_id(field: &'static str, raw: &str) -> Result<WorkerId, WorkerCon
     Ok(WorkerId::from_raw(value))
 }
 
-#[cfg(test)]
 fn parse_hex_32(field: &'static str, raw: &str) -> Result<[u8; 32], WorkerConfigError> {
     parse_hex_32_inner(field, raw, false)
 }
@@ -2660,36 +2659,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_tenant_id_redacts_invalid_input() {
+    fn parse_tenant_id_shows_invalid_input_in_error() {
         let raw_input = "not-valid-hex-at-all";
         let err = parse_tenant_id("tenant_id", raw_input)
             .expect_err("invalid tenant_id hex should be rejected");
 
         let display = err.to_string();
         assert!(
-            display.contains("[redacted]"),
-            "tenant_id parse error must redact the raw input, got: {display}"
+            display.contains(raw_input),
+            "tenant_id is not a secret; parse error must include the bad value for \
+             operator debuggability, got: {display}"
         );
         assert!(
-            !display.contains(raw_input),
-            "tenant_id parse error must not contain the raw input, got: {display}"
+            !display.contains("[redacted]"),
+            "tenant_id must not be redacted — only secret keys warrant redaction, got: {display}"
         );
     }
 
     #[test]
-    fn parse_policy_hash_redacts_invalid_input() {
+    fn parse_policy_hash_shows_invalid_input_in_error() {
         let raw_input = "short-policy-hash";
         let err = parse_policy_hash("policy_hash", raw_input)
             .expect_err("invalid policy_hash hex should be rejected");
 
         let display = err.to_string();
         assert!(
-            display.contains("[redacted]"),
-            "policy_hash parse error must redact the raw input, got: {display}"
+            display.contains(raw_input),
+            "policy_hash is not a secret; parse error must include the bad value for \
+             operator debuggability, got: {display}"
         );
         assert!(
-            !display.contains(raw_input),
-            "policy_hash parse error must not contain the raw input, got: {display}"
+            !display.contains("[redacted]"),
+            "policy_hash must not be redacted — only secret keys warrant redaction, got: {display}"
         );
     }
 
@@ -3743,5 +3744,12 @@ mod tests {
             message.contains("path"),
             "error must name the path field: {message}"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "mirror_root must not be empty")]
+    fn git_distributed_source_settings_rejects_empty_mirror_root() {
+        let _settings =
+            GitDistributedSourceSettings::new(GitSourceSettings::new("/tmp/repo"), PathBuf::new());
     }
 }

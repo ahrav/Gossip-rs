@@ -22,10 +22,15 @@ use crate::identity::{FenceEpoch, PolicyHash, RunId, ShardId, TenantId};
 /// rejection from a single value rather than scattered scalar parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WriteContext {
+    /// Tenant isolation boundary for downstream writes.
     tenant_id: TenantId,
+    /// Detection-policy version under which the write was produced.
     policy_hash: PolicyHash,
+    /// Run that produced the write.
     run_id: RunId,
+    /// Shard that produced the write.
     shard_id: ShardId,
+    /// Fence epoch proving lease ownership when the write was created.
     fence_epoch: FenceEpoch,
 }
 

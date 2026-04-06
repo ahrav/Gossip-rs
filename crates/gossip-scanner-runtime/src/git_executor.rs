@@ -21,6 +21,7 @@ use gossip_contracts::connector::git::{
     GitDebugLevel, GitExecutionLimits, GitMergeStrategy, GitRepoExecutor, GitRunError,
     GitRunOutcome, GitScanMode as ContractGitScanMode, GitSelection, LocalMirror,
 };
+use gossip_contracts::identity::RuleFingerprint;
 use scanner_engine::Engine;
 use scanner_git::{
     ArtifactAcquireError, CommitPlanError, GitEventOutput, GitScanConfig as ScannerGitScanConfig,
@@ -93,6 +94,12 @@ impl ScannerGitExecutor {
             config.anchor_mode,
         )?;
         Ok(Self::new(config.repo_id, engine, event_sink))
+    }
+
+    /// Build a stable rule-fingerprint mapper backed by the executor's engine.
+    pub(crate) fn rule_fingerprint_fn(&self) -> Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync> {
+        let engine = Arc::clone(&self.engine);
+        Arc::new(move |rule_id| RuleFingerprint::from_bytes(engine.rule_fingerprint_bytes(rule_id)))
     }
 
     /// Core dual-thread execution path shared by all Git scan entry points.

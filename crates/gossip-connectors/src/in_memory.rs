@@ -169,10 +169,10 @@ impl InMemoryDeterministicConnector {
     pub fn new(mut items: Vec<MemItem>) -> Self {
         items.sort_by(|left, right| left.key.cmp(&right.key));
 
-        // Enforce unique keys. Duplicate keys break cursor resume
-        // (upper_bound skips remaining duplicates) and split-point selection
-        // (empty shards). Format the
-        // duplicate through ItemKey itself so panic diagnostics stay redacted.
+        // INVARIANT: Unique keys are strictly required.
+        // Duplicate keys break the `upper_bound` binary search logic during
+        // cursor resumption and produce invalid split-point selections resulting
+        // in empty shards. The offending key is surfaced to diagnostics securely.
         if let Some(pos) = items.windows(2).position(|w| w[0].key == w[1].key) {
             panic!(
                 "InMemoryDeterministicConnector requires unique item keys; \

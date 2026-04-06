@@ -486,7 +486,7 @@ fn encode_sarif_result(finding: &scanner_scheduler::events::FindingEvent<'_>, li
     line.push(b'}');
 }
 
-fn sanitize_path(path: &[u8]) -> String {
+pub(crate) fn sanitize_path(path: &[u8]) -> String {
     let text = String::from_utf8_lossy(path);
     if !text.chars().any(char::is_control) {
         return text.into_owned();
@@ -594,7 +594,7 @@ mod tests {
             end: 40,
             rule_id: 7,
             rule_name: "aws-access-key",
-            norm_hash: Some([0xAB; 32]),
+            norm_hash: [0xAB; 32],
             commit_id: None,
             change_kind: None,
             confidence_score: 8,
@@ -609,6 +609,14 @@ mod tests {
             .expect("vec writer");
         let line = String::from_utf8(output).expect("valid utf8 output");
         assert_eq!(line, load_event_golden("finding_fs.jsonl"));
+        assert!(
+            !line.contains("norm_hash"),
+            "encoded event must omit norm_hash, got: {line}"
+        );
+        assert!(
+            !line.contains("rule_id"),
+            "encoded event must omit rule_id, got: {line}"
+        );
     }
 
     #[test]
@@ -621,7 +629,7 @@ mod tests {
             end: 32,
             rule_id: 9,
             rule_name: "generic-secret",
-            norm_hash: Some([0xCD; 32]),
+            norm_hash: [0xCD; 32],
             commit_id: Some(3),
             change_kind: Some("add"),
             confidence_score: -4,
@@ -636,6 +644,14 @@ mod tests {
             .expect("vec writer");
         let line = String::from_utf8(output).expect("valid utf8 output");
         assert_eq!(line, load_event_golden("finding_git.jsonl"));
+        assert!(
+            !line.contains("norm_hash"),
+            "encoded git event must omit norm_hash, got: {line}"
+        );
+        assert!(
+            !line.contains("rule_id"),
+            "encoded git event must omit rule_id, got: {line}"
+        );
     }
 
     #[test]
@@ -648,7 +664,7 @@ mod tests {
             end: 12,
             rule_id: 1,
             rule_name: "rule",
-            norm_hash: Some([0x11; 32]),
+            norm_hash: [0x11; 32],
             commit_id: None,
             change_kind: None,
             confidence_score: 0,
@@ -675,7 +691,7 @@ mod tests {
             end: 2,
             rule_id: 1,
             rule_name: "rule",
-            norm_hash: None,
+            norm_hash: [0x21; 32],
             commit_id: None,
             change_kind: None,
             confidence_score: 3,
@@ -703,7 +719,7 @@ mod tests {
             end: 2,
             rule_id: 1,
             rule_name: "rule",
-            norm_hash: None,
+            norm_hash: [0x22; 32],
             commit_id: None,
             change_kind: None,
             confidence_score: 3,
@@ -735,7 +751,7 @@ mod tests {
             end: 20,
             rule_id: 2,
             rule_name: "aws-access-key",
-            norm_hash: None,
+            norm_hash: [0x23; 32],
             commit_id: None,
             change_kind: None,
             confidence_score: 7,
@@ -767,7 +783,7 @@ mod tests {
             end: 20,
             rule_id: 2,
             rule_name: "aws-access-key",
-            norm_hash: None,
+            norm_hash: [0x24; 32],
             commit_id: None,
             change_kind: None,
             confidence_score: 7,

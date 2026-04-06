@@ -29,6 +29,9 @@ debug
 
 todos/*
 
+# Machine-local Cargo configuration (may contain absolute paths)
+.cargo/
+
 # TLC (TLA+ model checker) trace files and state directories
 *_TTrace_*.bin
 specs/coordination/states/

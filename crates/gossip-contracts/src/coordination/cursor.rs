@@ -457,14 +457,12 @@ pub fn key_successor_into<'a>(key: &[u8], out: &'a mut [u8; MAX_KEY_SIZE]) -> Op
         return None;
     }
 
-    // Fast path: room to append a 0x00 byte, producing the immediate successor.
     if key.len() < MAX_KEY_SIZE {
         out[..key.len()].copy_from_slice(key);
         out[key.len()] = 0;
         return Some(&out[..key.len() + 1]);
     }
 
-    // Slow path: key is already at maximum length, must use prefix increment.
     prefix_successor_into(key, out)
 }
 

@@ -142,7 +142,7 @@ contains both deterministic `#[test]` assertions and `proptest!` fuzz runs.
 | `counterexample_shrinker`            |    10 |        1 | Custom MutationPlan shrinking         |
 | `entropy_threshold_soundness`        |     9 |        1 | Entropy threshold boundaries          |
 | `git_commit_walk`                    |     2 |        1 | Commit walk properties                |
-| `git_engine_adapter`                 |     1 |        1 | Adapter correctness                   |
+| `git_engine_adapter`                 |     2 |        1 | Adapter correctness                   |
 | `git_pack_delta`                     |     8 |        1 | Pack delta application                |
 | `git_pack_plan`                      |     5 |        1 | Pack plan computation                 |
 | `git_spill_dedupe`                   |     3 |        2 | Spill deduplication                   |
@@ -169,7 +169,7 @@ harnesses. Tests are feature-gated per subsystem.
 | `scanner_max_file_size`     | `sim-harness`        |     1 | File size limit enforcement        |
 | `scanner_budget_invariance` | `sim-harness`        |     1 | Budget invariance                  |
 | `git_scan_corpus`           | `sim-harness`        |     1 | Git scan corpus replay             |
-| `git_scan_random`           | `sim-harness`        |     1 | Random git scan simulation         |
+| `git_scan_random`           | `sim-harness`        |     2 | Random git scan simulation and fault-injection reproducibility |
 | `git_scan_shallow_limits`   | `sim-harness`        |     1 | Shallow clone limits               |
 | `scanner_mutation_random`   | `sim-harness`        |     1 | Random mutation testing             |
 | `scanner_mutation_corpus`   | `sim-harness`        |     1 | Mutation corpus replay             |

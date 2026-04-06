@@ -125,7 +125,9 @@ impl BlobKind {
 /// Decoded owner-key payload stored under a shard's `/owner` key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnerLeaseValue {
+    /// The worker holding the lease.
     pub worker: WorkerId,
+    /// The fence epoch of the worker's lease.
     pub fence: FenceEpoch,
 }
 
@@ -220,21 +222,17 @@ pub fn encode_shard_record_into(
     buf.extend_from_slice(VERSION_PREFIX_V1);
     buf.push(BlobKind::ShardRecord.as_u8());
 
-    // Identity.
     put_tenant(buf, record.tenant);
     put_u64(buf, record.run.as_raw());
     put_u64(buf, record.shard.as_raw());
 
-    // Lifecycle.
     put_u8(buf, record.status.as_u8());
     put_opt_u8(buf, record.park_reason.map(ParkReason::as_u8));
 
-    // Spec fields — read directly from slab, no intermediate Vec.
     put_bytes(buf, record.spec.key_range_start(slab));
     put_bytes(buf, record.spec.key_range_end(slab));
     put_bytes(buf, record.spec.metadata(slab));
 
-    // Cursor — read directly from slab.
     put_opt_bytes(buf, record.cursor.last_key(slab));
     put_opt_bytes(buf, record.cursor.token(slab));
     put_u8(buf, record.cursor_semantics.as_u8());
@@ -255,13 +253,11 @@ pub fn encode_shard_record_into(
     put_u64(buf, record.fence_epoch.as_raw());
     put_opt_u64(buf, record.parent.map(|p| p.as_raw()));
 
-    // Spawned — iterate directly from slab, no collected Vec.
     put_len(buf, record.spawned.len());
     for shard in record.spawned.iter(slab) {
         put_u64(buf, shard.as_raw());
     }
 
-    // Op log — OpLogEntry fields are all scalars (Copy), no heap data.
     put_len(buf, record.op_log.len());
     for entry in record.op_log.iter() {
         put_u64(buf, entry.op_id().as_raw());

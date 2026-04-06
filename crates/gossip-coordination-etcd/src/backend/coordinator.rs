@@ -103,11 +103,16 @@ use super::test_support::EtcdTestFaultState;
 /// - `on_gc_run` — simulation uses this to drop cached run state.
 #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 pub(crate) trait SyncEtcdLike: Sized {
+    /// The configuration used to construct this backend.
     fn config(&self) -> &EtcdCoordinatorConfig;
+
+    /// The keyspace builder used for all etcd key construction.
     fn keyspace(&self) -> &EtcdKeyspace;
 
+    /// Advance the synthetic logical time (used by the simulation backend).
     fn sync_logical_time(&self, _now: LogicalTime) {}
 
+    /// Synchronously refresh cached run state from etcd.
     fn refresh_cached_run_state(
         &mut self,
         _tenant: TenantId,
@@ -211,21 +216,26 @@ pub(crate) trait SyncEtcdLike: Sized {
         Ok(persisted)
     }
 
+    /// Execute a `get` RPC against the etcd backend.
     fn etcd_get(
         &self,
         key: Vec<u8>,
         options: Option<GetOptions>,
     ) -> Result<etcd_client::GetResponse, EtcdCoordinatorError>;
 
+    /// Execute a compare-and-swap transaction against the etcd backend.
     fn etcd_txn(&self, txn: Txn) -> Result<etcd_client::TxnResponse, EtcdCoordinatorError>;
 
+    /// Grant a new lease with the specified TTL (in seconds).
     fn etcd_lease_grant(
         &self,
         ttl: i64,
     ) -> Result<etcd_client::LeaseGrantResponse, EtcdCoordinatorError>;
 
+    /// Send a single keep-alive ping for the given lease.
     fn etcd_lease_keep_alive_once(&self, lease_id: i64) -> Result<(), EtcdCoordinatorError>;
 
+    /// Revoke the given lease.
     fn etcd_lease_revoke(
         &self,
         lease_id: i64,
@@ -1636,6 +1646,7 @@ impl AsyncEtcdCoordinator {
         }
     }
 
+    /// Asynchronously refresh cached run state from etcd (currently a no-op).
     async fn refresh_cached_run_state(
         &mut self,
         _tenant: TenantId,

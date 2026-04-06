@@ -30,22 +30,33 @@ pub struct FindingEvent<'a> {
     pub source: SourceKind,
     /// Source-relative object path for the scanned payload.
     pub object_path: &'a [u8],
-    /// Inclusive byte offset where the match starts.
+    /// Byte offset marking the start of the finding region (inclusive).
+    ///
+    /// Both scan paths populate this from root-hint offsets (`root_hint_start`),
+    /// which delimit the broader context region containing the match. The FS
+    /// path reads `root_hint_start` directly from the engine finding record;
+    /// the Git path reads it via `FindingKey.start`, which is itself derived
+    /// from `root_hint_start` at scan time.
+    ///
+    /// Persistence identity derivation uses the finding record's `span_start`
+    /// and `span_end` fields (the exact match location) rather than these
+    /// root-hint event fields.
     pub start: u64,
-    /// Exclusive byte offset where the match ends.
+    /// Byte offset marking the end of the finding region (exclusive).
+    ///
+    /// Same source semantics as [`start`](Self::start): populated from
+    /// `root_hint_end` in both scan paths. Not used for persistence identity.
     pub end: u64,
     /// Numeric identifier of the matching detection rule.
     pub rule_id: u32,
     /// Human-readable rule name resolved from `rule_id`.
     pub rule_name: &'a str,
-    /// Normalized content hash for deduplication. `None` for filesystem findings
-    /// where the scanner does not produce a content-derived digest.
+    /// Normalized content hash for deduplication and persistence identity.
     ///
-    /// The `Option<[u8; 32]>` representation adds 33 bytes per event. This is
-    /// acceptable because `FindingEvent` is constructed on WARM paths (per-finding,
-    /// not per-chunk), and moving the hash out-of-band would complicate the event
-    /// flow without measurable benefit.
-    pub norm_hash: Option<[u8; 32]>,
+    /// The digest is always present on the scheduler event surface so runtime
+    /// sinks can derive durable finding identity without a parallel side
+    /// channel.
+    pub norm_hash: [u8; 32],
     /// Commit-graph position for Git findings.
     pub commit_id: Option<u32>,
     /// Git diff classification associated with the finding.
@@ -54,17 +65,12 @@ pub struct FindingEvent<'a> {
     pub confidence_score: i8,
 }
 
-/// Debug-format wrapper that prints `[redacted]` when a secret-derived digest
-/// is present and `None` otherwise. Prevents accidental hash leakage in logs.
-pub struct RedactedNormHash(pub bool);
+/// Debug-format wrapper that prints `[redacted]` for secret-derived digests.
+pub struct RedactedNormHash;
 
 impl fmt::Debug for RedactedNormHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0 {
-            f.write_str("[redacted]")
-        } else {
-            f.write_str("None")
-        }
+        f.write_str("[redacted]")
     }
 }
 
@@ -78,7 +84,7 @@ impl fmt::Debug for FindingEvent<'_> {
             .field("rule_id", &self.rule_id)
             .field("rule_name", &self.rule_name)
             // Secret-derived digests are redacted to keep debug output safe.
-            .field("norm_hash", &RedactedNormHash(self.norm_hash.is_some()))
+            .field("norm_hash", &RedactedNormHash)
             .field("commit_id", &self.commit_id)
             .field("change_kind", &self.change_kind)
             .field("confidence_score", &self.confidence_score)
@@ -393,7 +399,7 @@ mod tests {
             end: 20,
             rule_id: 7,
             rule_name: "rule",
-            norm_hash: Some([0xAB; 32]),
+            norm_hash: [0xAB; 32],
             commit_id: Some(3),
             change_kind: Some("modify"),
             confidence_score: 85,
@@ -415,7 +421,7 @@ mod tests {
             end: 20,
             rule_id: 7,
             rule_name: "rule",
-            norm_hash: Some([0xDE; 32]),
+            norm_hash: [0xDE; 32],
             commit_id: Some(3),
             change_kind: Some("modify"),
             confidence_score: 85,

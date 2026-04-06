@@ -11,6 +11,19 @@
 //! intentionally small and mostly curates the public exports that downstream
 //! code uses to select a connector implementation.
 //!
+//! # Invariants
+//!
+//! - **Stateless Connectors:** Connector instances maintain no internal state
+//!   regarding the coordination layer; they purely map source data to standard
+//!   types.
+//!
+//! # Design Trade-offs
+//!
+//! - **Dependency Isolation:** By keeping standard types in `gossip-contracts`
+//!   and concrete implementations here, we prevent coordination engines from
+//!   importing heavyweight dependencies (like `git2` or filesystem libraries)
+//!   unless specifically required.
+//!
 //! **Dependency direction:** This crate depends on `gossip-contracts` for value
 //! types and traits. It must not depend on persistence backends or
 //! coordination backend implementations.

@@ -12,8 +12,9 @@
 //! - `ovid.rs` defines object-version identity hashing used by the done-ledger.
 //! - `done_ledger.rs` defines done-ledger keys, records, safe error codes, and
 //!   the backend-neutral `DoneLedger` trait.
-//! - `findings.rs` defines stable finding, occurrence, and observation record
-//!   shapes plus the backend-neutral `FindingsSink` trait.
+//! - `findings.rs` defines the `PersistenceFinding` normalization boundary,
+//!   stable finding / occurrence / observation record shapes, and the
+//!   backend-neutral `FindingsSink` trait.
 //! - `page_commit.rs` defines the family-neutral checkpoint boundary types and
 //!   the `PageCommit<S>` typestate machine that enforces findings →
 //!   done-ledger → checkpoint ordering.
@@ -22,7 +23,7 @@
 //! - `error.rs` defines shared input-validation errors used by persistence-only
 //!   value wrappers.
 //! - `conformance.rs` defines the backend-agnostic persistence conformance
-//!   harness used by reference backends and future production implementations.
+//!   harness used by reference backends and production implementations.
 //!
 //! ## Conformance harness
 //!
@@ -30,12 +31,11 @@
 //! implementors to verify correctness against the contract surface:
 //!
 //! - `run_conformance` executes done-ledger, findings, and redaction checks.
-//! - `run_done_ledger_conformance` executes only the done-ledger checks (5)
-//!   for backends that have not implemented findings persistence yet.
-//! - `run_findings_conformance` executes only the findings-layer checks (4)
-//!   for backends that have findings but not done-ledger persistence.
-//! - `run_redaction_conformance` executes only the `Debug`-redaction checks
-//!   (3) and requires no backend instance (pure in-memory assertions).
+//! - `run_done_ledger_conformance` executes only the done-ledger checks
+//!   for backends that do not implement findings persistence.
+//! - `run_findings_conformance` executes only the findings-layer checks
+//!   for backends that implement findings but not done-ledger persistence.
+//! - `run_redaction_conformance` executes only the `Debug`-redaction checks and requires no backend instance (pure in-memory assertions).
 //! - `FindingsConformanceProbe` keeps findings replay/idempotency verification
 //!   out of the production `FindingsSink` trait surface.
 //! - External backend crates can depend on this public module in integration
@@ -114,6 +114,7 @@ pub use done_ledger::{
 pub use error::PersistenceInputError;
 pub use findings::{
     FindingRecord, FindingsSink, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
+    PersistenceFinding,
 };
 pub use ovid::{OvidHash, OvidHashInputs, derive_ovid_hash};
 pub use page_commit::{

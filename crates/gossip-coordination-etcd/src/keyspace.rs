@@ -1,12 +1,17 @@
 //! Deterministic etcd path construction for coordination records.
 //!
+//! # Purpose
 //! Every coordination record (run, shard, ownership, active-index) maps to
 //! exactly one etcd key. This module owns the mapping from identity tuples
 //! (`TenantId`, `RunId`, `ShardId`) to ASCII key paths, so persistence code
 //! never builds raw strings itself.
 //!
-//! # Key layout
+//! # Invariants
+//! - All generated keys are pure-ASCII and absolute etcd paths (starting with `/`).
+//! - No key contains accidental double slashes (`//`).
+//! - Lexicographic key order strictly matches numeric identity order.
 //!
+//! # Algorithm
 //! All paths are rooted at a caller-chosen namespace prefix (e.g. `/gossip/v1`).
 //! The tree is designed for etcd prefix scans — each category of record sits
 //! under a distinct path segment so a single `get_prefix` call can enumerate
@@ -28,8 +33,7 @@
 //!         {run_hex}                        # active-run index entry
 //! ```
 //!
-//! # Design rationale
-//!
+//! # Design Trade-offs
 //! - **`runs/` vs `runs_active/`**: Record keys and active-index keys are
 //!   siblings under the tenant, not nested. This avoids a prefix scan on
 //!   `runs/` from pulling in active-index entries, and vice versa.
@@ -42,15 +46,12 @@
 //!   scans predictable.
 //! - **Lowercase-only hex**: All hex output uses `[0-9a-f]`. No uppercase
 //!   letters appear, so byte-level equality works for key comparison.
-//!
-//! # Buffer-reuse API
-//!
-//! Every key method has a corresponding `_into` variant that appends into a
-//! caller-owned `&mut String` without clearing it first. This allows hot-path
-//! callers to reuse a single buffer across multiple key constructions,
-//! avoiding per-call heap allocation. Exact-key convenience methods return
-//! typed wrappers such as [`RunRecordKey`] and [`ShardOwnerKey`], while
-//! prefix-scan helpers continue to return `String`.
+//! - **Buffer-reuse API**: Every key method has a corresponding `_into` variant
+//!   that appends into a caller-owned `&mut String` without clearing it first.
+//!   This trades API simplicity for performance, allowing hot-path callers to
+//!   reuse a single buffer and avoid per-call heap allocation. Exact-key convenience
+//!   methods return typed wrappers such as [`RunRecordKey`] and [`ShardOwnerKey`],
+//!   while prefix-scan helpers continue to return `String`.
 
 use std::fmt;
 use std::fmt::Write;
@@ -58,6 +59,8 @@ use std::fmt::Write;
 use gossip_contracts::identity::{RunId, ShardId, TenantId};
 
 /// Validation errors for [`EtcdKeyspace`] construction.
+///
+/// # Guarantees
 ///
 /// The prefix rules exist to guarantee that every generated key is an
 /// absolute etcd path and that no key contains accidental double slashes
@@ -86,26 +89,44 @@ mod private {
 }
 
 /// Exact etcd key path for a run record.
+///
+/// # Guarantees
+/// Contains a valid, absolute etcd path without double slashes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RunRecordKey(String);
 
 /// Exact etcd key path for a shard record.
+///
+/// # Guarantees
+/// Contains a valid, absolute etcd path without double slashes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ShardRecordKey(String);
 
 /// Exact etcd key path for a shard ownership record.
+///
+/// # Guarantees
+/// Contains a valid, absolute etcd path without double slashes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ShardOwnerKey(String);
 
 /// Exact etcd key path for an active-run index entry.
+///
+/// # Guarantees
+/// Contains a valid, absolute etcd path without double slashes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RunActiveIndexKey(String);
 
 /// Exact etcd key path for a per-tenant shard counter.
+///
+/// # Guarantees
+/// Contains a valid, absolute etcd path without double slashes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TenantShardCountKey(String);
 
 /// Exact etcd key path for an active-shard index entry.
+///
+/// # Guarantees
+/// Contains a valid, absolute etcd path without double slashes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ShardActiveIndexKey(String);
 
@@ -124,20 +145,36 @@ pub(crate) trait EtcdKey: private::Sealed + Clone {
 macro_rules! impl_exact_key {
     ($name:ident) => {
         impl $name {
+            /// Returns a string slice representing the key.
+            ///
+            /// # Complexity
+            /// `O(1)`
             #[must_use]
             pub fn as_str(&self) -> &str {
                 &self.0
             }
 
+            /// Returns a byte slice representing the key.
+            ///
+            /// # Complexity
+            /// `O(1)`
             #[must_use]
             pub fn as_bytes(&self) -> &[u8] {
                 self.0.as_bytes()
             }
 
+            /// Consumes the key and returns the underlying byte vector.
+            ///
+            /// # Complexity
+            /// `O(1)`
             #[must_use]
             pub fn into_bytes(self) -> Vec<u8> {
                 self.0.into_bytes()
             }
+            /// Creates a key from an existing string.
+            ///
+            /// # Complexity
+            /// `O(1)`
 
             pub(crate) fn from_string(key: String) -> Self {
                 Self(key)
@@ -193,6 +230,9 @@ impl_exact_key!(ShardActiveIndexKey);
 
 impl ShardRecordKey {
     /// Returns the owner key stored under this shard record key.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the resulting key.
     #[must_use]
     pub fn owner_key(&self) -> ShardOwnerKey {
         let mut key = self.0.clone();
@@ -201,12 +241,18 @@ impl ShardRecordKey {
     }
 
     /// Converts this shard record key into its `/owner` child key.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the resulting key.
     #[must_use]
     pub fn into_owner_key(mut self) -> ShardOwnerKey {
         self.0.push_str("/owner");
         ShardOwnerKey::from_string(self.0)
     }
-
+    /// Parses the exact key from a byte slice.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the slice.
     pub(crate) fn from_encoded_key(key: &[u8]) -> Option<Self> {
         if PersistedShardSubtreeKey::classify(key) != Some(PersistedShardSubtreeKey::Record) {
             return None;
@@ -217,6 +263,10 @@ impl ShardRecordKey {
 }
 
 impl ShardOwnerKey {
+    /// Parses the exact key from a byte slice.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the slice.
     pub(crate) fn from_encoded_key(key: &[u8]) -> Option<Self> {
         if PersistedShardSubtreeKey::classify(key) != Some(PersistedShardSubtreeKey::Owner) {
             return None;
@@ -226,6 +276,9 @@ impl ShardOwnerKey {
     }
 
     /// Parse the owned shard ID from an owner key under `shards_scan_prefix`.
+    ///
+    /// # Complexity
+    /// `O(P)` where `P` is the length of `shards_scan_prefix`.
     pub(crate) fn parse_owned_shard(shards_scan_prefix: &[u8], key: &[u8]) -> Option<ShardId> {
         let suffix = key.strip_prefix(shards_scan_prefix)?;
         let shard_hex = suffix.strip_suffix(b"/owner")?;
@@ -235,6 +288,9 @@ impl ShardOwnerKey {
 
 impl RunRecordKey {
     /// Parse the run ID of a direct child under `prefix`.
+    ///
+    /// # Complexity
+    /// `O(P)` where `P` is the length of `prefix`.
     pub(crate) fn parse_direct_run_id(prefix: &str, key: &[u8]) -> Option<RunId> {
         parse_direct_hex_u64_child(prefix.as_bytes(), key).map(RunId::from_raw)
     }
@@ -242,6 +298,9 @@ impl RunRecordKey {
 
 impl RunActiveIndexKey {
     /// Parse the run ID of a direct child under `prefix`.
+    ///
+    /// # Complexity
+    /// `O(P)` where `P` is the length of `prefix`.
     pub(crate) fn parse_direct_run_id(prefix: &str, key: &[u8]) -> Option<RunId> {
         parse_direct_hex_u64_child(prefix.as_bytes(), key).map(RunId::from_raw)
     }
@@ -249,6 +308,9 @@ impl RunActiveIndexKey {
 
 impl ShardActiveIndexKey {
     /// Parse the shard ID of a direct child under `prefix`.
+    ///
+    /// # Complexity
+    /// `O(P)` where `P` is the length of `prefix`.
     pub(crate) fn parse_direct_shard_id(prefix: &str, key: &[u8]) -> Option<ShardId> {
         parse_direct_hex_u64_child(prefix.as_bytes(), key).map(ShardId::from_raw)
     }
@@ -256,6 +318,9 @@ impl ShardActiveIndexKey {
 
 impl PersistedShardSubtreeKey {
     /// Classify a persisted key read from a `.../shards/` subtree.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of `key`.
     #[must_use]
     pub fn classify(key: &[u8]) -> Option<Self> {
         const SHARD_RECORD_KEY_SEGMENT: &[u8] = b"/shards/";
@@ -328,6 +393,9 @@ impl EtcdKeyspace {
     ///
     /// Returns [`EtcdKeyspaceError`] if the trimmed prefix is empty,
     /// does not start with `/`, or ends with `/` (unless it is `"/"`).
+    ///
+    /// # Complexity
+    /// `O(N)` where `N` is the length of the prefix.
     pub fn new(prefix: impl Into<String>) -> Result<Self, EtcdKeyspaceError> {
         let prefix = prefix.into().trim().to_owned();
         if prefix.is_empty() {
@@ -346,24 +414,32 @@ impl EtcdKeyspace {
     }
 
     /// Returns the validated root namespace prefix as stored.
+    ///
+    /// # Complexity
+    /// `O(1)`
     #[must_use]
     pub fn prefix(&self) -> &str {
         &self.prefix
     }
 
-    // -----------------------------------------------------------------------
-    // Tenant-scoped prefixes
-    // -----------------------------------------------------------------------
-
     /// Scan prefix for all tenant subtrees: `{prefix}/tenants`.
     ///
     /// Appends the key into `buf` without clearing it first, enabling
     /// buffer reuse across multiple key constructions.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn tenants_prefix_into(&self, buf: &mut String) {
         self.join_namespace_into(buf, "tenants");
     }
 
     /// Scan prefix for all tenant subtrees: `{prefix}/tenants`.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn tenants_prefix(&self) -> String {
         let mut buf = String::new();
@@ -376,6 +452,12 @@ impl EtcdKeyspace {
     ///
     /// `tenant_hex` is the 64-character lowercase hex encoding of the
     /// 32-byte [`TenantId`]. Appends into `buf` without clearing.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn tenant_prefix_into(&self, buf: &mut String, tenant: TenantId) {
         self.tenants_prefix_into(buf);
         buf.push('/');
@@ -386,6 +468,9 @@ impl EtcdKeyspace {
     ///
     /// `tenant_hex` is the 64-character lowercase hex encoding of the
     /// 32-byte [`TenantId`].
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn tenant_prefix(&self, tenant: TenantId) -> String {
         let mut buf = String::new();
@@ -398,6 +483,12 @@ impl EtcdKeyspace {
     ///
     /// The value stores an 8-byte little-endian `u64` count of persisted
     /// shard records under the tenant. Appends into `buf` without clearing.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn tenant_shard_count_key_into(&self, buf: &mut String, tenant: TenantId) {
         self.tenant_prefix_into(buf, tenant);
         buf.push_str("/shard_count");
@@ -405,16 +496,15 @@ impl EtcdKeyspace {
 
     /// Exact key for a tenant's materialized shard counter:
     /// `{prefix}/tenants/{tenant_hex}/shard_count`.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn tenant_shard_count_key(&self, tenant: TenantId) -> TenantShardCountKey {
         let mut buf = String::new();
         self.tenant_shard_count_key_into(&mut buf, tenant);
         TenantShardCountKey::from_string(buf)
     }
-
-    // -----------------------------------------------------------------------
-    // Run record keys
-    // -----------------------------------------------------------------------
 
     /// Common segment for run records under a tenant:
     /// `{prefix}/tenants/{tenant_hex}/runs`.
@@ -423,6 +513,12 @@ impl EtcdKeyspace {
     /// Use [`run_records_scan_prefix_into`](Self::run_records_scan_prefix_into)
     /// for etcd prefix scans to avoid matching sibling `runs_active/` keys.
     /// Appends into `buf` without clearing.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn runs_prefix_into(&self, buf: &mut String, tenant: TenantId) {
         self.tenant_prefix_into(buf, tenant);
         buf.push_str("/runs");
@@ -434,6 +530,9 @@ impl EtcdKeyspace {
     /// This is the *non-trailing-slash* form used for building child keys.
     /// Use [`run_records_scan_prefix`](Self::run_records_scan_prefix) for
     /// etcd prefix scans to avoid matching sibling `runs_active/` keys.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn runs_prefix(&self, tenant: TenantId) -> String {
         let mut buf = String::new();
@@ -449,6 +548,12 @@ impl EtcdKeyspace {
     /// `"runs"` is a prefix of `"runs_active"`. The trailing slash
     /// restricts the scan to children of the `runs/` directory only.
     /// Appends into `buf` without clearing.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn run_records_scan_prefix_into(&self, buf: &mut String, tenant: TenantId) {
         self.runs_prefix_into(buf, tenant);
         buf.push('/');
@@ -461,6 +566,9 @@ impl EtcdKeyspace {
     /// `.../runs` would also match `.../runs_active/...` keys because
     /// `"runs"` is a prefix of `"runs_active"`. The trailing slash
     /// restricts the scan to children of the `runs/` directory only.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn run_records_scan_prefix(&self, tenant: TenantId) -> String {
         let mut buf = String::new();
@@ -473,6 +581,12 @@ impl EtcdKeyspace {
     ///
     /// `run_hex` is the 16-character zero-padded lowercase hex encoding of
     /// the `u64` [`RunId`]. Appends into `buf` without clearing.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn run_record_key_into(&self, buf: &mut String, tenant: TenantId, run: RunId) {
         self.runs_prefix_into(buf, tenant);
         buf.push('/');
@@ -484,16 +598,15 @@ impl EtcdKeyspace {
     ///
     /// `run_hex` is the 16-character zero-padded lowercase hex encoding of
     /// the `u64` [`RunId`].
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn run_record_key(&self, tenant: TenantId, run: RunId) -> RunRecordKey {
         let mut buf = String::new();
         self.run_record_key_into(&mut buf, tenant, run);
         RunRecordKey::from_string(buf)
     }
-
-    // -----------------------------------------------------------------------
-    // Shard record keys
-    // -----------------------------------------------------------------------
 
     /// Common segment for shard records under a run:
     /// `{run_record_key}/shards`.
@@ -502,6 +615,12 @@ impl EtcdKeyspace {
     /// [`shard_records_scan_prefix_into`](Self::shard_records_scan_prefix_into)
     /// for prefix scans to avoid matching sibling `shards_active/` keys.
     /// Appends into `buf` without clearing.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn run_shards_prefix_into(&self, buf: &mut String, tenant: TenantId, run: RunId) {
         self.run_record_key_into(buf, tenant, run);
         buf.push_str("/shards");
@@ -513,6 +632,9 @@ impl EtcdKeyspace {
     /// This is the *non-trailing-slash* form. Use
     /// [`shard_records_scan_prefix`](Self::shard_records_scan_prefix) for
     /// prefix scans to avoid matching sibling `shards_active/` keys.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn run_shards_prefix(&self, tenant: TenantId, run: RunId) -> String {
         let mut buf = String::new();
@@ -528,6 +650,12 @@ impl EtcdKeyspace {
     /// `"shards"` is a prefix of `"shards_active"`. The trailing slash
     /// restricts the scan to children of the `shards/` directory only.
     /// Appends into `buf` without clearing.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn shard_records_scan_prefix_into(&self, buf: &mut String, tenant: TenantId, run: RunId) {
         self.run_shards_prefix_into(buf, tenant, run);
         buf.push('/');
@@ -540,6 +668,9 @@ impl EtcdKeyspace {
     /// `.../shards` would also match `.../shards_active/...` keys because
     /// `"shards"` is a prefix of `"shards_active"`. The trailing slash
     /// restricts the scan to children of the `shards/` directory only.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn shard_records_scan_prefix(&self, tenant: TenantId, run: RunId) -> String {
         let mut buf = String::new();
@@ -552,6 +683,12 @@ impl EtcdKeyspace {
     ///
     /// `shard_hex` is the 16-character zero-padded lowercase hex encoding
     /// of the `u64` [`ShardId`]. Appends into `buf` without clearing.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn shard_record_key_into(
         &self,
         buf: &mut String,
@@ -569,6 +706,9 @@ impl EtcdKeyspace {
     ///
     /// `shard_hex` is the 16-character zero-padded lowercase hex encoding
     /// of the `u64` [`ShardId`].
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn shard_record_key(&self, tenant: TenantId, run: RunId, shard: ShardId) -> ShardRecordKey {
         let mut buf = String::new();
@@ -582,6 +722,12 @@ impl EtcdKeyspace {
     /// Stored as a child of the shard record key so a delete on the shard
     /// record key prefix also removes the ownership key. Appends into `buf`
     /// without clearing.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn shard_owner_key_into(
         &self,
         buf: &mut String,
@@ -598,6 +744,9 @@ impl EtcdKeyspace {
     ///
     /// Stored as a child of the shard record key so a delete on the shard
     /// record key prefix also removes the ownership key.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn shard_owner_key(&self, tenant: TenantId, run: RunId, shard: ShardId) -> ShardOwnerKey {
         let mut buf = String::new();
@@ -605,20 +754,18 @@ impl EtcdKeyspace {
         ShardOwnerKey::from_string(buf)
     }
 
-    // -----------------------------------------------------------------------
-    // Active-index keys
-    // -----------------------------------------------------------------------
-    //
-    // Active indexes are lightweight marker keys that allow listing only
-    // active runs/shards without scanning (and filtering) the full record
-    // keyspace.
-
     /// Scan prefix for active-run index entries:
     /// `{prefix}/tenants/{tenant_hex}/runs_active`.
     ///
     /// Lives as a sibling of `runs/` under the tenant — not nested inside
     /// `runs/` — so that a prefix scan on `runs/` returns only run records.
     /// Appends into `buf` without clearing.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn runs_active_prefix_into(&self, buf: &mut String, tenant: TenantId) {
         self.tenant_prefix_into(buf, tenant);
         buf.push_str("/runs_active");
@@ -629,6 +776,9 @@ impl EtcdKeyspace {
     ///
     /// Lives as a sibling of `runs/` under the tenant — not nested inside
     /// `runs/` — so that a prefix scan on `runs/` returns only run records.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn runs_active_prefix(&self, tenant: TenantId) -> String {
         let mut buf = String::new();
@@ -639,6 +789,12 @@ impl EtcdKeyspace {
     /// Exact key for an active-run index entry:
     /// `{prefix}/tenants/{tenant_hex}/runs_active/{run_hex}`.
     /// Appends into `buf` without clearing.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn run_active_index_key_into(&self, buf: &mut String, tenant: TenantId, run: RunId) {
         self.runs_active_prefix_into(buf, tenant);
         buf.push('/');
@@ -647,6 +803,9 @@ impl EtcdKeyspace {
 
     /// Exact key for an active-run index entry:
     /// `{prefix}/tenants/{tenant_hex}/runs_active/{run_hex}`.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn run_active_index_key(&self, tenant: TenantId, run: RunId) -> RunActiveIndexKey {
         let mut buf = String::new();
@@ -661,6 +820,12 @@ impl EtcdKeyspace {
     /// inside `shards/` — for the same scan-isolation reason as
     /// [`runs_active_prefix`](Self::runs_active_prefix). Appends into
     /// `buf` without clearing.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn shards_active_prefix_into(&self, buf: &mut String, tenant: TenantId, run: RunId) {
         self.run_record_key_into(buf, tenant, run);
         buf.push_str("/shards_active");
@@ -672,6 +837,9 @@ impl EtcdKeyspace {
     /// Lives as a sibling of `shards/` under the run key — not nested
     /// inside `shards/` — for the same scan-isolation reason as
     /// [`runs_active_prefix`](Self::runs_active_prefix).
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn shards_active_prefix(&self, tenant: TenantId, run: RunId) -> String {
         let mut buf = String::new();
@@ -682,6 +850,12 @@ impl EtcdKeyspace {
     /// Exact key for an active-shard index entry:
     /// `{run_record_key}/shards_active/{shard_hex}`.
     /// Appends into `buf` without clearing.
+    ///
+    /// # Side Effects
+    /// Appends to `buf` without clearing it.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the number of bytes appended to `buf`.
     pub fn shard_active_index_key_into(
         &self,
         buf: &mut String,
@@ -696,6 +870,9 @@ impl EtcdKeyspace {
 
     /// Exact key for an active-shard index entry:
     /// `{run_record_key}/shards_active/{shard_hex}`.
+    ///
+    /// # Complexity
+    /// `O(L)` where `L` is the length of the returned key.
     #[must_use]
     pub fn shard_active_index_key(
         &self,
@@ -723,14 +900,6 @@ impl EtcdKeyspace {
         buf.push_str(suffix);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Hex encoding helpers
-// ---------------------------------------------------------------------------
-//
-// All identity types are encoded as fixed-width lowercase hex so that etcd
-// keys are human-readable in `etcdctl` output and lexicographic key order
-// matches numeric order (important for range scans).
 
 /// Append a 32-byte `TenantId` as 64 lowercase hex characters into `buf`.
 fn tenant_hex_into(buf: &mut String, tenant: TenantId) {
@@ -760,11 +929,19 @@ fn encode_hex_into(buf: &mut String, bytes: &[u8]) {
     }
 }
 
+/// Parses a direct `u64` child ID from a prefix.
+///
+/// # Complexity
+/// `O(L)` where `L` is `prefix.len()`.
 fn parse_direct_hex_u64_child(prefix: &[u8], key: &[u8]) -> Option<u64> {
     let suffix = key.strip_prefix(prefix)?;
     parse_hex_u64_suffix_bytes(suffix)
 }
 
+/// Parses a 16-character hex suffix into a `u64`.
+///
+/// # Complexity
+/// `O(1)` as it expects exactly 16 bytes.
 fn parse_hex_u64_suffix_bytes(suffix: &[u8]) -> Option<u64> {
     if suffix.len() != 16 {
         return None;

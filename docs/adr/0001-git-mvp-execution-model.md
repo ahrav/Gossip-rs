@@ -113,7 +113,7 @@ flowchart TD
     C --> D{"FinalizeOutcome"}
     D -->|Complete| E["data_ops + watermark_ops durable"]
     D -->|Partial| F["data_ops durable; watermark_ops suppressed"]
-    E --> G["Translate durable repo result"]
+    E --> G["Translate repo result + captured findings<br/>via translate_git_item_result"]
     F --> G
     G --> H["ResultCommitter -> ItemCommitReceipt"]
     H --> I["CompletedUnit::repo_frontier + ItemCommitReceipt -> UnitCommitReceipt"]
@@ -138,6 +138,12 @@ The outer runtime already has the receipt-only rule it needs:
 - `PrefixCheckpointAggregator` advances only from durable contiguous prefixes.
 - `RepoFrontier` remains a normal checkpoint-boundary kind in the shared
   aggregator rather than a Git-only side channel.
+
+The translation step now includes Git findings themselves, not only finalize
+outcome metadata. Repo-frontier workers capture emitted finding payloads during
+scan execution, normalize them behind `PersistenceFinding`, and commit them
+through the same findings-first, done-ledger-second `ResultCommitter` path used
+by ordered-content scans before they synthesize the outer checkpoint receipt.
 
 ### Crash window: `InnerDurable -> OuterCheckpointed`
 
@@ -251,12 +257,20 @@ execution model keeps these invariants explicit:
 7. Logs, metrics, and traces never contain raw secret bytes, repo paths, refs, or tokens.
 8. Duplicate submission and worker replay are idempotent.
 
+Operational telemetry follows the same rule. Stage-oriented Git observability
+may emit scalar timings, shard digests, and closed-set retry or lease-loss
+labels, but never raw mirror roots, repo locators, refs, commit IDs, or
+connector tokens.
+
 ## Consequences
 
 - `ShardStatus` remains the only persisted outer lifecycle for repo work.
 - `RepoFrontier` remains part of the shared receipt and checkpoint model rather
   than a Git-only completion path.
 - Lease loss is a first-class outcome that stops work without parking the shard.
+- Git stage telemetry stays low-cardinality and redaction-safe: worker logs and
+  recorder events emit digests plus scalar timings rather than raw repository
+  identifiers.
 - The first scope optimizes for deterministic replay and narrow control-plane
   state, not for packing density.
 

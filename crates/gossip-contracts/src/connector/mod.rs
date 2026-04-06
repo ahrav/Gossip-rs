@@ -1,109 +1,52 @@
-//! Connector contract types shared between connector runtimes and
-//! coordinator-facing contracts.
+//! Connector contract types shared between connector runtimes and coordinator-facing contracts.
+//!
+//! # Purpose
 //!
 //! This module exports validated wrapper types for connector-originated bytes
 //! (`ItemKey`, `ItemRef`, `TokenBytes`), cursor and metadata types used by
-//! enumeration/read flows, and a log-safe digest type ([`ToxicDigest`]) for
+//! enumeration/read flows, and a log-safe digest type
+//! ([`ToxicDigest`](crate::connector::ToxicDigest)) for
 //! redacting untrusted connector data in diagnostics.
 //!
-//! ## Surface split
+//! # Public Surface
 //!
-//! The connector contract surface is split into focused layers:
+//! - [`common`](crate::connector::common) provides the shared paging vocabulary
+//!   ([`PageBuf`](crate::connector::PageBuf),
+//!   [`PageState`](crate::connector::PageState)) and page-shape validators.
+//! - [`ordered`](crate::connector::ordered) and
+//!   [`git`](crate::connector::git) define the family-specific source traits.
+//! - [`Cursor`](crate::connector::Cursor),
+//!   [`Budgets`](crate::connector::Budgets),
+//!   [`ScanItem`](crate::connector::ScanItem), and
+//!   [`VersionId`](crate::connector::VersionId) model the paging and item
+//!   metadata exchanged between connectors and runtimes.
+//! - [`ConnectorCapabilities`](crate::connector::ConnectorCapabilities),
+//!   [`EnumerateError`](crate::connector::EnumerateError), and
+//!   [`ReadError`](crate::connector::ReadError) describe source capabilities
+//!   and failure boundaries.
 //!
-//! - `types.rs` defines validated value wrappers, item metadata/value
-//!   invariants (including toxic-byte redaction and size bounds), and
-//!   [`ToxicDigest`].
-//! - `api.rs` defines operation-outcome classification and optional capability
-//!   negotiation (`ErrorClass`, `EnumerateError`, `ReadError`,
-//!   `ConnectorCapabilities`).
-//! - `common.rs` defines shared paging vocabulary reused across connector
-//!   families and exposed at [`common`] ([`PageBuf`], [`PageState`],
-//!   [`PagingCapabilities`], [`KeyedPageItem`], [`validate_filled_page`]).
-//! - `conformance.rs` provides the reusable ordered-content conformance
-//!   harness ([`conformance::run_ordered_content_conformance`],
-//!   [`conformance::drain_ordered_source`]).
-//! - `ordered.rs` defines the ordered-content family contract
-//!   ([`ordered::OrderedContentCapabilities`],
-//!   [`ordered::OrderedContentSource`]).
-//! - `git.rs` defines the Git family contract
-//!   ([`git::RepoKey`], [`git::RepoLocator`], [`git::GitRepoTarget`],
-//!   [`git::GitSelection`], [`git::LocalMirror`],
-//!   [`git::GitExecutionLimits`], [`git::GitRunOutcome`],
-//!   [`git::GitRunError`], [`git::GitDiscoveryCapabilities`],
-//!   [`git::GitRepoDiscoverySource`],
-//!   [`git::GitMirrorManager`], [`git::GitRepoExecutor`]).
+//! The contract surface is split into focused, composable layers rather than a single
+//! universal connector model. It isolates connector value contracts, shared paging
+//! vocabulary, and family-specific trait surfaces from orchestration decisions
+//! (retry, scheduling, backoff policy), which live in runtime crates.
 //!
-//! `api.rs` and `types.rs` remain internal organization units; their public
-//! items are re-exported here so runtime crates keep a single import boundary
-//! for shared nouns and error taxonomy. [`common`] is public because the paging
-//! vocabulary is reused across families, while the family contracts stay
-//! namespaced under [`ordered`] and [`git`]. Conformance harnesses stay
-//! namespaced under [`conformance`] as cross-cutting test utilities consumed
-//! by multiple downstream crates.
-//!
-//! Family modules compose from the shared layers instead of inheriting a
-//! single universal connector model: [`ordered`] and [`git`] depend on
-//! [`common`], `types.rs`, and `api.rs` for paging, value wrappers, and error
-//! classification.
-//!
-//! ## Invariants
+//! # Invariants
 //!
 //! - Boundary byte wrappers are always non-empty and bounded by hard limits.
-//! - `Debug`/`Display` output is redacted (length + short hash prefix), never
-//!   raw bytes.
-//! - `Cursor` owns paging state and bridges safely to coordination's borrowed
-//!   `CursorUpdate`.
-//! - `MAX_ITEM_KEY_SIZE` and `MAX_TOKEN_SIZE` mirror coordination cursor
-//!   limits so connector paging state and cursor updates stay aligned.
-//!   Alignment is covered by connector type tests.
-//! - Pooled toxic-byte wrappers retain a shared page slab (`PooledByteSlab`);
-//!   any key/ref/token clones that escape a page keep that slab alive.
+//! - `Debug`/`Display` output of untrusted bytes is redacted (length + short hash prefix).
+//! - `Cursor` owns paging state and safely bridges to coordination's borrowed `CursorUpdate`.
+//! - `MAX_ITEM_KEY_SIZE` and `MAX_TOKEN_SIZE` strictly mirror coordination cursor limits
+//!   to ensure connector paging state and cursor updates stay aligned.
+//! - Pooled toxic-byte wrappers retain a shared page slab (`PooledByteSlab`); key/ref/token
+//!   clones that escape a page keep that slab alive.
 //!
-//! ## Public surface
+//! # Design Trade-offs
 //!
-//! - Byte wrappers: [`ItemKey`], [`ItemRef`], [`TokenBytes`]
-//! - Pooled slab owner for page-scoped toxic-byte wrappers: [`PooledByteSlab`]
-//! - Shared paging vocabulary: [`PageBuf`], [`PageState`], [`PagingCapabilities`],
-//!   [`KeyedPageItem`], [`PageShapeError`], [`PageSequenceViolation`]
-//! - Paging bridge: [`Cursor`]
-//! - Version semantics: [`VersionId`]
-//! - Optional metadata: [`ContentHints`], [`Location`]
-//! - Enumeration composites: [`ScanItem`]
-//! - Scan budgets: [`Budgets`]
-//! - Validation errors: [`ConnectorInputError`]
-//! - Log-safe digest: [`ToxicDigest`]
-//! - Connector API errors: [`ErrorClass`], [`EnumerateError`], [`ReadError`]
-//! - Connector feature flags: [`ConnectorCapabilities`]
-//! - Ordered-content family contract: [`ordered::OrderedContentCapabilities`],
-//!   [`ordered::OrderedContentSource`]
-//! - Ordered-content conformance harness (under [`conformance`]):
-//!   [`conformance::run_ordered_content_conformance`],
-//!   [`conformance::drain_ordered_source`],
-//!   [`conformance::drain_ordered_source_from`],
-//!   [`conformance::assert_repeatable_drain`],
-//!   [`conformance::assert_resume_after_corrupt_token`],
-//!   [`conformance::assert_no_forbidden_fragments`]
-//! - Conformance snapshot types (under [`conformance`]):
-//!   [`conformance::ObservedScanItem`],
-//!   [`conformance::OrderedContentDrain`],
-//!   [`conformance::OrderedContentConformanceError`]
-//! - Git family types and contracts: [`git::RepoKey`], [`git::RepoLocator`],
-//!   [`git::GitRepoTarget`], [`git::GitSelection`], [`git::LocalMirror`],
-//!   [`git::GitExecutionLimits`], [`git::GitRunOutcome`],
-//!   [`git::GitRunError`], [`git::GitDiscoveryCapabilities`],
-//!   [`git::GitRepoDiscoverySource`],
-//!   [`git::GitMirrorManager`], [`git::GitRepoExecutor`]
-//!
-//! These types are intentionally composable: a connector validates once at the
-//! boundary, then hands strongly-typed values across crate boundaries without
-//! repeating raw-byte checks.
-//!
-//! ## Ownership boundary
-//!
-//! `gossip-contracts` defines connector value contracts, shared paging
-//! vocabulary, and family-specific trait surfaces only. Runtime connector
-//! implementations and orchestration decisions (retry, scheduling, backoff
-//! policy) live in runtime crates.
+//! - **Composition over Inheritance:** Family modules (`ordered`, `git`) compose from shared
+//!   layers (`common`, `types`, `api`) instead of implementing a monolithic connector trait.
+//!   This prevents leaking unrelated methods across distinct source families.
+//! - **Boundary Validation:** Connectors validate untrusted byte wrappers once at the boundary,
+//!   handing strongly-typed values across crate boundaries to avoid repeating raw-byte checks.
 
 use crate::identity::ConnectorTag;
 
@@ -113,7 +56,6 @@ pub mod conformance;
 pub mod git;
 pub mod ordered;
 mod types;
-// types_tests.rs is declared inside types.rs via #[path] attribute.
 
 pub use api::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
 // Re-export for use by `define_connector_error!` macro via `$crate::connector::` path.
@@ -128,10 +70,6 @@ pub use types::{
     MAX_ITEM_KEY_SIZE, MAX_ITEM_REF_SIZE, MAX_LOCATION_DISPLAY_SIZE, MAX_LOCATION_URL_SIZE,
     MAX_TOKEN_SIZE, PooledByteSlab, ScanItem, TokenBytes, ToxicDigest, VersionId,
 };
-
-// ---------------------------------------------------------------------------
-// Canonical connector-tag constants
-// ---------------------------------------------------------------------------
 
 /// Connector tag for filesystem-sourced items.
 ///
