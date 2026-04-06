@@ -481,7 +481,7 @@ a receipt is in hand.
 
 | File                                                   | Purpose                                                                                   |
 | :----------------------------------------------------- | :---------------------------------------------------------------------------------------- |
-| `07-boundary-5-persistence/04-commit-protocol-typestate.md` | Deep dive design document for the commit protocol typestate                          |
+| `docs/gossip-contracts/boundary-5-persistence.md` | Deep dive design document for the commit protocol typestate                          |
 | `crates/gossip-contracts/src/persistence/page_commit.rs` | `PageCommit<S>` typestate, `CheckpointBoundary`, `CommitScope`, `PageCommitValidationError`, `CommitAdvanceError` |
 | `crates/gossip-contracts/src/persistence/commit.rs`    | `CommitHandle` trait, `ReadyCommitHandle`, all receipt types (`FindingsCommitReceipt`, `DoneLedgerCommitReceipt`, `CheckpointCommitReceipt`, `ItemCommitReceipt`, `PageCommitReceipt`) |
 | `crates/gossip-contracts/src/persistence/mod.rs`       | Public re-exports and cross-trait ordering contract documentation                         |

@@ -273,13 +273,13 @@ compared to the risk of inconsistency.
 When the failure is between the worker and the external data source (GitHub, S3,
 etc.) rather than between the worker and the coordinator, the retry-budget
 pattern contains the damage. The scan loop uses a `RetryBudget` that classifies
-errors via `BackendError` into `RetryableReason` and `PermanentReason` categories.
+errors via `ErrorClass` into `RetryableReason` and `PermanentReason` categories.
 After the retry budget is exhausted, the shard is parked with
 `ParkReason::TooManyErrors`, freeing the worker for other shards.
 
 > **Note:** The sequence diagram below shows a **target design** where a full
 > circuit breaker state machine (Closed/Open/HalfOpen) mediates connector calls.
-> The current implementation uses a `RetryBudget` with `BackendError` classification
+> The current implementation uses a `RetryBudget` with `ErrorClass` classification
 > in `scanner-scheduler/src/scheduler/failure.rs`. The parking outcome (`ParkReason::TooManyErrors`) is the same;
 > the intermediate states (Open, HalfOpen, probe) are aspirational.
 
@@ -354,7 +354,7 @@ S3 is fine, workers can continue scanning S3 shards without interruption.
 > **Note:** The target design introduces a full circuit breaker state machine
 > (Closed → Open → HalfOpen) with cooldown and probe phases (shown in the
 > sequence diagram above). The current implementation achieves the same parking
-> outcome (`ParkReason::TooManyErrors`) via `RetryBudget` and `BackendError`
+> outcome (`ParkReason::TooManyErrors`) via `RetryBudget` and `ErrorClass`
 > classification, without the intermediate Open/HalfOpen states.
 
 The parking mechanism ensures the shard is not lost. A parked shard retains its

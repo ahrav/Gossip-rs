@@ -114,7 +114,7 @@ sequenceDiagram
     participant WB as Worker B
 
     Note over WA,WB: Normal operation
-    WA->>CO: acquire_and_restore(shard_1)
+    WA->>CO: acquire_and_restore_into(shard_1)
     CO-->>WA: Ok(token=42)
     WA->>CO: checkpoint(shard_1, token=42, cursor=100)
     CO-->>WA: Ok
@@ -127,7 +127,7 @@ sequenceDiagram
     end
 
     Note over CO,WB: Coordinator reassigns shard
-    WB->>CO: acquire_and_restore(shard_1)
+    WB->>CO: acquire_and_restore_into(shard_1)
     CO-->>WB: Ok(token=43)
 
     Note over WB: Worker B is now the valid owner (INV-S10)
