@@ -1080,13 +1080,18 @@ where
     Ok((execution.report, completion, stage_metrics))
 }
 
+/// Typed error marker for commit-OID-map saturation.
+///
+/// Wrapping saturation in a concrete type enables
+/// [`should_park_git_repo_failure`] to classify the failure via
+/// `downcast_ref` rather than parsing the display string.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "git repo-frontier shard '{shard_id}': commit OID map saturated at {entry_limit} entries; {detail}"
+    "git repo-frontier shard '{shard_id}': commit OID map saturated at {} entries; {detail}",
+    FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES
 )]
 struct CommitOidMapSaturationError {
     shard_id: String,
-    entry_limit: usize,
     detail: String,
 }
 
@@ -1094,7 +1099,6 @@ impl CommitOidMapSaturationError {
     fn new(redacted_shard_id: &ToxicDigest, detail: impl Into<String>) -> Self {
         Self {
             shard_id: redacted_shard_id.to_string(),
-            entry_limit: FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES,
             detail: detail.into(),
         }
     }
@@ -1104,9 +1108,13 @@ impl CommitOidMapSaturationError {
 ///
 /// Centralizes the error shape so the error-path and success-path saturation
 /// checks produce the same `Driver` variant with consistent formatting. The
-/// stable inner error type lets the outer worker classify saturation without
-/// parsing the display string.
-fn oid_map_saturation_error(
+/// stable inner error type lets the caller classify saturation via downcast
+/// rather than parsing the display string.
+///
+/// The returned error must remain the root cause of the `Driver` variant
+/// (no `.context()` wrapping) so [`should_park_git_repo_failure`] can
+/// recover it via `downcast_ref`.
+pub(super) fn oid_map_saturation_error(
     redacted_shard_id: &ToxicDigest,
     detail: &str,
 ) -> DistributedRuntimeError {
@@ -1115,7 +1123,7 @@ fn oid_map_saturation_error(
     )))
 }
 
-fn should_park_git_repo_failure(error: &DistributedRuntimeError) -> bool {
+pub(super) fn should_park_git_repo_failure(error: &DistributedRuntimeError) -> bool {
     matches!(
         error,
         DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(source))
@@ -1319,11 +1327,13 @@ where
                     ) {
                         Ok(()) => tracing::info!(
                             shard_id = %stage_sink.redacted_shard_id(),
+                            reason = %ParkReason::Poisoned,
                             "parked shard after commit OID map saturation",
                         ),
                         Err(park_error) => tracing::warn!(
                             shard_id = %stage_sink.redacted_shard_id(),
                             park_error = %park_error,
+                            attempted_reason = %ParkReason::Poisoned,
                             "failed to park shard after commit OID map saturation; shard will become claimable again after lease expiry",
                         ),
                     }
