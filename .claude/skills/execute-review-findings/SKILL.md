@@ -430,8 +430,8 @@ After all waves complete, present:
 | Writing a new standalone test when rstest cases exist | Test proliferation, maintenance burden, inconsistent patterns | Add a `#[case]` to the existing rstest instead |
 | Ignoring existing proptest coverage for a bug | Duplicates coverage, misses the property violation | Tighten the property assertion or add a targeted `prop_assert` |
 | Skipping doc-verify after fixes | Fixes can invalidate doc comments, creating silent drift | Always run Phase 5 doc-verify on modified files |
-| Creating follow-up tasks with bare `bd create` | Missing test strategy, implementation guidance, and doc requirements — next agent must re-research | Always use `/task-forge` for follow-up tasks discovered during execution |
-| Scope-creeping a finding to include adjacent issues | Findings lose focus, partial completion harder to track | File a `/task-forge` follow-up and keep the current task scoped |
+| Creating follow-up tasks with bare `bd create` | Missing test strategy, implementation guidance, and doc requirements — next agent must re-research | Use `/task-forge` for non-trivial follow-ups; trivial follow-ups may use `/create-task` |
+| Scope-creeping a finding to include adjacent issues | Findings lose focus, partial completion harder to track | File a `/task-forge` follow-up for non-trivial work and keep the current task scoped |
 
 ## Configuration
 

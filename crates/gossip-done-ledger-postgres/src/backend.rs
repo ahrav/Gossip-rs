@@ -266,7 +266,11 @@ impl DoneLedger for DoneLedgerPg {
         let stmt = client.prepare(COUNT_DONE_HASHES_SQL)?;
         let row = client.query_one(&stmt, &[&tenant_bytes, &policy_bytes, &terminal_statuses])?;
         let count: i64 = row.get(0);
-        Ok(Some(count as usize))
+        let count = usize::try_from(count).map_err(|_| DoneLedgerPgError::Conversion {
+            record_index: None,
+            source: DoneLedgerPgConversionError::CountOutOfRange { value: count },
+        })?;
+        Ok(Some(count))
     }
 
     fn batch_upsert(

@@ -37,6 +37,9 @@ pub enum DoneLedgerPgConversionError {
     /// A persisted `findings_count` value did not fit in `u32`.
     #[error("stored findings_count {value} does not fit in u32")]
     FindingsCountOutOfRange { value: i64 },
+    /// A `count(*)` result did not fit in `usize`.
+    #[error("count(*) result {value} does not fit in usize")]
+    CountOutOfRange { value: i64 },
 }
 
 /// Unified backend error for the PostgreSQL done-ledger implementation.
