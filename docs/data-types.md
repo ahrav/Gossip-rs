@@ -18,21 +18,24 @@ classDiagram
         -Vec~RuleCold~ rules_cold
         -Vec~TransformConfig~ transforms
         -Tuning tuning
+        -Vec~ConfirmAllCompiled~ confirm_all_gates
+        -Vec~KeywordsCompiled~ keyword_gates
+        -Vec~PackedPatterns~ value_suppressor_gates
+        -Vec~EntropyCompiled~ entropy_gates
+        -Vec~TwoPhaseCompiled~ two_phase_gates
+        -Vec~LocalContextSpec~ local_context_gates
+        -Vec~OfflineValidationSpec~ offline_validation_gates
+        -Vec~CharClassCompiled~ char_class_gates
+        -SafelistFilter safelist
+        -Vec~f32~ entropy_log2
         -Option~VsPrefilterDb~ vs
         -Option~VsAnchorDb~ vs_utf16
         -Option~VsUtf16StreamDb~ vs_utf16_stream
         -Option~VsStreamDb~ vs_stream
         -Option~VsGateDb~ vs_gate
         -Option~Base64YaraGate~ b64_gate
-        -SafelistFilter safelist
-        -Vec~OfflineValidationSpec~ offline_validation_gates
-        -Vec~ConfirmAllCompiled~ confirm_all_gates
-        -Vec~KeywordsCompiled~ keyword_gates
-        -Vec~PackedPatterns~ value_suppressor_gates
-        -Vec~EntropyCompiled~ entropy_gates
-        -Vec~CharClassCompiled~ char_class_gates
-        -Vec~TwoPhaseCompiled~ two_phase_gates
-        -Vec~LocalContextSpec~ local_context_gates
+        -Vec~(usize, UnfilterableReason)~ unfilterable_rules
+        -bool has_utf16_anchors
         -usize max_window_diameter_bytes
         -usize max_prefilter_width
         +new(rules, transforms, tuning) Engine
@@ -78,6 +81,7 @@ classDiagram
 
     class RuleCold {
         -&'static str name
+        -[u8; 32] fingerprint
         -i8 min_confidence
     }
 
@@ -276,6 +280,9 @@ classDiagram
     }
 
     class FileTable {
+        -Vec~PathSpan~ path_spans [unix only]
+        -ScratchVec~u8~ path_bytes [unix only]
+        -Vec~PathBuf~ paths [non-Unix only]
         -Vec~u64~ sizes
         -Vec~(u64, u64)~ dev_inodes
         -Vec~u32~ flags
@@ -469,10 +476,10 @@ classDiagram
 
     class FsFindingRecord {
         +u32 rule_id
-        +u64 root_hint_start
-        +u64 root_hint_end
-        +u64 span_start
-        +u64 span_end
+        +u64 blob_offset_start
+        +u64 blob_offset_end
+        +u64 window_start
+        +u64 window_end
         +NormHash norm_hash
         +i8 confidence_score
     }
