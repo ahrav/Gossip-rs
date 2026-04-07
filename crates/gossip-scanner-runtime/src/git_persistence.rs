@@ -1047,6 +1047,12 @@ pub mod test_support {
         }
 
         /// Clears any previously enqueued get faults.
+        ///
+        /// The call counter is NOT reset: subsequent calls to
+        /// [`enqueue_get_fault`](Self::enqueue_get_fault) or
+        /// [`set_fail_on_get_call`](Self::set_fail_on_get_call) must still use
+        /// `call_no` values strictly greater than the number of `get` calls
+        /// already issued.
         pub fn clear_fail_on_get_call(&self) {
             self.state.borrow_mut().get_faults.clear();
         }
@@ -1099,7 +1105,7 @@ pub mod test_support {
         ///
         /// Each call number may have at most one fault; duplicates panic.
         pub fn enqueue_multi_get_fault(&self, call_no: usize, fault: GetFault) {
-            let state = self.state.borrow();
+            let mut state = self.state.borrow_mut();
             assert!(
                 call_no > state.multi_get_fault_count,
                 "call_no={call_no} has already passed; next multi_get call is {}",
@@ -1114,11 +1120,7 @@ pub mod test_support {
                 "enqueue_multi_get_fault and set_multi_get_truncate are mutually exclusive; \
                  faults silently suppress the length-mismatch simulation"
             );
-            drop(state);
-            self.state
-                .borrow_mut()
-                .multi_get_faults
-                .push((call_no, fault));
+            state.multi_get_faults.push((call_no, fault));
         }
 
         /// Configures `multi_get` to return one fewer result than requested.
@@ -1323,11 +1325,17 @@ mod tests {
         GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash)
     }
 
+    /// Simplified watermark key for crash-recovery tests. Real watermark keys
+    /// include repo_id, policy_hash, and ref_name components; this constant
+    /// carries just the `rw` namespace prefix needed for `BatchFaultTrigger`
+    /// matching.
+    const TEST_WATERMARK_KEY: &[u8] = b"rw\0wm";
+
     fn complete_finalize_with_watermark(value: u8) -> FinalizeOutput {
         FinalizeOutput {
             data_ops: Vec::new(),
             watermark_ops: vec![WriteOp {
-                key: b"rw\0wm".to_vec(),
+                key: TEST_WATERMARK_KEY.to_vec(),
                 value: vec![value],
             }],
             outcome: FinalizeOutcome::Complete,
@@ -2811,16 +2819,17 @@ mod tests {
             format!("{err}").contains("corrupt staging bitmap"),
             "error should mention corrupt staging bitmap, got: {err}"
         );
-        assert!(
-            backend.contains_key(&staging_key),
-            "corrupt staging bytes must remain untouched after the failed finalize"
+        assert_eq!(
+            backend.get_value(&staging_key).as_deref(),
+            Some(&[0xFF][..]),
+            "failed finalize must leave the corrupt staging payload unchanged"
         );
         assert!(
             !backend.contains_key(&scope_key),
             "scope writes must not land when staging deserialization fails"
         );
         assert!(
-            backend.get_value(b"rw\0wm").is_none(),
+            backend.get_value(TEST_WATERMARK_KEY).is_none(),
             "watermarks must not land when finalize aborts before writing batches"
         );
     }
@@ -2873,7 +2882,7 @@ mod tests {
             "staging must survive when finalize aborts during seen-store load"
         );
         assert!(
-            backend.get_value(b"rw\0wm").is_none(),
+            backend.get_value(TEST_WATERMARK_KEY).is_none(),
             "watermarks must not land when finalize aborts before writing batches"
         );
     }
@@ -2907,7 +2916,7 @@ mod tests {
             "watermark-phase failure must leave staging deleted once the scope committed"
         );
         assert!(
-            backend.get_value(b"rw\0wm").is_none(),
+            backend.get_value(TEST_WATERMARK_KEY).is_none(),
             "watermarks must remain absent after the first crash"
         );
 
@@ -2931,7 +2940,7 @@ mod tests {
         assert_scope_contains(&backend, repo_id, &policy_hash, &[oid_a, oid_b]);
         assert_staging_contains(&backend, repo_id, &policy_hash, &[oid_b]);
         assert!(
-            backend.get_value(b"rw\0wm").is_none(),
+            backend.get_value(TEST_WATERMARK_KEY).is_none(),
             "watermarks must remain absent after the staging-delete crash"
         );
         assert_eq!(
@@ -2967,6 +2976,10 @@ mod tests {
         );
         assert_scope_contains(&backend, repo_id, &policy_hash, &[oid_a, oid_b]);
         assert_staging_contains(&backend, repo_id, &policy_hash, &[oid_b, oid_c]);
+        assert!(
+            backend.get_value(TEST_WATERMARK_KEY).is_none(),
+            "watermarks must remain absent after the any-phase crash"
+        );
         assert_eq!(
             fresh_adapter(&backend, repo_id, policy_hash)
                 .batch_check_seen(&[oid_a, oid_b, oid_c])
@@ -3001,7 +3014,7 @@ mod tests {
             "successful recovery must clear staging"
         );
         assert_eq!(
-            backend.get_value(b"rw\0wm").as_deref(),
+            backend.get_value(TEST_WATERMARK_KEY).as_deref(),
             Some(&[4][..]),
             "successful recovery must advance watermarks"
         );
@@ -3111,8 +3124,11 @@ mod tests {
 
             let expected: Vec<_> = staged_set.into_iter().collect();
 
+            // Cold-read: create a fresh adapter to verify durable state rather
+            // than the warm in-memory cache left by the recovery finalize.
+            let reloaded = fresh_adapter(&backend, repo_id, policy_hash);
             prop_assert_eq!(
-                recovered
+                reloaded
                     .batch_check_seen(&expected)
                     .expect("final seen check"),
                 vec![true; expected.len()],
@@ -3122,7 +3138,7 @@ mod tests {
                 "disjoint set must contain at least one non-colliding OID"
             );
             prop_assert_eq!(
-                recovered
+                reloaded
                     .batch_check_seen(&disjoint)
                     .expect("disjoint OIDs must not be seen"),
                 vec![false; disjoint.len()],
@@ -3131,7 +3147,7 @@ mod tests {
                 !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
                 "successful recovery must clear staging"
             );
-            let wm = backend.get_value(b"rw\0wm");
+            let wm = backend.get_value(TEST_WATERMARK_KEY);
             prop_assert_eq!(
                 wm.as_deref(),
                 Some(&[2u8][..]),
