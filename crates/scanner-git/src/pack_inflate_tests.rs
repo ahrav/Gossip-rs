@@ -683,3 +683,37 @@ fn apply_delta_with_poison_round_trip() {
     // Mixed copy+add delta is already exercised by
     // `apply_delta_mixed_copy_and_add`; no need to duplicate it here.
 }
+
+// ── TLS reentrancy fallback tests ─────────────────────────────────────
+
+#[test]
+fn inflate_exact_falls_back_under_tls_reentrancy() {
+    let payload = b"flate2 reentrancy fallback test payload".to_vec();
+    let compressed = zlib_compress(&payload);
+    let mut out = Vec::new();
+
+    let (consumed, result_out) = super::hold_inflate_tls_borrow_for_test(|| {
+        let consumed = inflate_exact(&compressed, &mut out, payload.len())
+            .expect("inflate_exact should succeed via local fallback");
+        (consumed, out)
+    });
+
+    assert_eq!(consumed, compressed.len());
+    assert_eq!(result_out, payload);
+}
+
+#[test]
+fn inflate_limited_falls_back_under_tls_reentrancy() {
+    let payload = b"flate2 limited reentrancy test".to_vec();
+    let compressed = zlib_compress(&payload);
+    let mut out = Vec::new();
+
+    let (consumed, result_out) = super::hold_inflate_tls_borrow_for_test(|| {
+        let consumed = inflate_limited(&compressed, &mut out, payload.len() + 1024)
+            .expect("inflate_limited should succeed via local fallback");
+        (consumed, out)
+    });
+
+    assert_eq!(consumed, compressed.len());
+    assert_eq!(result_out, payload);
+}

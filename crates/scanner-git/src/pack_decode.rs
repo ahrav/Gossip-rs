@@ -235,6 +235,10 @@ pub fn inflate_entry_payload(
         return pack_inflate_libdeflate::inflate_nondelta_exact(slice, expected, out);
     }
 
+    // The libdeflate-eligible path is fully handled above. The inner
+    // `use_libdeflate_for_header` check in `inflate_entry_payload_with`
+    // only fires for `pack_exec` callers that pass their own `libde`;
+    // from this call site it is unreachable.
     super::pack_inflate::with_tls_decompress(|de| {
         inflate_entry_payload_with(de, None, pack, header, out, limits)
     })
@@ -252,7 +256,6 @@ mod tests {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
-
 
     fn test_limits(max_object_bytes: usize) -> PackDecodeLimits {
         PackDecodeLimits::new(64, max_object_bytes, max_object_bytes)
@@ -447,15 +450,34 @@ mod tests {
         let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
         let header = entry_header_at(&pack, offset, &limits).expect("parse header");
 
-        let (consumed, out) =
-            crate::pack_inflate_libdeflate::hold_tls_borrow_for_test(|| {
-                let mut out = Vec::new();
-                let consumed =
-                    inflate_entry_payload(&pack, &header, &mut out, &limits).expect("inflate");
-                (consumed, out)
-            });
+        let (consumed, out) = crate::pack_inflate_libdeflate::hold_tls_borrow_for_test(|| {
+            let mut out = Vec::new();
+            let consumed =
+                inflate_entry_payload(&pack, &header, &mut out, &limits).expect("inflate");
+            (consumed, out)
+        });
         assert_eq!(consumed, compressed.len());
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn libdeflate_tls_fallback_with_corrupt_data_returns_error() {
+        let corrupt_compressed = b"\x78\x9c\xff\xff";
+        let (pack_bytes, offset) = single_entry_pack(non_delta_entry(8, corrupt_compressed));
+        let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
+        let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
+        let header = entry_header_at(&pack, offset, &limits).expect("parse header");
+
+        assert!(pack_inflate_libdeflate::use_libdeflate_for_header(&header));
+
+        let (res, out) = crate::pack_inflate_libdeflate::hold_tls_borrow_for_test(|| {
+            let mut out = Vec::new();
+            let res = inflate_entry_payload(&pack, &header, &mut out, &limits);
+            (res, out)
+        });
+
+        assert!(res.is_err(), "corrupt data should produce an error");
+        assert!(out.is_empty(), "output should be cleared on error");
     }
 
     #[test]

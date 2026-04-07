@@ -89,8 +89,15 @@ where
 
 /// Borrows the thread-local `Decompress` for the duration of `f`.
 ///
-/// Used by `pack_decode::inflate_entry_payload` to delegate to
-/// `inflate_entry_payload_with` without duplicating routing logic.
+/// Returns `Result<R, InflateError>` because this accessor owns its own
+/// fallback: when TLS is unavailable (init failure or reentrant borrow),
+/// it allocates a short-lived local `Decompress` internally. The only
+/// error case is total resource exhaustion where even the local fallback
+/// fails.
+///
+/// Contrast with [`super::pack_inflate_libdeflate::with_tls_decompressor`],
+/// which returns `Option<R>` — its fallback (flate2) crosses module
+/// boundaries, so the caller owns the fallback decision.
 pub(crate) fn with_tls_decompress<F, R>(f: F) -> Result<R, InflateError>
 where
     F: FnOnce(&mut Decompress) -> R,
@@ -98,7 +105,13 @@ where
     with_inflate_scratch(|de, _buf| Ok(f(de)))
 }
 
-fn init_decompress() -> Option<Decompress> {
+/// Attempt to create a `Decompress`. Wraps `Decompress::new(true)` in
+/// `catch_unwind` because flate2's constructor panics via `assert_eq!`
+/// when the underlying zlib-ng allocator returns an error code (OOM),
+/// rather than surfacing a `Result`. The panic originates in pure Rust
+/// code after the C call returns, so catching it is sound —
+/// `Decompress` is `UnwindSafe` and no C frames are on the stack.
+pub(crate) fn init_decompress() -> Option<Decompress> {
     std::panic::catch_unwind(|| Decompress::new(true)).ok()
 }
 
@@ -109,6 +122,17 @@ where
     let mut de = init_decompress().ok_or(InflateError::Backend)?;
     let mut buf = [0u8; INFLATE_BUF_SIZE];
     f(&mut de, &mut buf)
+}
+
+#[cfg(test)]
+pub(crate) fn hold_inflate_tls_borrow_for_test<R>(f: impl FnOnce() -> R) -> R {
+    INFLATE_SCRATCH.with(|scratch| {
+        let mut guard = scratch.borrow_mut();
+        let _scratch = guard
+            .as_mut()
+            .expect("inflate TLS should initialize for test coverage");
+        f()
+    })
 }
 
 /// Parsed object kind for non-delta entries.

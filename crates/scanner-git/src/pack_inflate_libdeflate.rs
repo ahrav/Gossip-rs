@@ -133,6 +133,14 @@ impl Drop for LibdeflateDecompressor {
 // enforced by the `&mut self` borrow on `zlib_decompress_exact`.
 unsafe impl Send for LibdeflateDecompressor {}
 
+/// Borrows the thread-local `LibdeflateDecompressor` for the duration of `f`.
+///
+/// Returns `Option<R>`: `None` when TLS is unavailable (init failure or
+/// reentrant borrow). The caller is responsible for choosing a fallback
+/// strategy — typically delegating to the flate2 path via
+/// [`super::pack_inflate::inflate_exact`]. This differs from
+/// [`super::pack_inflate::with_tls_decompress`] which owns its fallback
+/// internally and returns `Result`.
 #[inline]
 pub(crate) fn with_tls_decompressor<F, R>(f: F) -> Option<R>
 where
