@@ -792,10 +792,9 @@ mod tests {
         }
     }
 
-    /// `StoredGitEvent` must fit within two cache lines (128 bytes).
-    /// With `OidBytes` (33 bytes) instead of `HexOid` (65 bytes), the enum
-    /// drops from ~112 bytes to ~80 bytes. This bound catches accidental
-    /// field inflation.
+    /// `StoredGitEvent` must stay within two cache lines (128 bytes).
+    /// The `OidBytes` field (33 bytes) keeps the enum at ~80 bytes.
+    /// This bound catches accidental field inflation.
     const _: () = assert!(std::mem::size_of::<StoredGitEvent>() <= 80);
 
     #[test]

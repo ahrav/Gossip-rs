@@ -804,8 +804,7 @@ impl SanitizedCoordinationRecord {
             } => Self::GitCommitMeta {
                 shard_id,
                 commit_id,
-                // Redaction input is raw OID bytes (not hex text), so digest
-                // values differ from builds that hashed the hex-encoded string.
+                // Redaction operates on the raw OID bytes, not a hex-text representation.
                 oid: RedactedDigest::bytes("git_commit_oid", commit_oid.as_slice()),
                 timestamp,
                 author_name_id,
