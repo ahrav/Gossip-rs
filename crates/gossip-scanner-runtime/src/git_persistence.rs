@@ -1551,6 +1551,137 @@ mod tests {
     }
 
     #[test]
+    fn adapter_non_atomic_watermark_fault_preserves_data() {
+        let backend = TestBackend::non_atomic();
+        backend.enable_phase_logging();
+        // KeyPrefix targeting the watermark namespace skips the first-phase
+        // batch (data+seen) and fires on the watermark batch.
+        backend.set_batch_faults(vec![BatchFaultTrigger::key_prefix(
+            scanner_git::NS_REF_WATERMARK.as_slice(),
+        )]);
+
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 50, [0x50; 32]);
+        let err = adapter
+            .commit_finalize(&finalize_output(FinalizeOutcome::Complete))
+            .expect_err("watermark batch fault must propagate");
+
+        assert!(format!("{err}").contains("injected batch failure"));
+        // Data ops must have landed (first-phase batch succeeded).
+        assert_eq!(
+            backend.get_value(b"bc\0blob").as_deref(),
+            Some(&[0xAA][..]),
+            "data writes must survive when only the watermark batch fails"
+        );
+        // Watermarks must NOT have landed.
+        assert!(
+            backend.get_value(b"rw\0wm").is_none(),
+            "watermarks must remain absent when the watermark batch fails"
+        );
+        // Phase log must contain data phases but not watermark.
+        let namespaces: Vec<_> = backend.op_log().iter().map(|e| e.ns).collect();
+        assert!(namespaces.contains(&KeyNamespace::BlobCtx));
+        assert!(
+            !namespaces.contains(&KeyNamespace::Watermark),
+            "watermark ops must not appear in the log when the batch was rejected"
+        );
+    }
+
+    #[test]
+    fn adapter_non_atomic_first_batch_fault_blocks_everything() {
+        let backend = TestBackend::non_atomic();
+        backend.enable_phase_logging();
+        // Any fault fires on the very first apply_batch (data+seen phase).
+        backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
+
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 51, [0x51; 32]);
+        let err = adapter
+            .commit_finalize(&finalize_output(FinalizeOutcome::Complete))
+            .expect_err("first-phase fault must propagate");
+
+        assert!(format!("{err}").contains("injected batch failure"));
+        // Nothing must have landed.
+        assert!(
+            backend.get_value(b"bc\0blob").is_none(),
+            "data writes must not land when the first-phase batch fails"
+        );
+        assert!(
+            backend.get_value(b"rw\0wm").is_none(),
+            "watermarks must not land when the first-phase batch fails"
+        );
+        assert!(
+            backend.op_log().is_empty(),
+            "operation log must be empty when the first batch was rejected"
+        );
+    }
+
+    #[test]
+    fn adapter_atomic_single_batch_all_phases() {
+        let backend = TestBackend::atomic();
+        backend.enable_phase_logging();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 52, [0x52; 32]);
+        let oid = sim_oid(0xCC);
+
+        adapter
+            .persist_seen_delta(&[oid])
+            .expect("stage seen delta");
+        adapter
+            .commit_finalize(&finalize_output(FinalizeOutcome::Complete))
+            .expect("atomic finalize must succeed");
+
+        // Atomic backend: staging persist is 1 batch, finalize is 1 batch.
+        assert_eq!(
+            backend.batches().len(),
+            2,
+            "atomic backend: staging + finalize = 2 batches"
+        );
+
+        // The finalize batch must contain all phases in a single apply_batch.
+        let namespaces: Vec<_> = backend.op_log().iter().map(|e| e.ns).collect();
+        assert!(
+            namespaces.contains(&KeyNamespace::BlobCtx),
+            "finalize batch must contain blob context ops"
+        );
+        assert!(
+            namespaces.contains(&KeyNamespace::SeenScope),
+            "finalize batch must contain seen-scope ops"
+        );
+        assert!(
+            namespaces.contains(&KeyNamespace::Watermark),
+            "finalize batch must contain watermark ops"
+        );
+
+        // Data integrity.
+        assert_eq!(
+            adapter.batch_check_seen(&[oid]).expect("seen check"),
+            vec![true]
+        );
+        assert_eq!(backend.get_value(b"rw\0wm").as_deref(), Some(&[0xBB][..]));
+    }
+
+    #[test]
+    fn batch_fault_prefix_rejects_entire_batch_on_single_match() {
+        let backend = TestBackend::non_atomic();
+        backend.set_batch_faults(vec![BatchFaultTrigger::key_prefix(b"rw")]);
+
+        // Batch contains one matching and one non-matching op. The entire
+        // batch must be rejected because `any` op key matches the prefix.
+        let err = backend
+            .apply_batch(&[put_op(b"bc\0blob", &[0x01]), put_op(b"rw\0wm", &[0x02])])
+            .expect_err("prefix match on one key rejects the entire batch");
+
+        assert!(err.to_string().contains("injected batch failure"));
+        // Neither op should have landed.
+        assert!(
+            backend.get_value(b"bc\0blob").is_none(),
+            "non-matching op must also be rejected when the batch fails"
+        );
+        assert!(
+            backend.get_value(b"rw\0wm").is_none(),
+            "matching op must not land when the batch is rejected"
+        );
+    }
+
+    #[test]
     fn sim_backend_get_fault_skips_earlier_calls_and_fires_on_target() {
         let backend = TestBackend::non_atomic();
         let key = b"bc\0blob".to_vec();
