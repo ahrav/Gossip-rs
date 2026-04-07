@@ -28,9 +28,7 @@ use scanner_git::{
     StartSetResolver, WriteOp, run_git_scan,
 };
 
-const NS_BLOB_CTX: [u8; 3] = *b"bc\0";
-const NS_FINDING: [u8; 3] = *b"fn\0";
-use scanner_git::NS_SEEN_BLOB;
+use scanner_git::{NS_BLOB_CTX, NS_FINDING, NS_SEEN_BLOB};
 
 pub(crate) fn perf_stats_enabled() -> bool {
     cfg!(all(feature = "perf-stats", debug_assertions))
