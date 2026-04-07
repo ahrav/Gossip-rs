@@ -822,7 +822,9 @@ pub mod test_support {
     use std::collections::BTreeMap;
     use std::rc::Rc;
 
-    use super::{GitPersistenceBackend, GitPersistenceOp};
+    use scanner_git::{NS_BLOB_CTX, NS_FINDING, NS_REF_WATERMARK, NS_SEEN_STAGING};
+
+    use super::{GitPersistenceBackend, GitPersistenceOp, NS_SEEN_BLOB};
 
     /// Error type returned by [`TestBackend`] when fault injection fires.
     #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
