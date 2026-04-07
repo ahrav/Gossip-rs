@@ -219,5 +219,4 @@ graph TD
 | `FilesystemConnector::fill_page_directory()` | `crates/gossip-connectors/src/filesystem.rs` | Directory-mode key-only resume path |
 | `DirectoryWalker::new()` | `crates/gossip-connectors/src/filesystem.rs` | Rebuilds the live walk from the canonical root |
 | `DirectoryWalker::next_file()` | `crates/gossip-connectors/src/filesystem.rs` | Skips all keys at or below the resume floor |
-| `GitConnector::with_tokens()` | `crates/gossip-connectors/src/git.rs` | Capability toggle for token-aware surfaces |
 | `InMemoryDeterministicConnector::with_tokens()` | `crates/gossip-connectors/src/in_memory.rs` | Capability toggle for token-aware fixture behavior |

@@ -33,14 +33,11 @@ graph TD
 
     subgraph Connectors["Concrete implementations"]
         FS["<b>FilesystemConnector</b><br/>seek_by_key: ✓<br/>token_resume: ✗<br/>range_read: ✓<br/>split_hints: ✗ (caps)<br/><i>has choose_split_point<br/>via StreamingSplitEstimator</i>"]
-        GIT["<b>GitConnector</b><br/>seek_by_key: ✓<br/>token_resume: configurable<br/>range_read: ✓<br/>split_hints: ✓"]
         MEM["<b>InMemoryDeterministicConnector</b><br/>seek_by_key: ✓<br/>token_resume: configurable<br/>range_read: ✓<br/>split_hints: ✓"]
     end
 
     FS -->|provides| EM
     FS -->|provides| RM
-    GIT -->|provides| EM
-    GIT -->|provides| RM
     MEM -->|provides| EM
     MEM -->|provides| RM
 
@@ -48,7 +45,6 @@ graph TD
     style EM fill:#FEE2E2,stroke:#991B1B
     style RM fill:#FEE2E2,stroke:#991B1B
     style FS fill:#FEE2E2,stroke:#991B1B
-    style GIT fill:#FEE2E2,stroke:#991B1B
     style MEM fill:#FEE2E2,stroke:#991B1B
 ```
 
@@ -66,7 +62,7 @@ graph TD
   range reads are available, while token resume is not. Split estimation is
   available via `StreamingSplitEstimator` even though `split_hints` reports
   `false` in `caps()`.
-- `GitConnector` and `InMemoryDeterministicConnector` can expose token resume
+- `InMemoryDeterministicConnector` can expose token resume
   conditionally through `with_tokens(bool)`.
 
 See also: [09-circuit-breaker.md](./09-circuit-breaker.md) for failure
@@ -176,7 +172,6 @@ graph LR
 
     subgraph Sources["gossip-connectors"]
         FSC["<b>FilesystemConnector</b>"]
-        GTC["<b>GitConnector</b>"]
         IMC["<b>InMemoryDeterministicConnector</b>"]
     end
 
@@ -191,9 +186,6 @@ graph LR
 
     FSC --> OCS
     IMC --> OCS
-    GTC --> GDS
-    GTC --> GMM
-    GTC --> GRE
 
     style CLAIM fill:#DCFCE7,stroke:#166534
     style OCR fill:#FEE2E2,stroke:#991B1B
@@ -204,7 +196,6 @@ graph LR
     style GMM fill:#FEE2E2,stroke:#991B1B
     style GRE fill:#FEE2E2,stroke:#991B1B
     style FSC fill:#FEE2E2,stroke:#991B1B
-    style GTC fill:#FEE2E2,stroke:#991B1B
     style IMC fill:#FEE2E2,stroke:#991B1B
 ```
 
@@ -319,7 +310,6 @@ for system-wide recovery patterns.
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/mod.rs` | `FILESYSTEM_CONNECTOR_TAG`, `GIT_CONNECTOR_TAG`, `IN_MEMORY_CONNECTOR_TAG`, re-export hub |
 | `gossip-connectors` | `crates/gossip-connectors/src/common.rs` | `is_permanent_io_error`, `classify_io_enumerate_error`, `classify_io_read_error`, `path_digest`, `path_buf_from_bytes`, `borrowed_shard_bound`, `resolve_bounds`, `key_resume_start`, `estimate_split_from_sorted`, `is_valid_split_candidate` |
 | `gossip-connectors` | `crates/gossip-connectors/src/filesystem.rs` | `FilesystemConnector` |
-| `gossip-connectors` | `crates/gossip-connectors/src/git.rs` | `GitConnector` |
 | `gossip-connectors` | `crates/gossip-connectors/src/in_memory.rs` | `InMemoryDeterministicConnector`, `MemItem` |
 | `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/ordered_content.rs` | `OrderedContentRuntime`, `scan_local_filesystem` (pub(crate)) |
 | `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/git_repo.rs` | `GitRepoRuntime`, `scan_local_repo` (pub(crate)) |

@@ -304,11 +304,6 @@ graph TD
         FS_RESET["rebuild_walk_state():<br/>reset estimator to fresh state"]
     end
 
-    subgraph GIT ["GitConnector — batch"]
-        GIT_ENTRIES["entries: Vec&lt;GitEntry&gt;<br/>(all index entries in memory)"]
-        GIT_SPLIT["choose_split_point_bounds():<br/>common::estimate_split_from_sorted(<br/>  entries.iter().map(key, size),<br/>  range.len(), cursor, end<br/>)"]
-    end
-
     subgraph MEM ["InMemoryDeterministicConnector — batch"]
         MEM_ITEMS["items: Vec&lt;InMemoryItem&gt;<br/>(all items in memory)"]
         MEM_SPLIT["choose_split_point_bounds():<br/>common::estimate_split_from_sorted(<br/>  items.iter().map(key, size),<br/>  range.len(), cursor, end<br/>)"]
@@ -342,14 +337,13 @@ graph TD
 | Connector | Estimator Lifetime | Feed Mechanism | Compaction? |
 |---|---|---|---|
 | `FilesystemConnector` | Persistent field, reset on walk rebuild | `observe()` called per emitted file during walk traversal | Yes — `sample_cap = DEFAULT_SAMPLE_CAP` (1024) |
-| `GitConnector` | Ephemeral, built at split-selection time | `from_sorted_entries()` bulk-loads all in-range entries | No — `sample_cap = entry_count` |
 | `InMemoryDeterministicConnector` | Ephemeral, built at split-selection time | `from_sorted_entries()` bulk-loads all in-range items | No — `sample_cap = entry_count` |
 
 The filesystem connector benefits from streaming estimation because its DFS walk
 is incremental — the estimator accumulates observations across multiple connector
-calls on the same connector instance. The git and in-memory connectors already
-hold all entries in memory, so they set `sample_cap = entry_count` to avoid
-compaction and produce exact byte-weighted midpoints.
+calls on the same connector instance. The in-memory connector already
+holds all entries in memory, so it sets `sample_cap = entry_count` to avoid
+compaction and produces exact byte-weighted midpoints.
 
 ### Post-selection validation
 
@@ -389,9 +383,7 @@ the split or continuing to scan the shard as-is.
 | `estimate_split_from_sorted()` | `crates/gossip-connectors/src/common.rs` | Shared batch-connector split path |
 | `is_valid_split_candidate()` | `crates/gossip-connectors/src/common.rs` | Post-selection cursor/bound guard |
 | `FilesystemConnector::choose_split_point()` | `crates/gossip-connectors/src/filesystem.rs` | Shard-based split-point entry point (delegates to `choose_split_point_bounds`) |
-| `GitConnector::choose_split_point()` | `crates/gossip-connectors/src/git.rs` | Shard-based split-point entry point (delegates to `choose_split_point_bounds`) |
 | `InMemoryDeterministicConnector::choose_split_point()` | `crates/gossip-connectors/src/in_memory.rs` | Shard-based split-point entry point (delegates to `choose_split_point_bounds`) |
 | `FilesystemConnector::split_estimator` | `crates/gossip-connectors/src/filesystem.rs` | Persistent estimator field |
 | `FilesystemConnector::choose_split_point_bounds()` | `crates/gossip-connectors/src/filesystem.rs` | FS split selection entry point |
-| `GitConnector::choose_split_point_bounds()` | `crates/gossip-connectors/src/git.rs` | Git split selection entry point |
 | `InMemoryDeterministicConnector::choose_split_point_bounds()` | `crates/gossip-connectors/src/in_memory.rs` | In-memory split selection entry point |

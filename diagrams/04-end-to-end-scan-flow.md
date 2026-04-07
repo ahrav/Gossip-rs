@@ -142,7 +142,7 @@ graph TD
 family-shaped generic hooks exported by the runtime crate.
 
 **Concrete implementations stay on the family contracts.**
-`FilesystemConnector`, `GitConnector`, and `InMemoryDeterministicConnector`
+`FilesystemConnector` and `InMemoryDeterministicConnector`
 live in `gossip-connectors` and implement the connector family contracts
 defined in `gossip-contracts`.
 
