@@ -376,6 +376,8 @@ mod proptests {
     }
 
     proptest! {
+        #![proptest_config(crate::test_support::miri_proptest_config(16))]
+
         #[test]
         fn timing_wheel_prop_g8(
             max_horizon in 0u16..512,
@@ -424,6 +426,8 @@ mod bitset_tests {
     use proptest::prelude::*;
 
     proptest! {
+        #![proptest_config(crate::test_support::miri_proptest_config(16))]
+
         #[test]
         fn bitset2_matches_naive(
             bits in 1usize..1024,
