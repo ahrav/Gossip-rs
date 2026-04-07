@@ -46,9 +46,8 @@ fill_page(shard, cursor, budgets)
 **Concrete connectors:**
 `FilesystemConnector` directly implements `OrderedContentSource` and keeps
 matching inherent helper methods in `gossip-connectors/src/filesystem.rs`.
-`GitConnector` (git-tracked files via `ls-files`) and
-`InMemoryDeterministicConnector` expose the same read/split surface as
-inherent methods in `gossip-connectors/src/`.
+`InMemoryDeterministicConnector` exposes the same read/split surface as
+inherent methods in `gossip-connectors/src/in_memory.rs`.
 
 **Submission staging:**
 
@@ -158,9 +157,8 @@ and `types.rs`.
 | `crates/gossip-contracts/src/connector/api.rs` | Error taxonomy, capabilities |
 | `crates/gossip-contracts/src/connector/conformance.rs` | Ordered-content conformance harness shared by concrete connector implementations |
 | `crates/gossip-contracts/src/connector/mod.rs` | Re-export hub, canonical connector tags |
-| `crates/gossip-connectors/src/lib.rs` | Crate root re-exports for concrete filesystem, Git, and in-memory connector implementations |
+| `crates/gossip-connectors/src/lib.rs` | Crate root re-exports for concrete filesystem and in-memory connector implementations |
 | `crates/gossip-connectors/src/filesystem.rs` | Filesystem ordered-content connector |
-| `crates/gossip-connectors/src/git.rs` | Git `ls-files` ordered-content connector |
 | `crates/gossip-connectors/src/in_memory.rs` | Deterministic in-memory test connector |
 | `crates/gossip-connectors/src/common.rs` | Shared connector utilities |
 | `crates/gossip-connectors/src/split_estimator.rs` | Streaming byte-weighted split-point estimator (internal; used by `common.rs` and `FilesystemConnector`) |
