@@ -60,7 +60,11 @@ impl PendingPrefixCheckpoint {
         self.page.scope().committed_units().get()
     }
 
-    /// Tokenless cursor that will be stored durably if checkpointing succeeds.
+    /// Cursor that will be stored durably if checkpointing succeeds.
+    ///
+    /// Ordered-content boundaries persist only the authoritative `last_key`
+    /// (token stripped). Repo-frontier boundaries preserve both `last_key`
+    /// and token for inner-stage resume.
     #[inline]
     #[must_use]
     pub fn checkpoint_cursor(&self) -> &Cursor {

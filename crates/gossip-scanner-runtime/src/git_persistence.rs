@@ -912,14 +912,20 @@ where
         } else {
             Vec::new()
         };
-        let checkpoint_delete_ops = [
-            GitPersistenceOp::Delete {
-                key: checkpoint_base_key.to_vec(),
-            },
-            GitPersistenceOp::Delete {
-                key: checkpoint_prefix_key.to_vec(),
-            },
-        ];
+        let checkpoint_delete_ops: Vec<_> = if is_complete {
+            vec![
+                GitPersistenceOp::Delete {
+                    key: checkpoint_base_key.to_vec(),
+                },
+                GitPersistenceOp::Delete {
+                    key: checkpoint_prefix_key.to_vec(),
+                },
+            ]
+        } else {
+            // Partial finalize: preserve checkpoint keys so the next reclaim
+            // can resume from the durable mid-scan anchor.
+            Vec::new()
+        };
 
         if self.backend.supports_atomic_batches() {
             let mut all_ops = first_phase_ops;
@@ -988,9 +994,11 @@ where
                 .apply_batch(&watermark_ops)
                 .map_err(|err| PersistError::backend(err.to_string()))?;
         }
-        self.backend
-            .apply_batch(&checkpoint_delete_ops)
-            .map_err(|err| PersistError::backend(err.to_string()))?;
+        if !checkpoint_delete_ops.is_empty() {
+            self.backend
+                .apply_batch(&checkpoint_delete_ops)
+                .map_err(|err| PersistError::backend(err.to_string()))?;
+        }
         Ok(())
     }
 }
@@ -1743,6 +1751,46 @@ mod tests {
 
         assert!(!backend.contains_key(&base_key));
         assert!(!backend.contains_key(&prefix_key));
+    }
+
+    #[test]
+    fn partial_finalize_preserves_checkpoint_keys() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new_with_start_set(
+            backend.clone(),
+            79,
+            [0x79; 32],
+            start_set_id(0x45),
+        );
+        let sink = GitRepoCheckpointSink::new(&adapter, repo_key());
+        let plan = Vec::<scanner_git::PlannedCommit>::new();
+
+        sink.notify_stage_complete(&StageCheckpoint::PostCommitPlan {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &scanner_git::RepoArtifactFingerprint {
+                packs_hash: [0x41; 32],
+                idx_hash: [0x42; 32],
+            },
+            plan: &plan,
+        })
+        .expect("checkpoint should persist");
+
+        let base_key = adapter.checkpoint_base_key();
+        assert!(backend.contains_key(&base_key));
+
+        adapter
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+                stats: Default::default(),
+            })
+            .expect("partial finalize should succeed");
+
+        assert!(
+            backend.contains_key(&base_key),
+            "partial finalize must preserve base checkpoint for resume"
+        );
     }
 
     #[test]

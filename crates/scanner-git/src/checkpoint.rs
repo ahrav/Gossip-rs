@@ -292,9 +292,8 @@ impl StageCheckpoint<'_> {
                 artifact_fingerprint,
                 plan,
             } => {
-                let encoded = postcard::to_allocvec(&StoredBaseStateEnvelope {
-                    schema_version: CHECKPOINT_SCHEMA_VERSION,
-                    state: StoredBaseState::CommitPlan(StoredCommitPlanState {
+                let encoded =
+                    postcard::to_allocvec(&StoredBaseState::CommitPlan(StoredCommitPlanState {
                         scan_mode: StoredGitScanMode::from(*scan_mode),
                         artifact_fingerprint: StoredRepoArtifactFingerprint::from(
                             *artifact_fingerprint,
@@ -304,9 +303,8 @@ impl StageCheckpoint<'_> {
                             .copied()
                             .map(StoredPlannedCommit::from)
                             .collect(),
-                    }),
-                })
-                .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
+                    }))
+                    .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
                 Ok(Some(encoded))
             }
             Self::PostSpillDedup {
@@ -320,9 +318,8 @@ impl StageCheckpoint<'_> {
                 spill_stats,
                 mapping_stats,
             } => {
-                let encoded = postcard::to_allocvec(&StoredBaseStateEnvelope {
-                    schema_version: CHECKPOINT_SCHEMA_VERSION,
-                    state: StoredBaseState::SpillDedup(StoredSpillDedupState {
+                let encoded =
+                    postcard::to_allocvec(&StoredBaseState::SpillDedup(StoredSpillDedupState {
                         scan_mode: StoredGitScanMode::from(*scan_mode),
                         artifact_fingerprint: StoredRepoArtifactFingerprint::from(
                             *artifact_fingerprint,
@@ -346,9 +343,8 @@ impl StageCheckpoint<'_> {
                         tree_diff_stats: StoredTreeDiffStats::from(tree_diff_stats.clone()),
                         spill_stats: StoredSpillStats::from(spill_stats.clone()),
                         mapping_stats: StoredMappingStats::from(*mapping_stats),
-                    }),
-                })
-                .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
+                    }))
+                    .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
                 Ok(Some(encoded))
             }
             Self::PackPlanComplete { .. } | Self::PreFinalize { .. } => Ok(None),
@@ -376,19 +372,16 @@ impl StageCheckpoint<'_> {
                 let completed_plan_count = u32::try_from(*completed_plan_count).map_err(|_| {
                     ScanCheckpointError::Encode("completed_plan_count exceeds u32::MAX".to_owned())
                 })?;
-                let encoded = postcard::to_allocvec(&StoredPrefixStateEnvelope {
-                    schema_version: CHECKPOINT_SCHEMA_VERSION,
-                    state: StoredPrefixState {
-                        stage: self.stage(),
-                        completed_plan_count,
-                        scanned: StoredScannedBlobs::from(*scanned),
-                        skipped_candidates: skipped_candidates
-                            .iter()
-                            .copied()
-                            .map(StoredSkippedCandidate::from)
-                            .collect(),
-                        common_metrics: StoredGitScanCommonMetrics::from(*common_metrics),
-                    },
+                let encoded = postcard::to_allocvec(&StoredPrefixState {
+                    stage: self.stage(),
+                    completed_plan_count,
+                    scanned: StoredScannedBlobs::from(*scanned),
+                    skipped_candidates: skipped_candidates
+                        .iter()
+                        .copied()
+                        .map(StoredSkippedCandidate::from)
+                        .collect(),
+                    common_metrics: StoredGitScanCommonMetrics::from(*common_metrics),
                 })
                 .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
                 Ok(Some(encoded))
@@ -438,12 +431,19 @@ fn validate_stored_base_candidates(
     Ok(())
 }
 
-/// Validate OID lengths, finding-arena bounds, and skipped-candidate OIDs
-/// for a deserialized prefix state.
-fn validate_stored_prefix(prefix: &StoredPrefixState) -> Result<(), ScanCheckpointError> {
+/// Validate OID lengths, finding-arena bounds, path-arena bounds, and
+/// skipped-candidate OIDs for a deserialized prefix state.
+///
+/// `path_arena_len` is the length of the base state's path arena, which
+/// prefix `ScannedBlob` entries reference via `ctx.path_ref`.
+fn validate_stored_prefix(
+    prefix: &StoredPrefixState,
+    path_arena_len: u32,
+) -> Result<(), ScanCheckpointError> {
     let finding_arena_len = prefix.scanned.finding_arena.len();
     for (i, blob) in prefix.scanned.blobs.iter().enumerate() {
         validate_stored_oid(&blob.oid, "scanned blob", i)?;
+        validate_stored_byte_ref(&blob.ctx.path_ref, path_arena_len, "scanned blob", i)?;
         let end = blob
             .findings
             .start
@@ -537,22 +537,13 @@ impl ScanResumeState {
             } => (base_state, Some(prefix_state)),
         };
 
-        let envelope: StoredBaseStateEnvelope = match checkpoint_deserialize(&base_state) {
+        let base: StoredBaseState = match checkpoint_deserialize(&base_state) {
             Ok(e) => e,
             Err(err) => {
                 tracing::warn!("checkpoint base decode failed, restarting fresh: {err}");
                 return Ok(None);
             }
         };
-        if envelope.schema_version != CHECKPOINT_SCHEMA_VERSION {
-            tracing::warn!(
-                schema_version = envelope.schema_version,
-                expected = CHECKPOINT_SCHEMA_VERSION,
-                "checkpoint schema version mismatch, restarting fresh"
-            );
-            return Ok(None);
-        }
-        let base = envelope.state;
         match base {
             StoredBaseState::CommitPlan(base) => {
                 if GitScanMode::from(base.scan_mode) != scan_mode
@@ -606,27 +597,17 @@ impl ScanResumeState {
                 let Some(prefix_state) = prefix_state else {
                     return Ok(Some(Self::PostSpillDedup(base)));
                 };
-                let prefix_envelope: StoredPrefixStateEnvelope =
-                    match checkpoint_deserialize(&prefix_state) {
-                        Ok(e) => e,
-                        Err(err) => {
-                            tracing::warn!(
-                                "checkpoint prefix decode failed, resuming from base only: {err}"
-                            );
-                            return Ok(Some(Self::PostSpillDedup(base)));
-                        }
-                    };
-                if prefix_envelope.schema_version != CHECKPOINT_SCHEMA_VERSION {
-                    tracing::warn!(
-                        schema_version = prefix_envelope.schema_version,
-                        expected = CHECKPOINT_SCHEMA_VERSION,
-                        "prefix schema version mismatch, resuming from base only"
-                    );
-                    return Ok(Some(Self::PostSpillDedup(base)));
-                }
-                let prefix = prefix_envelope.state;
+                let prefix: StoredPrefixState = match checkpoint_deserialize(&prefix_state) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        tracing::warn!(
+                            "checkpoint prefix decode failed, resuming from base only: {err}"
+                        );
+                        return Ok(Some(Self::PostSpillDedup(base)));
+                    }
+                };
 
-                validate_stored_prefix(&prefix)?;
+                validate_stored_prefix(&prefix, arena_len)?;
 
                 let prefix_stage = match prefix.stage {
                     ScanCheckpointStage::PackPlanComplete => PrefixStage::PackPlanComplete,
@@ -637,6 +618,14 @@ impl ScanResumeState {
                         ));
                     }
                 };
+
+                let plan_len = base.packed.len();
+                if (prefix.completed_plan_count as usize) > plan_len {
+                    return Err(ScanCheckpointError::InvalidState(format!(
+                        "completed_plan_count ({}) exceeds packed candidate count ({plan_len})",
+                        prefix.completed_plan_count,
+                    )));
+                }
 
                 let prefix = ScanResumePrefixState {
                     stage: prefix_stage,
@@ -682,17 +671,12 @@ impl ScanResumeState {
         Option<ScanResumePrefixState>,
     ) {
         match self {
-            Self::PostCommitPlan(state) => {
-                let base = ScanResumeBaseState {
-                    plan: state.plan,
-                    packed: Vec::new(),
-                    loose: Vec::new(),
-                    path_arena: ByteArena::with_capacity(0),
-                    tree_diff_stats: TreeDiffStats::default(),
-                    spill_stats: SpillStats::default(),
-                    mapping_stats: MappingStats::default(),
-                };
-                (ScanCheckpointStage::PostCommitPlan, Some(base), None)
+            Self::PostCommitPlan(_state) => {
+                // The commit plan is already threaded into the mode pipelines
+                // by `run_git_scan_with_context`; returning `None` for the base
+                // forces the runners to run full candidate generation (tree diff,
+                // spill/dedup) rather than skipping it with empty vectors.
+                (ScanCheckpointStage::PostCommitPlan, None, None)
             }
             Self::PostSpillDedup(base) => (ScanCheckpointStage::PostSpillDedup, Some(base), None),
             Self::PackPlanComplete { base, prefix } => (
@@ -734,25 +718,6 @@ pub struct ScanResumePrefixState {
     pub scanned: ScannedBlobs,
     pub skipped_candidates: Vec<SkippedCandidate>,
     pub common_metrics: GitScanCommonMetrics,
-}
-
-/// Schema version for checkpoint blobs.
-///
-/// Bumped whenever the stored layout changes. Blobs with a mismatched
-/// version are discarded (the scan restarts fresh) rather than producing
-/// hard errors, so format evolution is transparent to operators.
-const CHECKPOINT_SCHEMA_VERSION: u8 = 1;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct StoredBaseStateEnvelope {
-    schema_version: u8,
-    state: StoredBaseState,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct StoredPrefixStateEnvelope {
-    schema_version: u8,
-    state: StoredPrefixState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2001,18 +1966,15 @@ mod tests {
 
         // Build a prefix payload with an invalid stage (PostCommitPlan is not
         // valid as a prefix discriminator).
-        let invalid_prefix = StoredPrefixStateEnvelope {
-            schema_version: CHECKPOINT_SCHEMA_VERSION,
-            state: StoredPrefixState {
-                stage: ScanCheckpointStage::PostCommitPlan,
-                completed_plan_count: 0,
-                scanned: StoredScannedBlobs {
-                    blobs: Vec::new(),
-                    finding_arena: Vec::new(),
-                },
-                skipped_candidates: Vec::new(),
-                common_metrics: StoredGitScanCommonMetrics::from(GitScanCommonMetrics::default()),
+        let invalid_prefix = StoredPrefixState {
+            stage: ScanCheckpointStage::PostCommitPlan,
+            completed_plan_count: 0,
+            scanned: StoredScannedBlobs {
+                blobs: Vec::new(),
+                finding_arena: Vec::new(),
             },
+            skipped_candidates: Vec::new(),
+            common_metrics: StoredGitScanCommonMetrics::from(GitScanCommonMetrics::default()),
         };
         let prefix_bytes =
             postcard::to_allocvec(&invalid_prefix).expect("serialize invalid prefix");
@@ -2102,20 +2064,17 @@ mod tests {
             pack_id: 0,
             offset: 0,
         };
-        let stored = StoredBaseStateEnvelope {
-            schema_version: CHECKPOINT_SCHEMA_VERSION,
-            state: StoredBaseState::SpillDedup(StoredSpillDedupState {
-                scan_mode: StoredGitScanMode::DiffHistory,
-                artifact_fingerprint: StoredRepoArtifactFingerprint::from(&fp),
-                plan: Vec::new(),
-                packed: vec![bad_packed],
-                loose: Vec::new(),
-                path_arena: Vec::new(),
-                tree_diff_stats: StoredTreeDiffStats::from(TreeDiffStats::default()),
-                spill_stats: StoredSpillStats::from(SpillStats::default()),
-                mapping_stats: StoredMappingStats::from(MappingStats::default()),
-            }),
-        };
+        let stored = StoredBaseState::SpillDedup(StoredSpillDedupState {
+            scan_mode: StoredGitScanMode::DiffHistory,
+            artifact_fingerprint: StoredRepoArtifactFingerprint::from(&fp),
+            plan: Vec::new(),
+            packed: vec![bad_packed],
+            loose: Vec::new(),
+            path_arena: Vec::new(),
+            tree_diff_stats: StoredTreeDiffStats::from(TreeDiffStats::default()),
+            spill_stats: StoredSpillStats::from(SpillStats::default()),
+            mapping_stats: StoredMappingStats::from(MappingStats::default()),
+        });
         let blob = postcard::to_allocvec(&stored).expect("encode");
 
         let loaded = LoadedScanCheckpoint::BaseOnly { base_state: blob };
@@ -2153,20 +2112,17 @@ mod tests {
             pack_id: 0,
             offset: 0,
         };
-        let stored = StoredBaseStateEnvelope {
-            schema_version: CHECKPOINT_SCHEMA_VERSION,
-            state: StoredBaseState::SpillDedup(StoredSpillDedupState {
-                scan_mode: StoredGitScanMode::DiffHistory,
-                artifact_fingerprint: StoredRepoArtifactFingerprint::from(&fp),
-                plan: Vec::new(),
-                packed: vec![bad_packed],
-                loose: Vec::new(),
-                path_arena: vec![0u8; 4],
-                tree_diff_stats: StoredTreeDiffStats::from(TreeDiffStats::default()),
-                spill_stats: StoredSpillStats::from(SpillStats::default()),
-                mapping_stats: StoredMappingStats::from(MappingStats::default()),
-            }),
-        };
+        let stored = StoredBaseState::SpillDedup(StoredSpillDedupState {
+            scan_mode: StoredGitScanMode::DiffHistory,
+            artifact_fingerprint: StoredRepoArtifactFingerprint::from(&fp),
+            plan: Vec::new(),
+            packed: vec![bad_packed],
+            loose: Vec::new(),
+            path_arena: vec![0u8; 4],
+            tree_diff_stats: StoredTreeDiffStats::from(TreeDiffStats::default()),
+            spill_stats: StoredSpillStats::from(SpillStats::default()),
+            mapping_stats: StoredMappingStats::from(MappingStats::default()),
+        });
         let blob = postcard::to_allocvec(&stored).expect("encode");
 
         let loaded = LoadedScanCheckpoint::BaseOnly { base_state: blob };
@@ -2209,15 +2165,12 @@ mod tests {
             }],
             finding_arena: Vec::new(),
         };
-        let prefix = StoredPrefixStateEnvelope {
-            schema_version: CHECKPOINT_SCHEMA_VERSION,
-            state: StoredPrefixState {
-                stage: ScanCheckpointStage::PackPlanComplete,
-                completed_plan_count: 0,
-                scanned: bad_scanned,
-                skipped_candidates: Vec::new(),
-                common_metrics: StoredGitScanCommonMetrics::from(GitScanCommonMetrics::default()),
-            },
+        let prefix = StoredPrefixState {
+            stage: ScanCheckpointStage::PackPlanComplete,
+            completed_plan_count: 0,
+            scanned: bad_scanned,
+            skipped_candidates: Vec::new(),
+            common_metrics: StoredGitScanCommonMetrics::from(GitScanCommonMetrics::default()),
         };
         let prefix_blob = postcard::to_allocvec(&prefix).expect("encode");
 
@@ -2260,11 +2213,10 @@ mod tests {
         let (stage, base, prefix) = resume.into_parts();
         assert_eq!(stage, ScanCheckpointStage::PostCommitPlan);
         assert!(prefix.is_none(), "PostCommitPlan must not carry a prefix");
-
-        let base = base.expect("base must be present");
-        assert_eq!(base.plan.len(), commits.len());
-        assert_eq!(base.plan[0].pos, commits[0].pos);
-        assert_eq!(base.plan[1].snapshot_root, commits[1].snapshot_root);
+        assert!(
+            base.is_none(),
+            "PostCommitPlan must not carry a base — runners must regenerate candidates"
+        );
     }
 
     /// PreFinalize round-trip: encode → from_loaded → verify stage and prefix.
@@ -2350,7 +2302,7 @@ mod tests {
             tree_diff_stats: TreeDiffStats::default(),
             spill_stats: SpillStats::default(),
             mapping_stats: MappingStats::default(),
-            completed_plan_count: 7,
+            completed_plan_count: 2,
             scanned: &scanned,
             skipped_candidates: &[],
             common_metrics: GitScanCommonMetrics::default(),
@@ -2371,7 +2323,7 @@ mod tests {
         let (_stage, _base, prefix) = resume.into_parts();
         let prefix = prefix.expect("PackPlanComplete must carry a prefix");
         assert_eq!(
-            prefix.completed_plan_count, 7,
+            prefix.completed_plan_count, 2,
             "completed_plan_count must survive serialization round-trip"
         );
     }
