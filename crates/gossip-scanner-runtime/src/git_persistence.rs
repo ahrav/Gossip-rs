@@ -836,8 +836,8 @@ pub mod test_support {
         pub message: &'static str,
     }
 
-    /// Categorizes a backend key by its namespace prefix for phase-level
-    /// assertions (ordering, presence, absence) in finalize tests.
+    /// Categorizes a backend key by the durable-state namespace encoded in
+    /// its prefix (e.g., blob context, finding, watermark).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum KeyNamespace {
         BlobCtx,
@@ -870,9 +870,8 @@ pub mod test_support {
         }
     }
 
-    /// One logged backend operation annotated with the key namespace it
-    /// belongs to, used to verify write-phase invariants (ordering, presence,
-    /// absence) in finalize tests.
+    /// One logged backend operation annotated with the namespace of its key,
+    /// enabling write-phase ordering and presence/absence verification.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct SimBackendOp {
         ns: KeyNamespace,
@@ -1041,6 +1040,11 @@ pub mod test_support {
         pub fn set_fail_on_batch_call(&self, call_no: usize) {
             let mut state = self.state.borrow_mut();
             assert!(
+                call_no > state.batch_call_count,
+                "call_no={call_no} has already passed; next batch call is {}",
+                state.batch_call_count + 1
+            );
+            assert!(
                 state.batch_faults.is_empty(),
                 "set_fail_on_batch_call and set_batch_faults are mutually exclusive; \
                  positional faults shadow content-aware faults and prevent queue advancement"
@@ -1059,8 +1063,12 @@ pub mod test_support {
         /// Overwrites any previously enqueued get faults. Use
         /// [`enqueue_get_fault`](Self::enqueue_get_fault) for additive semantics.
         pub fn set_fail_on_get_call(&self, call_no: usize) {
-            assert!(call_no > 0, "call_no is 1-indexed; 0 can never fire");
             let mut state = self.state.borrow_mut();
+            assert!(
+                call_no > state.get_fault_count,
+                "call_no={call_no} has already passed; next get call is {}",
+                state.get_fault_count + 1
+            );
             state.get_faults.clear();
             state.get_faults.push((call_no, GetFault::Fail));
         }
@@ -1106,8 +1114,12 @@ pub mod test_support {
         ///
         /// Each call number may have at most one fault; duplicates panic.
         pub fn enqueue_get_fault(&self, call_no: usize, fault: GetFault) {
-            assert!(call_no > 0, "call_no is 1-indexed; 0 can never fire");
             let mut state = self.state.borrow_mut();
+            assert!(
+                call_no > state.get_fault_count,
+                "call_no={call_no} has already passed; next get call is {}",
+                state.get_fault_count + 1
+            );
             assert!(
                 !state.get_faults.iter().any(|(n, _)| *n == call_no),
                 "duplicate get fault at call_no={call_no}; only the first would fire"
@@ -1119,8 +1131,12 @@ pub mod test_support {
         ///
         /// Each call number may have at most one fault; duplicates panic.
         pub fn enqueue_multi_get_fault(&self, call_no: usize, fault: GetFault) {
-            assert!(call_no > 0, "call_no is 1-indexed; 0 can never fire");
             let state = self.state.borrow();
+            assert!(
+                call_no > state.multi_get_fault_count,
+                "call_no={call_no} has already passed; next multi_get call is {}",
+                state.multi_get_fault_count + 1
+            );
             assert!(
                 !state.multi_get_faults.iter().any(|(n, _)| *n == call_no),
                 "duplicate multi_get fault at call_no={call_no}; only the first would fire"
