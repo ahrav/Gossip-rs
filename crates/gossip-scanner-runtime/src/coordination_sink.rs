@@ -844,9 +844,8 @@ mod tests {
         }
     }
 
-    /// `OidBytes` (33 bytes) keeps the enum at ~80 bytes — well within a
-    /// single cache line. This compile-time bound catches accidental field
-    /// inflation.
+    /// Compile-time bound: `StoredGitEvent` must stay at or below 80 bytes.
+    /// Catches accidental field inflation from new variants or widened fields.
     const _: () = assert!(std::mem::size_of::<StoredGitEvent>() <= 80);
 
     #[test]
