@@ -884,9 +884,23 @@ where
     let (execution, mut stage_metrics) = execution?;
     let complete_time = wall_clock_now();
     if !matches!(execution.finalize_outcome, FinalizeOutcome::Complete) {
+        let checkpoint = execution.resume_checkpoint.clone().or_else(|| {
+            lease
+                .resume_cursor()
+                .last_key()
+                .map(|_| lease.resume_cursor().clone())
+        });
+        if let Some(checkpoint) = checkpoint {
+            ensure_post_drain_lease_trust(&lease_uncertainty)?;
+            return Ok((
+                execution.report,
+                ShardCompletionOutcome::Checkpoint { checkpoint },
+                stage_metrics,
+            ));
+        }
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow!(
-                "git repo-frontier shard '{}' finalized partially; outer repo-frontier progress requires a complete durable repo receipt",
+                "git repo-frontier shard '{}' stopped before complete finalize and produced no checkpointable repo-frontier cursor",
                 stage_sink.redacted_shard_id()
             ),
         )));

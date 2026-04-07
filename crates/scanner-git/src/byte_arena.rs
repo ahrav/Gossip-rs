@@ -121,6 +121,17 @@ impl ByteArena {
         }
     }
 
+    /// Reconstruct an arena from already-interned bytes.
+    ///
+    /// The restored arena is read-only by construction: its capacity is set to
+    /// the current backing length because resume paths only dereference
+    /// existing `ByteRef` values and never append new paths.
+    #[must_use]
+    pub fn from_backing_bytes(bytes: Vec<u8>) -> Self {
+        let capacity = bytes.len().min(u32::MAX as usize) as u32;
+        Self { bytes, capacity }
+    }
+
     /// Pushes a byte slice into the arena, returning a reference.
     ///
     /// This is an append-only operation; previously returned references

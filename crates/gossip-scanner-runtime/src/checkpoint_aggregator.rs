@@ -577,12 +577,14 @@ fn validate_receipt(
 }
 
 fn strip_checkpoint_token(boundary: &CheckpointBoundary) -> Option<CheckpointBoundary> {
-    let last_key = boundary.cursor().last_key().cloned()?;
-    let cursor = Cursor::with_last_key(last_key);
-
     Some(match boundary {
-        CheckpointBoundary::OrderedContent(_) => CheckpointBoundary::ordered_content(cursor),
-        CheckpointBoundary::RepoFrontier(_) => CheckpointBoundary::repo_frontier(cursor),
+        CheckpointBoundary::OrderedContent(_) => {
+            let last_key = boundary.cursor().last_key().cloned()?;
+            CheckpointBoundary::ordered_content(Cursor::with_last_key(last_key))
+        }
+        CheckpointBoundary::RepoFrontier(_) => {
+            CheckpointBoundary::repo_frontier(boundary.cursor().clone())
+        }
     })
 }
 
@@ -1434,13 +1436,17 @@ mod tests {
             pending.scope().checkpoint_boundary_kind(),
             CheckpointBoundaryKind::RepoFrontier
         );
-        // Token stripped, last key preserved from the final receipt in
-        // sequence order (seq 1 carries key 'r').
+        // Repo-frontier checkpoints preserve the final receipt token so the
+        // singleton source can resume the same repo from an inner stage
+        // checkpoint.
         assert_eq!(
             pending.checkpoint_cursor().last_key(),
             Some(&item_key(b'r'))
         );
-        assert!(pending.checkpoint_cursor().token().is_none());
+        assert_eq!(
+            pending.checkpoint_cursor().token(),
+            Some(&TokenBytes::try_from_slice(&[0xCC]).unwrap())
+        );
         // Aggregated findings: seq 0 (1,2,3) + seq 1 (3,4,5) = (4,6,8).
         assert_eq!(
             pending.item_commit_receipt().findings(),

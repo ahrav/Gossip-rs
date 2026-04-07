@@ -28,7 +28,6 @@ use scanner_git::{
     GitScanError, GitScanMode as ScannerGitScanMode, MergeDiffMode, RepoOpenError, TreeDiffError,
 };
 
-use crate::git_persistence::{GitPersistenceAdapter, GitPersistenceBackend};
 use crate::git_repo::{
     GitRunExecution, GitRuntimeStores, apply_scan_limit_overrides, digest_repo_path,
     format_git_debug_output, resolve_scan_ns, run_runtime_git_scan,
@@ -242,18 +241,15 @@ impl ScannerGitExecutor {
     /// finalize outcome and synthesize a checkpoint. The caller-owned `abort`
     /// flag is forwarded into the runtime bridge so lease expiry can stop the
     /// scan before finalize persistence begins.
-    pub(crate) fn run_repo_with_persistence<B>(
+    pub(crate) fn run_repo_with_persistence(
         &self,
         mirror: &LocalMirror,
         selection: &GitSelection,
         limits: GitExecutionLimits,
         policy_hash: [u8; 32],
         abort: &AtomicBool,
-        persistence: &GitPersistenceAdapter<B>,
-    ) -> Result<GitRunExecution, GitRunError>
-    where
-        B: GitPersistenceBackend,
-    {
+        stores: GitRuntimeStores<'_>,
+    ) -> Result<GitRunExecution, GitRunError> {
         self.execute_repo_with(
             mirror,
             selection,
@@ -261,18 +257,7 @@ impl ScannerGitExecutor {
             policy_hash,
             abort,
             |repo, engine, git_cfg, abort, git_sink| {
-                run_runtime_git_scan_with_stores(
-                    repo,
-                    engine,
-                    git_cfg,
-                    abort,
-                    git_sink,
-                    GitRuntimeStores {
-                        seen_store: persistence,
-                        watermark_store: persistence,
-                        persist_store: Some(persistence),
-                    },
-                )
+                run_runtime_git_scan_with_stores(repo, engine, git_cfg, abort, git_sink, stores)
             },
         )
     }
@@ -489,6 +474,7 @@ fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
         }
         GitScanError::Io(_)
         | GitScanError::Persist(_)
+        | GitScanError::Checkpoint(_)
         | GitScanError::PackExec(_)
         | GitScanError::PackIo(_)
         | GitScanError::Spill(_) => true,

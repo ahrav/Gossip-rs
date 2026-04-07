@@ -39,12 +39,13 @@ use gossip_contracts::persistence::WriteContext;
 use gossip_orchestrator::{GitSelectionLoweringError, GitShardPayload};
 use scanner_git::{
     FinalizeOutcome, GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanError,
-    GitScanResult, NativeRefResolver, NeverSeenStore, PersistenceStore, RefWatermark,
-    RefWatermarkStore, RepoOpenError, RepoOpenLimits, SeenBlobStore, StartSetConfig, run_git_scan,
+    GitScanResult, GitScanRunContext, NativeRefResolver, NeverSeenStore, NoopCheckpointSink,
+    PersistenceStore, RefWatermark, RefWatermarkStore, RepoOpenError, RepoOpenLimits,
+    ScanCheckpointSink, SeenBlobStore, StartSetConfig, run_git_scan_with_context,
 };
 
 use crate::git_executor::{ScannerGitExecutor, map_merge_strategy, map_scan_mode};
-use crate::git_persistence::{GitPersistenceAdapter, GitPersistenceBackend};
+use crate::git_persistence::{GitPersistenceAdapter, GitPersistenceBackend, GitRepoCheckpointSink};
 use crate::{
     AssignmentOutcome, CancellationToken, ChannelEventOutput, EVENT_CHANNEL_CAP, GitDebugLevel,
     GitScanConfig, ScanReport, ScanRuntimeError, build_runtime_engine, forward_git_events,
@@ -83,6 +84,9 @@ pub(crate) struct GitRepoExecutionOutcome<B> {
     /// Whether the scanner fully traversed the configured start-set
     /// (`Complete`) or stopped early due to resource limits or errors.
     pub(crate) finalize_outcome: FinalizeOutcome,
+    /// Latest durable repo-frontier checkpoint cursor produced during the
+    /// current lease, if any.
+    pub(crate) resume_checkpoint: Option<Cursor>,
 }
 
 impl<B: fmt::Debug> fmt::Debug for GitRepoExecutionOutcome<B> {
@@ -93,6 +97,7 @@ impl<B: fmt::Debug> fmt::Debug for GitRepoExecutionOutcome<B> {
             .field("write_context", &self.write_context)
             .field("rule_fingerprint", &"<fn>")
             .field("finalize_outcome", &self.finalize_outcome)
+            .field("resume_checkpoint", &self.resume_checkpoint)
             .finish()
     }
 }
@@ -160,18 +165,25 @@ impl GitRepoRuntime {
             distributed_git_scan_config(scan_template, mirror, payload, &selection);
         let executor = ScannerGitExecutor::from_runtime_config(&runtime_config, event_sink)?;
         let rule_fingerprint = executor.rule_fingerprint_fn();
-        let persistence = GitPersistenceAdapter::new(
+        let persistence = GitPersistenceAdapter::new_with_start_set(
             backend,
             payload.repo_id(),
             *write_context.policy_hash().as_bytes(),
+            start_set_from_ref_selection(selection.refs()).id(),
         );
+        let checkpoint_sink = GitRepoCheckpointSink::new(&persistence, payload.repo_key().clone());
         let execution = match executor.run_repo_with_persistence(
             mirror,
             &selection,
             payload.execution_limits(),
             *write_context.policy_hash().as_bytes(),
             abort,
-            &persistence,
+            GitRuntimeStores {
+                seen_store: &persistence,
+                watermark_store: &persistence,
+                persist_store: Some(&persistence),
+                checkpoint_sink: &checkpoint_sink,
+            },
         ) {
             Ok(exec) => exec,
             Err(error) if abort.load(Ordering::Relaxed) => {
@@ -183,12 +195,15 @@ impl GitRepoRuntime {
                     %error,
                     "scan error with abort signalled; treating as cancellation",
                 );
+                let resume_checkpoint = checkpoint_sink.latest_checkpoint_cursor();
+                drop(checkpoint_sink);
                 return Ok(GitRepoExecutionOutcome {
                     report: ScanReport::default(),
                     persistence,
                     write_context,
                     rule_fingerprint,
                     finalize_outcome: FinalizeOutcome::Partial { skipped_count: 0 },
+                    resume_checkpoint,
                 });
             }
             Err(error) => {
@@ -202,6 +217,8 @@ impl GitRepoRuntime {
         };
         let finalize_outcome = execution.result.0.finalize.outcome;
         let report = git_report_to_scan_report(execution.result, execution.scan_elapsed);
+        let resume_checkpoint = checkpoint_sink.latest_checkpoint_cursor();
+        drop(checkpoint_sink);
 
         Ok(GitRepoExecutionOutcome {
             report,
@@ -209,6 +226,7 @@ impl GitRepoRuntime {
             write_context,
             rule_fingerprint,
             finalize_outcome,
+            resume_checkpoint,
         })
     }
 }
@@ -335,6 +353,8 @@ pub(crate) struct GitRuntimeStores<'a> {
     /// Optional persistence sink for durable finalize output (data ops,
     /// watermark ops). `None` for local scans that do not persist state.
     pub(crate) persist_store: Option<&'a dyn PersistenceStore>,
+    /// Stage checkpoint sink used for mid-scan resume.
+    pub(crate) checkpoint_sink: &'a dyn ScanCheckpointSink,
 }
 
 /// Run a full Git object scan against a local repository.
@@ -563,6 +583,7 @@ pub(crate) fn run_runtime_git_scan(
 ) -> Result<GitRunExecution, GitScanError> {
     let watermarks = EmptyWatermarkStore;
     let seen = NeverSeenStore;
+    let checkpoint_sink = NoopCheckpointSink;
 
     run_runtime_git_scan_with_stores(
         canonical_repo,
@@ -574,6 +595,7 @@ pub(crate) fn run_runtime_git_scan(
             seen_store: &seen,
             watermark_store: &watermarks,
             persist_store: None,
+            checkpoint_sink: &checkpoint_sink,
         },
     )
 }
@@ -603,16 +625,19 @@ pub(crate) fn run_runtime_git_scan_with_stores(
 ) -> Result<GitRunExecution, GitScanError> {
     let resolver = NativeRefResolver::new(git_cfg.start_set.clone());
     let scan_start = std::time::Instant::now();
-    let result = run_git_scan(
+    let result = run_git_scan_with_context(
         canonical_repo,
         engine,
         &resolver,
-        stores.seen_store,
-        stores.watermark_store,
-        stores.persist_store,
         git_cfg,
-        abort,
-        git_sink,
+        GitScanRunContext {
+            seen_store: stores.seen_store,
+            watermark_store: stores.watermark_store,
+            persist_store: stores.persist_store,
+            checkpoint_sink: stores.checkpoint_sink,
+            abort,
+            event_sink: git_sink,
+        },
     )?;
 
     Ok(GitRunExecution::new(result, scan_start.elapsed()))

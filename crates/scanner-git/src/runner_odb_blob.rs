@@ -38,8 +38,11 @@ use scanner_engine::Engine;
 #[cfg(feature = "git-perf")]
 use scanner_scheduler::{alloc_stats, AllocStats};
 
-use super::blob_introducer::{introduce_parallel, BlobIntroStats, BlobIntroducer};
+use super::blob_introducer::{introduce_parallel, BlobIntroducer};
 use super::byte_arena::ByteArena;
+use super::checkpoint::{
+    ScanCheckpointError, ScanCheckpointSink, ScanCheckpointStage, ScanResumeState, StageCheckpoint,
+};
 use super::commit_graph::CommitGraphIndex;
 use super::commit_walk::PlannedCommit;
 use super::engine_adapter::{CommitMetaContext, EngineAdapter, GitScanCommonMetrics, ScannedBlobs};
@@ -51,28 +54,29 @@ use super::oid_index::OidIndex;
 use super::pack_candidates::{
     CappedPackCandidateSink, LooseCandidate, PackCandidate, PackCandidateCollector,
 };
+use super::pack_exec::PackExecReport;
 use super::pack_io::PackIo;
 use super::pack_plan::{bucket_pack_candidates, build_pack_plan_for_pack, PackPlanError};
 use super::pack_plan_model::CompletedPacksBitmap;
 use super::runner::{
-    check_abort, GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
+    check_abort, checkpoint_stage, GitScanAllocStats, GitScanConfig, GitScanError,
+    GitScanStageNanos, ScanModeOutput,
 };
 use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
 use super::spiller::{SpillStats, Spiller};
 use super::tree_delta_cache::TreeDeltaCache;
 use super::tree_diff::TreeDiffStats;
 
+use super::repo_open::RepoJobState;
 use super::repo_paths::{
     collect_loose_dirs, collect_pack_dirs, list_pack_files, resolve_pack_paths,
 };
 use super::runner_exec::{
     append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views, collect_scheduler_outputs,
     estimate_path_arena_capacity, execute_pack_plans_with_scheduler, load_midx, make_spill_dir,
-    mmap_pack_files, per_worker_cache_bytes, scan_loose_candidates, select_pack_exec_strategy,
-    PackExecStrategy, SpillCandidateSink,
+    mmap_pack_files, per_worker_cache_bytes, plan_completed_cleanly, scan_loose_candidates,
+    select_pack_exec_strategy, PackExecStrategy, SpillCandidateSink,
 };
-
-use super::repo_open::RepoJobState;
 use crate::perf_set;
 
 /// Runs the ODB-blob fast-path scan pipeline.
@@ -145,6 +149,8 @@ pub(super) fn run_odb_blob(
     plan: &[PlannedCommit],
     config: &GitScanConfig,
     abort: &AtomicBool,
+    resume_state: Option<&ScanResumeState>,
+    checkpoint_sink: &dyn ScanCheckpointSink,
     commit_meta: CommitMetaContext,
 ) -> Result<ScanModeOutput, GitScanError> {
     let CommitMetaContext {
@@ -164,6 +170,10 @@ pub(super) fn run_odb_blob(
     };
 
     let midx = load_midx(repo)?;
+    let artifact_fingerprint = repo
+        .artifact_fingerprint
+        .as_ref()
+        .ok_or_else(|| GitScanError::Io(io::Error::other("artifact fingerprint missing")))?;
     let mut completed_packs = CompletedPacksBitmap::empty(midx.pack_count() as usize);
     let mut mapping_cfg = config.mapping;
     let default_mapping_cfg = MappingBridgeConfig::default();
@@ -198,143 +208,148 @@ pub(super) fn run_odb_blob(
         )
     };
 
+    let resumed_base = resume_state.and_then(ScanResumeState::base_state);
+    let resumed_prefix = resume_state.and_then(ScanResumeState::prefix_state);
+
     // ── Stage 1: blob introduction ───────────────────────────────────
-    // When blob_intro_workers > 1, use the parallel path with shared
-    // AtomicSeenSets. The parallel path does not support the spill/retry
-    // fallback (which is serial-only); on capacity overflow it returns an
-    // error that falls through to the serial spill retry below.
-    let intro_start = Instant::now();
-    // Clamp workers: at least 1, at most the plan length (no empty chunks),
-    // and at most 8 because inflate is memory-bandwidth-bound and shows
-    // diminishing returns beyond ~8 threads on current hardware.
-    let effective_workers = config
-        .blob_intro_workers
-        .max(1)
-        .min(plan.len().max(1))
-        .min(8);
-
-    let (intro_stats, mut packed, loose, path_arena, spill_stats, mapping_stats) =
-        if effective_workers > 1 {
-            // ── Parallel blob introduction ──
-            match introduce_parallel(
-                effective_workers,
-                repo,
-                config,
-                &spill_dir,
-                &object_store_layout,
-                cg_index,
-                plan,
-                &midx,
-                &oid_index,
-                mapping_cfg.path_arena_capacity,
-                mapping_cfg.max_packed_candidates,
-                mapping_cfg.max_loose_candidates,
-                abort,
-            ) {
-                Ok(result) => {
-                    perf_set!(
-                        stage_nanos,
-                        blob_intro,
-                        intro_start.elapsed().as_nanos() as u64
-                    );
-                    let mapping_stats = MappingStats {
-                        unique_blobs_in: result.packed.len().saturating_add(result.loose.len())
-                            as u64,
-                        packed_matched: result.packed.len() as u64,
-                        loose_unmatched: result.loose.len() as u64,
-                    };
-                    (
-                        result.stats,
-                        result.packed,
-                        result.loose,
-                        result.path_arena,
-                        SpillStats::default(),
-                        mapping_stats,
-                    )
-                }
-                Err(
-                    TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull,
-                ) => {
-                    // Parallel path overflowed — fall back to serial spill/retry.
-                    let mut object_store = open_object_store()?;
-                    run_serial_spill_retry(
-                        repo,
-                        config,
-                        &spill_dir,
-                        cg_index,
-                        plan,
-                        &midx,
-                        &oid_index,
-                        &mapping_cfg,
-                        seen_store,
-                        seen_persister,
-                        &mut object_store,
-                        abort,
-                        &mut stage_nanos,
-                        intro_start,
-                    )?
-                }
-                Err(err) => return Err(err.into()),
-            }
+    let (tree_diff_stats, mut packed, loose, path_arena, spill_stats, mapping_stats) =
+        if let Some(base) = resumed_base {
+            (
+                base.tree_diff_stats.clone(),
+                base.packed.clone(),
+                base.loose.clone(),
+                base.path_arena.clone(),
+                base.spill_stats.clone(),
+                base.mapping_stats,
+            )
         } else {
-            // ── Serial blob introduction (original path) ──
-            let mut object_store = open_object_store()?;
-            let mut introducer = BlobIntroducer::new(
-                &config.tree_diff,
-                repo.object_format.oid_len(),
-                midx.object_count(),
-                mapping_cfg.max_loose_candidates,
-                config.engine_adapter.scan_binary,
-            );
+            // When blob_intro_workers > 1, use the parallel path with shared
+            // AtomicSeenSets. The parallel path does not support the spill/retry
+            // fallback (which is serial-only); on capacity overflow it returns an
+            // error that falls through to the serial spill retry below.
+            let intro_start = Instant::now();
+            let effective_workers = config
+                .blob_intro_workers
+                .max(1)
+                .min(plan.len().max(1))
+                .min(8);
 
-            let mut collector = PackCandidateCollector::new(
-                &midx,
-                &oid_index,
-                mapping_cfg.path_arena_capacity,
-                mapping_cfg.max_packed_candidates,
-                mapping_cfg.max_loose_candidates,
-            );
-
-            match introducer.introduce(
-                &mut object_store,
-                cg_index,
-                plan,
-                &oid_index,
-                abort,
-                &mut collector,
-            ) {
-                Ok(stats) => {
-                    perf_set!(
-                        stage_nanos,
-                        blob_intro,
-                        intro_start.elapsed().as_nanos() as u64
-                    );
-                    let collect_start = Instant::now();
-                    let (packed, loose, path_arena) = collector.finish();
-                    perf_set!(
-                        stage_nanos,
-                        pack_collect,
-                        collect_start.elapsed().as_nanos() as u64
-                    );
-                    let mapping_stats = MappingStats {
-                        unique_blobs_in: packed.len().saturating_add(loose.len()) as u64,
-                        packed_matched: packed.len() as u64,
-                        loose_unmatched: loose.len() as u64,
-                    };
-                    (
-                        stats,
-                        packed,
-                        loose,
-                        path_arena,
-                        SpillStats::default(),
-                        mapping_stats,
-                    )
+            let result = if effective_workers > 1 {
+                match introduce_parallel(
+                    effective_workers,
+                    repo,
+                    config,
+                    &spill_dir,
+                    &object_store_layout,
+                    cg_index,
+                    plan,
+                    &midx,
+                    &oid_index,
+                    mapping_cfg.path_arena_capacity,
+                    mapping_cfg.max_packed_candidates,
+                    mapping_cfg.max_loose_candidates,
+                    abort,
+                ) {
+                    Ok(result) => {
+                        perf_set!(
+                            stage_nanos,
+                            blob_intro,
+                            intro_start.elapsed().as_nanos() as u64
+                        );
+                        let mapping_stats = MappingStats {
+                            unique_blobs_in: result.packed.len().saturating_add(result.loose.len())
+                                as u64,
+                            packed_matched: result.packed.len() as u64,
+                            loose_unmatched: result.loose.len() as u64,
+                        };
+                        (
+                            TreeDiffStats::from(result.stats),
+                            result.packed,
+                            result.loose,
+                            result.path_arena,
+                            SpillStats::default(),
+                            mapping_stats,
+                        )
+                    }
+                    Err(
+                        TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull,
+                    ) => {
+                        let mut object_store = open_object_store()?;
+                        run_serial_spill_retry(
+                            repo,
+                            config,
+                            &spill_dir,
+                            cg_index,
+                            plan,
+                            &midx,
+                            &oid_index,
+                            &mapping_cfg,
+                            seen_store,
+                            seen_persister,
+                            &mut object_store,
+                            abort,
+                            &mut stage_nanos,
+                            intro_start,
+                        )?
+                    }
+                    Err(err) => return Err(err.into()),
                 }
-                Err(
-                    TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull,
-                ) => {
-                    // Serial fast path overflowed — retry with spill pipeline.
-                    run_serial_spill_retry(
+            } else {
+                let mut object_store = open_object_store()?;
+                let mut introducer = BlobIntroducer::new(
+                    &config.tree_diff,
+                    repo.object_format.oid_len(),
+                    midx.object_count(),
+                    mapping_cfg.max_loose_candidates,
+                    config.engine_adapter.scan_binary,
+                );
+
+                let mut collector = PackCandidateCollector::new(
+                    &midx,
+                    &oid_index,
+                    mapping_cfg.path_arena_capacity,
+                    mapping_cfg.max_packed_candidates,
+                    mapping_cfg.max_loose_candidates,
+                );
+
+                match introducer.introduce(
+                    &mut object_store,
+                    cg_index,
+                    plan,
+                    &oid_index,
+                    abort,
+                    &mut collector,
+                ) {
+                    Ok(stats) => {
+                        perf_set!(
+                            stage_nanos,
+                            blob_intro,
+                            intro_start.elapsed().as_nanos() as u64
+                        );
+                        let collect_start = Instant::now();
+                        let (packed, loose, path_arena) = collector.finish();
+                        perf_set!(
+                            stage_nanos,
+                            pack_collect,
+                            collect_start.elapsed().as_nanos() as u64
+                        );
+                        let mapping_stats = MappingStats {
+                            unique_blobs_in: packed.len().saturating_add(loose.len()) as u64,
+                            packed_matched: packed.len() as u64,
+                            loose_unmatched: loose.len() as u64,
+                        };
+                        (
+                            TreeDiffStats::from(stats),
+                            packed,
+                            loose,
+                            path_arena,
+                            SpillStats::default(),
+                            mapping_stats,
+                        )
+                    }
+                    Err(
+                        TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull,
+                    ) => run_serial_spill_retry(
                         repo,
                         config,
                         &spill_dir,
@@ -349,16 +364,33 @@ pub(super) fn run_odb_blob(
                         abort,
                         &mut stage_nanos,
                         intro_start,
-                    )?
+                    )?,
+                    Err(err) => return Err(err.into()),
                 }
-                Err(err) => return Err(err.into()),
-            }
+            };
+
+            checkpoint_stage(
+                checkpoint_sink,
+                &StageCheckpoint::PostSpillDedup {
+                    scan_mode: config.scan_mode,
+                    artifact_fingerprint,
+                    plan,
+                    packed: &result.1,
+                    loose: &result.2,
+                    path_arena: &result.3,
+                    tree_diff_stats: result.0.clone(),
+                    spill_stats: result.4.clone(),
+                    mapping_stats: result.5,
+                },
+            )?;
+            result
         };
     check_abort(abort)?;
 
     // ── Stage 2 + 3: pack planning + execution ──────────────────────
     let pack_plan_start = Instant::now();
-    packed.retain(|cand| !completed_packs.is_complete(cand.pack_id));
+    let checkpoint_packed = packed.clone();
+    let checkpoint_loose = loose.clone();
 
     let pack_dirs = collect_pack_dirs(&repo.paths);
     let pack_names = list_pack_files(&pack_dirs)?;
@@ -399,13 +431,29 @@ pub(super) fn run_odb_blob(
     let pack_cache_bytes: u32 = pack_cache_target
         .try_into()
         .map_err(|_| io::Error::other("pack cache size exceeds u32::MAX"))?;
+    let prefix_resume = resumed_prefix.filter(|prefix| {
+        matches!(
+            prefix.stage,
+            ScanCheckpointStage::PackPlanComplete | ScanCheckpointStage::PreFinalize
+        )
+    });
+    let checkpointing_enabled = checkpoint_sink.checkpoints_enabled() || prefix_resume.is_some();
     let mut pack_exec_reports = Vec::with_capacity(used_pack_ids.len());
-    let mut skipped_candidates = Vec::new();
-    let mut common_metrics = GitScanCommonMetrics::default();
-    let mut scanned = ScannedBlobs {
-        blobs: Vec::with_capacity(packed_len.saturating_add(loose_len)),
-        finding_arena: Vec::new(),
-    };
+    let mut skipped_candidates = prefix_resume
+        .map(|prefix| prefix.skipped_candidates.clone())
+        .unwrap_or_default();
+    let mut common_metrics = prefix_resume
+        .map(|prefix| prefix.common_metrics)
+        .unwrap_or_default();
+    let mut scanned = prefix_resume
+        .map(|prefix| prefix.scanned.clone())
+        .unwrap_or_else(|| ScannedBlobs {
+            blobs: Vec::with_capacity(packed_len.saturating_add(loose_len)),
+            finding_arena: Vec::new(),
+        });
+    let mut completed_plan_prefix_len = prefix_resume
+        .map(|prefix| prefix.completed_plan_count)
+        .unwrap_or(0);
     let path_arena = Arc::new(path_arena);
     let spill_dir = Arc::new(spill_dir);
 
@@ -452,66 +500,167 @@ pub(super) fn run_odb_blob(
             pack_plan_delta_deps_max = pack_plan_delta_deps_max.max(deps_len);
             plans.push(plan);
         }
-        // No plan-level filter needed: the candidate-level retain above
-        // already removed every candidate belonging to a completed pack, so
-        // bucket_pack_candidates never produces those pack_ids and no plan is
-        // built for them.
         perf_set!(
             stage_nanos,
             pack_plan,
             pack_plan_start.elapsed().as_nanos() as u64
         );
 
+        if completed_plan_prefix_len > plans.len() {
+            return Err(ScanCheckpointError::InvalidState(format!(
+                "resume checkpoint completed {completed_plan_prefix_len} pack plans but rebuilt only {}",
+                plans.len()
+            ))
+            .into());
+        }
+
         if !plans.is_empty() {
             check_abort(abort)?;
-            #[cfg(feature = "git-perf")]
-            start_pack_exec();
             let plan_pack_ids: Vec<u16> = plans.iter().map(|plan| plan.pack_id()).collect();
-            let strategy = select_pack_exec_strategy(pack_exec_workers, &plans);
-            let scheduler_workers = match strategy {
-                PackExecStrategy::Serial => 1,
-                PackExecStrategy::PackParallel | PackExecStrategy::IntraPackSharded { .. } => {
-                    pack_exec_workers
-                }
-            };
+            for pack_id in plan_pack_ids
+                .iter()
+                .take(completed_plan_prefix_len)
+                .copied()
+            {
+                completed_packs.mark_complete(pack_id);
+            }
+            pack_exec_reports.resize_with(completed_plan_prefix_len, PackExecReport::default);
+
             let midx_bytes = repo
                 .mmaps
                 .midx
                 .clone()
                 .ok_or_else(|| GitScanError::Io(io::Error::other("midx bytes missing")))?;
-            let outputs = execute_pack_plans_with_scheduler(
-                Arc::clone(&engine),
-                event_sink.clone(),
-                midx_bytes,
-                repo.object_format,
-                Arc::clone(&pack_paths),
-                Arc::clone(&loose_dirs),
-                Arc::clone(&pack_mmaps),
-                Arc::clone(&path_arena),
-                Arc::clone(&spill_dir),
-                plans,
-                config.pack_decode,
-                config.pack_io,
-                config.engine_adapter,
-                pack_cache_bytes,
-                scheduler_workers,
-                config.pin_threads,
-                abort,
-                Arc::clone(&commit_graph_index),
-                Arc::clone(&commit_meta_seen),
-            )?;
-            collect_scheduler_outputs(
-                &plan_pack_ids,
-                outputs,
-                &mut completed_packs,
-                &mut pack_exec_reports,
-                &mut skipped_candidates,
-                &mut common_metrics,
-                &mut scanned,
-            )?;
+
+            if matches!(
+                resume_state.map(ScanResumeState::stage),
+                Some(ScanCheckpointStage::PreFinalize)
+            ) {
+                pack_exec_reports.resize_with(plans.len(), PackExecReport::default);
+            } else if checkpointing_enabled {
+                for (plan_idx, pack_plan) in plans
+                    .into_iter()
+                    .enumerate()
+                    .skip(completed_plan_prefix_len)
+                {
+                    #[cfg(feature = "git-perf")]
+                    start_pack_exec();
+                    let strategy = select_pack_exec_strategy(
+                        pack_exec_workers,
+                        std::slice::from_ref(&pack_plan),
+                    );
+                    let scheduler_workers = match strategy {
+                        PackExecStrategy::Serial => 1,
+                        PackExecStrategy::PackParallel
+                        | PackExecStrategy::IntraPackSharded { .. } => pack_exec_workers,
+                    };
+                    let outputs = execute_pack_plans_with_scheduler(
+                        Arc::clone(&engine),
+                        event_sink.clone(),
+                        midx_bytes.clone(),
+                        repo.object_format,
+                        Arc::clone(&pack_paths),
+                        Arc::clone(&loose_dirs),
+                        Arc::clone(&pack_mmaps),
+                        Arc::clone(&path_arena),
+                        Arc::clone(&spill_dir),
+                        vec![pack_plan],
+                        config.pack_decode,
+                        config.pack_io,
+                        config.engine_adapter,
+                        pack_cache_bytes,
+                        scheduler_workers,
+                        config.pin_threads,
+                        abort,
+                        Arc::clone(&commit_graph_index),
+                        Arc::clone(&commit_meta_seen),
+                    )?;
+                    collect_scheduler_outputs(
+                        &plan_pack_ids[plan_idx..=plan_idx],
+                        outputs,
+                        &mut completed_packs,
+                        &mut pack_exec_reports,
+                        &mut skipped_candidates,
+                        &mut common_metrics,
+                        &mut scanned,
+                    )?;
+                    if pack_exec_reports.last().is_some_and(plan_completed_cleanly)
+                        && plan_idx == completed_plan_prefix_len
+                    {
+                        completed_plan_prefix_len += 1;
+                        checkpoint_stage(
+                            checkpoint_sink,
+                            &StageCheckpoint::PackPlanComplete {
+                                scan_mode: config.scan_mode,
+                                artifact_fingerprint,
+                                plan,
+                                packed: &checkpoint_packed,
+                                loose: &checkpoint_loose,
+                                path_arena: path_arena.as_ref(),
+                                tree_diff_stats: tree_diff_stats.clone(),
+                                spill_stats: spill_stats.clone(),
+                                mapping_stats,
+                                completed_plan_count: completed_plan_prefix_len,
+                                scanned: &scanned,
+                                skipped_candidates: &skipped_candidates,
+                                common_metrics,
+                            },
+                        )?;
+                    }
+                }
+            } else {
+                #[cfg(feature = "git-perf")]
+                start_pack_exec();
+                let strategy = select_pack_exec_strategy(pack_exec_workers, &plans);
+                let scheduler_workers = match strategy {
+                    PackExecStrategy::Serial => 1,
+                    PackExecStrategy::PackParallel | PackExecStrategy::IntraPackSharded { .. } => {
+                        pack_exec_workers
+                    }
+                };
+                let outputs = execute_pack_plans_with_scheduler(
+                    Arc::clone(&engine),
+                    event_sink.clone(),
+                    midx_bytes,
+                    repo.object_format,
+                    Arc::clone(&pack_paths),
+                    Arc::clone(&loose_dirs),
+                    Arc::clone(&pack_mmaps),
+                    Arc::clone(&path_arena),
+                    Arc::clone(&spill_dir),
+                    plans,
+                    config.pack_decode,
+                    config.pack_io,
+                    config.engine_adapter,
+                    pack_cache_bytes,
+                    scheduler_workers,
+                    config.pin_threads,
+                    abort,
+                    Arc::clone(&commit_graph_index),
+                    Arc::clone(&commit_meta_seen),
+                )?;
+                collect_scheduler_outputs(
+                    &plan_pack_ids,
+                    outputs,
+                    &mut completed_packs,
+                    &mut pack_exec_reports,
+                    &mut skipped_candidates,
+                    &mut common_metrics,
+                    &mut scanned,
+                )?;
+                completed_plan_prefix_len = pack_exec_reports
+                    .iter()
+                    .take_while(|report| plan_completed_cleanly(report))
+                    .count();
+            }
         }
 
-        if !loose.is_empty() {
+        if !loose.is_empty()
+            && !matches!(
+                resume_state.map(ScanResumeState::stage),
+                Some(ScanCheckpointStage::PreFinalize)
+            )
+        {
             check_abort(abort)?;
             #[cfg(feature = "git-perf")]
             start_pack_exec();
@@ -557,7 +706,12 @@ pub(super) fn run_odb_blob(
             pack_plan,
             pack_plan_start.elapsed().as_nanos() as u64
         );
-        if !loose.is_empty() {
+        if !loose.is_empty()
+            && !matches!(
+                resume_state.map(ScanResumeState::stage),
+                Some(ScanCheckpointStage::PreFinalize)
+            )
+        {
             check_abort(abort)?;
             #[cfg(feature = "git-perf")]
             start_pack_exec();
@@ -599,6 +753,30 @@ pub(super) fn run_odb_blob(
         }
     }
 
+    if !matches!(
+        resume_state.map(ScanResumeState::stage),
+        Some(ScanCheckpointStage::PreFinalize)
+    ) {
+        checkpoint_stage(
+            checkpoint_sink,
+            &StageCheckpoint::PreFinalize {
+                scan_mode: config.scan_mode,
+                artifact_fingerprint,
+                plan,
+                packed: &checkpoint_packed,
+                loose: &checkpoint_loose,
+                path_arena: path_arena.as_ref(),
+                tree_diff_stats: tree_diff_stats.clone(),
+                spill_stats: spill_stats.clone(),
+                mapping_stats,
+                completed_plan_count: completed_plan_prefix_len,
+                scanned: &scanned,
+                skipped_candidates: &skipped_candidates,
+                common_metrics,
+            },
+        )?;
+    }
+
     #[cfg(feature = "git-perf")]
     if pack_exec_started {
         stage_nanos.pack_exec = pack_exec_start.elapsed().as_nanos() as u64;
@@ -617,7 +795,7 @@ pub(super) fn run_odb_blob(
         pack_plan_config: pack_plan_cfg,
         pack_plan_delta_deps_total,
         pack_plan_delta_deps_max,
-        tree_diff_stats: TreeDiffStats::from(intro_stats),
+        tree_diff_stats,
         spill_stats,
         mapping_stats,
         common_metrics,
@@ -630,14 +808,14 @@ pub(super) fn run_odb_blob(
 /// Tuple returned by Stage 1 blob introduction (both serial and parallel paths).
 ///
 /// Fields (in order):
-/// 0. `BlobIntroStats` -- commit/tree/blob counters from the walk.
+/// 0. `TreeDiffStats` -- commit/tree/blob counters from the walk.
 /// 1. `Vec<PackCandidate>` -- blobs mapped to MIDX pack offsets.
 /// 2. `Vec<LooseCandidate>` -- blobs not in any pack (loose objects).
 /// 3. `ByteArena` -- interned file paths referenced by candidates.
 /// 4. `SpillStats` -- spill pipeline stats (zeroed when fast path succeeds).
 /// 5. `MappingStats` -- mapping bridge stats (synthetic when no bridge used).
 type IntroResult = (
-    BlobIntroStats,
+    TreeDiffStats,
     Vec<PackCandidate>,
     Vec<LooseCandidate>,
     ByteArena,
@@ -729,7 +907,7 @@ fn run_serial_spill_retry(
     let loose = std::mem::take(&mut sink.loose);
 
     Ok((
-        stats,
+        TreeDiffStats::from(stats),
         packed,
         loose,
         mapping_arena,

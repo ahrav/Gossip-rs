@@ -61,18 +61,23 @@ use scanner_scheduler::{alloc_stats, AllocStats};
 use crate::{perf_let, perf_set};
 use scanner_engine::Engine;
 
+use super::checkpoint::{
+    ScanCheckpointError, ScanCheckpointSink, ScanCheckpointStage, ScanResumeState, StageCheckpoint,
+};
 use super::commit_walk::{CommitGraph, ParentScratch, PlannedCommit};
 use super::engine_adapter::{CommitMetaContext, EngineAdapter, GitScanCommonMetrics, ScannedBlobs};
-use super::mapping_bridge::{MappingBridge, MappingBridgeConfig};
+use super::mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 use super::object_store::{ObjectStore, ObjectStoreLayout};
 use super::pack_candidates::CappedPackCandidateSink;
+use super::pack_exec::PackExecReport;
 use super::pack_io::PackIo;
 use super::pack_plan::build_pack_plans;
 use super::pack_plan_model::CompletedPacksBitmap;
 use super::policy_hash::MergeDiffMode;
 use super::repo_open::RepoJobState;
 use super::runner::{
-    check_abort, GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
+    check_abort, checkpoint_stage, GitScanAllocStats, GitScanConfig, GitScanError,
+    GitScanStageNanos, ScanModeOutput,
 };
 use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
 use super::spiller::Spiller;
@@ -85,8 +90,8 @@ use super::repo_paths::{
 use super::runner_exec::{
     append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views, collect_scheduler_outputs,
     execute_pack_plans_with_scheduler, load_midx, make_spill_dir, mmap_pack_files,
-    per_worker_cache_bytes, scan_loose_candidates, select_pack_exec_strategy,
-    summarize_pack_plan_deps, PackExecStrategy, SpillCandidateSink,
+    per_worker_cache_bytes, plan_completed_cleanly, scan_loose_candidates,
+    select_pack_exec_strategy, summarize_pack_plan_deps, PackExecStrategy, SpillCandidateSink,
 };
 
 /// Runs the diff-history scan pipeline.
@@ -152,6 +157,8 @@ pub(super) fn run_diff_history(
     plan: &[PlannedCommit],
     config: &GitScanConfig,
     abort: &AtomicBool,
+    resume_state: Option<&ScanResumeState>,
+    checkpoint_sink: &dyn ScanCheckpointSink,
     commit_meta: CommitMetaContext,
 ) -> Result<ScanModeOutput, GitScanError> {
     let CommitMetaContext {
@@ -171,157 +178,184 @@ pub(super) fn run_diff_history(
         None => make_spill_dir()?,
     };
 
-    let mut spiller = Spiller::new(config.spill, repo.object_format.oid_len(), &spill_dir)?;
     let midx = load_midx(repo)?;
     let mut completed_packs = CompletedPacksBitmap::empty(midx.pack_count() as usize);
-    let object_store_layout = ObjectStoreLayout::from_midx(repo, midx)?;
-    // Scale tree delta-cache to repo size to reduce repeated base decode work
-    // while staying within the configured max cache budget.
-    let auto_cache_bytes = auto_tree_delta_cache_bytes(
-        midx.object_count(),
-        config.tree_diff.max_tree_delta_cache_bytes,
-    );
-    let tree_delta_cache = TreeDeltaCache::new(auto_cache_bytes);
-    let mut object_store = ObjectStore::open_with_layout(
-        &object_store_layout,
-        &config.tree_diff,
-        &spill_dir,
-        tree_delta_cache,
-    )?;
-    let mut walker = TreeDiffWalker::new(&config.tree_diff, repo.object_format.oid_len());
-    // Reused across commits to avoid per-commit allocation for parent position lists.
-    let mut parent_scratch = ParentScratch::new();
+    let artifact_fingerprint = repo
+        .artifact_fingerprint
+        .as_ref()
+        .ok_or_else(|| GitScanError::Io(io::Error::other("artifact fingerprint missing")))?;
+    let resumed_base = resume_state.and_then(ScanResumeState::base_state);
+    let resumed_prefix = resume_state.and_then(ScanResumeState::prefix_state);
 
-    // ── Stage 1: Tree diff ──────────────────────────────────────────────
-    // Walk each planned commit and diff its tree against parent trees to
-    // discover changed blob OIDs. The SpillCandidateSink streams candidates
-    // directly into the spiller, bounding memory even for repositories with
-    // millions of changed blobs.
-    {
-        perf_let!(diff_start = Instant::now());
-        let mut sink = SpillCandidateSink::new(&mut spiller);
-        for PlannedCommit { pos, snapshot_root } in plan {
-            check_abort(abort)?;
-            let commit_id = pos.0;
-            let new_tree = cg.root_tree_oid(*pos)?;
-
-            // Snapshot roots are diffed against the empty tree (old_tree=None),
-            // treating every blob in the tree as a new addition. This is used
-            // for orphan commits and forced snapshot points in the commit plan.
-            if *snapshot_root {
-                walker.diff_trees(
-                    &mut object_store,
-                    &mut sink,
-                    Some(&new_tree),
-                    None,
-                    commit_id,
-                    0,
-                    abort,
-                )?;
-                continue;
-            }
-
-            parent_scratch.clear();
-            cg.collect_parents(
-                *pos,
-                config.commit_walk.max_parents_per_commit,
-                &mut parent_scratch,
+    let (tree_diff_stats, spill_stats, mapping_stats, mut packed, loose, mapping_arena) =
+        if let Some(base) = resumed_base {
+            (
+                base.tree_diff_stats.clone(),
+                base.spill_stats.clone(),
+                base.mapping_stats,
+                base.packed.clone(),
+                base.loose.clone(),
+                base.path_arena.clone(),
+            )
+        } else {
+            let object_store_layout = ObjectStoreLayout::from_midx(repo, midx)?;
+            // Scale tree delta-cache to repo size to reduce repeated base decode work
+            // while staying within the configured max cache budget.
+            let auto_cache_bytes = auto_tree_delta_cache_bytes(
+                midx.object_count(),
+                config.tree_diff.max_tree_delta_cache_bytes,
+            );
+            let tree_delta_cache = TreeDeltaCache::new(auto_cache_bytes);
+            let mut object_store = ObjectStore::open_with_layout(
+                &object_store_layout,
+                &config.tree_diff,
+                &spill_dir,
+                tree_delta_cache,
             )?;
-            let parents = parent_scratch.as_slice();
+            let mut walker = TreeDiffWalker::new(&config.tree_diff, repo.object_format.oid_len());
+            let mut spiller = Spiller::new(config.spill, repo.object_format.oid_len(), &spill_dir)?;
+            // Reused across commits to avoid per-commit allocation for parent position lists.
+            let mut parent_scratch = ParentScratch::new();
 
-            // Parentless commits (e.g. grafted roots) use the same empty-tree
-            // diff as snapshot roots—every blob is considered introduced.
-            if parents.is_empty() {
-                walker.diff_trees(
-                    &mut object_store,
-                    &mut sink,
-                    Some(&new_tree),
-                    None,
-                    commit_id,
-                    0,
-                    abort,
-                )?;
-                continue;
-            }
+            // ── Stage 1: Tree diff ──────────────────────────────────────────
+            {
+                perf_let!(diff_start = Instant::now());
+                let mut sink = SpillCandidateSink::new(&mut spiller);
+                for PlannedCommit { pos, snapshot_root } in plan {
+                    check_abort(abort)?;
+                    let commit_id = pos.0;
+                    let new_tree = cg.root_tree_oid(*pos)?;
 
-            match config.merge_diff_mode {
-                MergeDiffMode::AllParents => {
-                    for (idx, parent_pos) in parents.iter().enumerate() {
-                        let old_tree = cg.root_tree_oid(*parent_pos)?;
+                    if *snapshot_root {
                         walker.diff_trees(
                             &mut object_store,
                             &mut sink,
                             Some(&new_tree),
-                            Some(&old_tree),
+                            None,
                             commit_id,
-                            idx as u8,
+                            0,
                             abort,
                         )?;
+                        continue;
+                    }
+
+                    parent_scratch.clear();
+                    cg.collect_parents(
+                        *pos,
+                        config.commit_walk.max_parents_per_commit,
+                        &mut parent_scratch,
+                    )?;
+                    let parents = parent_scratch.as_slice();
+
+                    if parents.is_empty() {
+                        walker.diff_trees(
+                            &mut object_store,
+                            &mut sink,
+                            Some(&new_tree),
+                            None,
+                            commit_id,
+                            0,
+                            abort,
+                        )?;
+                        continue;
+                    }
+
+                    match config.merge_diff_mode {
+                        MergeDiffMode::AllParents => {
+                            for (idx, parent_pos) in parents.iter().enumerate() {
+                                let old_tree = cg.root_tree_oid(*parent_pos)?;
+                                walker.diff_trees(
+                                    &mut object_store,
+                                    &mut sink,
+                                    Some(&new_tree),
+                                    Some(&old_tree),
+                                    commit_id,
+                                    idx as u8,
+                                    abort,
+                                )?;
+                            }
+                        }
+                        MergeDiffMode::FirstParentOnly => {
+                            let old_tree = cg.root_tree_oid(parents[0])?;
+                            walker.diff_trees(
+                                &mut object_store,
+                                &mut sink,
+                                Some(&new_tree),
+                                Some(&old_tree),
+                                commit_id,
+                                0,
+                                abort,
+                            )?;
+                        }
                     }
                 }
-                MergeDiffMode::FirstParentOnly => {
-                    let old_tree = cg.root_tree_oid(parents[0])?;
-                    walker.diff_trees(
-                        &mut object_store,
-                        &mut sink,
-                        Some(&new_tree),
-                        Some(&old_tree),
-                        commit_id,
-                        0,
-                        abort,
-                    )?;
-                }
+                perf_set!(
+                    stage_nanos,
+                    tree_diff,
+                    diff_start.elapsed().as_nanos() as u64
+                );
             }
-        }
-        perf_set!(
-            stage_nanos,
-            tree_diff,
-            diff_start.elapsed().as_nanos() as u64
-        );
-    }
 
-    // ── Stages 2–3: Spill/dedupe → mapping bridge ──────────────────────
-    // Finalize the spiller: flush any on-disk runs, merge-sort, and replay
-    // unique (unseen) OIDs through the mapping bridge. The bridge resolves
-    // each OID to a pack location via the MIDX, splitting candidates into
-    // packed (with pack_id + offset) and loose (fan-out directory lookup).
-    // The returned path arena owns all file-path bytes for the rest of the
-    // pipeline.
-    perf_let!(spill_start = Instant::now());
-    let mut mapping_cfg = config.mapping;
-    let default_mapping_cfg = MappingBridgeConfig::default();
-    if mapping_cfg.max_packed_candidates >= default_mapping_cfg.max_packed_candidates {
-        // Keep explicit low caps as hard limits; only scale default-or-higher
-        // caps to handle very large repositories.
-        mapping_cfg.max_packed_candidates =
-            mapping_cfg.max_packed_candidates.max(midx.object_count());
-    }
-    let mut bridge = MappingBridge::new(
-        &midx,
-        CappedPackCandidateSink::new(
-            mapping_cfg.max_packed_candidates,
-            mapping_cfg.max_loose_candidates,
-        ),
-        mapping_cfg,
-    );
-    check_abort(abort)?;
-    let spill_stats = spiller.finalize(seen_store, seen_persister, &mut bridge)?;
-    perf_set!(stage_nanos, spill, spill_start.elapsed().as_nanos() as u64);
-    let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
-    let mapping_arena = Arc::new(mapping_arena);
+            // ── Stages 2–3: Spill/dedupe → mapping bridge ──────────────────
+            perf_let!(spill_start = Instant::now());
+            let mut mapping_cfg = config.mapping;
+            let default_mapping_cfg = MappingBridgeConfig::default();
+            if mapping_cfg.max_packed_candidates >= default_mapping_cfg.max_packed_candidates {
+                mapping_cfg.max_packed_candidates =
+                    mapping_cfg.max_packed_candidates.max(midx.object_count());
+            }
+            let mut bridge = MappingBridge::new(
+                &midx,
+                CappedPackCandidateSink::new(
+                    mapping_cfg.max_packed_candidates,
+                    mapping_cfg.max_loose_candidates,
+                ),
+                mapping_cfg,
+            );
+            check_abort(abort)?;
+            let spill_stats = spiller.finalize(seen_store, seen_persister, &mut bridge)?;
+            perf_set!(stage_nanos, spill, spill_start.elapsed().as_nanos() as u64);
+            let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
+            let tree_diff_stats = walker.stats().clone();
+
+            checkpoint_stage(
+                checkpoint_sink,
+                &StageCheckpoint::PostSpillDedup {
+                    scan_mode: config.scan_mode,
+                    artifact_fingerprint,
+                    plan,
+                    packed: &sink.packed,
+                    loose: &sink.loose,
+                    path_arena: &mapping_arena,
+                    tree_diff_stats: tree_diff_stats.clone(),
+                    spill_stats: spill_stats.clone(),
+                    mapping_stats,
+                },
+            )?;
+
+            (
+                tree_diff_stats,
+                spill_stats,
+                mapping_stats,
+                std::mem::take(&mut sink.packed),
+                std::mem::take(&mut sink.loose),
+                mapping_arena,
+            )
+        };
     check_abort(abort)?;
 
     // ── Stage 4: Pack planning ───────────────────────────────────────────
     perf_let!(pack_plan_start = Instant::now());
-    sink.packed
-        .retain(|cand| !completed_packs.is_complete(cand.pack_id));
+    let checkpoint_packed = packed.clone();
+    let checkpoint_loose = loose.clone();
+    packed.retain(|cand| !completed_packs.is_complete(cand.pack_id));
     let pack_dirs = collect_pack_dirs(&repo.paths);
     let pack_names = list_pack_files(&pack_dirs)?;
     midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))?;
     let pack_paths = resolve_pack_paths(&midx, &pack_dirs)?;
     // Only mmap packs that contain at least one candidate. This avoids
     // wasting address space on multi-pack repos where most packs are idle.
-    let mut used_pack_ids: Vec<u16> = sink.packed.iter().map(|cand| cand.pack_id).collect();
+    let mut used_pack_ids: Vec<u16> = packed.iter().map(|cand| cand.pack_id).collect();
     used_pack_ids.sort_unstable();
     used_pack_ids.dedup();
     let pack_mmaps = mmap_pack_files(&pack_paths, &used_pack_ids, config.pack_mmap)?;
@@ -329,12 +363,9 @@ pub(super) fn run_diff_history(
 
     let mut pack_plan_stats = Vec::new();
     let mut plans = Vec::new();
-    let packed_len = sink.packed.len();
-    let loose_len = sink.loose.len();
-    if !sink.packed.is_empty() {
-        // Move candidates out of the sink to avoid cloning the potentially
-        // large candidate vec; the sink's packed field is left empty.
-        let packed = std::mem::take(&mut sink.packed);
+    let packed_len = packed.len();
+    let loose_len = loose.len();
+    if !packed.is_empty() {
         let mut pack_plans = build_pack_plans(packed, &pack_views, &midx, &config.pack_plan)?;
         pack_plan_stats.extend(pack_plans.iter().map(|p| p.stats));
         plans.append(&mut pack_plans);
@@ -369,70 +400,187 @@ pub(super) fn run_diff_history(
         .try_into()
         .map_err(|_| io::Error::other("pack cache size exceeds u32::MAX"))?;
     let pack_exec_workers = config.pack_exec_workers.max(1);
-    let pack_exec_strategy = select_pack_exec_strategy(pack_exec_workers, &plans);
     let plan_count = plans.len();
+    let prefix_resume = resumed_prefix.filter(|prefix| {
+        matches!(
+            prefix.stage,
+            ScanCheckpointStage::PackPlanComplete | ScanCheckpointStage::PreFinalize
+        )
+    });
+    let checkpointing_enabled = checkpoint_sink.checkpoints_enabled() || prefix_resume.is_some();
+    let mut completed_plan_prefix_len = prefix_resume
+        .map(|prefix| prefix.completed_plan_count)
+        .unwrap_or(0);
     let loose_dirs = Arc::new(collect_loose_dirs(&repo.paths));
     let pack_paths = Arc::new(pack_paths);
     let pack_mmaps = Arc::new(pack_mmaps);
+    let mapping_arena = Arc::new(mapping_arena);
     let spill_dir = Arc::new(spill_dir);
     let mut pack_exec_reports = Vec::with_capacity(plan_count);
-    let mut skipped_candidates = Vec::new();
-    let mut common_metrics = GitScanCommonMetrics::default();
-    let mut scanned = ScannedBlobs {
-        blobs: Vec::with_capacity(packed_len.saturating_add(loose_len)),
-        finding_arena: Vec::new(),
-    };
+    let mut skipped_candidates = prefix_resume
+        .map(|prefix| prefix.skipped_candidates.clone())
+        .unwrap_or_default();
+    let mut common_metrics = prefix_resume
+        .map(|prefix| prefix.common_metrics)
+        .unwrap_or_default();
+    let mut scanned = prefix_resume
+        .map(|prefix| prefix.scanned.clone())
+        .unwrap_or_else(|| ScannedBlobs {
+            blobs: Vec::with_capacity(packed_len.saturating_add(loose_len)),
+            finding_arena: Vec::new(),
+        });
 
     #[cfg(feature = "git-perf")]
     let pack_exec_start = Instant::now();
     #[cfg(feature = "git-perf")]
     let pack_exec_alloc_before: AllocStats = alloc_stats();
+    if completed_plan_prefix_len > plans.len() {
+        return Err(ScanCheckpointError::InvalidState(format!(
+            "resume checkpoint completed {completed_plan_prefix_len} pack plans but rebuilt only {}",
+            plans.len()
+        ))
+        .into());
+    }
     if !plans.is_empty() {
         check_abort(abort)?;
-        let scheduler_workers = match pack_exec_strategy {
-            PackExecStrategy::Serial => 1,
-            PackExecStrategy::PackParallel | PackExecStrategy::IntraPackSharded { .. } => {
-                pack_exec_workers
-            }
-        };
+        let plan_pack_ids: Vec<u16> = plans.iter().map(|plan| plan.pack_id()).collect();
+        for pack_id in plan_pack_ids
+            .iter()
+            .take(completed_plan_prefix_len)
+            .copied()
+        {
+            completed_packs.mark_complete(pack_id);
+        }
+        pack_exec_reports.resize_with(completed_plan_prefix_len, PackExecReport::default);
         let midx_bytes = repo
             .mmaps
             .midx
             .clone()
             .ok_or_else(|| GitScanError::Io(io::Error::other("midx bytes missing")))?;
-        let plan_pack_ids: Vec<u16> = plans.iter().map(|plan| plan.pack_id()).collect();
-        let outputs = execute_pack_plans_with_scheduler(
-            Arc::clone(&engine),
-            event_sink.clone(),
-            midx_bytes,
-            repo.object_format,
-            Arc::clone(&pack_paths),
-            Arc::clone(&loose_dirs),
-            Arc::clone(&pack_mmaps),
-            Arc::clone(&mapping_arena),
-            Arc::clone(&spill_dir),
-            plans,
-            config.pack_decode,
-            config.pack_io,
-            config.engine_adapter,
-            pack_cache_bytes,
-            scheduler_workers,
-            config.pin_threads,
-            abort,
-            Arc::clone(&commit_graph_index),
-            Arc::clone(&commit_meta_seen),
-        )?;
-        collect_scheduler_outputs(
-            &plan_pack_ids,
-            outputs,
-            &mut completed_packs,
-            &mut pack_exec_reports,
-            &mut skipped_candidates,
-            &mut common_metrics,
-            &mut scanned,
-        )?;
+
+        if matches!(
+            resume_state.map(ScanResumeState::stage),
+            Some(ScanCheckpointStage::PreFinalize)
+        ) {
+            pack_exec_reports.resize_with(plans.len(), PackExecReport::default);
+        } else if checkpointing_enabled {
+            for (plan_idx, pack_plan) in plans
+                .into_iter()
+                .enumerate()
+                .skip(completed_plan_prefix_len)
+            {
+                let strategy =
+                    select_pack_exec_strategy(pack_exec_workers, std::slice::from_ref(&pack_plan));
+                let scheduler_workers = match strategy {
+                    PackExecStrategy::Serial => 1,
+                    PackExecStrategy::PackParallel | PackExecStrategy::IntraPackSharded { .. } => {
+                        pack_exec_workers
+                    }
+                };
+                let outputs = execute_pack_plans_with_scheduler(
+                    Arc::clone(&engine),
+                    event_sink.clone(),
+                    midx_bytes.clone(),
+                    repo.object_format,
+                    Arc::clone(&pack_paths),
+                    Arc::clone(&loose_dirs),
+                    Arc::clone(&pack_mmaps),
+                    Arc::clone(&mapping_arena),
+                    Arc::clone(&spill_dir),
+                    vec![pack_plan],
+                    config.pack_decode,
+                    config.pack_io,
+                    config.engine_adapter,
+                    pack_cache_bytes,
+                    scheduler_workers,
+                    config.pin_threads,
+                    abort,
+                    Arc::clone(&commit_graph_index),
+                    Arc::clone(&commit_meta_seen),
+                )?;
+                collect_scheduler_outputs(
+                    &plan_pack_ids[plan_idx..=plan_idx],
+                    outputs,
+                    &mut completed_packs,
+                    &mut pack_exec_reports,
+                    &mut skipped_candidates,
+                    &mut common_metrics,
+                    &mut scanned,
+                )?;
+                if pack_exec_reports.last().is_some_and(plan_completed_cleanly)
+                    && plan_idx == completed_plan_prefix_len
+                {
+                    completed_plan_prefix_len += 1;
+                    checkpoint_stage(
+                        checkpoint_sink,
+                        &StageCheckpoint::PackPlanComplete {
+                            scan_mode: config.scan_mode,
+                            artifact_fingerprint,
+                            plan,
+                            packed: &checkpoint_packed,
+                            loose: &checkpoint_loose,
+                            path_arena: mapping_arena.as_ref(),
+                            tree_diff_stats: tree_diff_stats.clone(),
+                            spill_stats: spill_stats.clone(),
+                            mapping_stats,
+                            completed_plan_count: completed_plan_prefix_len,
+                            scanned: &scanned,
+                            skipped_candidates: &skipped_candidates,
+                            common_metrics,
+                        },
+                    )?;
+                }
+            }
+        } else {
+            let strategy = select_pack_exec_strategy(pack_exec_workers, &plans);
+            let scheduler_workers = match strategy {
+                PackExecStrategy::Serial => 1,
+                PackExecStrategy::PackParallel | PackExecStrategy::IntraPackSharded { .. } => {
+                    pack_exec_workers
+                }
+            };
+            let outputs = execute_pack_plans_with_scheduler(
+                Arc::clone(&engine),
+                event_sink.clone(),
+                midx_bytes,
+                repo.object_format,
+                Arc::clone(&pack_paths),
+                Arc::clone(&loose_dirs),
+                Arc::clone(&pack_mmaps),
+                Arc::clone(&mapping_arena),
+                Arc::clone(&spill_dir),
+                plans,
+                config.pack_decode,
+                config.pack_io,
+                config.engine_adapter,
+                pack_cache_bytes,
+                scheduler_workers,
+                config.pin_threads,
+                abort,
+                Arc::clone(&commit_graph_index),
+                Arc::clone(&commit_meta_seen),
+            )?;
+            collect_scheduler_outputs(
+                &plan_pack_ids,
+                outputs,
+                &mut completed_packs,
+                &mut pack_exec_reports,
+                &mut skipped_candidates,
+                &mut common_metrics,
+                &mut scanned,
+            )?;
+            completed_plan_prefix_len = pack_exec_reports
+                .iter()
+                .take_while(|report| plan_completed_cleanly(report))
+                .count();
+        }
     }
-    if !sink.loose.is_empty() {
+    if !loose.is_empty()
+        && !matches!(
+            resume_state.map(ScanResumeState::stage),
+            Some(ScanCheckpointStage::PreFinalize)
+        )
+    {
         check_abort(abort)?;
         let mut adapter = EngineAdapter::new_with_event_sink(
             engine.as_ref(),
@@ -444,7 +592,7 @@ pub(super) fn run_diff_history(
                 identity_interner: identity_interner.clone(),
             },
         );
-        adapter.reserve_results(sink.loose.len());
+        adapter.reserve_results(loose.len());
         let mut external = PackIo::from_parts(
             midx,
             (*pack_paths).clone(),
@@ -453,7 +601,7 @@ pub(super) fn run_diff_history(
         )
         .map_err(GitScanError::PackIo)?;
         scan_loose_candidates(
-            &sink.loose,
+            &loose,
             mapping_arena.as_ref(),
             &mut adapter,
             &mut external,
@@ -475,6 +623,30 @@ pub(super) fn run_diff_history(
         alloc_deltas.pack_exec = pack_exec_alloc_after.since(&pack_exec_alloc_before);
     }
 
+    if !matches!(
+        resume_state.map(ScanResumeState::stage),
+        Some(ScanCheckpointStage::PreFinalize)
+    ) {
+        checkpoint_stage(
+            checkpoint_sink,
+            &StageCheckpoint::PreFinalize {
+                scan_mode: config.scan_mode,
+                artifact_fingerprint,
+                plan,
+                packed: &checkpoint_packed,
+                loose: &checkpoint_loose,
+                path_arena: mapping_arena.as_ref(),
+                tree_diff_stats: tree_diff_stats.clone(),
+                spill_stats: spill_stats.clone(),
+                mapping_stats,
+                completed_plan_count: completed_plan_prefix_len,
+                scanned: &scanned,
+                skipped_candidates: &skipped_candidates,
+                common_metrics,
+            },
+        )?;
+    }
+
     Ok(ScanModeOutput {
         scanned,
         path_arena: Arc::try_unwrap(mapping_arena)
@@ -486,7 +658,7 @@ pub(super) fn run_diff_history(
         pack_plan_config: config.pack_plan,
         pack_plan_delta_deps_total,
         pack_plan_delta_deps_max,
-        tree_diff_stats: walker.stats().clone(),
+        tree_diff_stats,
         spill_stats,
         mapping_stats,
         common_metrics,

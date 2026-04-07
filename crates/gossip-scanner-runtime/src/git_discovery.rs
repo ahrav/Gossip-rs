@@ -6,9 +6,11 @@
 //! lookups or mirror checks; it only decides whether that target should be
 //! emitted for the current shard and cursor.
 //!
-//! Resume is key-authoritative: [`Cursor::last_key`] decides whether the target
-//! is already complete, and connector tokens are ignored because a single
-//! payload target has no extra provider-side continuation state.
+//! Resume is repo-frontier aware: a cursor strictly past the target key proves
+//! completion, and an equal-key cursor is considered complete only when its
+//! token is absent. Equal-key cursors with a token re-emit the singleton
+//! target so the runtime can resume the same repository from an inner
+//! checkpoint.
 //!
 //! ## Surface overview
 //!
@@ -64,14 +66,15 @@ impl GitRepoDiscoverySource for StaticGitRepoDiscoverySource {
     /// Return static discovery capabilities for one-target payload-backed shards.
     ///
     /// Pages are ordered by the carried [`GitRepoTarget`]'s canonical
-    /// [`RepoKey`](gossip_contracts::connector::git::RepoKey), there is no opaque resume
-    /// token to preserve across calls, and the source never proposes split
-    /// points because one-target shards have no interior split geometry.
+    /// [`RepoKey`](gossip_contracts::connector::git::RepoKey), equal-key
+    /// repo-frontier cursors remain resumable when they carry a token, and the
+    /// source never proposes split points because one-target shards have no
+    /// interior split geometry.
     fn capabilities(&self) -> GitDiscoveryCapabilities {
         GitDiscoveryCapabilities {
             paging: PagingCapabilities {
                 ordered_keys: true,
-                resumable: false,
+                resumable: true,
                 splittable: false,
             },
         }
@@ -88,7 +91,8 @@ impl GitRepoDiscoverySource for StaticGitRepoDiscoverySource {
     ///   rejects the page, indicating invalid local runtime state rather than a
     ///   retryable remote condition.
     ///
-    /// Any opaque token on `cursor` is ignored.
+    /// A token on an equal-key cursor indicates "resume this repo" rather than
+    /// "the repo is fully complete".
     fn discover_page(
         &mut self,
         shard: &ShardSpec,
@@ -144,9 +148,17 @@ impl GitRepoDiscoverySource for StaticGitRepoDiscoverySource {
 }
 
 fn cursor_covers_target(cursor: &Cursor, target: &GitRepoTarget) -> bool {
-    cursor
-        .last_key()
-        .is_some_and(|last_key| last_key >= target.repo_key().as_item_key())
+    let Some(last_key) = cursor.last_key() else {
+        return false;
+    };
+    let target_key = target.repo_key().as_item_key();
+    if last_key > target_key {
+        return true;
+    }
+    if last_key < target_key {
+        return false;
+    }
+    cursor.token().is_none()
 }
 
 #[cfg(test)]
@@ -219,7 +231,7 @@ mod tests {
         assert!(second.is_none(), "second call must not re-emit");
     }
 
-    /// A resume cursor at the target key proves completion without re-emission.
+    /// An equal-key cursor without a token proves completion without re-emission.
     #[test]
     fn discover_page_cursor_last_key_at_target_returns_none() {
         let target = make_test_target(b"git:repo:c");
@@ -234,6 +246,25 @@ mod tests {
             page.is_none(),
             "cursor at target key should complete the source"
         );
+    }
+
+    /// An equal-key cursor with a token resumes the same repo rather than
+    /// proving completion.
+    #[test]
+    fn discover_page_cursor_last_key_with_token_re_emits_target() {
+        let target = make_test_target(b"git:repo:c:resume");
+        let mut discovery = StaticGitRepoDiscoverySource::new(target.clone());
+        let cursor = Cursor::with_token(
+            target.repo_key().clone().into_item_key(),
+            token(b"resume-token"),
+        );
+
+        let page = discovery
+            .discover_page(&ShardSpec::unbounded(), &cursor, budgets())
+            .expect("discover_page succeeds")
+            .expect("equal-key token should resume the target");
+
+        assert_eq!(&page.items()[0], &target);
     }
 
     /// The shard lower bound is inclusive when it matches the target key exactly.
@@ -294,12 +325,12 @@ mod tests {
 
     /// The advertised capabilities match the static one-target discovery contract.
     #[test]
-    fn capabilities_reports_ordered_keys_not_resumable_not_splittable() {
+    fn capabilities_reports_ordered_keys_resumable_not_splittable() {
         let discovery = StaticGitRepoDiscoverySource::new(make_test_target(b"git:repo:g"));
         let capabilities = discovery.capabilities();
 
         assert!(capabilities.paging.ordered_keys);
-        assert!(!capabilities.paging.resumable);
+        assert!(capabilities.paging.resumable);
         assert!(!capabilities.paging.splittable);
     }
 

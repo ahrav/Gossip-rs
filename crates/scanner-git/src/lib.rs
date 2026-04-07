@@ -89,6 +89,8 @@ pub mod byte_arena;
 /// Defines a minimal read-only byte container for Git artifact data.
 pub mod bytes;
 pub(crate) mod cache_common;
+/// Defines durable stage checkpoints and resume-state codecs for git scans.
+pub mod checkpoint;
 /// Provides commit-graph indexing helpers for attribution-first ODB scans.
 pub mod commit_graph;
 /// Implements an in-memory commit graph built from loaded commit objects.
@@ -375,6 +377,10 @@ pub use watermark_keys::{
 // ── Cross-cutting: errors, config, runner, I/O ──────────────────────────
 pub use byte_arena::{ByteArena, ByteRef};
 pub use bytes::BytesView;
+pub use checkpoint::{
+    CheckpointAck, LoadedScanCheckpoint, NoopCheckpointSink, ScanCheckpointError,
+    ScanCheckpointSink, ScanCheckpointStage, StageCheckpoint,
+};
 pub use errors::PersistError;
 pub use errors::{CommitPlanError, MappingCandidateKind, RepoOpenError, SpillError, TreeDiffError};
 pub use policy_hash::{policy_hash, MergeDiffMode, PolicyHash};
@@ -383,8 +389,9 @@ pub use run_reader::RunReader;
 pub use run_writer::RunWriter;
 pub use runner::auto_pack_exec_workers_for_in_pack;
 pub use runner::{
-    run_git_scan, CandidateSkipReason, GitScanAllocStats, GitScanConfig, GitScanError, GitScanMode,
-    GitScanReport, GitScanResult, GitScanStageNanos, PackMmapLimits, SkippedCandidate,
+    run_git_scan, run_git_scan_with_context, CandidateSkipReason, GitScanAllocStats, GitScanConfig,
+    GitScanError, GitScanMode, GitScanReport, GitScanResult, GitScanRunContext, GitScanStageNanos,
+    PackMmapLimits, SkippedCandidate,
 };
 pub use scanner_engine::perf_counters::{
     reset as reset_git_perf, snapshot as git_perf_snapshot, GitPerfStats,
