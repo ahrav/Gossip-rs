@@ -27,12 +27,10 @@ use crate::OwnedCoreEvent;
 pub enum StoredGitEvent {
     /// Metadata for a single commit.
     ///
-    /// The raw object ID bytes stay unencoded on the forwarding path so
-    /// recorder and persistence consumers can choose when to render hex.
+    /// Stores raw object ID bytes without hex encoding.
     CommitMeta {
         commit_id: u32,
-        /// Raw object identifier bytes. Consumers hex-encode at the
-        /// persistence boundary when they need a textual form.
+        /// Raw object identifier bytes, stored without hex encoding.
         commit_oid: OidBytes,
         timestamp: u64,
         author_name_id: Option<u32>,
@@ -812,19 +810,44 @@ mod tests {
         }
     }
 
-    /// `StoredGitEvent` must stay within two cache lines (128 bytes).
-    /// The `OidBytes` field (33 bytes) keeps the enum at ~80 bytes.
-    /// This bound catches accidental field inflation.
-    const _: () = assert!(std::mem::size_of::<StoredGitEvent>() <= 80);
-
     #[test]
-    fn stored_git_event_stays_compact() {
-        let current = std::mem::size_of::<StoredGitEvent>();
-        assert!(
-            current <= 96,
-            "StoredGitEvent should stay compact ({current} bytes, limit 96)"
-        );
+    fn findings_capture_sink_maps_all_sentinel_ids_to_none() {
+        let (sink, recorder) = make_sink_and_recorder();
+
+        sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+            commit_id: 99,
+            commit_oid: OidBytes::sha1([0x77; 20]),
+            timestamp: 1_700_000_002,
+            identity: Some(scanner_git::CommitIdentityIds {
+                author_name: scanner_git::SENTINEL_ID,
+                author_email: scanner_git::SENTINEL_ID,
+                committer_name: scanner_git::SENTINEL_ID,
+                committer_email: scanner_git::SENTINEL_ID,
+            }),
+        }));
+
+        let forwarded = recorder.git_events.lock().unwrap();
+        match &forwarded[0] {
+            StoredGitEvent::CommitMeta {
+                author_name_id,
+                author_email_id,
+                committer_name_id,
+                committer_email_id,
+                ..
+            } => {
+                assert_eq!(*author_name_id, None);
+                assert_eq!(*author_email_id, None);
+                assert_eq!(*committer_name_id, None);
+                assert_eq!(*committer_email_id, None);
+            }
+            other => panic!("expected CommitMeta, got: {other:?}"),
+        }
     }
+
+    /// `OidBytes` (33 bytes) keeps the enum at ~80 bytes — well within a
+    /// single cache line. This compile-time bound catches accidental field
+    /// inflation.
+    const _: () = assert!(std::mem::size_of::<StoredGitEvent>() <= 80);
 
     #[test]
     fn findings_capture_sink_skips_invalid_blob_oid_payloads() {

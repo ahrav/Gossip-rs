@@ -1086,8 +1086,8 @@ mod tests {
                 format!("git-commit-shard-{canary}"),
                 StoredGitEvent::CommitMeta {
                     commit_id: 17,
-                    // Use a distinctive 20-byte pattern (SHA-1 length) whose hex
-                    // representation contains the canary's first 8 hex chars.
+                    // A recognisable 20-byte (SHA-1) pattern that is easy to
+                    // spot in test output without leaking the canary string.
                     commit_oid: scanner_git::OidBytes::sha1([
                         0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67,
                         0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98,
@@ -1377,6 +1377,12 @@ mod tests {
                     oid,
                     RedactedDigest::bytes("git_commit_oid", commit_oid.as_slice())
                 );
+                // Digest reflects raw byte length (20 for SHA-1), not hex string length (40).
+                let display = format!("{oid}");
+                assert!(
+                    display.starts_with("len=20,"),
+                    "redaction len must reflect raw OID byte count: {display}"
+                );
             }
             other => panic!("expected GitCommitMeta, got: {other:?}"),
         }
@@ -1603,7 +1609,7 @@ mod tests {
                     "none-git-shard",
                     StoredGitEvent::CommitMeta {
                         commit_id: 1,
-                        commit_oid: scanner_git::OidBytes::from_slice(&[
+                        commit_oid: scanner_git::OidBytes::sha1([
                             0xAB, 0xC1, 0x23, 0x99, 0x10, 0x42, 0x54, 0x76, 0x88, 0x9A, 0xBC, 0xDE,
                             0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
                         ]),

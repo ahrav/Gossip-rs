@@ -529,8 +529,7 @@ fn write_f64(line: &mut Vec<u8>, value: f64) {
     line.extend_from_slice(rendered.as_bytes());
 }
 
-/// Persistence-boundary encoder that writes raw OID bytes as a quoted
-/// lowercase hex JSON string.
+/// Writes raw OID bytes as a quoted lowercase hex JSON string.
 ///
 /// Delegates to [`scanner_git::json_write::write_oid_hex`] — the canonical
 /// implementation for this encoding.
