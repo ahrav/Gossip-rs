@@ -33,7 +33,7 @@ use super::pack_inflate::{EntryHeader, EntryKind, InflateError};
 pub const LIBDEFLATE_THRESHOLD_BYTES: usize = 256 * 1024;
 
 thread_local! {
-    static LIBDEFLATE_SCRATCH: RefCell<LibdeflateDecompressor> =
+    static LIBDEFLATE_SCRATCH: RefCell<Option<LibdeflateDecompressor>> =
         RefCell::new(LibdeflateDecompressor::new());
 }
 
@@ -60,26 +60,15 @@ impl std::fmt::Debug for LibdeflateDecompressor {
     }
 }
 
-impl Default for LibdeflateDecompressor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl LibdeflateDecompressor {
     /// Allocates a new libdeflate decompressor.
-    ///
-    /// # Panics
-    /// Panics if the underlying C allocator returns null.
-    pub fn new() -> Self {
+    pub fn new() -> Option<Self> {
         // SAFETY: `libdeflate_alloc_decompressor` returns either a valid
         // decompressor pointer or null on allocation failure. The null case is
-        // handled explicitly below, and the resulting non-null pointer is freed
+        // represented as `None`, and any resulting non-null pointer is freed
         // exactly once in `Drop`.
         let raw = unsafe { libdeflate_alloc_decompressor() };
-        let raw = NonNull::new(raw)
-            .unwrap_or_else(|| panic!("libdeflate_alloc_decompressor returned null"));
-        Self { raw }
+        NonNull::new(raw).map(|raw| Self { raw })
     }
 
     fn zlib_decompress_exact(
@@ -144,20 +133,34 @@ impl Drop for LibdeflateDecompressor {
 // enforced by the `&mut self` borrow on `zlib_decompress_exact`.
 unsafe impl Send for LibdeflateDecompressor {}
 
+/// Borrows the thread-local `LibdeflateDecompressor` for the duration of `f`.
+///
+/// Returns `Option<R>`: `None` when TLS is unavailable (init failure or
+/// reentrant borrow). The caller is responsible for choosing a fallback
+/// strategy — typically delegating to the flate2 path via
+/// [`super::pack_inflate::inflate_exact`]. This differs from
+/// [`super::pack_inflate::with_tls_decompress`] which owns its fallback
+/// internally and returns `Result`.
 #[inline]
-fn with_decompressor<F, R>(f: F) -> R
+pub(crate) fn with_tls_decompressor<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut LibdeflateDecompressor) -> R,
 {
-    LIBDEFLATE_SCRATCH.with(|scratch| {
-        let mut scratch = scratch.borrow_mut();
-        f(&mut scratch)
+    LIBDEFLATE_SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
+        Ok(mut scratch) => scratch.as_mut().map(f),
+        Err(_) => None,
     })
 }
 
 #[cfg(test)]
 pub(crate) fn hold_tls_borrow_for_test<R>(f: impl FnOnce() -> R) -> R {
-    with_decompressor(|_| f())
+    LIBDEFLATE_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let _libde = scratch
+            .as_mut()
+            .expect("libdeflate TLS should initialize for test coverage");
+        f()
+    })
 }
 
 #[must_use]
@@ -186,17 +189,24 @@ pub(crate) fn inflate_nondelta_exact_with(
 /// `LibdeflateDecompressor`.
 ///
 /// Convenience wrapper around [`inflate_nondelta_exact_with`] for callers
-/// that don't maintain their own decompressor.
-///
-/// # Panics
-/// Panics on same-thread reentrancy because the per-thread decompressor is
-/// stored in `thread_local!` scratch guarded by `RefCell`.
+/// that don't maintain their own decompressor. When the thread-local
+/// libdeflate state is unavailable, this falls back to the flate2 exact-size
+/// path.
 pub(crate) fn inflate_nondelta_exact(
     pack_slice: &[u8],
     expected: usize,
     out: &mut Vec<u8>,
 ) -> Result<usize, PackDecodeError> {
-    with_decompressor(|libde| inflate_nondelta_exact_core(libde, pack_slice, expected, out))
+    with_tls_decompressor(|libde| inflate_nondelta_exact_core(libde, pack_slice, expected, out))
+        .unwrap_or_else(
+            || match crate::pack_inflate::inflate_exact(pack_slice, out, expected) {
+                Ok(consumed) => Ok(consumed),
+                Err(err) => {
+                    out.clear();
+                    Err(PackDecodeError::from(err))
+                }
+            },
+        )
 }
 
 fn inflate_nondelta_exact_core(
