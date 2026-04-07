@@ -813,9 +813,9 @@ pub(crate) fn git_repo_ovid_inputs(repo_id: u64) -> OvidHashInputs {
 /// In-memory [`GitPersistenceBackend`] for integration and unit tests.
 ///
 /// Provides a `BTreeMap`-backed KV store with fault injection hooks
-/// (positional batch faults, content-aware batch fault queues,
-/// per-call get/multi_get fault queues), phase-annotated operation
-/// logging, and batch recording.
+/// (content-aware batch fault queues, per-call get/multi_get fault
+/// queues, and optional multi-get length-mismatch simulation),
+/// phase-annotated operation logging, and batch recording.
 /// Gated behind `cfg(test)` (unit tests in this crate) and the
 /// `test-support` feature (integration tests in downstream crates).
 #[cfg(any(test, feature = "test-support"))]
@@ -1068,6 +1068,14 @@ pub mod test_support {
         /// at least one op key starts with the given prefix. Non-matching
         /// batches skip the current trigger without advancing the index.
         pub fn set_batch_faults(&self, faults: Vec<BatchFaultTrigger>) {
+            for fault in &faults {
+                if let BatchFaultTrigger::KeyPrefix(prefix) = fault {
+                    assert!(
+                        !prefix.is_empty(),
+                        "empty prefix matches every key; use BatchFaultTrigger::Any instead"
+                    );
+                }
+            }
             let mut state = self.state.borrow_mut();
             state.batch_faults = faults;
             state.batch_fault_idx = 0;
