@@ -989,7 +989,10 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::num::NonZeroU32;
+    use std::rc::Rc;
 
     use gossip_contracts::{
         connector::git::RepoKey,
@@ -1027,6 +1030,518 @@ mod tests {
             outcome,
             stats: Default::default(),
         }
+    }
+
+    fn put_op(key: &[u8], value: &[u8]) -> GitPersistenceOp {
+        GitPersistenceOp::Put {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        }
+    }
+
+    fn delete_op(key: &[u8]) -> GitPersistenceOp {
+        GitPersistenceOp::Delete { key: key.to_vec() }
+    }
+
+    fn sim_oid(byte: u8) -> OidBytes {
+        OidBytes::sha1([byte; 20])
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SimPhase {
+        BlobCtx,
+        Finding,
+        SeenScope,
+        SeenStaging,
+        Watermark,
+        Unknown,
+    }
+
+    impl SimPhase {
+        fn from_key(key: &[u8]) -> Self {
+            if key.starts_with(b"bc\0") {
+                Self::BlobCtx
+            } else if key.starts_with(b"fn\0") {
+                Self::Finding
+            } else if key.starts_with(NS_SEEN_BLOB.as_slice()) {
+                Self::SeenScope
+            } else if key.starts_with(b"ss\0") {
+                Self::SeenStaging
+            } else if key.starts_with(scanner_git::NS_REF_WATERMARK.as_slice()) {
+                Self::Watermark
+            } else {
+                Self::Unknown
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SimBackendOp {
+        phase: SimPhase,
+        op: GitPersistenceOp,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum BatchFaultTrigger {
+        Any,
+        KeyPrefix(Vec<u8>),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SimBatchFault {
+        trigger: BatchFaultTrigger,
+    }
+
+    impl SimBatchFault {
+        fn any() -> Self {
+            Self {
+                trigger: BatchFaultTrigger::Any,
+            }
+        }
+
+        fn key_prefix(prefix: &[u8]) -> Self {
+            Self {
+                trigger: BatchFaultTrigger::KeyPrefix(prefix.to_vec()),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum GetFault {
+        Fail,
+        Truncate { max_len: usize },
+    }
+
+    #[derive(Debug, Default)]
+    struct SimBackendState {
+        kv: BTreeMap<Vec<u8>, Vec<u8>>,
+        log: Vec<SimBackendOp>,
+        batch_faults: Vec<SimBatchFault>,
+        batch_fault_idx: usize,
+        get_fault: Option<(usize, GetFault)>,
+        get_call_count: usize,
+    }
+
+    impl SimBackendState {
+        fn next_get_fault(&mut self) -> Option<GetFault> {
+            self.get_call_count += 1;
+            self.get_fault.as_ref().and_then(|(call_no, fault)| {
+                (*call_no == self.get_call_count).then(|| fault.clone())
+            })
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct SimGitPersistenceBackend {
+        state: Rc<RefCell<SimBackendState>>,
+        atomic: bool,
+    }
+
+    impl SimGitPersistenceBackend {
+        fn atomic() -> Self {
+            Self::new(true)
+        }
+
+        fn non_atomic() -> Self {
+            Self::new(false)
+        }
+
+        fn new(atomic: bool) -> Self {
+            Self {
+                state: Rc::new(RefCell::new(SimBackendState::default())),
+                atomic,
+            }
+        }
+
+        fn set(&self, key: Vec<u8>, value: Vec<u8>) {
+            self.state.borrow_mut().kv.insert(key, value);
+        }
+
+        fn contains_key(&self, key: &[u8]) -> bool {
+            self.state.borrow().kv.contains_key(key)
+        }
+
+        fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.state.borrow().kv.get(key).cloned()
+        }
+
+        fn log(&self) -> Vec<SimBackendOp> {
+            self.state.borrow().log.clone()
+        }
+
+        fn set_batch_faults(&self, faults: Vec<SimBatchFault>) {
+            let mut state = self.state.borrow_mut();
+            state.batch_faults = faults;
+            state.batch_fault_idx = 0;
+        }
+
+        fn set_get_fault(&self, call_no: usize, fault: GetFault) {
+            self.state.borrow_mut().get_fault = Some((call_no, fault));
+        }
+
+        fn batch_fault_index(&self) -> usize {
+            self.state.borrow().batch_fault_idx
+        }
+    }
+
+    fn op_key(op: &GitPersistenceOp) -> &[u8] {
+        match op {
+            GitPersistenceOp::Put { key, .. } | GitPersistenceOp::Delete { key } => key.as_slice(),
+        }
+    }
+
+    fn truncate_value(value: Option<Vec<u8>>, max_len: usize) -> Option<Vec<u8>> {
+        value.map(|mut bytes| {
+            bytes.truncate(max_len);
+            bytes
+        })
+    }
+
+    fn apply_get_fault_value(
+        value: Option<Vec<u8>>,
+        fault: GetFault,
+    ) -> Result<Option<Vec<u8>>, TestBackendError> {
+        match fault {
+            GetFault::Fail => Err(TestBackendError {
+                message: "injected get failure",
+            }),
+            GetFault::Truncate { max_len } => Ok(truncate_value(value, max_len)),
+        }
+    }
+
+    fn apply_get_fault_values(
+        values: Vec<Option<Vec<u8>>>,
+        fault: GetFault,
+    ) -> Result<Vec<Option<Vec<u8>>>, TestBackendError> {
+        match fault {
+            GetFault::Fail => Err(TestBackendError {
+                message: "injected get failure",
+            }),
+            GetFault::Truncate { max_len } => Ok(values
+                .into_iter()
+                .map(|value| truncate_value(value, max_len))
+                .collect()),
+        }
+    }
+
+    impl GitPersistenceBackend for SimGitPersistenceBackend {
+        type Error = TestBackendError;
+
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+            let mut state = self.state.borrow_mut();
+            let fault = state.next_get_fault();
+            let value = state.kv.get(key).cloned();
+            drop(state);
+            match fault {
+                Some(fault) => apply_get_fault_value(value, fault),
+                None => Ok(value),
+            }
+        }
+
+        fn apply_batch(&self, ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
+            let mut state = self.state.borrow_mut();
+            let next_fault = state.batch_faults.get(state.batch_fault_idx).cloned();
+            if let Some(fault) = next_fault {
+                let triggered = match &fault.trigger {
+                    BatchFaultTrigger::Any => true,
+                    BatchFaultTrigger::KeyPrefix(prefix) => {
+                        ops.iter().any(|op| op_key(op).starts_with(prefix))
+                    }
+                };
+                if triggered {
+                    state.batch_fault_idx += 1;
+                    return Err(TestBackendError {
+                        message: "injected batch failure",
+                    });
+                }
+            }
+
+            for op in ops {
+                state.log.push(SimBackendOp {
+                    phase: SimPhase::from_key(op_key(op)),
+                    op: op.clone(),
+                });
+                match op {
+                    GitPersistenceOp::Put { key, value } => {
+                        state.kv.insert(key.clone(), value.clone());
+                    }
+                    GitPersistenceOp::Delete { key } => {
+                        state.kv.remove(key);
+                    }
+                }
+            }
+
+            Ok(())
+        }
+
+        fn supports_atomic_batches(&self) -> bool {
+            self.atomic
+        }
+
+        fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+            let mut state = self.state.borrow_mut();
+            let fault = state.next_get_fault();
+            let values: Vec<_> = keys
+                .iter()
+                .map(|key| state.kv.get(key.as_slice()).cloned())
+                .collect();
+            drop(state);
+            match fault {
+                Some(fault) => apply_get_fault_values(values, fault),
+                None => Ok(values),
+            }
+        }
+    }
+
+    #[test]
+    fn sim_backend_put_get_roundtrip() {
+        let backend = SimGitPersistenceBackend::non_atomic();
+        let key = b"bc\0blob".to_vec();
+        let value = vec![0x10, 0x20, 0x30];
+
+        backend
+            .apply_batch(&[put_op(&key, &value)])
+            .expect("put must succeed");
+
+        assert_eq!(
+            backend.get(&key).expect("get must succeed"),
+            Some(value.clone())
+        );
+        assert_eq!(
+            backend
+                .multi_get(std::slice::from_ref(&key))
+                .expect("multi_get must succeed"),
+            vec![Some(value)]
+        );
+    }
+
+    #[test]
+    fn sim_backend_delete_removes_key() {
+        let backend = SimGitPersistenceBackend::atomic();
+        let key = b"fn\0finding".to_vec();
+        backend.set(key.clone(), vec![0xAB]);
+
+        backend
+            .apply_batch(&[delete_op(&key)])
+            .expect("delete must succeed");
+
+        assert!(!backend.contains_key(&key));
+        assert_eq!(backend.get(&key).expect("get must succeed"), None);
+    }
+
+    #[test]
+    fn sim_backend_batch_fault_any_fires_on_first_call() {
+        let backend = SimGitPersistenceBackend::non_atomic();
+        backend.set_batch_faults(vec![SimBatchFault::any()]);
+
+        let err = backend
+            .apply_batch(&[put_op(b"bc\0blob", &[0xAA])])
+            .expect_err("the queued Any fault must fail the next batch");
+
+        assert!(err.to_string().contains("injected batch failure"));
+        assert_eq!(backend.batch_fault_index(), 1);
+        assert!(backend.get_value(b"bc\0blob").is_none());
+        assert!(backend.log().is_empty());
+    }
+
+    #[test]
+    fn sim_backend_batch_fault_key_prefix_fires_on_matching_batch() {
+        let backend = SimGitPersistenceBackend::non_atomic();
+        backend.set_batch_faults(vec![SimBatchFault::key_prefix(b"rw")]);
+
+        let err = backend
+            .apply_batch(&[put_op(b"rw\0wm", &[0xBB])])
+            .expect_err("the queued prefix fault must fail the matching batch");
+
+        assert!(err.to_string().contains("injected batch failure"));
+        assert_eq!(backend.batch_fault_index(), 1);
+        assert!(backend.get_value(b"rw\0wm").is_none());
+    }
+
+    #[test]
+    fn sim_backend_batch_fault_key_prefix_skips_non_matching_batch() {
+        let backend = SimGitPersistenceBackend::non_atomic();
+        backend.set_batch_faults(vec![SimBatchFault::key_prefix(b"rw")]);
+
+        backend
+            .apply_batch(&[put_op(b"bc\0blob", &[0x01])])
+            .expect("non-matching batch must succeed");
+
+        assert_eq!(backend.batch_fault_index(), 0);
+        assert_eq!(backend.get_value(b"bc\0blob"), Some(vec![0x01]));
+    }
+
+    #[test]
+    fn sim_backend_get_fault_truncates_value() {
+        let get_backend = SimGitPersistenceBackend::atomic();
+        let get_key = b"bc\0blob".to_vec();
+        get_backend.set(get_key.clone(), vec![0x11, 0x22, 0x33]);
+        get_backend.set_get_fault(1, GetFault::Truncate { max_len: 2 });
+
+        assert_eq!(
+            get_backend.get(&get_key).expect("get must truncate"),
+            Some(vec![0x11, 0x22])
+        );
+
+        let multi_backend = SimGitPersistenceBackend::atomic();
+        let multi_key = b"rw\0wm".to_vec();
+        multi_backend.set(multi_key.clone(), vec![0x44, 0x55, 0x66]);
+        multi_backend.set_get_fault(1, GetFault::Truncate { max_len: 1 });
+
+        assert_eq!(
+            multi_backend
+                .multi_get(std::slice::from_ref(&multi_key))
+                .expect("multi_get must truncate"),
+            vec![Some(vec![0x44])]
+        );
+    }
+
+    #[test]
+    fn sim_backend_get_fault_returns_error() {
+        let get_backend = SimGitPersistenceBackend::atomic();
+        let get_key = b"bc\0blob".to_vec();
+        get_backend.set(get_key.clone(), vec![0x11]);
+        get_backend.set_get_fault(1, GetFault::Fail);
+
+        let err = get_backend.get(&get_key).expect_err("get must fail");
+        assert!(err.to_string().contains("injected get failure"));
+
+        let multi_backend = SimGitPersistenceBackend::atomic();
+        let multi_key = b"rw\0wm".to_vec();
+        multi_backend.set(multi_key.clone(), vec![0x22]);
+        multi_backend.set_get_fault(1, GetFault::Fail);
+
+        let err = multi_backend
+            .multi_get(std::slice::from_ref(&multi_key))
+            .expect_err("multi_get must fail");
+        assert!(err.to_string().contains("injected get failure"));
+    }
+
+    #[test]
+    fn sim_backend_log_annotates_phases() {
+        let backend = SimGitPersistenceBackend::non_atomic();
+        let scope_key = build_seen_scope_key(42, &[0x42; 32]);
+        let staging_key = build_seen_staging_key(42, &[0x42; 32]);
+
+        backend
+            .apply_batch(&[
+                put_op(b"bc\0blob", &[0x01]),
+                put_op(b"fn\0finding", &[0x02]),
+                put_op(&scope_key, &[0x03]),
+                delete_op(&staging_key),
+                put_op(b"rw\0wm", &[0x04]),
+                put_op(b"zz", &[0x05]),
+            ])
+            .expect("batch must succeed");
+
+        let phases: Vec<_> = backend.log().into_iter().map(|entry| entry.phase).collect();
+        assert_eq!(
+            phases,
+            vec![
+                SimPhase::BlobCtx,
+                SimPhase::Finding,
+                SimPhase::SeenScope,
+                SimPhase::SeenStaging,
+                SimPhase::Watermark,
+                SimPhase::Unknown,
+            ]
+        );
+    }
+
+    #[test]
+    fn sim_backend_atomic_flag_is_configurable() {
+        assert!(SimGitPersistenceBackend::atomic().supports_atomic_batches());
+        assert!(!SimGitPersistenceBackend::non_atomic().supports_atomic_batches());
+    }
+
+    #[test]
+    fn sim_backend_non_matching_prefix_fault_does_not_advance_index() {
+        let backend = SimGitPersistenceBackend::non_atomic();
+        backend.set_batch_faults(vec![SimBatchFault::key_prefix(b"rw"), SimBatchFault::any()]);
+
+        backend
+            .apply_batch(&[put_op(b"bc\0blob", &[0x01])])
+            .expect("first non-matching batch must succeed");
+        backend
+            .apply_batch(&[put_op(b"fn\0finding", &[0x02])])
+            .expect("second non-matching batch must succeed");
+        assert_eq!(backend.batch_fault_index(), 0);
+
+        backend
+            .apply_batch(&[put_op(b"rw\0wm", &[0x03])])
+            .expect_err("matching prefix must consume the first queued fault");
+        assert_eq!(backend.batch_fault_index(), 1);
+
+        backend
+            .apply_batch(&[put_op(b"bc\0next", &[0x04])])
+            .expect_err("the next queued Any fault must now fire");
+        assert_eq!(backend.batch_fault_index(), 2);
+    }
+
+    #[test]
+    fn sim_backend_multiple_faults_fire_in_sequence() {
+        let backend = SimGitPersistenceBackend::non_atomic();
+        backend.set_batch_faults(vec![SimBatchFault::any(), SimBatchFault::key_prefix(b"rw")]);
+
+        backend
+            .apply_batch(&[put_op(b"bc\0blob", &[0x01])])
+            .expect_err("the first Any fault must fire");
+        assert_eq!(backend.batch_fault_index(), 1);
+
+        backend
+            .apply_batch(&[put_op(b"fn\0finding", &[0x02])])
+            .expect("the queued prefix fault must ignore non-matching batches");
+        assert_eq!(backend.batch_fault_index(), 1);
+
+        backend
+            .apply_batch(&[put_op(b"rw\0wm", &[0x03])])
+            .expect_err("the queued prefix fault must fire on the matching batch");
+        assert_eq!(backend.batch_fault_index(), 2);
+    }
+
+    #[test]
+    fn sim_backend_exhausted_faults_default_to_success() {
+        let backend = SimGitPersistenceBackend::non_atomic();
+        backend.set_batch_faults(vec![SimBatchFault::any()]);
+
+        backend
+            .apply_batch(&[put_op(b"bc\0blob", &[0x01])])
+            .expect_err("the only queued fault must fire once");
+        assert_eq!(backend.batch_fault_index(), 1);
+
+        backend
+            .apply_batch(&[put_op(b"bc\0blob", &[0x02])])
+            .expect("batches must succeed after the fault plan is exhausted");
+        assert_eq!(backend.get_value(b"bc\0blob"), Some(vec![0x02]));
+    }
+
+    #[test]
+    fn sim_backend_works_with_git_persistence_adapter() {
+        let backend = SimGitPersistenceBackend::non_atomic();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 42, [0x42; 32]);
+        let oid = sim_oid(0xAB);
+
+        adapter
+            .persist_seen_delta(&[oid])
+            .expect("stage seen delta");
+        adapter
+            .commit_finalize(&finalize_output(FinalizeOutcome::Complete))
+            .expect("complete finalize must succeed");
+
+        assert_eq!(
+            adapter.batch_check_seen(&[oid]).expect("seen check"),
+            vec![true]
+        );
+        assert!(
+            !backend.contains_key(&build_seen_staging_key(42, &[0x42; 32])),
+            "complete finalize must remove the staging key"
+        );
+        assert_eq!(backend.get_value(b"rw\0wm"), Some(vec![0xBB]));
+
+        let phases: Vec<_> = backend.log().into_iter().map(|entry| entry.phase).collect();
+        assert!(phases.contains(&SimPhase::SeenStaging));
+        assert!(phases.contains(&SimPhase::SeenScope));
+        assert!(phases.contains(&SimPhase::Watermark));
     }
 
     #[test]
