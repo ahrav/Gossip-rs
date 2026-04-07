@@ -89,11 +89,10 @@ where
 
 /// Borrows the thread-local `Decompress` for the duration of `f`.
 ///
-/// Returns `Result<R, InflateError>` because this accessor owns its own
-/// fallback: when TLS is unavailable (init failure or reentrant borrow),
-/// it allocates a short-lived local `Decompress` internally. The only
-/// error case is total resource exhaustion where even the local fallback
-/// fails.
+/// Returns `Result<R, InflateError>` — the `Err` variant indicates
+/// resource exhaustion where even the local fallback decompressor could
+/// not be allocated. Errors from the closure `f` are carried within `R`
+/// and are not wrapped by this function.
 ///
 /// Contrast with [`super::pack_inflate_libdeflate::with_tls_decompressor`],
 /// which returns `Option<R>` — its fallback (flate2) crosses module
@@ -108,11 +107,24 @@ where
 /// Attempt to create a `Decompress`. Wraps `Decompress::new(true)` in
 /// `catch_unwind` because flate2's constructor panics via `assert_eq!`
 /// when the underlying zlib-ng allocator returns an error code (OOM),
-/// rather than surfacing a `Result`. The panic originates in pure Rust
-/// code after the C call returns, so catching it is sound —
-/// `Decompress` is `UnwindSafe` and no C frames are on the stack.
+/// rather than surfacing a `Result`. Catching is sound: the closure
+/// captures no mutable references and only constructs a fresh value,
+/// so no partially-mutated state is observable after the unwind.
 pub(crate) fn init_decompress() -> Option<Decompress> {
-    std::panic::catch_unwind(|| Decompress::new(true)).ok()
+    match std::panic::catch_unwind(|| Decompress::new(true)) {
+        Ok(de) => Some(de),
+        Err(_payload) => {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "init_decompress: caught panic during Decompress::new: {:?}",
+                _payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| _payload.downcast_ref::<String>().map(|s| s.as_str()))
+            );
+            None
+        }
+    }
 }
 
 fn with_local_inflate_scratch<F, R>(f: F) -> Result<R, InflateError>
@@ -618,6 +630,7 @@ pub fn inflate_exact_with(
 ) -> Result<usize, InflateError> {
     let consumed = inflate_limited_with(de, input, out, expected)?;
     if out.len() != expected {
+        out.clear();
         return Err(InflateError::TruncatedInput);
     }
     Ok(consumed)

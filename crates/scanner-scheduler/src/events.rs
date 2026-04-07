@@ -10,7 +10,8 @@ use std::fmt;
 use std::sync::Mutex;
 
 /// Wire-encoded length of a blob OID: 1 byte length prefix + 32 bytes
-/// zero-padded payload. Must match `OidBytes::WIRE_LEN` in `scanner-git`.
+/// zero-padded payload. Must match `OidBytes::WIRE_LEN` in `scanner-git`;
+/// enforced by a compile-time assert in `gossip-scanner-runtime`.
 pub const BLOB_OID_WIRE_LEN: usize = 33;
 
 /// Scheduler event emitted during a scan run.
@@ -240,6 +241,8 @@ impl EventOutput for VecEventOutput {
                 write_i8(&mut line, f.confidence_score);
 
                 // norm_hash intentionally omitted — secret-derived digest must not appear in event logs.
+                // blob_oid intentionally omitted — raw binary OID is surfaced through the
+                // git-specific event channel and would need hex encoding for JSON.
                 if let Some(commit_id) = f.commit_id {
                     line.extend_from_slice(b",\"commit_id\":");
                     write_u64(&mut line, u64::from(commit_id));

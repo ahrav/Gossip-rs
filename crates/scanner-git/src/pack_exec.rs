@@ -734,13 +734,15 @@ pub struct PackExecScratch {
 
 impl Default for DecodeBufs {
     fn default() -> Self {
-        // `Decompress::new(true)` panics if zlib-ng's internal allocator
-        // fails (OOM). The TLS path in `pack_inflate::init_decompress`
-        // catches this with `catch_unwind`, but here a panic is acceptable:
-        // `DecodeBufs` is constructed once per executor run (COLD path),
-        // and the calling thread can catch the unwind at a higher level.
+        // `init_decompress` wraps `Decompress::new(true)` in `catch_unwind`
+        // to convert the opaque zlib-ng OOM panic into a clear expect message.
+        // Panicking here is acceptable: `DecodeBufs` is constructed once per
+        // executor run (COLD path) and there is no fallback decompressor for
+        // flate2. `LibdeflateDecompressor::new()` returns `Option` because
+        // libdeflate failures degrade gracefully to the flate2 path.
         Self {
-            de: flate2::Decompress::new(true),
+            de: crate::pack_inflate::init_decompress()
+                .expect("Decompress allocation (COLD path, once per executor)"),
             libde: crate::pack_inflate_libdeflate::LibdeflateDecompressor::new(),
             inflate_buf: Vec::new(),
             result_buf: Vec::new(),

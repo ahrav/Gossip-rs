@@ -217,8 +217,11 @@ pub fn inflate_entry_payload_with(
 ///   selected entry kind.
 ///
 /// # Errors
-/// - Propagates `PackDecodeError::Inflate(...)` from
-///   [`inflate_entry_payload_with`] with the same variants and conditions.
+/// - For small non-delta entries: propagates errors from
+///   [`pack_inflate_libdeflate::inflate_nondelta_exact`] (or its flate2
+///   fallback).
+/// - For all other entries: propagates `PackDecodeError::Inflate(...)`
+///   from [`inflate_entry_payload_with`].
 ///
 /// # Panics
 /// Panics if `header.data_start` is out of bounds for `pack` (bounds check in
@@ -235,14 +238,17 @@ pub fn inflate_entry_payload(
         return pack_inflate_libdeflate::inflate_nondelta_exact(slice, expected, out);
     }
 
-    // The libdeflate-eligible path is fully handled above. The inner
-    // `use_libdeflate_for_header` check in `inflate_entry_payload_with`
-    // only fires for `pack_exec` callers that pass their own `libde`;
-    // from this call site it is unreachable.
+    // Small non-delta entries are fully handled by the early return
+    // above. The remaining entries are either large non-delta or delta,
+    // neither of which triggers the libdeflate gate inside
+    // `inflate_entry_payload_with`.
     super::pack_inflate::with_tls_decompress(|de| {
         inflate_entry_payload_with(de, None, pack, header, out, limits)
     })
-    .map_err(PackDecodeError::from)?
+    .map_err(|e| {
+        out.clear();
+        PackDecodeError::from(e)
+    })?
 }
 
 #[cfg(test)]

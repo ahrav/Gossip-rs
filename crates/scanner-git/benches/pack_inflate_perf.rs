@@ -86,6 +86,11 @@ fn build_non_delta_case(size: usize) -> (Vec<u8>, u64, Vec<u8>) {
     (pack, offsets[0], payload)
 }
 
+/// Build a synthetic OFS_DELTA pack entry for inflate-throughput measurement.
+///
+/// The delta body is arbitrary patterned bytes, not a valid git delta stream.
+/// This is sufficient for benchmarking zlib decompression, but the inflated
+/// output cannot be fed to `apply_delta`/`apply_delta_into`.
 fn build_delta_case(size: usize) -> (Vec<u8>, u64, Vec<u8>) {
     let base = patterned_bytes(size);
     let delta = patterned_bytes(size);
