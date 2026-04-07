@@ -39,11 +39,18 @@ struct InflateScratch {
     buf: [u8; INFLATE_BUF_SIZE],
 }
 
+impl InflateScratch {
+    fn new() -> Option<Self> {
+        Some(Self {
+            de: init_decompress()?,
+            buf: [0u8; INFLATE_BUF_SIZE],
+        })
+    }
+}
+
 thread_local! {
-    static INFLATE_SCRATCH: RefCell<InflateScratch> = RefCell::new(InflateScratch {
-        de: Decompress::new(true),
-        buf: [0u8; INFLATE_BUF_SIZE],
-    });
+    static INFLATE_SCRATCH: RefCell<Option<InflateScratch>> =
+        RefCell::new(InflateScratch::new());
 }
 
 /// Fill spare capacity with `0xDE` in debug builds so that any
@@ -65,23 +72,18 @@ pub(crate) fn poison_spare_capacity(buf: &mut Vec<u8>) {
 /// Runs an inflate operation using per-thread scratch buffers.
 ///
 /// This avoids per-call allocations by reusing a thread-local `Decompress`
-/// and output buffer.
-///
-/// # Panics
-///
-/// Panics if called reentrantly on the same thread (the `RefCell` borrow
-/// guard detects double-borrow). Callers must not invoke inflate helpers
-/// recursively from within an `inflate_stream` callback. The `_with`
-/// variants that accept a caller-owned `Decompress` bypass this TLS
-/// entirely and are safe for reentrant use.
-fn with_inflate_scratch<F, R>(f: F) -> R
+/// and output buffer. When the thread-local state is unavailable, the call
+/// falls back to a short-lived local decompressor plus stack scratch buffer.
+fn with_inflate_scratch<F, R>(f: F) -> Result<R, InflateError>
 where
-    F: FnOnce(&mut Decompress, &mut [u8]) -> R,
+    F: FnOnce(&mut Decompress, &mut [u8]) -> Result<R, InflateError>,
 {
-    INFLATE_SCRATCH.with(|scratch| {
-        let mut scratch = scratch.borrow_mut();
-        let s = &mut *scratch;
-        f(&mut s.de, &mut s.buf)
+    INFLATE_SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
+        Ok(mut scratch) => match scratch.as_mut() {
+            Some(scratch) => f(&mut scratch.de, &mut scratch.buf),
+            None => with_local_inflate_scratch(f),
+        },
+        Err(_) => with_local_inflate_scratch(f),
     })
 }
 
@@ -89,11 +91,24 @@ where
 ///
 /// Used by `pack_decode::inflate_entry_payload` to delegate to
 /// `inflate_entry_payload_with` without duplicating routing logic.
-pub(crate) fn with_tls_decompress<F, R>(f: F) -> R
+pub(crate) fn with_tls_decompress<F, R>(f: F) -> Result<R, InflateError>
 where
     F: FnOnce(&mut Decompress) -> R,
 {
-    with_inflate_scratch(|de, _buf| f(de))
+    with_inflate_scratch(|de, _buf| Ok(f(de)))
+}
+
+fn init_decompress() -> Option<Decompress> {
+    std::panic::catch_unwind(|| Decompress::new(true)).ok()
+}
+
+fn with_local_inflate_scratch<F, R>(f: F) -> Result<R, InflateError>
+where
+    F: FnOnce(&mut Decompress, &mut [u8]) -> Result<R, InflateError>,
+{
+    let mut de = init_decompress().ok_or(InflateError::Backend)?;
+    let mut buf = [0u8; INFLATE_BUF_SIZE];
+    f(&mut de, &mut buf)
 }
 
 /// Parsed object kind for non-delta entries.
@@ -492,7 +507,8 @@ pub fn inflate_limited_with(
 /// `Decompress`.
 ///
 /// Convenience wrapper around [`inflate_limited_with`] for callers that
-/// don't maintain their own decompressor.
+/// don't maintain their own decompressor. When the thread-local state is
+/// unavailable, this falls back to a short-lived local decompressor.
 pub fn inflate_limited(
     input: &[u8],
     out: &mut Vec<u8>,
@@ -586,7 +602,8 @@ pub fn inflate_exact_with(
 /// Inflate a zlib stream expecting exactly `expected` output bytes.
 ///
 /// Convenience wrapper around [`inflate_exact_with`] using the thread-local
-/// `Decompress`.
+/// `Decompress`. When the thread-local state is unavailable, this falls back
+/// to a short-lived local decompressor.
 pub fn inflate_exact(
     input: &[u8],
     out: &mut Vec<u8>,

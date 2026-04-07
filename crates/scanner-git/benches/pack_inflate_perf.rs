@@ -327,7 +327,7 @@ fn bench_inflate_entry_payload(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(payload_len as u64));
         group.bench_function(BenchmarkId::new("bucket", name), |b| {
             let mut de = flate2::Decompress::new(true);
-            let mut libde = LibdeflateDecompressor::new();
+            let mut libde = LibdeflateDecompressor::new().expect("allocate libdeflate");
             let mut out = Vec::new();
             b.iter(|| {
                 let consumed = pack_decode::inflate_entry_payload_with(
@@ -368,7 +368,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(payload.len() as u64));
         group.bench_function(BenchmarkId::new("dispatch", name), |b| {
             let mut de = flate2::Decompress::new(true);
-            let mut libde = LibdeflateDecompressor::new();
+            let mut libde = LibdeflateDecompressor::new().expect("allocate libdeflate");
             let mut out = Vec::new();
             b.iter(|| {
                 let consumed = pack_decode::inflate_entry_payload_with(
@@ -411,7 +411,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(payload.len() as u64));
         group.bench_function(BenchmarkId::new("dispatch", "large_nondelta"), |b| {
             let mut de = flate2::Decompress::new(true);
-            let mut libde = LibdeflateDecompressor::new();
+            let mut libde = LibdeflateDecompressor::new().expect("allocate libdeflate");
             let mut out = Vec::new();
             b.iter(|| {
                 let consumed = pack_decode::inflate_entry_payload_with(
@@ -454,7 +454,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(payload.len() as u64));
         group.bench_function(BenchmarkId::new("dispatch", "delta_payload"), |b| {
             let mut de = flate2::Decompress::new(true);
-            let mut libde = LibdeflateDecompressor::new();
+            let mut libde = LibdeflateDecompressor::new().expect("allocate libdeflate");
             let mut out = Vec::new();
             b.iter(|| {
                 let consumed = pack_decode::inflate_entry_payload_with(

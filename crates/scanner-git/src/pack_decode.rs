@@ -118,9 +118,8 @@ pub fn entry_header_at(
 /// of `limits.max_delta_bytes`.
 ///
 /// When `libde` is `Some`, the libdeflate fast path uses the provided
-/// decompressor directly. When `None`, the thread-local libdeflate
-/// decompressor is used as a fallback. The caller-provided `Decompress` is
-/// bypassed entirely when the libdeflate fast path is selected.
+/// decompressor directly. When `None`, small non-delta entries fall back to
+/// the caller-provided `Decompress`.
 ///
 /// This function does not enforce `limits.max_object_bytes` for non-delta
 /// entries and does not parse delta varints/result sizes; those checks happen
@@ -146,8 +145,6 @@ pub fn entry_header_at(
 /// # Panics
 /// Panics if `header.data_start` is out of bounds for `pack` (bounds check in
 /// `PackFile::slice_from`).
-/// When `libde` is `None`, may panic on same-thread reentrancy because the
-/// thread-local libdeflate decompressor is guarded by `RefCell`.
 pub fn inflate_entry_payload_with(
     de: &mut Decompress,
     libde: Option<&mut pack_inflate_libdeflate::LibdeflateDecompressor>,
@@ -157,7 +154,6 @@ pub fn inflate_entry_payload_with(
     limits: &PackDecodeLimits,
 ) -> Result<usize, PackDecodeError> {
     if pack_inflate_libdeflate::use_libdeflate_for_header(header) {
-        // `de` is unused: libdeflate uses its own thread-local decompressor.
         let slice = pack.slice_from(header.data_start);
         // Safe truncation: `use_libdeflate_for_header` gates on size <= 256 KB,
         // which fits in any `usize`.
@@ -166,7 +162,13 @@ pub fn inflate_entry_payload_with(
             Some(libde) => {
                 pack_inflate_libdeflate::inflate_nondelta_exact_with(libde, slice, expected, out)
             }
-            None => pack_inflate_libdeflate::inflate_nondelta_exact(slice, expected, out),
+            None => match inflate_exact_with(de, slice, out, expected) {
+                Ok(consumed) => Ok(consumed),
+                Err(err) => {
+                    out.clear();
+                    Err(PackDecodeError::from(err))
+                }
+            },
         };
     }
 
@@ -212,20 +214,24 @@ pub fn inflate_entry_payload_with(
 ///   [`inflate_entry_payload_with`] with the same variants and conditions.
 ///
 /// # Panics
-/// - Panics if `header.data_start` is out of bounds for `pack` (bounds check in
-///   `PackFile::slice_from`).
-/// - May panic if called reentrantly on the same thread because the
-///   thread-local inflate scratch and thread-local libdeflate scratch both use
-///   `RefCell` borrowing.
+/// Panics if `header.data_start` is out of bounds for `pack` (bounds check in
+/// `PackFile::slice_from`).
 pub fn inflate_entry_payload(
     pack: &PackFile<'_>,
     header: &EntryHeader,
     out: &mut Vec<u8>,
     limits: &PackDecodeLimits,
 ) -> Result<usize, PackDecodeError> {
+    if pack_inflate_libdeflate::use_libdeflate_for_header(header) {
+        let slice = pack.slice_from(header.data_start);
+        let expected = header.size as usize;
+        return pack_inflate_libdeflate::inflate_nondelta_exact(slice, expected, out);
+    }
+
     super::pack_inflate::with_tls_decompress(|de| {
         inflate_entry_payload_with(de, None, pack, header, out, limits)
     })
+    .map_err(PackDecodeError::from)?
 }
 
 #[cfg(test)]
@@ -365,10 +371,18 @@ mod tests {
         let header = entry_header_at(&pack, offset, &limits).expect("parse header");
         let mut out = Vec::new();
         let mut de = Decompress::new(true);
+        let mut libde = LibdeflateDecompressor::new().expect("allocate libdeflate decompressor");
 
         assert!(pack_inflate_libdeflate::use_libdeflate_for_header(&header));
-        let consumed =
-            inflate_entry_payload_with(&mut de, None, &pack, &header, &mut out, &limits).unwrap();
+        let consumed = inflate_entry_payload_with(
+            &mut de,
+            Some(&mut libde),
+            &pack,
+            &header,
+            &mut out,
+            &limits,
+        )
+        .unwrap();
 
         assert_eq!(consumed, compressed.len());
         assert_eq!(out, payload);
@@ -418,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn libdeflate_tls_reentrancy_panics_predictably() {
+    fn libdeflate_tls_reentrancy_falls_back_to_flate2() {
         let payload = b"reentrant libdeflate".to_vec();
         let compressed = zlib_compress(&payload);
         let (pack_bytes, offset) = single_entry_pack(non_delta_entry(payload.len(), &compressed));
@@ -429,11 +443,15 @@ mod tests {
         let result = catch_unwind(AssertUnwindSafe(|| {
             crate::pack_inflate_libdeflate::hold_tls_borrow_for_test(|| {
                 let mut out = Vec::new();
-                let _ = inflate_entry_payload(&pack, &header, &mut out, &limits);
-            });
+                let consumed =
+                    inflate_entry_payload(&pack, &header, &mut out, &limits).expect("inflate");
+                (consumed, out)
+            })
         }));
 
-        assert!(result.is_err());
+        let (consumed, out) = result.expect("reentrant libdeflate path should not panic");
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(out, payload);
     }
 
     #[test]
@@ -448,9 +466,17 @@ mod tests {
         let header = entry_header_at(&pack, offset, &limits).expect("parse header");
         let mut out = Vec::new();
         let mut de = Decompress::new(true);
+        let mut libde = LibdeflateDecompressor::new().expect("allocate libdeflate decompressor");
 
-        let consumed =
-            inflate_entry_payload_with(&mut de, None, &pack, &header, &mut out, &limits).unwrap();
+        let consumed = inflate_entry_payload_with(
+            &mut de,
+            Some(&mut libde),
+            &pack,
+            &header,
+            &mut out,
+            &limits,
+        )
+        .unwrap();
 
         assert_eq!(consumed, compressed.len());
         assert_eq!(out, payload);
@@ -503,7 +529,7 @@ mod tests {
 
     #[test]
     fn caller_provided_libde_roundtrip() {
-        let mut libde = LibdeflateDecompressor::new();
+        let mut libde = LibdeflateDecompressor::new().expect("allocate libdeflate decompressor");
         let payload = b"roundtrip through caller-provided libdeflate decompressor".to_vec();
         let compressed = zlib_compress(&payload);
         let (pack_bytes, offset) = single_entry_pack(non_delta_entry(payload.len(), &compressed));
@@ -529,7 +555,7 @@ mod tests {
 
     #[test]
     fn caller_provided_libde_corrupt_returns_backend_error() {
-        let mut libde = LibdeflateDecompressor::new();
+        let mut libde = LibdeflateDecompressor::new().expect("allocate libdeflate decompressor");
         let (pack_bytes, offset) = single_entry_pack(non_delta_entry(8, b"\x78\x9c\xff\xff"));
         let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
         let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
@@ -594,7 +620,7 @@ mod tests {
 
     #[test]
     fn libdeflate_decompressor_reuse_across_payloads() {
-        let mut libde = LibdeflateDecompressor::new();
+        let mut libde = LibdeflateDecompressor::new().expect("allocate libdeflate decompressor");
 
         let payload_a = b"first payload for reuse test".to_vec();
         let compressed_a = zlib_compress(&payload_a);

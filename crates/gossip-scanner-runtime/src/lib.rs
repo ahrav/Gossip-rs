@@ -1654,7 +1654,7 @@ pub enum OwnedCoreEvent {
         /// BLAKE3 digest of the normalized secret content.
         norm_hash: [u8; 32],
         /// Encoded Git blob object ID forwarded from `FindingEvent::blob_oid`.
-        blob_oid: Option<[u8; 33]>,
+        blob_oid: Option<[u8; OidBytes::WIRE_LEN]>,
         commit_id: Option<u32>,
         change_kind: Option<String>,
         confidence_score: i8,

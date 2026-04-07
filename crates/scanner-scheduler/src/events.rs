@@ -9,6 +9,10 @@ use crate::source_kind::SourceKind;
 use std::fmt;
 use std::sync::Mutex;
 
+/// Wire-encoded length of a blob OID: 1 byte length prefix + 32 bytes
+/// zero-padded payload. Must match `OidBytes::WIRE_LEN` in `scanner-git`.
+pub const BLOB_OID_WIRE_LEN: usize = 33;
+
 /// Scheduler event emitted during a scan run.
 ///
 /// Covers finding reports, progress ticks, end-of-scan summaries, and
@@ -60,7 +64,7 @@ pub struct FindingEvent<'a> {
     /// `None` means the finding did not come from the Git scan path. When
     /// present, byte 0 stores the raw OID length (20 for SHA-1, 32 for
     /// SHA-256) and bytes 1..=32 store the zero-padded raw OID bytes.
-    pub blob_oid: Option<[u8; 33]>,
+    pub blob_oid: Option<[u8; BLOB_OID_WIRE_LEN]>,
     /// Commit-graph position for Git findings.
     pub commit_id: Option<u32>,
     /// Git diff classification associated with the finding.
