@@ -1338,9 +1338,16 @@ mod tests {
     fn read_bitmap(backend: &TestBackend, key: &[u8], label: &str) -> RoaringSeenBitmap {
         let bytes = backend
             .get_value(key)
-            .unwrap_or_else(|| panic!("{label} key must exist"));
+            .unwrap_or_else(|| panic!("{label} key must exist; key={key:02x?}"));
         RoaringSeenBitmap::deserialize(&bytes)
-            .unwrap_or_else(|err| panic!("{label} bitmap must deserialize: {err}"))
+            .unwrap_or_else(|err| panic!("{label} bitmap must deserialize (key={key:02x?}): {err}"))
+    }
+
+    fn assert_bitmap_contains(backend: &TestBackend, key: &[u8], label: &str, oids: &[OidBytes]) {
+        let bitmap = read_bitmap(backend, key, label);
+        for oid in oids {
+            assert!(bitmap.contains(oid), "{label} bitmap missing {oid:?}");
+        }
     }
 
     /// Subset check: asserts every OID in `oids` is present in the scope bitmap.
@@ -1351,11 +1358,12 @@ mod tests {
         policy_hash: &[u8; 32],
         oids: &[OidBytes],
     ) {
-        let key = build_seen_scope_key(repo_id, policy_hash);
-        let bitmap = read_bitmap(backend, &key, "scope");
-        for oid in oids {
-            assert!(bitmap.contains(oid), "scope bitmap missing {oid:?}");
-        }
+        assert_bitmap_contains(
+            backend,
+            &build_seen_scope_key(repo_id, policy_hash),
+            "scope",
+            oids,
+        );
     }
 
     /// Subset check: asserts every OID in `oids` is present in the staging bitmap.
@@ -1366,11 +1374,12 @@ mod tests {
         policy_hash: &[u8; 32],
         oids: &[OidBytes],
     ) {
-        let key = build_seen_staging_key(repo_id, policy_hash);
-        let bitmap = read_bitmap(backend, &key, "staging");
-        for oid in oids {
-            assert!(bitmap.contains(oid), "staging bitmap missing {oid:?}");
-        }
+        assert_bitmap_contains(
+            backend,
+            &build_seen_staging_key(repo_id, policy_hash),
+            "staging",
+            oids,
+        );
     }
 
     #[test]
@@ -2513,6 +2522,62 @@ mod tests {
     }
 
     #[test]
+    fn partial_finalize_crash_preserves_staging_for_later_recovery() {
+        let backend = TestBackend::non_atomic();
+        let repo_id = 32;
+        let policy_hash = [0x32; 32];
+        let oid = sim_oid(0xD1);
+
+        let first = fresh_adapter(&backend, repo_id, policy_hash);
+        first.persist_seen_delta(&[oid]).expect("stage OID");
+
+        // On non-atomic backends the partial-finalize path places the
+        // staging Delete in the same batch as first_phase_ops. An
+        // all-or-nothing batch failure leaves staging intact.
+        backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
+        first
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+                stats: Default::default(),
+            })
+            .expect_err("partial finalize crash must propagate");
+        assert_eq!(
+            backend.batch_fault_index(),
+            1,
+            "partial finalize fault must be consumed by exactly one batch"
+        );
+
+        assert_staging_contains(&backend, repo_id, &policy_hash, &[oid]);
+        assert_eq!(
+            fresh_adapter(&backend, repo_id, policy_hash)
+                .batch_check_seen(&[oid])
+                .expect("check between crash and recovery"),
+            vec![false],
+            "partial finalize crash must not merge staging into scope"
+        );
+
+        // A subsequent complete finalize on a fresh adapter must recover
+        // the staged OID into the scope bitmap via the cold-cache path.
+        let recovered = fresh_adapter(&backend, repo_id, policy_hash);
+        recovered
+            .commit_finalize(&complete_finalize_with_watermark(1))
+            .expect("recovery complete finalize must succeed");
+
+        assert_scope_contains(&backend, repo_id, &policy_hash, &[oid]);
+        assert!(
+            !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
+            "successful recovery must clear staging"
+        );
+        assert_eq!(
+            backend.get_value(b"rw\0wm").as_deref(),
+            Some(&[1][..]),
+            "successful recovery must advance watermarks"
+        );
+    }
+
+    #[test]
     fn non_atomic_first_phase_failure_leaves_seen_cache_unchanged() {
         let backend = TestBackend::non_atomic();
         let adapter = GitPersistenceAdapter::new(backend.clone(), 23, [0x23; 32]);
@@ -2567,6 +2632,25 @@ mod tests {
             .persist_seen_delta(&[OidBytes::sha1([0x77; 20])])
             .expect_err("backend get failure should propagate");
         assert!(format!("{err}").contains("staging bitmap read failed"));
+    }
+
+    #[test]
+    fn persist_seen_delta_rejects_corrupt_staging_bitmap_on_cold_cache() {
+        let backend = TestBackend::non_atomic();
+        let repo_id = 30;
+        let policy_hash = [0x30; 32];
+        let staging_key = build_seen_staging_key(repo_id, &policy_hash);
+        backend.set(staging_key, vec![0xFF]);
+
+        let adapter = fresh_adapter(&backend, repo_id, policy_hash);
+        let err = adapter
+            .persist_seen_delta(&[sim_oid(0x01)])
+            .expect_err("corrupt staging bitmap must fail persist_seen_delta");
+
+        assert!(
+            format!("{err}").contains("corrupt staging bitmap"),
+            "error should mention corrupt staging bitmap, got: {err}"
+        );
     }
 
     #[test]
@@ -2742,6 +2826,59 @@ mod tests {
     }
 
     #[test]
+    fn batch_check_seen_rejects_corrupt_scope_bitmap() {
+        let backend = TestBackend::non_atomic();
+        let repo_id = 28;
+        let policy_hash = [0x28; 32];
+        let scope_key = build_seen_scope_key(repo_id, &policy_hash);
+        backend.set(scope_key, vec![0xFF]);
+
+        let adapter = fresh_adapter(&backend, repo_id, policy_hash);
+        let err = adapter
+            .batch_check_seen(&[sim_oid(0x01)])
+            .expect_err("corrupt scope bitmap must fail batch_check_seen");
+
+        assert!(
+            format!("{err}").contains("corrupt seen-bitmap"),
+            "error should mention corrupt seen-bitmap, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cold_cache_finalize_rejects_corrupt_scope_bitmap() {
+        let backend = TestBackend::non_atomic();
+        let repo_id = 29;
+        let policy_hash = [0x29; 32];
+        let scope_key = build_seen_scope_key(repo_id, &policy_hash);
+        let staging_key = build_seen_staging_key(repo_id, &policy_hash);
+        backend.set(scope_key.clone(), vec![0xFF]);
+
+        // Staging write succeeds because persist_seen_delta does not read
+        // the scope key — it operates exclusively on the staging namespace.
+        let adapter = fresh_adapter(&backend, repo_id, policy_hash);
+        adapter
+            .persist_seen_delta(&[sim_oid(0x01)])
+            .expect("staging succeeds independently of a corrupt scope key");
+
+        let err = adapter
+            .commit_finalize(&complete_finalize_with_watermark(1))
+            .expect_err("corrupt scope bitmap must fail commit_finalize");
+
+        assert!(
+            format!("{err}").contains("corrupt seen-bitmap"),
+            "error should mention corrupt seen-bitmap, got: {err}"
+        );
+        assert!(
+            backend.contains_key(&staging_key),
+            "staging must survive when finalize aborts during seen-store load"
+        );
+        assert!(
+            backend.get_value(b"rw\0wm").is_none(),
+            "watermarks must not land when finalize aborts before writing batches"
+        );
+    }
+
+    #[test]
     fn consecutive_crashes_across_finalize_phases_recover_union_of_all_staged_oids() {
         let backend = TestBackend::non_atomic();
         let repo_id = 27;
@@ -2759,6 +2896,11 @@ mod tests {
         first
             .commit_finalize(&complete_finalize_with_watermark(1))
             .expect_err("watermark-phase failure must propagate");
+        assert_eq!(
+            backend.batch_fault_index(),
+            1,
+            "watermark-phase fault must be consumed by exactly one batch"
+        );
         assert_scope_contains(&backend, repo_id, &policy_hash, &[oid_a]);
         assert!(
             !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
@@ -2771,6 +2913,8 @@ mod tests {
 
         // Staging-delete-phase crash: scope write succeeds but staging
         // delete fails, leaving both scope and staging containing oid_b.
+        // Watermarks do not advance because the error aborts before the
+        // watermark batch.
         let staging_del = fresh_adapter(&backend, repo_id, policy_hash);
         staging_del
             .persist_seen_delta(&[oid_b])
@@ -2779,6 +2923,11 @@ mod tests {
         staging_del
             .commit_finalize(&complete_finalize_with_watermark(2))
             .expect_err("staging-delete-phase failure must propagate");
+        assert_eq!(
+            backend.batch_fault_index(),
+            1,
+            "staging-delete fault must be consumed by exactly one batch"
+        );
         assert_scope_contains(&backend, repo_id, &policy_hash, &[oid_a, oid_b]);
         assert_staging_contains(&backend, repo_id, &policy_hash, &[oid_b]);
         assert!(
@@ -2792,9 +2941,17 @@ mod tests {
             vec![true, true],
             "scope must contain both OIDs — scope write succeeded before staging delete failed"
         );
+        assert_eq!(
+            fresh_adapter(&backend, repo_id, policy_hash)
+                .batch_check_seen(&[oid_c, oid_d])
+                .expect("negative check after staging-delete crash"),
+            vec![false, false],
+            "oid_c and oid_d must not be in scope after the staging-delete crash"
+        );
 
         // Any-phase crash: persist_seen_delta merges oid_c into the stale
-        // staging {b} from the prior crash, then the entire first batch fails.
+        // staging {b} from the prior crash. The BatchFaultTrigger::any() fault
+        // fails the scope-write batch before any durable state changes.
         let third = fresh_adapter(&backend, repo_id, policy_hash);
         third
             .persist_seen_delta(&[oid_c])
@@ -2803,6 +2960,11 @@ mod tests {
         third
             .commit_finalize(&complete_finalize_with_watermark(3))
             .expect_err("any-phase failure must propagate");
+        assert_eq!(
+            backend.batch_fault_index(),
+            1,
+            "any-phase fault must be consumed by exactly one batch"
+        );
         assert_scope_contains(&backend, repo_id, &policy_hash, &[oid_a, oid_b]);
         assert_staging_contains(&backend, repo_id, &policy_hash, &[oid_b, oid_c]);
         assert_eq!(
@@ -2895,7 +3057,7 @@ mod tests {
         fn proptest_crash_recovery_preserves_seen_union(
             crash_phase in 0u8..3,
             crashed_oids in prop::collection::btree_set(any::<[u8; 20]>(), 1..=20),
-            recovery_oids in prop::collection::btree_set(any::<[u8; 20]>(), 0..=20),
+            recovery_oids in prop::collection::btree_set(any::<[u8; 20]>(), 1..=20),
             disjoint_oids in prop::collection::btree_set(any::<[u8; 20]>(), 1..=5),
         ) {
             let backend = TestBackend::non_atomic();
@@ -2905,11 +3067,15 @@ mod tests {
             let recovery_oids: Vec<_> = recovery_oids.into_iter().map(OidBytes::sha1).collect();
 
             let staged_set: BTreeSet<_> = crashed_oids.iter().chain(&recovery_oids).cloned().collect();
-            let disjoint: Vec<_> = disjoint_oids
+            let mut disjoint: Vec<_> = disjoint_oids
                 .into_iter()
-                .map(OidBytes::sha1)
+                .map(|mut raw: [u8; 20]| {
+                    raw[0] ^= 0x80;
+                    OidBytes::sha1(raw)
+                })
                 .filter(|oid| !staged_set.contains(oid))
                 .collect();
+            disjoint.sort();
 
             let crashed = fresh_adapter(&backend, repo_id, policy_hash);
             crashed
@@ -2922,9 +3088,18 @@ mod tests {
                 _ => unreachable!("crash_phase strategy is 0..3"),
             };
             backend.set_batch_faults(vec![trigger]);
-            crashed
+            let crash_err = crashed
                 .commit_finalize(&complete_finalize_with_watermark(1))
                 .expect_err("configured finalize crash must propagate");
+            prop_assert!(
+                format!("{crash_err}").contains("injected batch failure"),
+                "finalize must fail due to fault injection, not an unrelated error; got: {crash_err}"
+            );
+            prop_assert_eq!(
+                backend.batch_fault_index(),
+                1,
+                "crash fault must be consumed by exactly one batch"
+            );
 
             let recovered = fresh_adapter(&backend, repo_id, policy_hash);
             recovered
@@ -2942,14 +3117,16 @@ mod tests {
                     .expect("final seen check"),
                 vec![true; expected.len()],
             );
-            if !disjoint.is_empty() {
-                prop_assert_eq!(
-                    recovered
-                        .batch_check_seen(&disjoint)
-                        .expect("disjoint OIDs must not be seen"),
-                    vec![false; disjoint.len()],
-                );
-            }
+            prop_assert!(
+                !disjoint.is_empty(),
+                "disjoint set must contain at least one non-colliding OID"
+            );
+            prop_assert_eq!(
+                recovered
+                    .batch_check_seen(&disjoint)
+                    .expect("disjoint OIDs must not be seen"),
+                vec![false; disjoint.len()],
+            );
             prop_assert!(
                 !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
                 "successful recovery must clear staging"
