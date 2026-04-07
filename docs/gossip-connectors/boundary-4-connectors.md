@@ -224,7 +224,7 @@ Each concrete connector (`FilesystemConnector`,
 `InMemoryDeterministicConnector`) exposes the same set of inherent methods:
 
 ```rust
-impl FilesystemConnector {  // same signatures on all three connectors
+impl FilesystemConnector {  // same signatures on both connectors
     pub fn caps(&self) -> ConnectorCapabilities;
 
     pub fn choose_split_point(
@@ -248,7 +248,7 @@ Key design points:
 ### Read methods (inherent on each connector)
 
 ```rust
-impl FilesystemConnector {  // same signatures on all three connectors
+impl FilesystemConnector {  // same signatures on both connectors
     pub fn open(
         &mut self,
         item_ref: &ItemRef,
