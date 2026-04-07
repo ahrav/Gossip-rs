@@ -792,34 +792,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stored_git_event_is_smaller_than_hex_oid_layout() {
-        #[allow(dead_code)]
-        #[derive(Clone, Debug, PartialEq, Eq)]
-        enum LegacyStoredGitEvent {
-            CommitMeta {
-                commit_id: u32,
-                oid_hex: gossip_stdx::HexOid,
-                timestamp: u64,
-                author_name_id: Option<u32>,
-                author_email_id: Option<u32>,
-                committer_name_id: Option<u32>,
-                committer_email_id: Option<u32>,
-            },
-            IdentityDictionary {
-                id: u32,
-                value: Vec<u8>,
-            },
-        }
-
-        let current = std::mem::size_of::<StoredGitEvent>();
-        let legacy = std::mem::size_of::<LegacyStoredGitEvent>();
-
-        assert!(
-            current < legacy,
-            "raw OID storage should shrink StoredGitEvent ({current} < {legacy})"
-        );
-    }
+    /// `StoredGitEvent` must fit within two cache lines (128 bytes).
+    /// With `OidBytes` (33 bytes) instead of `HexOid` (65 bytes), the enum
+    /// drops from ~112 bytes to ~80 bytes. This bound catches accidental
+    /// field inflation.
+    const _: () = assert!(std::mem::size_of::<StoredGitEvent>() <= 80);
 
     #[test]
     fn findings_capture_sink_skips_invalid_blob_oid_payloads() {
