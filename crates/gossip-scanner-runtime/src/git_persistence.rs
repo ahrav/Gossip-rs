@@ -1265,6 +1265,7 @@ mod tests {
 
     use super::test_support::*;
     use super::*;
+    use scanner_git::NS_REF_WATERMARK;
 
     fn write_context() -> WriteContext {
         WriteContext::new(
