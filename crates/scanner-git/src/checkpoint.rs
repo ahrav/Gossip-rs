@@ -30,9 +30,16 @@ use crate::tree_candidate::{CandidateContext, ChangeKind};
 use crate::tree_diff::TreeDiffStats;
 use crate::NormHash;
 
+/// Maximum checkpoint blob size accepted during deserialization (256 MiB).
+///
+/// Prevents a crafted blob from triggering unbounded allocation via
+/// bincode length-prefixed collections.
+const MAX_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
+
 fn checkpoint_codec() -> impl bincode::Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
+        .with_limit(MAX_CHECKPOINT_BYTES)
         .allow_trailing_bytes()
 }
 
@@ -120,6 +127,23 @@ pub trait ScanCheckpointSink {
     fn load_resume_state(&self) -> Result<LoadedScanCheckpoint, ScanCheckpointError>;
 
     /// Persist one stage-complete checkpoint.
+    ///
+    /// The implementation must ensure atomicity between the base-state and
+    /// prefix-state blobs produced by
+    /// [`StageCheckpoint::encode_base_state`] and
+    /// [`StageCheckpoint::encode_prefix_state`]:
+    ///
+    /// - When `encode_base_state` returns `Some` and `encode_prefix_state`
+    ///   returns `None`, the base blob must be stored and any prior prefix
+    ///   blob must be deleted in the same atomic batch.
+    /// - When `encode_base_state` returns `None` and `encode_prefix_state`
+    ///   returns `Some`, the prefix blob must be stored alongside the
+    ///   existing base blob; a partial write that persists the prefix
+    ///   without the base creates an unrecoverable orphan.
+    /// - If the backend does not support atomic multi-key writes, the
+    ///   implementation should write the base key first and the prefix key
+    ///   second, so a crash between the two leaves a valid (though less
+    ///   advanced) base-only state rather than an orphaned prefix.
     fn notify_stage_complete(
         &self,
         checkpoint: &StageCheckpoint<'_>,
@@ -222,17 +246,20 @@ impl StageCheckpoint<'_> {
                 plan,
             } => {
                 let encoded = checkpoint_codec()
-                    .serialize(&StoredBaseState::CommitPlan(StoredCommitPlanState {
-                        scan_mode: StoredGitScanMode::from(*scan_mode),
-                        artifact_fingerprint: StoredRepoArtifactFingerprint::from(
-                            *artifact_fingerprint,
-                        ),
-                        plan: plan
-                            .iter()
-                            .copied()
-                            .map(StoredPlannedCommit::from)
-                            .collect(),
-                    }))
+                    .serialize(&StoredBaseStateEnvelope {
+                        schema_version: CHECKPOINT_SCHEMA_VERSION,
+                        state: StoredBaseState::CommitPlan(StoredCommitPlanState {
+                            scan_mode: StoredGitScanMode::from(*scan_mode),
+                            artifact_fingerprint: StoredRepoArtifactFingerprint::from(
+                                *artifact_fingerprint,
+                            ),
+                            plan: plan
+                                .iter()
+                                .copied()
+                                .map(StoredPlannedCommit::from)
+                                .collect(),
+                        }),
+                    })
                     .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
                 Ok(Some(encoded))
             }
@@ -248,31 +275,34 @@ impl StageCheckpoint<'_> {
                 mapping_stats,
             } => {
                 let encoded = checkpoint_codec()
-                    .serialize(&StoredBaseState::SpillDedup(StoredSpillDedupState {
-                        scan_mode: StoredGitScanMode::from(*scan_mode),
-                        artifact_fingerprint: StoredRepoArtifactFingerprint::from(
-                            *artifact_fingerprint,
-                        ),
-                        plan: plan
-                            .iter()
-                            .copied()
-                            .map(StoredPlannedCommit::from)
-                            .collect(),
-                        packed: packed
-                            .iter()
-                            .copied()
-                            .map(StoredPackCandidate::from)
-                            .collect(),
-                        loose: loose
-                            .iter()
-                            .copied()
-                            .map(StoredLooseCandidate::from)
-                            .collect(),
-                        path_arena: path_arena.backing_bytes().to_vec(),
-                        tree_diff_stats: StoredTreeDiffStats::from(tree_diff_stats.clone()),
-                        spill_stats: StoredSpillStats::from(spill_stats.clone()),
-                        mapping_stats: StoredMappingStats::from(*mapping_stats),
-                    }))
+                    .serialize(&StoredBaseStateEnvelope {
+                        schema_version: CHECKPOINT_SCHEMA_VERSION,
+                        state: StoredBaseState::SpillDedup(StoredSpillDedupState {
+                            scan_mode: StoredGitScanMode::from(*scan_mode),
+                            artifact_fingerprint: StoredRepoArtifactFingerprint::from(
+                                *artifact_fingerprint,
+                            ),
+                            plan: plan
+                                .iter()
+                                .copied()
+                                .map(StoredPlannedCommit::from)
+                                .collect(),
+                            packed: packed
+                                .iter()
+                                .copied()
+                                .map(StoredPackCandidate::from)
+                                .collect(),
+                            loose: loose
+                                .iter()
+                                .copied()
+                                .map(StoredLooseCandidate::from)
+                                .collect(),
+                            path_arena: path_arena.backing_bytes().to_vec(),
+                            tree_diff_stats: StoredTreeDiffStats::from(tree_diff_stats.clone()),
+                            spill_stats: StoredSpillStats::from(spill_stats.clone()),
+                            mapping_stats: StoredMappingStats::from(*mapping_stats),
+                        }),
+                    })
                     .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
                 Ok(Some(encoded))
             }
@@ -302,16 +332,19 @@ impl StageCheckpoint<'_> {
                     ScanCheckpointError::Encode("completed_plan_count exceeds u32::MAX".to_owned())
                 })?;
                 let encoded = checkpoint_codec()
-                    .serialize(&StoredPrefixState {
-                        stage: self.stage(),
-                        completed_plan_count,
-                        scanned: StoredScannedBlobs::from(*scanned),
-                        skipped_candidates: skipped_candidates
-                            .iter()
-                            .copied()
-                            .map(StoredSkippedCandidate::from)
-                            .collect(),
-                        common_metrics: StoredGitScanCommonMetrics::from(*common_metrics),
+                    .serialize(&StoredPrefixStateEnvelope {
+                        schema_version: CHECKPOINT_SCHEMA_VERSION,
+                        state: StoredPrefixState {
+                            stage: self.stage(),
+                            completed_plan_count,
+                            scanned: StoredScannedBlobs::from(*scanned),
+                            skipped_candidates: skipped_candidates
+                                .iter()
+                                .copied()
+                                .map(StoredSkippedCandidate::from)
+                                .collect(),
+                            common_metrics: StoredGitScanCommonMetrics::from(*common_metrics),
+                        },
                     })
                     .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
                 Ok(Some(encoded))
@@ -343,6 +376,84 @@ impl StageCheckpoint<'_> {
     }
 }
 
+/// Validate OID lengths and path-arena bounds for deserialized base-state
+/// candidates before infallible `From` conversion.
+fn validate_stored_base_candidates(
+    packed: &[StoredPackCandidate],
+    loose: &[StoredLooseCandidate],
+    arena_len: u32,
+) -> Result<(), ScanCheckpointError> {
+    for (i, cand) in packed.iter().enumerate() {
+        validate_stored_oid(&cand.oid, "packed candidate", i)?;
+        validate_stored_byte_ref(&cand.ctx.path_ref, arena_len, "packed candidate", i)?;
+    }
+    for (i, cand) in loose.iter().enumerate() {
+        validate_stored_oid(&cand.oid, "loose candidate", i)?;
+        validate_stored_byte_ref(&cand.ctx.path_ref, arena_len, "loose candidate", i)?;
+    }
+    Ok(())
+}
+
+/// Validate OID lengths, finding-arena bounds, and skipped-candidate OIDs
+/// for a deserialized prefix state.
+fn validate_stored_prefix(prefix: &StoredPrefixState) -> Result<(), ScanCheckpointError> {
+    let finding_arena_len = prefix.scanned.finding_arena.len();
+    for (i, blob) in prefix.scanned.blobs.iter().enumerate() {
+        validate_stored_oid(&blob.oid, "scanned blob", i)?;
+        let end = blob
+            .findings
+            .start
+            .checked_add(blob.findings.len)
+            .ok_or_else(|| {
+                ScanCheckpointError::InvalidState(format!(
+                    "scanned blob {i}: FindingSpan start + len overflows u32"
+                ))
+            })?;
+        if end as usize > finding_arena_len {
+            return Err(ScanCheckpointError::InvalidState(format!(
+                "scanned blob {i}: FindingSpan [{}, {end}) exceeds finding_arena length {finding_arena_len}",
+                blob.findings.start,
+            )));
+        }
+    }
+    for (i, skip) in prefix.skipped_candidates.iter().enumerate() {
+        validate_stored_oid(&skip.oid, "skipped candidate", i)?;
+    }
+    Ok(())
+}
+
+fn validate_stored_oid(
+    oid: &StoredOidBytes,
+    ctx: &str,
+    index: usize,
+) -> Result<(), ScanCheckpointError> {
+    if oid.len != 20 && oid.len != 32 {
+        return Err(ScanCheckpointError::InvalidState(format!(
+            "{ctx} {index}: invalid OID length {}",
+            oid.len,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_stored_byte_ref(
+    r: &StoredByteRef,
+    arena_len: u32,
+    ctx: &str,
+    index: usize,
+) -> Result<(), ScanCheckpointError> {
+    let end = r.off.checked_add(u32::from(r.len)).ok_or_else(|| {
+        ScanCheckpointError::InvalidState(format!("{ctx} {index}: ByteRef off + len overflows u32"))
+    })?;
+    if end > arena_len {
+        return Err(ScanCheckpointError::InvalidState(format!(
+            "{ctx} {index}: ByteRef [{}, {end}) exceeds arena length {arena_len}",
+            r.off,
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub enum ScanResumeState {
     PostCommitPlan(CommitPlanResumeState),
@@ -372,9 +483,22 @@ impl ScanResumeState {
             return Ok(None);
         };
 
-        let base: StoredBaseState = checkpoint_codec()
-            .deserialize(&base_state)
-            .map_err(|error| ScanCheckpointError::Decode(error.to_string()))?;
+        let envelope: StoredBaseStateEnvelope = match checkpoint_codec().deserialize(&base_state) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!("checkpoint base decode failed, restarting fresh: {err}");
+                return Ok(None);
+            }
+        };
+        if envelope.schema_version != CHECKPOINT_SCHEMA_VERSION {
+            tracing::warn!(
+                schema_version = envelope.schema_version,
+                expected = CHECKPOINT_SCHEMA_VERSION,
+                "checkpoint schema version mismatch, restarting fresh"
+            );
+            return Ok(None);
+        }
+        let base = envelope.state;
         match base {
             StoredBaseState::CommitPlan(base) => {
                 if GitScanMode::from(base.scan_mode) != scan_mode
@@ -404,6 +528,13 @@ impl ScanResumeState {
                     }
                     return Ok(None);
                 }
+
+                // Validate deserialized fields before conversion so that
+                // downstream From impls (which use debug_assert-only checks)
+                // never encounter out-of-range values in release builds.
+                let arena_len = base.path_arena.len() as u32;
+                validate_stored_base_candidates(&base.packed, &base.loose, arena_len)?;
+
                 let base = ScanResumeBaseState {
                     plan: base.plan.into_iter().map(PlannedCommit::from).collect(),
                     packed: base.packed.into_iter().map(PackCandidate::from).collect(),
@@ -417,9 +548,28 @@ impl ScanResumeState {
                 let Some(prefix_state) = loaded.prefix_state else {
                     return Ok(Some(Self::PostSpillDedup(base)));
                 };
-                let prefix: StoredPrefixState = checkpoint_codec()
-                    .deserialize(&prefix_state)
-                    .map_err(|error| ScanCheckpointError::Decode(error.to_string()))?;
+                let prefix_envelope: StoredPrefixStateEnvelope =
+                    match checkpoint_codec().deserialize(&prefix_state) {
+                        Ok(e) => e,
+                        Err(err) => {
+                            tracing::warn!(
+                                "checkpoint prefix decode failed, resuming from base only: {err}"
+                            );
+                            return Ok(Some(Self::PostSpillDedup(base)));
+                        }
+                    };
+                if prefix_envelope.schema_version != CHECKPOINT_SCHEMA_VERSION {
+                    tracing::warn!(
+                        schema_version = prefix_envelope.schema_version,
+                        expected = CHECKPOINT_SCHEMA_VERSION,
+                        "prefix schema version mismatch, resuming from base only"
+                    );
+                    return Ok(Some(Self::PostSpillDedup(base)));
+                }
+                let prefix = prefix_envelope.state;
+
+                validate_stored_prefix(&prefix)?;
+
                 let prefix = ScanResumePrefixState {
                     stage: prefix.stage,
                     completed_plan_count: prefix.completed_plan_count as usize,
@@ -519,6 +669,25 @@ pub struct ScanResumePrefixState {
     pub scanned: ScannedBlobs,
     pub skipped_candidates: Vec<SkippedCandidate>,
     pub common_metrics: GitScanCommonMetrics,
+}
+
+/// Schema version for checkpoint blobs.
+///
+/// Bumped whenever the stored layout changes. Blobs with a mismatched
+/// version are discarded (the scan restarts fresh) rather than producing
+/// hard errors, so format evolution is transparent to operators.
+const CHECKPOINT_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredBaseStateEnvelope {
+    schema_version: u8,
+    state: StoredBaseState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredPrefixStateEnvelope {
+    schema_version: u8,
+    state: StoredPrefixState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1771,15 +1940,18 @@ mod tests {
 
         // Build a prefix payload with an invalid stage (PostCommitPlan is not
         // valid as a prefix discriminator).
-        let invalid_prefix = StoredPrefixState {
-            stage: ScanCheckpointStage::PostCommitPlan,
-            completed_plan_count: 0,
-            scanned: StoredScannedBlobs {
-                blobs: Vec::new(),
-                finding_arena: Vec::new(),
+        let invalid_prefix = StoredPrefixStateEnvelope {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            state: StoredPrefixState {
+                stage: ScanCheckpointStage::PostCommitPlan,
+                completed_plan_count: 0,
+                scanned: StoredScannedBlobs {
+                    blobs: Vec::new(),
+                    finding_arena: Vec::new(),
+                },
+                skipped_candidates: Vec::new(),
+                common_metrics: StoredGitScanCommonMetrics::from(GitScanCommonMetrics::default()),
             },
-            skipped_candidates: Vec::new(),
-            common_metrics: StoredGitScanCommonMetrics::from(GitScanCommonMetrics::default()),
         };
         let prefix_bytes = checkpoint_codec()
             .serialize(&invalid_prefix)
@@ -1821,6 +1993,210 @@ mod tests {
         assert!(
             result.is_none(),
             "scan_mode mismatch must discard the checkpoint"
+        );
+    }
+
+    #[test]
+    fn deserialize_truncated_blob_restarts_fresh() {
+        let loaded = LoadedScanCheckpoint {
+            base_state: Some(vec![0xFF, 0x01, 0x02]),
+            prefix_state: None,
+        };
+        let result = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &artifact(1))
+            .expect("graceful decode failure returns Ok");
+        assert!(result.is_none(), "truncated blob must restart fresh");
+    }
+
+    #[test]
+    fn deserialize_oversized_blob_restarts_fresh() {
+        // Craft a blob that claims a Vec length exceeding the size limit.
+        // The envelope schema_version byte + StoredBaseState discriminant,
+        // then garbage that overflows deserialization.
+        let mut blob = Vec::new();
+        // schema_version = CHECKPOINT_SCHEMA_VERSION
+        blob.push(CHECKPOINT_SCHEMA_VERSION);
+        // StoredBaseState enum discriminant for SpillDedup = 1 (bincode fixint)
+        blob.extend_from_slice(&[1u8, 0, 0, 0]);
+        // scan_mode discriminant (DiffHistory = 0)
+        blob.extend_from_slice(&[0u8, 0, 0, 0]);
+        // artifact_fingerprint: packs_hash + idx_hash (64 bytes)
+        blob.extend_from_slice(&[0xAA; 64]);
+        // plan Vec length = 0
+        blob.extend_from_slice(&0u64.to_le_bytes());
+        // packed Vec length = absurdly large
+        blob.extend_from_slice(&u64::MAX.to_le_bytes());
+
+        let loaded = LoadedScanCheckpoint {
+            base_state: Some(blob),
+            prefix_state: None,
+        };
+        let result =
+            ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &artifact(0xAA))
+                .expect("graceful decode failure returns Ok");
+        assert!(result.is_none(), "oversized blob must restart fresh");
+    }
+
+    #[test]
+    fn resume_state_rejects_invalid_oid_length() {
+        let fp = artifact(0x10);
+
+        // Build a StoredBaseState with a corrupted OID length, serialize it,
+        // and verify that from_loaded rejects it.
+        let bad_oid = StoredOidBytes {
+            len: 99,
+            bytes: [0; 32],
+        };
+        let bad_packed = StoredPackCandidate {
+            oid: bad_oid,
+            ctx: StoredCandidateContext {
+                commit_id: 0,
+                parent_idx: 0,
+                change_kind: StoredChangeKind::Add,
+                ctx_flags: 0,
+                cand_flags: 0,
+                path_ref: StoredByteRef { off: 0, len: 0 },
+            },
+            pack_id: 0,
+            offset: 0,
+        };
+        let stored = StoredBaseStateEnvelope {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            state: StoredBaseState::SpillDedup(StoredSpillDedupState {
+                scan_mode: StoredGitScanMode::DiffHistory,
+                artifact_fingerprint: StoredRepoArtifactFingerprint::from(&fp),
+                plan: Vec::new(),
+                packed: vec![bad_packed],
+                loose: Vec::new(),
+                path_arena: Vec::new(),
+                tree_diff_stats: StoredTreeDiffStats::from(TreeDiffStats::default()),
+                spill_stats: StoredSpillStats::from(SpillStats::default()),
+                mapping_stats: StoredMappingStats::from(MappingStats::default()),
+            }),
+        };
+        let blob = checkpoint_codec().serialize(&stored).expect("encode");
+
+        let loaded = LoadedScanCheckpoint {
+            base_state: Some(blob),
+            prefix_state: None,
+        };
+        let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect_err("invalid OID length must fail");
+        assert!(
+            matches!(err, ScanCheckpointError::InvalidState(_)),
+            "expected InvalidState for bad OID, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("invalid OID length"),
+            "error message should mention OID: {err}"
+        );
+    }
+
+    #[test]
+    fn resume_state_rejects_out_of_bounds_byte_ref() {
+        let fp = artifact(0x11);
+        let valid_oid = StoredOidBytes {
+            len: 20,
+            bytes: [0xAA; 32],
+        };
+        // path_arena is 4 bytes, but ByteRef references offset 10.
+        let bad_ref = StoredByteRef { off: 10, len: 5 };
+        let bad_packed = StoredPackCandidate {
+            oid: valid_oid,
+            ctx: StoredCandidateContext {
+                commit_id: 0,
+                parent_idx: 0,
+                change_kind: StoredChangeKind::Add,
+                ctx_flags: 0,
+                cand_flags: 0,
+                path_ref: bad_ref,
+            },
+            pack_id: 0,
+            offset: 0,
+        };
+        let stored = StoredBaseStateEnvelope {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            state: StoredBaseState::SpillDedup(StoredSpillDedupState {
+                scan_mode: StoredGitScanMode::DiffHistory,
+                artifact_fingerprint: StoredRepoArtifactFingerprint::from(&fp),
+                plan: Vec::new(),
+                packed: vec![bad_packed],
+                loose: Vec::new(),
+                path_arena: vec![0u8; 4],
+                tree_diff_stats: StoredTreeDiffStats::from(TreeDiffStats::default()),
+                spill_stats: StoredSpillStats::from(SpillStats::default()),
+                mapping_stats: StoredMappingStats::from(MappingStats::default()),
+            }),
+        };
+        let blob = checkpoint_codec().serialize(&stored).expect("encode");
+
+        let loaded = LoadedScanCheckpoint {
+            base_state: Some(blob),
+            prefix_state: None,
+        };
+        let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect_err("OOB ByteRef must fail");
+        assert!(
+            matches!(err, ScanCheckpointError::InvalidState(_)),
+            "expected InvalidState for OOB ByteRef, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("ByteRef"),
+            "error message should mention ByteRef: {err}"
+        );
+    }
+
+    #[test]
+    fn resume_state_rejects_out_of_bounds_finding_span() {
+        let fp = artifact(0x12);
+        let (base_blob, ..) = encode_spill_dedup_base(&fp);
+
+        // Build a prefix with a FindingSpan that exceeds the finding_arena.
+        let bad_scanned = StoredScannedBlobs {
+            blobs: vec![StoredScannedBlob {
+                oid: StoredOidBytes {
+                    len: 20,
+                    bytes: [0xCC; 32],
+                },
+                ctx: StoredCandidateContext {
+                    commit_id: 0,
+                    parent_idx: 0,
+                    change_kind: StoredChangeKind::Add,
+                    ctx_flags: 0,
+                    cand_flags: 0,
+                    path_ref: StoredByteRef { off: 0, len: 0 },
+                },
+                findings: StoredFindingSpan {
+                    start: 0,
+                    len: 1000,
+                },
+            }],
+            finding_arena: Vec::new(),
+        };
+        let prefix = StoredPrefixStateEnvelope {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            state: StoredPrefixState {
+                stage: ScanCheckpointStage::PackPlanComplete,
+                completed_plan_count: 0,
+                scanned: bad_scanned,
+                skipped_candidates: Vec::new(),
+                common_metrics: StoredGitScanCommonMetrics::from(GitScanCommonMetrics::default()),
+            },
+        };
+        let prefix_blob = checkpoint_codec().serialize(&prefix).expect("encode");
+
+        let loaded = LoadedScanCheckpoint {
+            base_state: Some(base_blob),
+            prefix_state: Some(prefix_blob),
+        };
+        let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect_err("OOB FindingSpan must fail");
+        assert!(
+            matches!(err, ScanCheckpointError::InvalidState(_)),
+            "expected InvalidState for OOB FindingSpan, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("FindingSpan"),
+            "error message should mention FindingSpan: {err}"
         );
     }
 }

@@ -790,7 +790,9 @@ pub(super) fn run_odb_blob(
         }
     }
 
-    if !matches!(resume_stage, Some(ScanCheckpointStage::PreFinalize)) {
+    if checkpoint_sink.checkpoints_enabled()
+        && !matches!(resume_stage, Some(ScanCheckpointStage::PreFinalize))
+    {
         checkpoint_stage(
             checkpoint_sink,
             &StageCheckpoint::PreFinalize {

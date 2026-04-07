@@ -654,7 +654,9 @@ pub(super) fn run_diff_history(
         alloc_deltas.pack_exec = pack_exec_alloc_after.since(&pack_exec_alloc_before);
     }
 
-    if !matches!(resume_stage, Some(ScanCheckpointStage::PreFinalize)) {
+    if checkpoint_sink.checkpoints_enabled()
+        && !matches!(resume_stage, Some(ScanCheckpointStage::PreFinalize))
+    {
         checkpoint_stage(
             checkpoint_sink,
             &StageCheckpoint::PreFinalize {
