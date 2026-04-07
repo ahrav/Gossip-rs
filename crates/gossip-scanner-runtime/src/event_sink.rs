@@ -812,4 +812,27 @@ mod tests {
             serde_json::from_slice(&output).expect("double flush must still produce valid SARIF");
         assert_eq!(value["version"], "2.1.0");
     }
+
+    #[test]
+    fn write_oid_hex_matches_hex_oid_encoding() {
+        for oid in [
+            scanner_git::OidBytes::sha1([
+                0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB,
+                0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98,
+            ]),
+            scanner_git::OidBytes::sha256([0x55; 32]),
+        ] {
+            let mut buf = Vec::new();
+            write_oid_hex(&mut buf, &oid);
+            // Strip JSON quotes from write_oid_hex output.
+            let hex_from_write = std::str::from_utf8(&buf[1..buf.len() - 1]).unwrap();
+            let hex_oid = gossip_stdx::HexOid::from_oid_bytes(oid.as_slice());
+            assert_eq!(
+                hex_from_write,
+                hex_oid.as_str(),
+                "write_oid_hex and HexOid::from_oid_bytes must produce identical hex for {}-byte OID",
+                oid.len(),
+            );
+        }
+    }
 }

@@ -1361,6 +1361,14 @@ mod tests {
             !debug.contains("cafebabedeadbeef0123456789abcdeffedcba98"),
             "sanitized debug output must not expose raw OID hex: {debug}"
         );
+        assert!(
+            !debug.contains("0xca"),
+            "sanitized debug output must not contain raw OID byte representations: {debug}"
+        );
+        assert!(
+            !debug.contains("[ca,"),
+            "sanitized debug output must not contain OidBytes debug format: {debug}"
+        );
 
         match record {
             SanitizedCoordinationRecord::GitCommitMeta { shard_id, oid, .. } => {

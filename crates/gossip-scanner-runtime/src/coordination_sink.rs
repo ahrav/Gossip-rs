@@ -759,6 +759,26 @@ mod tests {
     }
 
     #[test]
+    fn findings_capture_sink_forwards_sha256_git_events() {
+        let (sink, recorder) = make_sink_and_recorder();
+        let oid = scanner_git::OidBytes::sha256([0xCD; 32]);
+        sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+            commit_id: 2,
+            commit_oid: oid,
+            timestamp: 1_700_000_000,
+            identity: None,
+        }));
+        let forwarded = recorder.git_events.lock().unwrap();
+        match &forwarded[0] {
+            StoredGitEvent::CommitMeta { commit_oid, .. } => {
+                assert_eq!(*commit_oid, oid, "SHA-256 OID must survive forwarding");
+                assert_eq!(commit_oid.len(), 32, "SHA-256 OIDs are 32 bytes");
+            }
+            other => panic!("expected CommitMeta, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn findings_capture_sink_preserves_identity_ids() {
         let (sink, recorder) = make_sink_and_recorder();
 
@@ -796,6 +816,15 @@ mod tests {
     /// The `OidBytes` field (33 bytes) keeps the enum at ~80 bytes.
     /// This bound catches accidental field inflation.
     const _: () = assert!(std::mem::size_of::<StoredGitEvent>() <= 80);
+
+    #[test]
+    fn stored_git_event_stays_compact() {
+        let current = std::mem::size_of::<StoredGitEvent>();
+        assert!(
+            current <= 96,
+            "StoredGitEvent should stay compact ({current} bytes, limit 96)"
+        );
+    }
 
     #[test]
     fn findings_capture_sink_skips_invalid_blob_oid_payloads() {
