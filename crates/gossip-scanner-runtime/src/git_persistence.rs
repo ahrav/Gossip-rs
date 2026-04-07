@@ -1255,17 +1255,18 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{collections::BTreeSet, num::NonZeroU32};
 
     use gossip_contracts::{
         connector::git::RepoKey,
         identity::{FenceEpoch, PolicyHash, RunId, ShardId, TenantId},
         persistence::CheckpointBoundaryKind,
     };
+    use proptest::prelude::*;
 
     use super::test_support::*;
     use super::*;
-    use scanner_git::NS_REF_WATERMARK;
+    use scanner_git::{NS_REF_WATERMARK, NS_SEEN_STAGING};
 
     fn write_context() -> WriteContext {
         WriteContext::new(
@@ -1309,6 +1310,60 @@ mod tests {
 
     fn sim_oid(byte: u8) -> OidBytes {
         OidBytes::sha1([byte; 20])
+    }
+
+    fn fresh_adapter(
+        backend: &TestBackend,
+        repo_id: u64,
+        policy_hash: [u8; 32],
+    ) -> GitPersistenceAdapter<TestBackend> {
+        GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash)
+    }
+
+    fn complete_finalize_with_watermark(value: u8) -> FinalizeOutput {
+        FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: vec![WriteOp {
+                key: b"rw\0wm".to_vec(),
+                value: vec![value],
+            }],
+            outcome: FinalizeOutcome::Complete,
+            stats: Default::default(),
+        }
+    }
+
+    fn read_bitmap(backend: &TestBackend, key: &[u8], label: &str) -> RoaringSeenBitmap {
+        let bytes = backend
+            .get_value(key)
+            .unwrap_or_else(|| panic!("{label} key must exist"));
+        RoaringSeenBitmap::deserialize(&bytes)
+            .unwrap_or_else(|err| panic!("{label} bitmap must deserialize: {err}"))
+    }
+
+    fn assert_scope_contains(
+        backend: &TestBackend,
+        repo_id: u64,
+        policy_hash: &[u8; 32],
+        oids: &[OidBytes],
+    ) {
+        let key = build_seen_scope_key(repo_id, policy_hash);
+        let bitmap = read_bitmap(backend, &key, "scope");
+        for oid in oids {
+            assert!(bitmap.contains(oid), "scope bitmap missing {oid:?}");
+        }
+    }
+
+    fn assert_staging_contains(
+        backend: &TestBackend,
+        repo_id: u64,
+        policy_hash: &[u8; 32],
+        oids: &[OidBytes],
+    ) {
+        let key = build_seen_staging_key(repo_id, policy_hash);
+        let bitmap = read_bitmap(backend, &key, "staging");
+        for oid in oids {
+            assert!(bitmap.contains(oid), "staging bitmap missing {oid:?}");
+        }
     }
 
     #[test]
@@ -2648,6 +2703,110 @@ mod tests {
     }
 
     #[test]
+    fn cold_cache_finalize_rejects_corrupt_staging_bitmap() {
+        let backend = TestBackend::non_atomic();
+        let repo_id = 26;
+        let policy_hash = [0x26; 32];
+        let staging_key = build_seen_staging_key(repo_id, &policy_hash);
+        let scope_key = build_seen_scope_key(repo_id, &policy_hash);
+        backend.set(staging_key.clone(), vec![0xFF]);
+
+        let adapter = fresh_adapter(&backend, repo_id, policy_hash);
+        let err = adapter
+            .commit_finalize(&complete_finalize_with_watermark(1))
+            .expect_err("corrupt staging bytes must fail the cold-cache finalize");
+
+        assert!(
+            format!("{err}").contains("corrupt staging bitmap"),
+            "error should mention corrupt staging bitmap, got: {err}"
+        );
+        assert!(
+            backend.contains_key(&staging_key),
+            "corrupt staging bytes must remain untouched after the failed finalize"
+        );
+        assert!(
+            !backend.contains_key(&scope_key),
+            "scope writes must not land when staging deserialization fails"
+        );
+        assert!(
+            backend.get_value(b"rw\0wm").is_none(),
+            "watermarks must not land when finalize aborts before writing batches"
+        );
+    }
+
+    #[test]
+    fn consecutive_crashes_across_finalize_phases_recover_union_of_all_staged_oids() {
+        let backend = TestBackend::non_atomic();
+        let repo_id = 27;
+        let policy_hash = [0x27; 32];
+        let oid_a = sim_oid(0xA1);
+        let oid_b = sim_oid(0xB2);
+        let oid_c = sim_oid(0xC3);
+
+        let first = fresh_adapter(&backend, repo_id, policy_hash);
+        first
+            .persist_seen_delta(&[oid_a])
+            .expect("stage first crash OID");
+        backend.set_batch_faults(vec![BatchFaultTrigger::key_prefix(&NS_REF_WATERMARK)]);
+        first
+            .commit_finalize(&complete_finalize_with_watermark(1))
+            .expect_err("watermark-phase failure must propagate");
+        assert_scope_contains(&backend, repo_id, &policy_hash, &[oid_a]);
+        assert!(
+            !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
+            "watermark-phase failure must leave staging deleted once the scope committed"
+        );
+        assert!(
+            backend.get_value(b"rw\0wm").is_none(),
+            "watermarks must remain absent after the first crash"
+        );
+
+        let second = fresh_adapter(&backend, repo_id, policy_hash);
+        second
+            .persist_seen_delta(&[oid_b])
+            .expect("stage second crash OID");
+        backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
+        second
+            .commit_finalize(&complete_finalize_with_watermark(2))
+            .expect_err("first-phase failure must propagate");
+        assert_scope_contains(&backend, repo_id, &policy_hash, &[oid_a]);
+        assert_staging_contains(&backend, repo_id, &policy_hash, &[oid_b]);
+        assert_eq!(
+            fresh_adapter(&backend, repo_id, policy_hash)
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("cold-cache reload after the second crash"),
+            vec![true, false],
+            "the recovered scope must reflect only the first durable finalize"
+        );
+
+        let recovered = fresh_adapter(&backend, repo_id, policy_hash);
+        recovered
+            .persist_seen_delta(&[oid_c])
+            .expect("stage recovery OID");
+        recovered
+            .commit_finalize(&complete_finalize_with_watermark(3))
+            .expect("recovery finalize must succeed");
+
+        assert_eq!(
+            recovered
+                .batch_check_seen(&[oid_a, oid_b, oid_c])
+                .expect("final seen check"),
+            vec![true, true, true],
+            "the recovered scope must contain every OID staged across both crashes"
+        );
+        assert_scope_contains(&backend, repo_id, &policy_hash, &[oid_a, oid_b, oid_c]);
+        assert!(
+            !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
+            "successful recovery must clear staging"
+        );
+        assert_eq!(
+            backend.get_value(b"rw\0wm").as_deref(),
+            Some(&[3][..]),
+            "successful recovery must advance watermarks"
+        );
+    }
+
+    #[test]
     fn load_watermarks_rejects_multi_get_result_count_mismatch() {
         let backend = TestBackend::atomic();
         let adapter = GitPersistenceAdapter::new(backend.clone(), 20, [0xFF; 32]);
@@ -2685,5 +2844,70 @@ mod tests {
         let a = derive_ovid_hash(&git_repo_ovid_inputs(42));
         let b = derive_ovid_hash(&git_repo_ovid_inputs(42));
         assert_eq!(a, b, "same repo ID must derive the same OVID");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn proptest_crash_recovery_preserves_seen_union(
+            crash_phase in 0u8..3,
+            crashed_oids in prop::collection::btree_set(any::<[u8; 20]>(), 1..=20),
+            recovery_oids in prop::collection::btree_set(any::<[u8; 20]>(), 0..=20),
+        ) {
+            let backend = TestBackend::non_atomic();
+            let repo_id = 31;
+            let policy_hash = [0x31; 32];
+            let crashed_oids: Vec<_> = crashed_oids.into_iter().map(OidBytes::sha1).collect();
+            let recovery_oids: Vec<_> = recovery_oids.into_iter().map(OidBytes::sha1).collect();
+
+            let crashed = fresh_adapter(&backend, repo_id, policy_hash);
+            crashed
+                .persist_seen_delta(&crashed_oids)
+                .expect("initial staging write must succeed");
+            let trigger = match crash_phase {
+                0 => BatchFaultTrigger::any(),
+                1 => BatchFaultTrigger::key_prefix(&NS_SEEN_STAGING),
+                _ => BatchFaultTrigger::key_prefix(&NS_REF_WATERMARK),
+            };
+            backend.set_batch_faults(vec![trigger]);
+            crashed
+                .commit_finalize(&complete_finalize_with_watermark(1))
+                .expect_err("configured finalize crash must propagate");
+
+            let recovered = fresh_adapter(&backend, repo_id, policy_hash);
+            recovered
+                .persist_seen_delta(&recovery_oids)
+                .expect("recovery staging write must succeed");
+            recovered
+                .commit_finalize(&complete_finalize_with_watermark(2))
+                .expect("recovery finalize must succeed");
+
+            let expected: Vec<_> = crashed_oids
+                .iter()
+                .chain(&recovery_oids)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+
+            prop_assert_eq!(
+                recovered
+                    .batch_check_seen(&expected)
+                    .expect("final seen check"),
+                vec![true; expected.len()],
+            );
+            prop_assert!(
+                !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
+                "successful recovery must clear staging"
+            );
+            prop_assert!(
+                backend.get_value(b"rw\0wm").is_some(),
+                "successful recovery must advance watermarks"
+            );
+        }
     }
 }
