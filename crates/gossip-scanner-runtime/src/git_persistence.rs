@@ -900,7 +900,7 @@ pub mod test_support {
         /// Fires on any `apply_batch` call regardless of key content.
         Any,
         /// Fires only when at least one op key starts with the given prefix.
-        KeyPrefix(Vec<u8>),
+        KeyPrefix(&'static [u8]),
     }
 
     impl BatchFaultTrigger {
