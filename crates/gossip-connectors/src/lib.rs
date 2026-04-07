@@ -1,9 +1,8 @@
-//! Source connectors: filesystem, git, and in-memory implementations.
+//! Source connectors: filesystem and in-memory implementations.
 //!
 //! This crate provides concrete source-family implementations that bridge
-//! specific data sources (local filesystem, git repository snapshots, or
-//! deterministic in-memory fixtures) into the shared connector contracts
-//! defined in `gossip-contracts`.
+//! specific data sources (local filesystem or deterministic in-memory fixtures)
+//! into the shared connector contracts defined in `gossip-contracts`.
 //!
 //! Shared connector value types (`ScanItem`, `ItemRef`, etc.) live in the
 //! `gossip_contracts::connector` module. This crate supplies concrete adapters
@@ -31,14 +30,12 @@
 mod common;
 #[cfg(unix)]
 pub mod filesystem;
-pub mod git;
 pub mod in_memory;
 mod split_estimator;
 
 pub use common::{is_permanent_io_error, is_symlink_loop, path_buf_from_bytes};
 #[cfg(unix)]
 pub use filesystem::FilesystemConnector;
-pub use git::GitConnector;
 pub use gossip_contracts::connector::{
     FILESYSTEM_CONNECTOR_TAG, GIT_CONNECTOR_TAG, IN_MEMORY_CONNECTOR_TAG,
 };
