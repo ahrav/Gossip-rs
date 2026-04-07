@@ -378,8 +378,9 @@ pub use watermark_keys::{
 pub use byte_arena::{ByteArena, ByteRef};
 pub use bytes::BytesView;
 pub use checkpoint::{
-    CheckpointAck, LoadedScanCheckpoint, NoopCheckpointSink, ScanCheckpointError,
-    ScanCheckpointSink, ScanCheckpointStage, StageCheckpoint,
+    CheckpointAck, CommitPlanResumeState, LoadedScanCheckpoint, NoopCheckpointSink,
+    ScanCheckpointError, ScanCheckpointSink, ScanCheckpointStage, ScanResumeBaseState,
+    ScanResumePrefixState, ScanResumeState, StageCheckpoint,
 };
 pub use errors::PersistError;
 pub use errors::{CommitPlanError, MappingCandidateKind, RepoOpenError, SpillError, TreeDiffError};

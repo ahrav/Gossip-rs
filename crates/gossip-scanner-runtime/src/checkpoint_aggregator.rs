@@ -494,10 +494,11 @@ impl PrefixCheckpointAggregator {
         // because both are set in the same loop iteration.
         let boundary = last_boundary.expect("set in the same iteration as last_sequence_no");
 
-        let checkpoint_boundary =
-            strip_checkpoint_token(boundary).ok_or(PrefixCheckpointError::MissingProgressKey {
+        let checkpoint_boundary = normalize_checkpoint_cursor(boundary).ok_or(
+            PrefixCheckpointError::MissingProgressKey {
                 sequence_no: last_seq,
-            })?;
+            },
+        )?;
         let committed_units = NonZeroU64::new(totals.committed_units).ok_or(
             PrefixCheckpointError::InternalInconsistency {
                 detail: "non-empty contiguous prefix committed zero units",
@@ -576,7 +577,16 @@ fn validate_receipt(
     Ok(receipt.completed_unit().checkpoint_boundary_kind())
 }
 
-fn strip_checkpoint_token(boundary: &CheckpointBoundary) -> Option<CheckpointBoundary> {
+/// Normalizes a checkpoint cursor for persistence.
+///
+/// The behavior is asymmetric by boundary kind:
+///  - **OrderedContent**: strips the token, preserving only the authoritative
+///    `last_key`. Tokens here are seek optimizations that must not leak into
+///    persisted checkpoints.
+///  - **RepoFrontier**: preserves the full cursor including the token. The
+///    token encodes inner-stage resume state (e.g. mid-scan progress) that
+///    the discovery source needs for resumption.
+fn normalize_checkpoint_cursor(boundary: &CheckpointBoundary) -> Option<CheckpointBoundary> {
     Some(match boundary {
         CheckpointBoundary::OrderedContent(_) => {
             // Ordered-content tokens are seek optimizations — strip them so

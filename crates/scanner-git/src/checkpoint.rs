@@ -1,7 +1,7 @@
 //! Durable stage checkpoints for Git scan resumption.
 //!
 //! The Git scan runner can persist stage-complete state at four boundaries:
-////!
+//!
 //! 1. post-commit-plan
 //! 2. post-spill/dedup
 //! 3. post-clean-pack-prefix
@@ -336,7 +336,7 @@ impl StageCheckpoint<'_> {
         };
 
         let mut token = Vec::with_capacity(9);
-        token.extend_from_slice(b"gcp1");
+        token.extend_from_slice(b"gcp\0");
         token.push(self.stage().as_u8());
         token.extend_from_slice(&completed_plan_count.to_le_bytes());
         Ok(token)
@@ -344,7 +344,7 @@ impl StageCheckpoint<'_> {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum ScanResumeState {
+pub enum ScanResumeState {
     PostCommitPlan(CommitPlanResumeState),
     PostSpillDedup(ScanResumeBaseState),
     PackPlanComplete {
@@ -358,7 +358,7 @@ pub(crate) enum ScanResumeState {
 }
 
 impl ScanResumeState {
-    pub(crate) fn from_loaded(
+    pub fn from_loaded(
         loaded: LoadedScanCheckpoint,
         scan_mode: GitScanMode,
         artifact_fingerprint: &RepoArtifactFingerprint,
@@ -497,28 +497,28 @@ impl ScanResumeState {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct CommitPlanResumeState {
-    pub(crate) plan: Vec<PlannedCommit>,
+pub struct CommitPlanResumeState {
+    pub plan: Vec<PlannedCommit>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ScanResumeBaseState {
-    pub(crate) plan: Vec<PlannedCommit>,
-    pub(crate) packed: Vec<PackCandidate>,
-    pub(crate) loose: Vec<LooseCandidate>,
-    pub(crate) path_arena: ByteArena,
-    pub(crate) tree_diff_stats: TreeDiffStats,
-    pub(crate) spill_stats: SpillStats,
-    pub(crate) mapping_stats: MappingStats,
+pub struct ScanResumeBaseState {
+    pub plan: Vec<PlannedCommit>,
+    pub packed: Vec<PackCandidate>,
+    pub loose: Vec<LooseCandidate>,
+    pub path_arena: ByteArena,
+    pub tree_diff_stats: TreeDiffStats,
+    pub spill_stats: SpillStats,
+    pub mapping_stats: MappingStats,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ScanResumePrefixState {
-    pub(crate) stage: ScanCheckpointStage,
-    pub(crate) completed_plan_count: usize,
-    pub(crate) scanned: ScannedBlobs,
-    pub(crate) skipped_candidates: Vec<SkippedCandidate>,
-    pub(crate) common_metrics: GitScanCommonMetrics,
+pub struct ScanResumePrefixState {
+    pub stage: ScanCheckpointStage,
+    pub completed_plan_count: usize,
+    pub scanned: ScannedBlobs,
+    pub skipped_candidates: Vec<SkippedCandidate>,
+    pub common_metrics: GitScanCommonMetrics,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1231,7 +1231,7 @@ mod tests {
             common_metrics: GitScanCommonMetrics::default(),
         };
         let token = checkpoint.resume_token().expect("token");
-        assert_eq!(&token[..4], b"gcp1");
+        assert_eq!(&token[..4], b"gcp\0");
         assert_eq!(token[4], ScanCheckpointStage::PackPlanComplete.as_u8());
         assert_eq!(u32::from_le_bytes(token[5..9].try_into().unwrap()), 3);
     }
@@ -1425,5 +1425,402 @@ mod tests {
         );
         assert_eq!(prefix.common_metrics.objects_scanned, 50);
         assert_eq!(prefix.common_metrics.bytes_scanned, 1_000_000);
+    }
+
+    /// Helper: builds a non-trivial `PostSpillDedup` checkpoint and returns the
+    /// encoded base state alongside the inputs for later verification.
+    fn encode_spill_dedup_base(
+        fp: &RepoArtifactFingerprint,
+    ) -> (
+        Vec<u8>,
+        Vec<PlannedCommit>,
+        Vec<PackCandidate>,
+        Vec<LooseCandidate>,
+        ByteArena,
+        TreeDiffStats,
+        SpillStats,
+        MappingStats,
+    ) {
+        let commits = vec![
+            PlannedCommit {
+                pos: Position(3),
+                snapshot_root: false,
+            },
+            PlannedCommit {
+                pos: Position(17),
+                snapshot_root: true,
+            },
+        ];
+        let mut path_arena = ByteArena::with_capacity(4096);
+        let path_ref = path_arena.intern(b"lib/scanner.rs").unwrap();
+
+        let oid_a = OidBytes::sha1([0xAA; 20]);
+        let oid_b = OidBytes::sha1([0xBB; 20]);
+        let ctx = CandidateContext {
+            commit_id: 5,
+            parent_idx: 1,
+            change_kind: ChangeKind::Modify,
+            ctx_flags: 0o100755,
+            cand_flags: 2,
+            path_ref,
+        };
+        let packed = vec![
+            PackCandidate {
+                oid: oid_a,
+                ctx,
+                pack_id: 4,
+                offset: 8192,
+            },
+            PackCandidate {
+                oid: oid_b,
+                ctx,
+                pack_id: 1,
+                offset: 256,
+            },
+        ];
+        let loose = vec![LooseCandidate { oid: oid_b, ctx }];
+
+        let tree_diff_stats = TreeDiffStats {
+            trees_loaded: 20,
+            tree_bytes_loaded: 4096,
+            tree_bytes_in_flight_peak: 1024,
+            candidates_emitted: 12,
+            subtrees_skipped: 3,
+            max_depth_reached: 5,
+        };
+        let spill_stats = SpillStats {
+            candidates_received: 200,
+            unique_blobs: 80,
+            spill_runs: 4,
+            spill_bytes: 16384,
+            seen_blobs: 20,
+            emitted_blobs: 60,
+        };
+        let mapping_stats = MappingStats {
+            unique_blobs_in: 80,
+            packed_matched: 55,
+            loose_unmatched: 25,
+        };
+
+        let checkpoint = StageCheckpoint::PostSpillDedup {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: fp,
+            plan: &commits,
+            packed: &packed,
+            loose: &loose,
+            path_arena: &path_arena,
+            tree_diff_stats: tree_diff_stats.clone(),
+            spill_stats: spill_stats.clone(),
+            mapping_stats,
+        };
+        let base_bytes = checkpoint
+            .encode_base_state()
+            .expect("encode must succeed")
+            .expect("PostSpillDedup produces base state");
+
+        (
+            base_bytes,
+            commits,
+            packed,
+            loose,
+            path_arena,
+            tree_diff_stats,
+            spill_stats,
+            mapping_stats,
+        )
+    }
+
+    #[test]
+    fn resume_state_round_trips_spill_dedup_base() {
+        let fp = artifact(10);
+        let (
+            base_bytes,
+            commits,
+            packed,
+            loose,
+            path_arena,
+            tree_diff_stats,
+            spill_stats,
+            mapping_stats,
+        ) = encode_spill_dedup_base(&fp);
+
+        let loaded = LoadedScanCheckpoint {
+            base_state: Some(base_bytes),
+            prefix_state: None,
+        };
+        let resume = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect("from_loaded should succeed")
+            .expect("matching fingerprint should produce Some");
+
+        match resume {
+            ScanResumeState::PostSpillDedup(base) => {
+                assert_eq!(base.plan.len(), commits.len());
+                assert_eq!(base.plan[0].pos, Position(3));
+                assert!(!base.plan[0].snapshot_root);
+                assert_eq!(base.plan[1].pos, Position(17));
+                assert!(base.plan[1].snapshot_root);
+
+                assert_eq!(base.packed.len(), packed.len());
+                assert_eq!(base.packed[0].oid, packed[0].oid);
+                assert_eq!(base.packed[0].pack_id, 4);
+                assert_eq!(base.packed[0].offset, 8192);
+                assert_eq!(base.packed[1].oid, packed[1].oid);
+                assert_eq!(base.packed[1].pack_id, 1);
+
+                assert_eq!(base.loose.len(), loose.len());
+                assert_eq!(base.loose[0].oid, loose[0].oid);
+
+                assert_eq!(
+                    base.path_arena.backing_bytes().len(),
+                    path_arena.backing_bytes().len()
+                );
+
+                assert_eq!(
+                    base.tree_diff_stats.trees_loaded,
+                    tree_diff_stats.trees_loaded
+                );
+                assert_eq!(
+                    base.tree_diff_stats.tree_bytes_loaded,
+                    tree_diff_stats.tree_bytes_loaded
+                );
+                assert_eq!(
+                    base.tree_diff_stats.candidates_emitted,
+                    tree_diff_stats.candidates_emitted
+                );
+                assert_eq!(
+                    base.tree_diff_stats.subtrees_skipped,
+                    tree_diff_stats.subtrees_skipped
+                );
+                assert_eq!(
+                    base.tree_diff_stats.max_depth_reached,
+                    tree_diff_stats.max_depth_reached
+                );
+
+                assert_eq!(
+                    base.spill_stats.candidates_received,
+                    spill_stats.candidates_received
+                );
+                assert_eq!(base.spill_stats.unique_blobs, spill_stats.unique_blobs);
+                assert_eq!(base.spill_stats.spill_runs, spill_stats.spill_runs);
+                assert_eq!(base.spill_stats.spill_bytes, spill_stats.spill_bytes);
+                assert_eq!(base.spill_stats.seen_blobs, spill_stats.seen_blobs);
+                assert_eq!(base.spill_stats.emitted_blobs, spill_stats.emitted_blobs);
+
+                assert_eq!(
+                    base.mapping_stats.unique_blobs_in,
+                    mapping_stats.unique_blobs_in
+                );
+                assert_eq!(
+                    base.mapping_stats.packed_matched,
+                    mapping_stats.packed_matched
+                );
+                assert_eq!(
+                    base.mapping_stats.loose_unmatched,
+                    mapping_stats.loose_unmatched
+                );
+            }
+            other => panic!(
+                "expected PostSpillDedup, got stage {:?}",
+                other.plan().len()
+            ),
+        }
+    }
+
+    #[test]
+    fn resume_state_round_trips_pack_plan_prefix() {
+        let fp = artifact(11);
+        let (base_bytes, _, _, _, _, _, _, _) = encode_spill_dedup_base(&fp);
+
+        let oid = OidBytes::sha1([0xCC; 20]);
+        let ctx = CandidateContext {
+            commit_id: 3,
+            parent_idx: 0,
+            change_kind: ChangeKind::Add,
+            ctx_flags: 0o100644,
+            cand_flags: 0,
+            path_ref: ByteRef::new(0, 0),
+        };
+        let finding = ScoredFinding {
+            key: FindingKey {
+                start: 5,
+                end: 15,
+                rule_id: 42,
+                norm_hash: [0xDD; 32],
+            },
+            confidence_score: -3,
+        };
+        let scanned = ScannedBlobs {
+            blobs: vec![ScannedBlob {
+                oid,
+                ctx,
+                findings: FindingSpan { start: 0, len: 1 },
+            }],
+            finding_arena: vec![finding],
+        };
+        let skipped = vec![SkippedCandidate {
+            oid,
+            reason: CandidateSkipReason::LooseMissing,
+        }];
+        let common_metrics = GitScanCommonMetrics {
+            objects_scanned: 100,
+            chunks_scanned: 400,
+            bytes_scanned: 2_000_000,
+            findings_emitted: 5,
+            binary_skipped: 2,
+            ext_skipped: 1,
+            lock_skipped: 0,
+            binary_extracted: 1,
+            errors: 0,
+        };
+
+        let prefix_checkpoint = StageCheckpoint::PackPlanComplete {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &fp,
+            plan: &[],
+            packed: &[],
+            loose: &[],
+            path_arena: &ByteArena::with_capacity(0),
+            tree_diff_stats: TreeDiffStats::default(),
+            spill_stats: SpillStats::default(),
+            mapping_stats: MappingStats::default(),
+            completed_plan_count: 2,
+            scanned: &scanned,
+            skipped_candidates: &skipped,
+            common_metrics,
+        };
+        let prefix_bytes = prefix_checkpoint
+            .encode_prefix_state()
+            .expect("prefix encode")
+            .expect("PackPlanComplete must produce prefix state");
+
+        let loaded = LoadedScanCheckpoint {
+            base_state: Some(base_bytes),
+            prefix_state: Some(prefix_bytes),
+        };
+        let resume = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect("from_loaded should succeed")
+            .expect("matching fingerprint should produce Some");
+
+        let (stage, _base, prefix) = resume.into_parts();
+        assert_eq!(stage, ScanCheckpointStage::PackPlanComplete);
+
+        let prefix = prefix.expect("prefix must be present");
+        assert_eq!(prefix.completed_plan_count, 2);
+        assert_eq!(prefix.scanned.blobs.len(), 1);
+        assert_eq!(prefix.scanned.finding_arena.len(), 1);
+        assert_eq!(prefix.scanned.finding_arena[0].confidence_score, -3);
+        assert_eq!(prefix.skipped_candidates.len(), 1);
+        assert_eq!(
+            prefix.skipped_candidates[0].reason,
+            CandidateSkipReason::LooseMissing
+        );
+        assert_eq!(prefix.common_metrics.objects_scanned, 100);
+        assert_eq!(prefix.common_metrics.chunks_scanned, 400);
+        assert_eq!(prefix.common_metrics.bytes_scanned, 2_000_000);
+        assert_eq!(prefix.common_metrics.findings_emitted, 5);
+        assert_eq!(prefix.common_metrics.binary_skipped, 2);
+        assert_eq!(prefix.common_metrics.ext_skipped, 1);
+        assert_eq!(prefix.common_metrics.binary_extracted, 1);
+    }
+
+    #[test]
+    fn from_loaded_rejects_prefix_without_base() {
+        let loaded = LoadedScanCheckpoint {
+            base_state: None,
+            prefix_state: Some(vec![0]),
+        };
+        let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &artifact(20))
+            .expect_err("should reject prefix without base");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("prefix checkpoint exists without"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_loaded_rejects_commit_plan_with_prefix() {
+        let fp = artifact(21);
+        let checkpoint = StageCheckpoint::PostCommitPlan {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &fp,
+            plan: &plan(),
+        };
+        let base_bytes = checkpoint
+            .encode_base_state()
+            .expect("encode")
+            .expect("PostCommitPlan produces base state");
+
+        let loaded = LoadedScanCheckpoint {
+            base_state: Some(base_bytes),
+            prefix_state: Some(vec![0xFF]),
+        };
+        let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect_err("should reject commit-plan with prefix");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("commit-plan checkpoint cannot carry"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_loaded_rejects_invalid_prefix_stage() {
+        let fp = artifact(22);
+        let (base_bytes, _, _, _, _, _, _, _) = encode_spill_dedup_base(&fp);
+
+        // Build a prefix payload with an invalid stage (PostCommitPlan is not
+        // valid as a prefix discriminator).
+        let invalid_prefix = StoredPrefixState {
+            stage: ScanCheckpointStage::PostCommitPlan,
+            completed_plan_count: 0,
+            scanned: StoredScannedBlobs {
+                blobs: Vec::new(),
+                finding_arena: Vec::new(),
+            },
+            skipped_candidates: Vec::new(),
+            common_metrics: StoredGitScanCommonMetrics::from(GitScanCommonMetrics::default()),
+        };
+        let prefix_bytes = checkpoint_codec()
+            .serialize(&invalid_prefix)
+            .expect("serialize invalid prefix");
+
+        let loaded = LoadedScanCheckpoint {
+            base_state: Some(base_bytes),
+            prefix_state: Some(prefix_bytes),
+        };
+        let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect_err("should reject invalid prefix stage");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid stage discriminator"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn resume_state_ignores_stale_scan_mode() {
+        let fp = artifact(23);
+        let checkpoint = StageCheckpoint::PostCommitPlan {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &fp,
+            plan: &plan(),
+        };
+        let base_bytes = checkpoint
+            .encode_base_state()
+            .expect("encode")
+            .expect("PostCommitPlan produces base state");
+
+        let loaded = LoadedScanCheckpoint {
+            base_state: Some(base_bytes),
+            prefix_state: None,
+        };
+        // Load with a different scan mode than what was encoded.
+        let result =
+            ScanResumeState::from_loaded(loaded, GitScanMode::OdbBlobFast, &fp).expect("load ok");
+        assert!(
+            result.is_none(),
+            "scan_mode mismatch must discard the checkpoint"
+        );
     }
 }

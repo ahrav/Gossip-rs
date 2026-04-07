@@ -412,6 +412,11 @@ pub(super) fn run_odb_blob(
     } else {
         (Vec::new(), Vec::new())
     };
+    // Drop candidates for packs fully scanned in a prior checkpoint run.
+    // Without this filter, bucket_pack_candidates builds plans for
+    // already-complete packs that are later skipped via
+    // completed_plan_prefix_len, wasting mmap and planning work.
+    packed.retain(|cand| !completed_packs.is_complete(cand.pack_id));
 
     let pack_dirs = collect_pack_dirs(&repo.paths);
     let pack_names = list_pack_files(&pack_dirs)?;

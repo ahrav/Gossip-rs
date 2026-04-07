@@ -930,7 +930,8 @@ where
             return Ok(());
         }
 
-        // Non-atomic path: write data+seen first, then advance watermarks.
+        // Non-atomic path: write data+seen first, then advance watermarks,
+        // then delete checkpoint keys last.
         //
         // For complete finalize, the staging Delete is in a separate batch
         // AFTER the seen scope Put so a crash between batches cannot lose
@@ -947,12 +948,15 @@ where
         // bitmap from the backend while watermarks remain at the old
         // position. The next scan re-walks the same commit range but skips
         // already-seen blobs, producing no duplicate findings.
+        //
+        // Checkpoint deletes are applied in a final batch so that a crash
+        // before watermarks are durable leaves the checkpoint intact for
+        // resume instead of forcing a full re-scan.
         if has_staging && !is_complete {
             first_phase_ops.push(GitPersistenceOp::Delete {
                 key: seen_staging_key.clone(),
             });
         }
-        first_phase_ops.extend(checkpoint_delete_ops.iter().cloned());
         if !first_phase_ops.is_empty() {
             self.backend
                 .apply_batch(&first_phase_ops)
@@ -973,6 +977,9 @@ where
                 .apply_batch(&watermark_ops)
                 .map_err(|err| PersistError::backend(err.to_string()))?;
         }
+        self.backend
+            .apply_batch(&checkpoint_delete_ops)
+            .map_err(|err| PersistError::backend(err.to_string()))?;
         Ok(())
     }
 }
@@ -1464,8 +1471,8 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use scanner_git::{
-        ByteArena, GitScanCommonMetrics, GitScanMode, MappingStats, NS_REF_WATERMARK, ScannedBlobs,
-        SpillStats, TreeDiffStats,
+        ByteArena, GitScanCommonMetrics, GitScanMode, MappingStats, NS_REF_WATERMARK,
+        RepoArtifactFingerprint, ScanResumeState, ScannedBlobs, SpillStats, TreeDiffStats,
     };
 
     fn write_context() -> WriteContext {
@@ -1529,12 +1536,14 @@ mod tests {
             finding_arena: Vec::new(),
         };
 
+        let fingerprint = RepoArtifactFingerprint {
+            packs_hash: [0x11; 32],
+            idx_hash: [0x22; 32],
+        };
+
         sink.notify_stage_complete(&StageCheckpoint::PostSpillDedup {
             scan_mode: GitScanMode::OdbBlobFast,
-            artifact_fingerprint: &scanner_git::RepoArtifactFingerprint {
-                packs_hash: [0x11; 32],
-                idx_hash: [0x22; 32],
-            },
+            artifact_fingerprint: &fingerprint,
             plan: &plan,
             packed: &[],
             loose: &[],
@@ -1551,12 +1560,18 @@ mod tests {
         assert!(base_only.base_state.is_some());
         assert!(base_only.prefix_state.is_none());
 
+        let decoded_base =
+            ScanResumeState::from_loaded(base_only, GitScanMode::OdbBlobFast, &fingerprint)
+                .expect("base decode must succeed")
+                .expect("base state must be present");
+        assert!(
+            matches!(decoded_base, ScanResumeState::PostSpillDedup(..)),
+            "base-only checkpoint should decode as PostSpillDedup"
+        );
+
         sink.notify_stage_complete(&StageCheckpoint::PackPlanComplete {
             scan_mode: GitScanMode::OdbBlobFast,
-            artifact_fingerprint: &scanner_git::RepoArtifactFingerprint {
-                packs_hash: [0x11; 32],
-                idx_hash: [0x22; 32],
-            },
+            artifact_fingerprint: &fingerprint,
             plan: &plan,
             packed: &[],
             loose: &[],
@@ -1576,6 +1591,23 @@ mod tests {
             .expect("base and prefix checkpoints should load");
         assert!(loaded.base_state.is_some());
         assert!(loaded.prefix_state.is_some());
+
+        let decoded_full =
+            ScanResumeState::from_loaded(loaded, GitScanMode::OdbBlobFast, &fingerprint)
+                .expect("full decode must succeed")
+                .expect("full state must be present");
+        match &decoded_full {
+            ScanResumeState::PackPlanComplete { prefix, .. } => {
+                assert_eq!(
+                    prefix.completed_plan_count, 0,
+                    "completed_plan_count must match the value set during checkpoint"
+                );
+            }
+            other => panic!(
+                "expected PackPlanComplete, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
 
         let cursor = sink
             .latest_checkpoint_cursor()
@@ -2915,9 +2947,9 @@ mod tests {
             Some(&[0xBB][..]),
             "watermarks must land on complete finalize"
         );
-        // Non-atomic: exactly 4 batches (staging persist, first-phase
-        // data+seen, staging delete, second-phase watermarks).
-        assert_eq!(backend.batches().len(), 4);
+        // Non-atomic: exactly 5 batches (staging persist, first-phase
+        // data+seen, staging delete, watermarks, checkpoint deletes).
+        assert_eq!(backend.batches().len(), 5);
     }
 
     #[test]
