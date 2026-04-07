@@ -397,6 +397,11 @@ impl ScanResumeState {
                     || RepoArtifactFingerprint::from(base.artifact_fingerprint.clone())
                         != *artifact_fingerprint
                 {
+                    if loaded.prefix_state.is_some() {
+                        tracing::debug!(
+                            "discarding stale prefix checkpoint alongside mismatched base state"
+                        );
+                    }
                     return Ok(None);
                 }
                 let base = ScanResumeBaseState {
@@ -453,32 +458,40 @@ impl ScanResumeState {
         }
     }
 
-    #[must_use]
-    pub(crate) const fn stage(&self) -> ScanCheckpointStage {
+    /// Split resume state into its constituent parts, consuming the value.
+    ///
+    /// Returns `(stage, base_state, prefix_state)` where base and prefix are
+    /// owned, avoiding multi-MiB clones that the reference-based accessors
+    /// would require.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ScanCheckpointStage,
+        Option<ScanResumeBaseState>,
+        Option<ScanResumePrefixState>,
+    ) {
         match self {
-            Self::PostCommitPlan(_) => ScanCheckpointStage::PostCommitPlan,
-            Self::PostSpillDedup(_) => ScanCheckpointStage::PostSpillDedup,
-            Self::PackPlanComplete { .. } => ScanCheckpointStage::PackPlanComplete,
-            Self::PreFinalize { .. } => ScanCheckpointStage::PreFinalize,
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn base_state(&self) -> Option<&ScanResumeBaseState> {
-        match self {
-            Self::PostCommitPlan(_) => None,
-            Self::PostSpillDedup(state) => Some(state),
-            Self::PackPlanComplete { base, .. } | Self::PreFinalize { base, .. } => Some(base),
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn prefix_state(&self) -> Option<&ScanResumePrefixState> {
-        match self {
-            Self::PackPlanComplete { prefix, .. } | Self::PreFinalize { prefix, .. } => {
-                Some(prefix)
+            Self::PostCommitPlan(state) => {
+                let base = ScanResumeBaseState {
+                    plan: state.plan,
+                    packed: Vec::new(),
+                    loose: Vec::new(),
+                    path_arena: ByteArena::with_capacity(0),
+                    tree_diff_stats: TreeDiffStats::default(),
+                    spill_stats: SpillStats::default(),
+                    mapping_stats: MappingStats::default(),
+                };
+                (ScanCheckpointStage::PostCommitPlan, Some(base), None)
             }
-            Self::PostCommitPlan(_) | Self::PostSpillDedup(_) => None,
+            Self::PostSpillDedup(base) => (ScanCheckpointStage::PostSpillDedup, Some(base), None),
+            Self::PackPlanComplete { base, prefix } => (
+                ScanCheckpointStage::PackPlanComplete,
+                Some(base),
+                Some(prefix),
+            ),
+            Self::PreFinalize { base, prefix } => {
+                (ScanCheckpointStage::PreFinalize, Some(base), Some(prefix))
+            }
         }
     }
 }
@@ -696,9 +709,38 @@ impl From<StoredCandidateContext> for CandidateContext {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Fixed-size OID storage that avoids per-OID heap allocation.
+///
+/// `OidBytes` is `(u8 len, [u8; 32])` — always 33 bytes. Storing the raw
+/// layout avoids one `Vec<u8>` allocation per candidate during checkpoint
+/// encoding. For SHA-1 OIDs the trailing 12 bytes are zeroed by
+/// construction.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct StoredOidBytes {
+    len: u8,
+    bytes: [u8; 32],
+}
+
+impl From<OidBytes> for StoredOidBytes {
+    #[inline]
+    fn from(value: OidBytes) -> Self {
+        Self {
+            len: value.len(),
+            bytes: value.raw_bytes(),
+        }
+    }
+}
+
+impl From<StoredOidBytes> for OidBytes {
+    #[inline]
+    fn from(value: StoredOidBytes) -> Self {
+        OidBytes::from_raw(value.len, value.bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct StoredPackCandidate {
-    oid: Vec<u8>,
+    oid: StoredOidBytes,
     ctx: StoredCandidateContext,
     pack_id: u16,
     offset: u64,
@@ -707,7 +749,7 @@ struct StoredPackCandidate {
 impl From<PackCandidate> for StoredPackCandidate {
     fn from(value: PackCandidate) -> Self {
         Self {
-            oid: value.oid.as_slice().to_vec(),
+            oid: value.oid.into(),
             ctx: value.ctx.into(),
             pack_id: value.pack_id,
             offset: value.offset,
@@ -718,7 +760,7 @@ impl From<PackCandidate> for StoredPackCandidate {
 impl From<StoredPackCandidate> for PackCandidate {
     fn from(value: StoredPackCandidate) -> Self {
         Self {
-            oid: OidBytes::from_slice(&value.oid),
+            oid: value.oid.into(),
             ctx: value.ctx.into(),
             pack_id: value.pack_id,
             offset: value.offset,
@@ -726,16 +768,16 @@ impl From<StoredPackCandidate> for PackCandidate {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct StoredLooseCandidate {
-    oid: Vec<u8>,
+    oid: StoredOidBytes,
     ctx: StoredCandidateContext,
 }
 
 impl From<LooseCandidate> for StoredLooseCandidate {
     fn from(value: LooseCandidate) -> Self {
         Self {
-            oid: value.oid.as_slice().to_vec(),
+            oid: value.oid.into(),
             ctx: value.ctx.into(),
         }
     }
@@ -744,7 +786,7 @@ impl From<LooseCandidate> for StoredLooseCandidate {
 impl From<StoredLooseCandidate> for LooseCandidate {
     fn from(value: StoredLooseCandidate) -> Self {
         Self {
-            oid: OidBytes::from_slice(&value.oid),
+            oid: value.oid.into(),
             ctx: value.ctx.into(),
         }
     }
@@ -814,7 +856,7 @@ impl From<StoredSpillStats> for SpillStats {
         Self {
             candidates_received: value.candidates_received,
             unique_blobs: value.unique_blobs,
-            spill_runs: value.spill_runs as usize,
+            spill_runs: value.spill_runs.try_into().unwrap_or(usize::MAX),
             spill_bytes: value.spill_bytes,
             seen_blobs: value.seen_blobs,
             emitted_blobs: value.emitted_blobs,
@@ -927,9 +969,9 @@ impl From<StoredFindingSpan> for FindingSpan {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct StoredScannedBlob {
-    oid: Vec<u8>,
+    oid: StoredOidBytes,
     ctx: StoredCandidateContext,
     findings: StoredFindingSpan,
 }
@@ -937,7 +979,7 @@ struct StoredScannedBlob {
 impl From<ScannedBlob> for StoredScannedBlob {
     fn from(value: ScannedBlob) -> Self {
         Self {
-            oid: value.oid.as_slice().to_vec(),
+            oid: value.oid.into(),
             ctx: value.ctx.into(),
             findings: value.findings.into(),
         }
@@ -947,7 +989,7 @@ impl From<ScannedBlob> for StoredScannedBlob {
 impl From<StoredScannedBlob> for ScannedBlob {
     fn from(value: StoredScannedBlob) -> Self {
         Self {
-            oid: OidBytes::from_slice(&value.oid),
+            oid: value.oid.into(),
             ctx: value.ctx.into(),
             findings: value.findings.into(),
         }
@@ -1040,16 +1082,16 @@ impl From<StoredCandidateSkipReason> for CandidateSkipReason {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct StoredSkippedCandidate {
-    oid: Vec<u8>,
+    oid: StoredOidBytes,
     reason: StoredCandidateSkipReason,
 }
 
 impl From<SkippedCandidate> for StoredSkippedCandidate {
     fn from(value: SkippedCandidate) -> Self {
         Self {
-            oid: value.oid.as_slice().to_vec(),
+            oid: value.oid.into(),
             reason: value.reason.into(),
         }
     }
@@ -1058,7 +1100,7 @@ impl From<SkippedCandidate> for StoredSkippedCandidate {
 impl From<StoredSkippedCandidate> for SkippedCandidate {
     fn from(value: StoredSkippedCandidate) -> Self {
         Self {
-            oid: OidBytes::from_slice(&value.oid),
+            oid: value.oid.into(),
             reason: value.reason.into(),
         }
     }
@@ -1229,5 +1271,159 @@ mod tests {
                 .is_some(),
             "clean-prefix checkpoints must still emit a prefix blob"
         );
+    }
+
+    #[test]
+    fn round_trip_pack_plan_complete_through_from_loaded() {
+        let fp = artifact(5);
+        let commits = plan();
+        let mut path_arena = ByteArena::with_capacity(1024);
+        let path_ref = path_arena.intern(b"src/main.rs").unwrap();
+
+        let oid = OidBytes::sha1([0xAA; 20]);
+        let ctx = CandidateContext {
+            commit_id: 7,
+            parent_idx: 0,
+            change_kind: ChangeKind::Add,
+            ctx_flags: 0o100644,
+            cand_flags: 1,
+            path_ref,
+        };
+        let packed = vec![PackCandidate {
+            oid,
+            ctx,
+            pack_id: 2,
+            offset: 4096,
+        }];
+        let loose = vec![LooseCandidate { oid, ctx }];
+
+        let tree_diff_stats = TreeDiffStats {
+            trees_loaded: 10,
+            tree_bytes_loaded: 2048,
+            tree_bytes_in_flight_peak: 512,
+            candidates_emitted: 5,
+            subtrees_skipped: 1,
+            max_depth_reached: 3,
+        };
+        let spill_stats = SpillStats {
+            candidates_received: 100,
+            unique_blobs: 42,
+            spill_runs: 2,
+            spill_bytes: 8192,
+            seen_blobs: 10,
+            emitted_blobs: 32,
+        };
+        let mapping_stats = MappingStats {
+            unique_blobs_in: 42,
+            packed_matched: 30,
+            loose_unmatched: 12,
+        };
+
+        // Encode base state from PostSpillDedup (the stage that emits base).
+        let base_checkpoint = StageCheckpoint::PostSpillDedup {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &fp,
+            plan: &commits,
+            packed: &packed,
+            loose: &loose,
+            path_arena: &path_arena,
+            tree_diff_stats: tree_diff_stats.clone(),
+            spill_stats: spill_stats.clone(),
+            mapping_stats,
+        };
+        let base_state = base_checkpoint
+            .encode_base_state()
+            .expect("base encode")
+            .expect("PostSpillDedup must produce base state");
+
+        // Encode prefix state from PackPlanComplete.
+        let finding = ScoredFinding {
+            key: FindingKey {
+                start: 10,
+                end: 20,
+                rule_id: 99,
+                norm_hash: [0xBB; 32],
+            },
+            confidence_score: 7,
+        };
+        let scanned = ScannedBlobs {
+            blobs: vec![ScannedBlob {
+                oid,
+                ctx,
+                findings: FindingSpan { start: 0, len: 1 },
+            }],
+            finding_arena: vec![finding],
+        };
+        let skipped = vec![SkippedCandidate {
+            oid,
+            reason: CandidateSkipReason::PackDelta,
+        }];
+        let common_metrics = GitScanCommonMetrics {
+            objects_scanned: 50,
+            chunks_scanned: 200,
+            bytes_scanned: 1_000_000,
+            findings_emitted: 3,
+            binary_skipped: 1,
+            ext_skipped: 0,
+            lock_skipped: 0,
+            binary_extracted: 0,
+            errors: 0,
+        };
+
+        let prefix_checkpoint = StageCheckpoint::PackPlanComplete {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &fp,
+            plan: &commits,
+            packed: &packed,
+            loose: &loose,
+            path_arena: &path_arena,
+            tree_diff_stats,
+            spill_stats: spill_stats.clone(),
+            mapping_stats,
+            completed_plan_count: 1,
+            scanned: &scanned,
+            skipped_candidates: &skipped,
+            common_metrics,
+        };
+        let prefix_state = prefix_checkpoint
+            .encode_prefix_state()
+            .expect("prefix encode")
+            .expect("PackPlanComplete must produce prefix state");
+
+        // Round-trip through from_loaded.
+        let loaded = LoadedScanCheckpoint {
+            base_state: Some(base_state),
+            prefix_state: Some(prefix_state),
+        };
+        let resume = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect("from_loaded should succeed")
+            .expect("matching fingerprint should produce Some");
+
+        let (stage, base, prefix) = resume.into_parts();
+        assert_eq!(stage, ScanCheckpointStage::PackPlanComplete);
+
+        let base = base.expect("base must be present");
+        assert_eq!(base.plan, commits);
+        assert_eq!(base.packed, packed);
+        assert_eq!(base.loose, loose);
+        assert_eq!(base.path_arena.backing_bytes(), path_arena.backing_bytes());
+        assert_eq!(base.spill_stats.spill_runs, 2);
+        assert_eq!(base.spill_stats.candidates_received, 100);
+        assert_eq!(base.mapping_stats.packed_matched, 30);
+        assert_eq!(base.tree_diff_stats.trees_loaded, 10);
+
+        let prefix = prefix.expect("prefix must be present");
+        assert_eq!(prefix.stage, ScanCheckpointStage::PackPlanComplete);
+        assert_eq!(prefix.completed_plan_count, 1);
+        assert_eq!(prefix.scanned.blobs.len(), 1);
+        assert_eq!(prefix.scanned.finding_arena.len(), 1);
+        assert_eq!(prefix.scanned.finding_arena[0].confidence_score, 7);
+        assert_eq!(prefix.skipped_candidates.len(), 1);
+        assert_eq!(
+            prefix.skipped_candidates[0].reason,
+            CandidateSkipReason::PackDelta
+        );
+        assert_eq!(prefix.common_metrics.objects_scanned, 50);
+        assert_eq!(prefix.common_metrics.bytes_scanned, 1_000_000);
     }
 }

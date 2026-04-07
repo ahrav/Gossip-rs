@@ -148,6 +148,31 @@ impl OidBytes {
         self.len
     }
 
+    /// Returns the full 32-byte backing array (zero-padded for SHA-1).
+    ///
+    /// Used by checkpoint serialization to avoid heap allocation — the
+    /// caller stores the raw array alongside the length discriminant.
+    #[inline]
+    #[must_use]
+    pub const fn raw_bytes(&self) -> [u8; 32] {
+        self.bytes
+    }
+
+    /// Reconstruct an `OidBytes` from a raw length + backing array pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics (debug only) if `len` is not 20 or 32.
+    #[inline]
+    #[must_use]
+    pub fn from_raw(len: u8, bytes: [u8; 32]) -> Self {
+        debug_assert!(
+            len == Self::SHA1_LEN || len == Self::SHA256_LEN,
+            "invalid OID len: {len}"
+        );
+        Self { len, bytes }
+    }
+
     /// Returns true if the OID is empty.
     ///
     /// OIDs are always 20 or 32 bytes; this is provided for API symmetry

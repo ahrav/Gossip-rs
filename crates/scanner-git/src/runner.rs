@@ -98,13 +98,14 @@ pub(super) fn check_abort(abort: &AtomicBool) -> Result<(), GitScanError> {
     Ok(())
 }
 
+#[inline]
 pub(super) fn checkpoint_stage(
     sink: &dyn ScanCheckpointSink,
     checkpoint: &StageCheckpoint<'_>,
 ) -> Result<(), GitScanError> {
     match sink.notify_stage_complete(checkpoint)? {
         CheckpointAck::Continue => Ok(()),
-        CheckpointAck::Abort => Err(TreeDiffError::Aborted.into()),
+        CheckpointAck::Abort => Err(GitScanError::CheckpointAbort),
     }
 }
 
@@ -308,6 +309,18 @@ fn detected_parallelism() -> usize {
 /// On a 64-core machine with the 6x large-repo multiplier the uncapped
 /// count would be 384, consuming over 1.5 GiB in cache alone.
 pub(crate) const MAX_PACK_EXEC_WORKERS: usize = 128;
+
+/// Minimum number of pack plan completions between durable checkpoints.
+///
+/// Checkpointing serializes all accumulated scan results (scanned blobs,
+/// findings, skip records) into a prefix payload. For repos with many
+/// pack plans, checkpointing on every plan completion creates O(N^2) total
+/// serialized bytes across the scan because the payload grows
+/// monotonically. Throttling to every `N` plans reduces this to
+/// O(N/interval * N) = O(N^2/interval), a constant-factor improvement.
+/// The PreFinalize checkpoint emitted after all plans ensures no trailing
+/// work is lost.
+pub(crate) const CHECKPOINT_PLAN_INTERVAL: usize = 10;
 
 /// Repositories below this `in-pack` object count use the baseline 1× core
 /// multiplier for pack execution.
@@ -912,6 +925,9 @@ pub enum GitScanError {
     /// or `git repack` invalidated the planned offsets. Callers should retry.
     #[error("concurrent git maintenance detected; artifacts changed during scan")]
     ConcurrentMaintenance,
+    /// Cooperative abort signalled by checkpoint sink.
+    #[error("scan aborted by checkpoint sink")]
+    CheckpointAbort,
 }
 
 /// Runs a full Git scan with the provided configuration and stores.
@@ -1065,8 +1081,7 @@ pub fn run_git_scan_with_context(
     )?;
 
     // Commit plan (shared across both modes).
-    #[allow(unused_mut, unused_variables)]
-    let mut commit_plan_nanos = 0u64;
+    perf_let!(mut commit_plan_nanos = 0u64);
     let plan = if let Some(resume_state) = &resume_state {
         resume_state.plan().to_vec()
     } else {
@@ -1121,7 +1136,7 @@ pub fn run_git_scan_with_context(
             &plan,
             config,
             context.abort,
-            resume_state.as_ref(),
+            resume_state,
             context.checkpoint_sink,
             mk_commit_meta(),
         )?,
@@ -1134,7 +1149,7 @@ pub fn run_git_scan_with_context(
             &plan,
             config,
             context.abort,
-            resume_state.as_ref(),
+            resume_state,
             context.checkpoint_sink,
             mk_commit_meta(),
         )?,

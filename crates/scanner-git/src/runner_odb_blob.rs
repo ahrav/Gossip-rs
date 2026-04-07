@@ -60,7 +60,7 @@ use super::pack_plan::{bucket_pack_candidates, build_pack_plan_for_pack, PackPla
 use super::pack_plan_model::CompletedPacksBitmap;
 use super::runner::{
     check_abort, checkpoint_stage, GitScanAllocStats, GitScanConfig, GitScanError,
-    GitScanStageNanos, ScanModeOutput,
+    GitScanStageNanos, ScanModeOutput, CHECKPOINT_PLAN_INTERVAL,
 };
 use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
 use super::spiller::{SpillStats, Spiller};
@@ -149,7 +149,7 @@ pub(super) fn run_odb_blob(
     plan: &[PlannedCommit],
     config: &GitScanConfig,
     abort: &AtomicBool,
-    resume_state: Option<&ScanResumeState>,
+    resume_state: Option<ScanResumeState>,
     checkpoint_sink: &dyn ScanCheckpointSink,
     commit_meta: CommitMetaContext,
 ) -> Result<ScanModeOutput, GitScanError> {
@@ -208,148 +208,87 @@ pub(super) fn run_odb_blob(
         )
     };
 
-    let resumed_base = resume_state.and_then(ScanResumeState::base_state);
-    let resumed_prefix = resume_state.and_then(ScanResumeState::prefix_state);
+    // Decompose owned resume state to avoid multi-MiB clones of base/prefix
+    // fields. The stage discriminant is Copy and extracted for later guards.
+    let (resume_stage, resumed_base, resumed_prefix) = match resume_state {
+        Some(state) => {
+            let (stage, base, prefix) = state.into_parts();
+            (Some(stage), base, prefix)
+        }
+        None => (None, None, None),
+    };
 
     // ── Stage 1: blob introduction ───────────────────────────────────
-    let (tree_diff_stats, mut packed, loose, path_arena, spill_stats, mapping_stats) =
-        if let Some(base) = resumed_base {
-            (
-                base.tree_diff_stats.clone(),
-                base.packed.clone(),
-                base.loose.clone(),
-                base.path_arena.clone(),
-                base.spill_stats.clone(),
-                base.mapping_stats,
-            )
-        } else {
-            // When blob_intro_workers > 1, use the parallel path with shared
-            // AtomicSeenSets. The parallel path does not support the spill/retry
-            // fallback (which is serial-only); on capacity overflow it returns an
-            // error that falls through to the serial spill retry below.
-            let intro_start = Instant::now();
-            let effective_workers = config
-                .blob_intro_workers
-                .max(1)
-                .min(plan.len().max(1))
-                .min(8);
+    let IntroResult {
+        tree_diff_stats,
+        mut packed,
+        loose,
+        path_arena,
+        spill_stats,
+        mapping_stats,
+    } = if let Some(base) = resumed_base {
+        IntroResult {
+            tree_diff_stats: base.tree_diff_stats,
+            packed: base.packed,
+            loose: base.loose,
+            path_arena: base.path_arena,
+            spill_stats: base.spill_stats,
+            mapping_stats: base.mapping_stats,
+        }
+    } else {
+        // When blob_intro_workers > 1, use the parallel path with shared
+        // AtomicSeenSets. The parallel path does not support the spill/retry
+        // fallback (which is serial-only); on capacity overflow it returns an
+        // error that falls through to the serial spill retry below.
+        let intro_start = Instant::now();
+        let effective_workers = config
+            .blob_intro_workers
+            .max(1)
+            .min(plan.len().max(1))
+            .min(8);
 
-            let result = if effective_workers > 1 {
-                match introduce_parallel(
-                    effective_workers,
-                    repo,
-                    config,
-                    &spill_dir,
-                    &object_store_layout,
-                    cg_index,
-                    plan,
-                    &midx,
-                    &oid_index,
-                    mapping_cfg.path_arena_capacity,
-                    mapping_cfg.max_packed_candidates,
-                    mapping_cfg.max_loose_candidates,
-                    abort,
-                ) {
-                    Ok(result) => {
-                        perf_set!(
-                            stage_nanos,
-                            blob_intro,
-                            intro_start.elapsed().as_nanos() as u64
-                        );
-                        let mapping_stats = MappingStats {
-                            unique_blobs_in: result.packed.len().saturating_add(result.loose.len())
-                                as u64,
-                            packed_matched: result.packed.len() as u64,
-                            loose_unmatched: result.loose.len() as u64,
-                        };
-                        (
-                            TreeDiffStats::from(result.stats),
-                            result.packed,
-                            result.loose,
-                            result.path_arena,
-                            SpillStats::default(),
-                            mapping_stats,
-                        )
+        let result = if effective_workers > 1 {
+            match introduce_parallel(
+                effective_workers,
+                repo,
+                config,
+                &spill_dir,
+                &object_store_layout,
+                cg_index,
+                plan,
+                &midx,
+                &oid_index,
+                mapping_cfg.path_arena_capacity,
+                mapping_cfg.max_packed_candidates,
+                mapping_cfg.max_loose_candidates,
+                abort,
+            ) {
+                Ok(result) => {
+                    perf_set!(
+                        stage_nanos,
+                        blob_intro,
+                        intro_start.elapsed().as_nanos() as u64
+                    );
+                    let mapping_stats = MappingStats {
+                        unique_blobs_in: result.packed.len().saturating_add(result.loose.len())
+                            as u64,
+                        packed_matched: result.packed.len() as u64,
+                        loose_unmatched: result.loose.len() as u64,
+                    };
+                    IntroResult {
+                        tree_diff_stats: TreeDiffStats::from(result.stats),
+                        packed: result.packed,
+                        loose: result.loose,
+                        path_arena: result.path_arena,
+                        spill_stats: SpillStats::default(),
+                        mapping_stats,
                     }
-                    Err(
-                        TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull,
-                    ) => {
-                        let mut object_store = open_object_store()?;
-                        run_serial_spill_retry(
-                            repo,
-                            config,
-                            &spill_dir,
-                            cg_index,
-                            plan,
-                            &midx,
-                            &oid_index,
-                            &mapping_cfg,
-                            seen_store,
-                            seen_persister,
-                            &mut object_store,
-                            abort,
-                            &mut stage_nanos,
-                            intro_start,
-                        )?
-                    }
-                    Err(err) => return Err(err.into()),
                 }
-            } else {
-                let mut object_store = open_object_store()?;
-                let mut introducer = BlobIntroducer::new(
-                    &config.tree_diff,
-                    repo.object_format.oid_len(),
-                    midx.object_count(),
-                    mapping_cfg.max_loose_candidates,
-                    config.engine_adapter.scan_binary,
-                );
-
-                let mut collector = PackCandidateCollector::new(
-                    &midx,
-                    &oid_index,
-                    mapping_cfg.path_arena_capacity,
-                    mapping_cfg.max_packed_candidates,
-                    mapping_cfg.max_loose_candidates,
-                );
-
-                match introducer.introduce(
-                    &mut object_store,
-                    cg_index,
-                    plan,
-                    &oid_index,
-                    abort,
-                    &mut collector,
-                ) {
-                    Ok(stats) => {
-                        perf_set!(
-                            stage_nanos,
-                            blob_intro,
-                            intro_start.elapsed().as_nanos() as u64
-                        );
-                        let collect_start = Instant::now();
-                        let (packed, loose, path_arena) = collector.finish();
-                        perf_set!(
-                            stage_nanos,
-                            pack_collect,
-                            collect_start.elapsed().as_nanos() as u64
-                        );
-                        let mapping_stats = MappingStats {
-                            unique_blobs_in: packed.len().saturating_add(loose.len()) as u64,
-                            packed_matched: packed.len() as u64,
-                            loose_unmatched: loose.len() as u64,
-                        };
-                        (
-                            TreeDiffStats::from(stats),
-                            packed,
-                            loose,
-                            path_arena,
-                            SpillStats::default(),
-                            mapping_stats,
-                        )
-                    }
-                    Err(
-                        TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull,
-                    ) => run_serial_spill_retry(
+                Err(
+                    TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull,
+                ) => {
+                    let mut object_store = open_object_store()?;
+                    run_serial_spill_retry(
                         repo,
                         config,
                         &spill_dir,
@@ -364,33 +303,115 @@ pub(super) fn run_odb_blob(
                         abort,
                         &mut stage_nanos,
                         intro_start,
-                    )?,
-                    Err(err) => return Err(err.into()),
+                    )?
                 }
-            };
+                Err(err) => return Err(err.into()),
+            }
+        } else {
+            let mut object_store = open_object_store()?;
+            let mut introducer = BlobIntroducer::new(
+                &config.tree_diff,
+                repo.object_format.oid_len(),
+                midx.object_count(),
+                mapping_cfg.max_loose_candidates,
+                config.engine_adapter.scan_binary,
+            );
 
-            checkpoint_stage(
-                checkpoint_sink,
-                &StageCheckpoint::PostSpillDedup {
-                    scan_mode: config.scan_mode,
-                    artifact_fingerprint,
+            let mut collector = PackCandidateCollector::new(
+                &midx,
+                &oid_index,
+                mapping_cfg.path_arena_capacity,
+                mapping_cfg.max_packed_candidates,
+                mapping_cfg.max_loose_candidates,
+            );
+
+            match introducer.introduce(
+                &mut object_store,
+                cg_index,
+                plan,
+                &oid_index,
+                abort,
+                &mut collector,
+            ) {
+                Ok(stats) => {
+                    perf_set!(
+                        stage_nanos,
+                        blob_intro,
+                        intro_start.elapsed().as_nanos() as u64
+                    );
+                    let collect_start = Instant::now();
+                    let (packed, loose, path_arena) = collector.finish();
+                    perf_set!(
+                        stage_nanos,
+                        pack_collect,
+                        collect_start.elapsed().as_nanos() as u64
+                    );
+                    let mapping_stats = MappingStats {
+                        unique_blobs_in: packed.len().saturating_add(loose.len()) as u64,
+                        packed_matched: packed.len() as u64,
+                        loose_unmatched: loose.len() as u64,
+                    };
+                    IntroResult {
+                        tree_diff_stats: TreeDiffStats::from(stats),
+                        packed,
+                        loose,
+                        path_arena,
+                        spill_stats: SpillStats::default(),
+                        mapping_stats,
+                    }
+                }
+                Err(
+                    TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull,
+                ) => run_serial_spill_retry(
+                    repo,
+                    config,
+                    &spill_dir,
+                    cg_index,
                     plan,
-                    packed: &result.1,
-                    loose: &result.2,
-                    path_arena: &result.3,
-                    tree_diff_stats: result.0.clone(),
-                    spill_stats: result.4.clone(),
-                    mapping_stats: result.5,
-                },
-            )?;
-            result
+                    &midx,
+                    &oid_index,
+                    &mapping_cfg,
+                    seen_store,
+                    seen_persister,
+                    &mut object_store,
+                    abort,
+                    &mut stage_nanos,
+                    intro_start,
+                )?,
+                Err(err) => return Err(err.into()),
+            }
         };
+
+        checkpoint_stage(
+            checkpoint_sink,
+            &StageCheckpoint::PostSpillDedup {
+                scan_mode: config.scan_mode,
+                artifact_fingerprint,
+                plan,
+                packed: &result.packed,
+                loose: &result.loose,
+                path_arena: &result.path_arena,
+                tree_diff_stats: result.tree_diff_stats.clone(),
+                spill_stats: result.spill_stats.clone(),
+                mapping_stats: result.mapping_stats,
+            },
+        )?;
+        result
+    };
     check_abort(abort)?;
 
     // ── Stage 2 + 3: pack planning + execution ──────────────────────
     let pack_plan_start = Instant::now();
-    let checkpoint_packed = packed.clone();
-    let checkpoint_loose = loose.clone();
+    // Snapshot candidates for checkpoint serialization. These clones are
+    // O(candidates) and paid once per scan — acceptable under WARM-tier
+    // allocation policy. Pack planning consumes the originals.
+    // NoopCheckpointSink returns false, avoiding a multi-MiB memcpy on
+    // the non-distributed path.
+    let (checkpoint_packed, checkpoint_loose) = if checkpoint_sink.checkpoints_enabled() {
+        (packed.clone(), loose.clone())
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     let pack_dirs = collect_pack_dirs(&repo.paths);
     let pack_names = list_pack_files(&pack_dirs)?;
@@ -439,21 +460,30 @@ pub(super) fn run_odb_blob(
     });
     let checkpointing_enabled = checkpoint_sink.checkpoints_enabled() || prefix_resume.is_some();
     let mut pack_exec_reports = Vec::with_capacity(used_pack_ids.len());
-    let mut skipped_candidates = prefix_resume
-        .map(|prefix| prefix.skipped_candidates.clone())
-        .unwrap_or_default();
-    let mut common_metrics = prefix_resume
-        .map(|prefix| prefix.common_metrics)
-        .unwrap_or_default();
-    let mut scanned = prefix_resume
-        .map(|prefix| prefix.scanned.clone())
-        .unwrap_or_else(|| ScannedBlobs {
-            blobs: Vec::with_capacity(packed_len.saturating_add(loose_len)),
-            finding_arena: Vec::new(),
-        });
-    let mut completed_plan_prefix_len = prefix_resume
-        .map(|prefix| prefix.completed_plan_count)
-        .unwrap_or(0);
+    // Destructure owned prefix to move data rather than cloning multi-MiB
+    // vectors. The prefix is consumed here and not used afterward.
+    let (mut skipped_candidates, mut common_metrics, mut scanned, completed_plan_prefix_init) =
+        match prefix_resume {
+            Some(prefix) => (
+                prefix.skipped_candidates,
+                prefix.common_metrics,
+                prefix.scanned,
+                prefix.completed_plan_count,
+            ),
+            None => (
+                Vec::new(),
+                GitScanCommonMetrics::default(),
+                ScannedBlobs {
+                    blobs: Vec::with_capacity(packed_len.saturating_add(loose_len)),
+                    finding_arena: Vec::new(),
+                },
+                0,
+            ),
+        };
+    let mut completed_plan_prefix_len = completed_plan_prefix_init;
+    // Track the prefix length at the last durable checkpoint to throttle
+    // per-plan checkpoint frequency and avoid O(N^2) serialization.
+    let mut last_checkpointed_prefix = completed_plan_prefix_init;
     let path_arena = Arc::new(path_arena);
     let spill_dir = Arc::new(spill_dir);
 
@@ -513,6 +543,13 @@ pub(super) fn run_odb_blob(
             ))
             .into());
         }
+        if completed_plan_prefix_len > 0 {
+            tracing::debug!(
+                completed_plan_prefix_len,
+                rebuilt_plan_count = plans.len(),
+                "resuming pack execution from checkpoint prefix"
+            );
+        }
 
         if !plans.is_empty() {
             check_abort(abort)?;
@@ -524,6 +561,8 @@ pub(super) fn run_odb_blob(
             {
                 completed_packs.mark_complete(pack_id);
             }
+            // Sentinel reports for pack plans completed in a prior checkpoint run.
+            // These carry zero stats and are not real execution outputs.
             pack_exec_reports.resize_with(completed_plan_prefix_len, PackExecReport::default);
 
             let midx_bytes = repo
@@ -532,10 +571,7 @@ pub(super) fn run_odb_blob(
                 .clone()
                 .ok_or_else(|| GitScanError::Io(io::Error::other("midx bytes missing")))?;
 
-            if matches!(
-                resume_state.map(ScanResumeState::stage),
-                Some(ScanCheckpointStage::PreFinalize)
-            ) {
+            if matches!(resume_stage, Some(ScanCheckpointStage::PreFinalize)) {
                 pack_exec_reports.resize_with(plans.len(), PackExecReport::default);
             } else if checkpointing_enabled {
                 for (plan_idx, pack_plan) in plans
@@ -588,24 +624,30 @@ pub(super) fn run_odb_blob(
                         && plan_idx == completed_plan_prefix_len
                     {
                         completed_plan_prefix_len += 1;
-                        checkpoint_stage(
-                            checkpoint_sink,
-                            &StageCheckpoint::PackPlanComplete {
-                                scan_mode: config.scan_mode,
-                                artifact_fingerprint,
-                                plan,
-                                packed: &checkpoint_packed,
-                                loose: &checkpoint_loose,
-                                path_arena: path_arena.as_ref(),
-                                tree_diff_stats: tree_diff_stats.clone(),
-                                spill_stats: spill_stats.clone(),
-                                mapping_stats,
-                                completed_plan_count: completed_plan_prefix_len,
-                                scanned: &scanned,
-                                skipped_candidates: &skipped_candidates,
-                                common_metrics,
-                            },
-                        )?;
+                        // Throttle checkpoint frequency to avoid O(N^2) cumulative
+                        // serialization. The PreFinalize checkpoint covers the tail.
+                        let delta = completed_plan_prefix_len - last_checkpointed_prefix;
+                        if delta >= CHECKPOINT_PLAN_INTERVAL {
+                            last_checkpointed_prefix = completed_plan_prefix_len;
+                            checkpoint_stage(
+                                checkpoint_sink,
+                                &StageCheckpoint::PackPlanComplete {
+                                    scan_mode: config.scan_mode,
+                                    artifact_fingerprint,
+                                    plan,
+                                    packed: &checkpoint_packed,
+                                    loose: &checkpoint_loose,
+                                    path_arena: path_arena.as_ref(),
+                                    tree_diff_stats: tree_diff_stats.clone(),
+                                    spill_stats: spill_stats.clone(),
+                                    mapping_stats,
+                                    completed_plan_count: completed_plan_prefix_len,
+                                    scanned: &scanned,
+                                    skipped_candidates: &skipped_candidates,
+                                    common_metrics,
+                                },
+                            )?;
+                        }
                     }
                 }
             } else {
@@ -655,12 +697,7 @@ pub(super) fn run_odb_blob(
             }
         }
 
-        if !loose.is_empty()
-            && !matches!(
-                resume_state.map(ScanResumeState::stage),
-                Some(ScanCheckpointStage::PreFinalize)
-            )
-        {
+        if !loose.is_empty() && !matches!(resume_stage, Some(ScanCheckpointStage::PreFinalize)) {
             check_abort(abort)?;
             #[cfg(feature = "git-perf")]
             start_pack_exec();
@@ -706,12 +743,7 @@ pub(super) fn run_odb_blob(
             pack_plan,
             pack_plan_start.elapsed().as_nanos() as u64
         );
-        if !loose.is_empty()
-            && !matches!(
-                resume_state.map(ScanResumeState::stage),
-                Some(ScanCheckpointStage::PreFinalize)
-            )
-        {
+        if !loose.is_empty() && !matches!(resume_stage, Some(ScanCheckpointStage::PreFinalize)) {
             check_abort(abort)?;
             #[cfg(feature = "git-perf")]
             start_pack_exec();
@@ -753,10 +785,7 @@ pub(super) fn run_odb_blob(
         }
     }
 
-    if !matches!(
-        resume_state.map(ScanResumeState::stage),
-        Some(ScanCheckpointStage::PreFinalize)
-    ) {
+    if !matches!(resume_stage, Some(ScanCheckpointStage::PreFinalize)) {
         checkpoint_stage(
             checkpoint_sink,
             &StageCheckpoint::PreFinalize {
@@ -805,23 +834,21 @@ pub(super) fn run_odb_blob(
     })
 }
 
-/// Tuple returned by Stage 1 blob introduction (both serial and parallel paths).
-///
-/// Fields (in order):
-/// 0. `TreeDiffStats` -- commit/tree/blob counters from the walk.
-/// 1. `Vec<PackCandidate>` -- blobs mapped to MIDX pack offsets.
-/// 2. `Vec<LooseCandidate>` -- blobs not in any pack (loose objects).
-/// 3. `ByteArena` -- interned file paths referenced by candidates.
-/// 4. `SpillStats` -- spill pipeline stats (zeroed when fast path succeeds).
-/// 5. `MappingStats` -- mapping bridge stats (synthetic when no bridge used).
-type IntroResult = (
-    TreeDiffStats,
-    Vec<PackCandidate>,
-    Vec<LooseCandidate>,
-    ByteArena,
-    SpillStats,
-    MappingStats,
-);
+/// Result of Stage 1 blob introduction (both serial and parallel paths).
+struct IntroResult {
+    /// Commit/tree/blob counters from the walk.
+    tree_diff_stats: TreeDiffStats,
+    /// Blobs mapped to MIDX pack offsets.
+    packed: Vec<PackCandidate>,
+    /// Blobs not in any pack (loose objects).
+    loose: Vec<LooseCandidate>,
+    /// Interned file paths referenced by candidates.
+    path_arena: ByteArena,
+    /// Spill pipeline stats (zeroed when fast path succeeds).
+    spill_stats: SpillStats,
+    /// Mapping bridge stats (synthetic when no bridge used).
+    mapping_stats: MappingStats,
+}
 
 /// Runs the serial spill/retry pipeline when the fast path overflows.
 ///
@@ -906,12 +933,12 @@ fn run_serial_spill_retry(
     let packed = std::mem::take(&mut sink.packed);
     let loose = std::mem::take(&mut sink.loose);
 
-    Ok((
-        TreeDiffStats::from(stats),
+    Ok(IntroResult {
+        tree_diff_stats: TreeDiffStats::from(stats),
         packed,
         loose,
-        mapping_arena,
+        path_arena: mapping_arena,
         spill_stats,
         mapping_stats,
-    ))
+    })
 }

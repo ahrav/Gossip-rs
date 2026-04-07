@@ -128,7 +128,8 @@ impl ByteArena {
     /// existing `ByteRef` values and never append new paths.
     #[must_use]
     pub fn from_backing_bytes(bytes: Vec<u8>) -> Self {
-        let capacity = bytes.len().min(u32::MAX as usize) as u32;
+        let capacity =
+            u32::try_from(bytes.len()).expect("restored arena exceeds u32 address space");
         Self { bytes, capacity }
     }
 

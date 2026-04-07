@@ -77,7 +77,7 @@ use super::policy_hash::MergeDiffMode;
 use super::repo_open::RepoJobState;
 use super::runner::{
     check_abort, checkpoint_stage, GitScanAllocStats, GitScanConfig, GitScanError,
-    GitScanStageNanos, ScanModeOutput,
+    GitScanStageNanos, ScanModeOutput, CHECKPOINT_PLAN_INTERVAL,
 };
 use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
 use super::spiller::Spiller;
@@ -157,7 +157,7 @@ pub(super) fn run_diff_history(
     plan: &[PlannedCommit],
     config: &GitScanConfig,
     abort: &AtomicBool,
-    resume_state: Option<&ScanResumeState>,
+    resume_state: Option<ScanResumeState>,
     checkpoint_sink: &dyn ScanCheckpointSink,
     commit_meta: CommitMetaContext,
 ) -> Result<ScanModeOutput, GitScanError> {
@@ -184,18 +184,25 @@ pub(super) fn run_diff_history(
         .artifact_fingerprint
         .as_ref()
         .ok_or_else(|| GitScanError::Io(io::Error::other("artifact fingerprint missing")))?;
-    let resumed_base = resume_state.and_then(ScanResumeState::base_state);
-    let resumed_prefix = resume_state.and_then(ScanResumeState::prefix_state);
+    // Decompose owned resume state to avoid multi-MiB clones of base/prefix
+    // fields. The stage discriminant is Copy and extracted for later guards.
+    let (resume_stage, resumed_base, resumed_prefix) = match resume_state {
+        Some(state) => {
+            let (stage, base, prefix) = state.into_parts();
+            (Some(stage), base, prefix)
+        }
+        None => (None, None, None),
+    };
 
     let (tree_diff_stats, spill_stats, mapping_stats, mut packed, loose, mapping_arena) =
         if let Some(base) = resumed_base {
             (
-                base.tree_diff_stats.clone(),
-                base.spill_stats.clone(),
+                base.tree_diff_stats,
+                base.spill_stats,
                 base.mapping_stats,
-                base.packed.clone(),
-                base.loose.clone(),
-                base.path_arena.clone(),
+                base.packed,
+                base.loose,
+                base.path_arena,
             )
         } else {
             let object_store_layout = ObjectStoreLayout::from_midx(repo, midx)?;
@@ -346,8 +353,16 @@ pub(super) fn run_diff_history(
 
     // ── Stage 4: Pack planning ───────────────────────────────────────────
     perf_let!(pack_plan_start = Instant::now());
-    let checkpoint_packed = packed.clone();
-    let checkpoint_loose = loose.clone();
+    // Snapshot candidates for checkpoint serialization. These clones are
+    // O(candidates) and paid once per scan — acceptable under WARM-tier
+    // allocation policy. Pack planning consumes the originals.
+    // NoopCheckpointSink returns false, avoiding a multi-MiB memcpy on
+    // the non-distributed path.
+    let (checkpoint_packed, checkpoint_loose) = if checkpoint_sink.checkpoints_enabled() {
+        (packed.clone(), loose.clone())
+    } else {
+        (Vec::new(), Vec::new())
+    };
     packed.retain(|cand| !completed_packs.is_complete(cand.pack_id));
     let pack_dirs = collect_pack_dirs(&repo.paths);
     let pack_names = list_pack_files(&pack_dirs)?;
@@ -409,6 +424,7 @@ pub(super) fn run_diff_history(
     });
     let checkpointing_enabled = checkpoint_sink.checkpoints_enabled() || prefix_resume.is_some();
     let mut completed_plan_prefix_len = prefix_resume
+        .as_ref()
         .map(|prefix| prefix.completed_plan_count)
         .unwrap_or(0);
     let loose_dirs = Arc::new(collect_loose_dirs(&repo.paths));
@@ -417,18 +433,26 @@ pub(super) fn run_diff_history(
     let mapping_arena = Arc::new(mapping_arena);
     let spill_dir = Arc::new(spill_dir);
     let mut pack_exec_reports = Vec::with_capacity(plan_count);
-    let mut skipped_candidates = prefix_resume
-        .map(|prefix| prefix.skipped_candidates.clone())
-        .unwrap_or_default();
-    let mut common_metrics = prefix_resume
-        .map(|prefix| prefix.common_metrics)
-        .unwrap_or_default();
-    let mut scanned = prefix_resume
-        .map(|prefix| prefix.scanned.clone())
-        .unwrap_or_else(|| ScannedBlobs {
-            blobs: Vec::with_capacity(packed_len.saturating_add(loose_len)),
-            finding_arena: Vec::new(),
-        });
+    // Track the prefix length at the last durable checkpoint to throttle
+    // per-plan checkpoint frequency and avoid O(N^2) serialization.
+    let mut last_checkpointed_prefix = completed_plan_prefix_len;
+    // Destructure owned prefix to move data rather than cloning multi-MiB
+    // vectors. The prefix is consumed here and not used afterward.
+    let (mut skipped_candidates, mut common_metrics, mut scanned) = match prefix_resume {
+        Some(prefix) => (
+            prefix.skipped_candidates,
+            prefix.common_metrics,
+            prefix.scanned,
+        ),
+        None => (
+            Vec::new(),
+            GitScanCommonMetrics::default(),
+            ScannedBlobs {
+                blobs: Vec::with_capacity(packed_len.saturating_add(loose_len)),
+                finding_arena: Vec::new(),
+            },
+        ),
+    };
 
     #[cfg(feature = "git-perf")]
     let pack_exec_start = Instant::now();
@@ -441,6 +465,13 @@ pub(super) fn run_diff_history(
         ))
         .into());
     }
+    if completed_plan_prefix_len > 0 {
+        tracing::debug!(
+            completed_plan_prefix_len,
+            rebuilt_plan_count = plans.len(),
+            "resuming pack execution from checkpoint prefix"
+        );
+    }
     if !plans.is_empty() {
         check_abort(abort)?;
         let plan_pack_ids: Vec<u16> = plans.iter().map(|plan| plan.pack_id()).collect();
@@ -451,6 +482,8 @@ pub(super) fn run_diff_history(
         {
             completed_packs.mark_complete(pack_id);
         }
+        // Sentinel reports for pack plans completed in a prior checkpoint run.
+        // These carry zero stats and are not real execution outputs.
         pack_exec_reports.resize_with(completed_plan_prefix_len, PackExecReport::default);
         let midx_bytes = repo
             .mmaps
@@ -458,10 +491,7 @@ pub(super) fn run_diff_history(
             .clone()
             .ok_or_else(|| GitScanError::Io(io::Error::other("midx bytes missing")))?;
 
-        if matches!(
-            resume_state.map(ScanResumeState::stage),
-            Some(ScanCheckpointStage::PreFinalize)
-        ) {
+        if matches!(resume_stage, Some(ScanCheckpointStage::PreFinalize)) {
             pack_exec_reports.resize_with(plans.len(), PackExecReport::default);
         } else if checkpointing_enabled {
             for (plan_idx, pack_plan) in plans
@@ -511,24 +541,30 @@ pub(super) fn run_diff_history(
                     && plan_idx == completed_plan_prefix_len
                 {
                     completed_plan_prefix_len += 1;
-                    checkpoint_stage(
-                        checkpoint_sink,
-                        &StageCheckpoint::PackPlanComplete {
-                            scan_mode: config.scan_mode,
-                            artifact_fingerprint,
-                            plan,
-                            packed: &checkpoint_packed,
-                            loose: &checkpoint_loose,
-                            path_arena: mapping_arena.as_ref(),
-                            tree_diff_stats: tree_diff_stats.clone(),
-                            spill_stats: spill_stats.clone(),
-                            mapping_stats,
-                            completed_plan_count: completed_plan_prefix_len,
-                            scanned: &scanned,
-                            skipped_candidates: &skipped_candidates,
-                            common_metrics,
-                        },
-                    )?;
+                    // Throttle checkpoint frequency to avoid O(N^2) cumulative
+                    // serialization. The PreFinalize checkpoint covers the tail.
+                    let delta = completed_plan_prefix_len - last_checkpointed_prefix;
+                    if delta >= CHECKPOINT_PLAN_INTERVAL {
+                        last_checkpointed_prefix = completed_plan_prefix_len;
+                        checkpoint_stage(
+                            checkpoint_sink,
+                            &StageCheckpoint::PackPlanComplete {
+                                scan_mode: config.scan_mode,
+                                artifact_fingerprint,
+                                plan,
+                                packed: &checkpoint_packed,
+                                loose: &checkpoint_loose,
+                                path_arena: mapping_arena.as_ref(),
+                                tree_diff_stats: tree_diff_stats.clone(),
+                                spill_stats: spill_stats.clone(),
+                                mapping_stats,
+                                completed_plan_count: completed_plan_prefix_len,
+                                scanned: &scanned,
+                                skipped_candidates: &skipped_candidates,
+                                common_metrics,
+                            },
+                        )?;
+                    }
                 }
             }
         } else {
@@ -575,12 +611,7 @@ pub(super) fn run_diff_history(
                 .count();
         }
     }
-    if !loose.is_empty()
-        && !matches!(
-            resume_state.map(ScanResumeState::stage),
-            Some(ScanCheckpointStage::PreFinalize)
-        )
-    {
+    if !loose.is_empty() && !matches!(resume_stage, Some(ScanCheckpointStage::PreFinalize)) {
         check_abort(abort)?;
         let mut adapter = EngineAdapter::new_with_event_sink(
             engine.as_ref(),
@@ -623,10 +654,7 @@ pub(super) fn run_diff_history(
         alloc_deltas.pack_exec = pack_exec_alloc_after.since(&pack_exec_alloc_before);
     }
 
-    if !matches!(
-        resume_state.map(ScanResumeState::stage),
-        Some(ScanCheckpointStage::PreFinalize)
-    ) {
+    if !matches!(resume_stage, Some(ScanCheckpointStage::PreFinalize)) {
         checkpoint_stage(
             checkpoint_sink,
             &StageCheckpoint::PreFinalize {

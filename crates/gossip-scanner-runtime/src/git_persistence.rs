@@ -70,17 +70,23 @@ const NS_GIT_SCAN_CHECKPOINT_BASE: [u8; 4] = *b"gcb\0";
 /// Durable prefix-state checkpoint key namespace for Git scan resume.
 const NS_GIT_SCAN_CHECKPOINT_PREFIX: [u8; 4] = *b"gcp\0";
 
+/// Fixed-size checkpoint key: namespace(4) + repo_id(8) + policy_hash(32) + start_set_id(32) = 76 bytes.
+const GIT_SCAN_CHECKPOINT_KEY_LEN: usize = 4 + 8 + 32 + 32;
+
+/// Stack-allocated checkpoint key that avoids per-call heap allocation.
+type CheckpointKey = [u8; GIT_SCAN_CHECKPOINT_KEY_LEN];
+
 fn build_git_scan_checkpoint_key(
-    namespace: &[u8],
+    namespace: &[u8; 4],
     repo_id: u64,
     policy_hash: &[u8; 32],
     start_set_id: &StartSetId,
-) -> Vec<u8> {
-    let mut key = Vec::with_capacity(namespace.len() + 8 + 32 + 32);
-    key.extend_from_slice(namespace);
-    key.extend_from_slice(&repo_id.to_le_bytes());
-    key.extend_from_slice(policy_hash);
-    key.extend_from_slice(start_set_id);
+) -> CheckpointKey {
+    let mut key = [0u8; GIT_SCAN_CHECKPOINT_KEY_LEN];
+    key[..4].copy_from_slice(namespace);
+    key[4..12].copy_from_slice(&repo_id.to_le_bytes());
+    key[12..44].copy_from_slice(policy_hash);
+    key[44..76].copy_from_slice(start_set_id);
     key
 }
 
@@ -235,7 +241,7 @@ impl<B> GitPersistenceAdapter<B> {
     }
 
     /// Build the durable base-state checkpoint key for this scan scope.
-    fn checkpoint_base_key(&self) -> Vec<u8> {
+    fn checkpoint_base_key(&self) -> CheckpointKey {
         build_git_scan_checkpoint_key(
             &NS_GIT_SCAN_CHECKPOINT_BASE,
             self.repo_id,
@@ -245,7 +251,7 @@ impl<B> GitPersistenceAdapter<B> {
     }
 
     /// Build the durable prefix-state checkpoint key for this scan scope.
-    fn checkpoint_prefix_key(&self) -> Vec<u8> {
+    fn checkpoint_prefix_key(&self) -> CheckpointKey {
         build_git_scan_checkpoint_key(
             &NS_GIT_SCAN_CHECKPOINT_PREFIX,
             self.repo_id,
@@ -378,8 +384,8 @@ where
 {
     fn load_resume_state(&self) -> Result<LoadedScanCheckpoint, ScanCheckpointError> {
         let keys = vec![
-            self.persistence.checkpoint_base_key(),
-            self.persistence.checkpoint_prefix_key(),
+            self.persistence.checkpoint_base_key().to_vec(),
+            self.persistence.checkpoint_prefix_key().to_vec(),
         ];
         let values = self
             .persistence
@@ -408,19 +414,28 @@ where
         let prefix_key = self.persistence.checkpoint_prefix_key();
         let mut ops = Vec::with_capacity(2);
 
-        if let Some(base_state) = checkpoint.encode_base_state()? {
-            ops.push(GitPersistenceOp::Put {
-                key: base_key,
-                value: base_state,
-            });
-        }
+        // Crash-consistency note: for non-atomic backends, the ops within
+        // apply_batch may be partially applied. Prefix ops are ordered before
+        // base ops so that the worst-case partial state is "no prefix + old
+        // base" (resumes from PostSpillDedup, which is correct) rather than
+        // "stale prefix + new base" (potential deserialization mismatch).
+        // For atomic backends the ordering is irrelevant — the batch is
+        // all-or-nothing.
         if let Some(prefix_state) = checkpoint.encode_prefix_state()? {
             ops.push(GitPersistenceOp::Put {
-                key: prefix_key,
+                key: prefix_key.to_vec(),
                 value: prefix_state,
             });
         } else {
-            ops.push(GitPersistenceOp::Delete { key: prefix_key });
+            ops.push(GitPersistenceOp::Delete {
+                key: prefix_key.to_vec(),
+            });
+        }
+        if let Some(base_state) = checkpoint.encode_base_state()? {
+            ops.push(GitPersistenceOp::Put {
+                key: base_key.to_vec(),
+                value: base_state,
+            });
         }
 
         self.persistence
@@ -888,10 +903,10 @@ where
         };
         let checkpoint_delete_ops = [
             GitPersistenceOp::Delete {
-                key: checkpoint_base_key.clone(),
+                key: checkpoint_base_key.to_vec(),
             },
             GitPersistenceOp::Delete {
-                key: checkpoint_prefix_key.clone(),
+                key: checkpoint_prefix_key.to_vec(),
             },
         ];
 

@@ -579,10 +579,15 @@ fn validate_receipt(
 fn strip_checkpoint_token(boundary: &CheckpointBoundary) -> Option<CheckpointBoundary> {
     Some(match boundary {
         CheckpointBoundary::OrderedContent(_) => {
+            // Ordered-content tokens are seek optimizations — strip them so
+            // checkpoints carry only the authoritative last_key.
             let last_key = boundary.cursor().last_key().cloned()?;
             CheckpointBoundary::ordered_content(Cursor::with_last_key(last_key))
         }
         CheckpointBoundary::RepoFrontier(_) => {
+            // Repo-frontier tokens encode inner-stage resume state (e.g.
+            // mid-scan checkpoint progress). Preserve them so the discovery
+            // source can re-emit the target for resumption.
             CheckpointBoundary::repo_frontier(boundary.cursor().clone())
         }
     })

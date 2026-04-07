@@ -478,6 +478,8 @@ fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
         | GitScanError::PackExec(_)
         | GitScanError::PackIo(_)
         | GitScanError::Spill(_) => true,
+        // Cooperative abort from the checkpoint sink — not a transient failure.
+        GitScanError::CheckpointAbort => false,
         GitScanError::Midx(_)
         | GitScanError::PackPlan(_)
         | GitScanError::ResourceLimit(_)
