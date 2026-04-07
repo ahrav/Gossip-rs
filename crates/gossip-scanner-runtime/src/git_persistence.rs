@@ -1312,6 +1312,9 @@ mod tests {
         OidBytes::sha1([byte; 20])
     }
 
+    /// Constructs a cold-cache adapter simulating a fresh process after crash.
+    /// The adapter starts with no cached seen-bitmap or staging state, forcing
+    /// fallback reads from the backend — exactly what happens after a restart.
     fn fresh_adapter(
         backend: &TestBackend,
         repo_id: u64,
@@ -1340,6 +1343,8 @@ mod tests {
             .unwrap_or_else(|err| panic!("{label} bitmap must deserialize: {err}"))
     }
 
+    /// Subset check: asserts every OID in `oids` is present in the scope bitmap.
+    /// The bitmap may contain additional OIDs beyond those listed.
     fn assert_scope_contains(
         backend: &TestBackend,
         repo_id: u64,
@@ -1353,6 +1358,8 @@ mod tests {
         }
     }
 
+    /// Subset check: asserts every OID in `oids` is present in the staging bitmap.
+    /// The bitmap may contain additional OIDs beyond those listed.
     fn assert_staging_contains(
         backend: &TestBackend,
         repo_id: u64,
@@ -2857,12 +2864,20 @@ mod tests {
             crash_phase in 0u8..3,
             crashed_oids in prop::collection::btree_set(any::<[u8; 20]>(), 1..=20),
             recovery_oids in prop::collection::btree_set(any::<[u8; 20]>(), 0..=20),
+            disjoint_oids in prop::collection::btree_set(any::<[u8; 20]>(), 1..=5),
         ) {
             let backend = TestBackend::non_atomic();
             let repo_id = 31;
             let policy_hash = [0x31; 32];
             let crashed_oids: Vec<_> = crashed_oids.into_iter().map(OidBytes::sha1).collect();
             let recovery_oids: Vec<_> = recovery_oids.into_iter().map(OidBytes::sha1).collect();
+
+            let staged_set: BTreeSet<_> = crashed_oids.iter().chain(&recovery_oids).cloned().collect();
+            let disjoint: Vec<_> = disjoint_oids
+                .into_iter()
+                .map(OidBytes::sha1)
+                .filter(|oid| !staged_set.contains(oid))
+                .collect();
 
             let crashed = fresh_adapter(&backend, repo_id, policy_hash);
             crashed
@@ -2886,13 +2901,7 @@ mod tests {
                 .commit_finalize(&complete_finalize_with_watermark(2))
                 .expect("recovery finalize must succeed");
 
-            let expected: Vec<_> = crashed_oids
-                .iter()
-                .chain(&recovery_oids)
-                .cloned()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
+            let expected: Vec<_> = staged_set.into_iter().collect();
 
             prop_assert_eq!(
                 recovered
@@ -2900,13 +2909,23 @@ mod tests {
                     .expect("final seen check"),
                 vec![true; expected.len()],
             );
+            if !disjoint.is_empty() {
+                prop_assert_eq!(
+                    recovered
+                        .batch_check_seen(&disjoint)
+                        .expect("disjoint OIDs must not be seen"),
+                    vec![false; disjoint.len()],
+                );
+            }
             prop_assert!(
                 !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
                 "successful recovery must clear staging"
             );
-            prop_assert!(
-                backend.get_value(b"rw\0wm").is_some(),
-                "successful recovery must advance watermarks"
+            let wm = backend.get_value(b"rw\0wm");
+            prop_assert_eq!(
+                wm.as_deref(),
+                Some(&[2u8][..]),
+                "recovery watermark must carry the recovery finalize value"
             );
         }
     }
