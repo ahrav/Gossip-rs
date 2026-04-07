@@ -416,12 +416,9 @@ pub(super) fn run_diff_history(
         .map_err(|_| io::Error::other("pack cache size exceeds u32::MAX"))?;
     let pack_exec_workers = config.pack_exec_workers.max(1);
     let plan_count = plans.len();
-    let prefix_resume = resumed_prefix.filter(|prefix| {
-        matches!(
-            prefix.stage,
-            ScanCheckpointStage::PackPlanComplete | ScanCheckpointStage::PreFinalize
-        )
-    });
+    // PrefixStage guarantees only PackPlanComplete or PreFinalize, so no
+    // filter is needed — the type makes invalid stages unrepresentable.
+    let prefix_resume = resumed_prefix;
     let checkpointing_enabled = checkpoint_sink.checkpoints_enabled() || prefix_resume.is_some();
     let mut completed_plan_prefix_len = prefix_resume
         .as_ref()

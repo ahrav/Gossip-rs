@@ -162,11 +162,16 @@ impl OidBytes {
     ///
     /// # Panics
     ///
-    /// Panics (debug only) if `len` is not 20 or 32.
+    /// Panics if `len` is not 20 or 32.
+    ///
+    /// Callers deserializing from untrusted storage should validate the length
+    /// before calling this function. The checkpoint module validates OID lengths
+    /// during `from_loaded`, ensuring the assert never fires for well-formed
+    /// checkpoint blobs.
     #[inline]
     #[must_use]
     pub fn from_raw(len: u8, bytes: [u8; 32]) -> Self {
-        debug_assert!(
+        assert!(
             len == Self::SHA1_LEN || len == Self::SHA256_LEN,
             "invalid OID len: {len}"
         );

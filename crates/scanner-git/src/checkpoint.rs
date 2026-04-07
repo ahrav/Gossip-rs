@@ -4,7 +4,7 @@
 //!
 //! 1. post-commit-plan
 //! 2. post-spill/dedup
-//! 3. post-clean-pack-prefix
+//! 3. pack-plan-complete
 //! 4. pre-finalize
 //!
 //! The public trait surface intentionally keeps the persistence backend opaque.
@@ -49,12 +49,26 @@ fn checkpoint_deserialize<'de, T: serde::Deserialize<'de>>(
 }
 
 /// Storage payloads returned by [`ScanCheckpointSink::load_resume_state`].
+///
+/// The three variants make orphaned prefixes (prefix present without a base)
+/// structurally unrepresentable.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LoadedScanCheckpoint {
-    /// Durable base-state blob, if any.
-    pub base_state: Option<Vec<u8>>,
-    /// Durable prefix-state blob, if any.
-    pub prefix_state: Option<Vec<u8>>,
+pub enum LoadedScanCheckpoint {
+    /// No durable checkpoint exists.
+    #[default]
+    Empty,
+    /// Only the base-state blob exists (no prefix).
+    BaseOnly {
+        /// Durable base-state blob.
+        base_state: Vec<u8>,
+    },
+    /// Both base-state and prefix-state blobs exist.
+    BaseAndPrefix {
+        /// Durable base-state blob.
+        base_state: Vec<u8>,
+        /// Durable prefix-state blob.
+        prefix_state: Vec<u8>,
+    },
 }
 
 /// Checkpoint sink control signal.
@@ -78,6 +92,30 @@ pub enum ScanCheckpointStage {
     PackPlanComplete = 3,
     /// Full scan output is durable and finalize can resume directly.
     PreFinalize = 4,
+}
+
+/// Stage discriminant restricted to stages that produce a durable prefix blob.
+///
+/// Only [`PackPlanComplete`](Self::PackPlanComplete) and
+/// [`PreFinalize`](Self::PreFinalize) emit prefix state. This type makes the
+/// constraint visible at compile time, eliminating dead match arms in
+/// consumers.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrefixStage {
+    /// A clean contiguous prefix of pack plans is durable.
+    PackPlanComplete = 3,
+    /// Full scan output is durable and finalize can resume directly.
+    PreFinalize = 4,
+}
+
+impl From<PrefixStage> for ScanCheckpointStage {
+    fn from(value: PrefixStage) -> Self {
+        match value {
+            PrefixStage::PackPlanComplete => Self::PackPlanComplete,
+            PrefixStage::PreFinalize => Self::PreFinalize,
+        }
+    }
 }
 
 impl ScanCheckpointStage {
@@ -146,9 +184,13 @@ pub trait ScanCheckpointSink {
     ///   existing base blob; a partial write that persists the prefix
     ///   without the base creates an unrecoverable orphan.
     /// - If the backend does not support atomic multi-key writes, the
-    ///   implementation should write the base key first and the prefix key
-    ///   second, so a crash between the two leaves a valid (though less
-    ///   advanced) base-only state rather than an orphaned prefix.
+    ///   implementation should apply prefix ops before base ops. For
+    ///   base-only stages the prefix op is a delete: a crash after the
+    ///   delete but before the base write leaves "no prefix + old base",
+    ///   which is a valid earlier checkpoint. For prefix-only stages the
+    ///   prefix is written first while the base is unchanged, so no crash
+    ///   window exists. This ordering ensures the worst case is always a
+    ///   valid, less-advanced state rather than an orphaned prefix.
     fn notify_stage_complete(
         &self,
         checkpoint: &StageCheckpoint<'_>,
@@ -456,6 +498,10 @@ fn validate_stored_byte_ref(
     Ok(())
 }
 
+/// Deserialized resume state produced by [`from_loaded`](Self::from_loaded).
+///
+/// Each variant corresponds to one of the four checkpoint stages and carries
+/// the validated, owned data needed to resume a scan from that point.
 #[derive(Clone, Debug)]
 pub enum ScanResumeState {
     PostCommitPlan(CommitPlanResumeState),
@@ -471,18 +517,24 @@ pub enum ScanResumeState {
 }
 
 impl ScanResumeState {
+    /// Decode and validate a durable checkpoint into resume state.
+    ///
+    /// Returns `Ok(None)` when the checkpoint should be discarded (empty,
+    /// schema version mismatch, stale scan mode or artifact fingerprint).
+    /// Returns `Err` when the checkpoint is structurally invalid (bad OID
+    /// lengths, out-of-bounds arena refs, invalid stage discriminator).
     pub fn from_loaded(
         loaded: LoadedScanCheckpoint,
         scan_mode: GitScanMode,
         artifact_fingerprint: &RepoArtifactFingerprint,
     ) -> Result<Option<Self>, ScanCheckpointError> {
-        let Some(base_state) = loaded.base_state else {
-            if loaded.prefix_state.is_some() {
-                return Err(ScanCheckpointError::InvalidState(
-                    "prefix checkpoint exists without a base checkpoint".to_owned(),
-                ));
-            }
-            return Ok(None);
+        let (base_state, prefix_state) = match loaded {
+            LoadedScanCheckpoint::Empty => return Ok(None),
+            LoadedScanCheckpoint::BaseOnly { base_state } => (base_state, None),
+            LoadedScanCheckpoint::BaseAndPrefix {
+                base_state,
+                prefix_state,
+            } => (base_state, Some(prefix_state)),
         };
 
         let envelope: StoredBaseStateEnvelope = match checkpoint_deserialize(&base_state) {
@@ -509,7 +561,7 @@ impl ScanResumeState {
                 {
                     return Ok(None);
                 }
-                if loaded.prefix_state.is_some() {
+                if prefix_state.is_some() {
                     return Err(ScanCheckpointError::InvalidState(
                         "commit-plan checkpoint cannot carry a prefix payload".to_owned(),
                     ));
@@ -523,7 +575,7 @@ impl ScanResumeState {
                     || RepoArtifactFingerprint::from(base.artifact_fingerprint.clone())
                         != *artifact_fingerprint
                 {
-                    if loaded.prefix_state.is_some() {
+                    if prefix_state.is_some() {
                         tracing::debug!(
                             "discarding stale prefix checkpoint alongside mismatched base state"
                         );
@@ -534,7 +586,11 @@ impl ScanResumeState {
                 // Validate deserialized fields before conversion so that
                 // downstream From impls (which use debug_assert-only checks)
                 // never encounter out-of-range values in release builds.
-                let arena_len = base.path_arena.len() as u32;
+                let arena_len = u32::try_from(base.path_arena.len()).map_err(|_| {
+                    ScanCheckpointError::InvalidState(
+                        "path arena exceeds u32 address space".to_owned(),
+                    )
+                })?;
                 validate_stored_base_candidates(&base.packed, &base.loose, arena_len)?;
 
                 let base = ScanResumeBaseState {
@@ -547,7 +603,7 @@ impl ScanResumeState {
                     mapping_stats: base.mapping_stats.into(),
                 };
 
-                let Some(prefix_state) = loaded.prefix_state else {
+                let Some(prefix_state) = prefix_state else {
                     return Ok(Some(Self::PostSpillDedup(base)));
                 };
                 let prefix_envelope: StoredPrefixStateEnvelope =
@@ -572,8 +628,18 @@ impl ScanResumeState {
 
                 validate_stored_prefix(&prefix)?;
 
+                let prefix_stage = match prefix.stage {
+                    ScanCheckpointStage::PackPlanComplete => PrefixStage::PackPlanComplete,
+                    ScanCheckpointStage::PreFinalize => PrefixStage::PreFinalize,
+                    _ => {
+                        return Err(ScanCheckpointError::InvalidState(
+                            "prefix checkpoint has an invalid stage discriminator".to_owned(),
+                        ));
+                    }
+                };
+
                 let prefix = ScanResumePrefixState {
-                    stage: prefix.stage,
+                    stage: prefix_stage,
                     completed_plan_count: prefix.completed_plan_count as usize,
                     scanned: prefix.scanned.into(),
                     skipped_candidates: prefix
@@ -585,17 +651,10 @@ impl ScanResumeState {
                 };
 
                 match prefix.stage {
-                    ScanCheckpointStage::PostCommitPlan | ScanCheckpointStage::PostSpillDedup => {
-                        Err(ScanCheckpointError::InvalidState(
-                            "prefix checkpoint has an invalid stage discriminator".to_owned(),
-                        ))
-                    }
-                    ScanCheckpointStage::PackPlanComplete => {
+                    PrefixStage::PackPlanComplete => {
                         Ok(Some(Self::PackPlanComplete { base, prefix }))
                     }
-                    ScanCheckpointStage::PreFinalize => {
-                        Ok(Some(Self::PreFinalize { base, prefix }))
-                    }
+                    PrefixStage::PreFinalize => Ok(Some(Self::PreFinalize { base, prefix })),
                 }
             }
         }
@@ -613,8 +672,8 @@ impl ScanResumeState {
     /// Split resume state into its constituent parts, consuming the value.
     ///
     /// Returns `(stage, base_state, prefix_state)` where base and prefix are
-    /// owned, avoiding multi-MiB clones that the reference-based accessors
-    /// would require.
+    /// moved out without cloning, which matters when the inner fields are
+    /// multi-MiB candidate vectors.
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -648,11 +707,14 @@ impl ScanResumeState {
     }
 }
 
+/// Early-stage resume state carrying only the commit plan.
 #[derive(Clone, Debug)]
 pub struct CommitPlanResumeState {
     pub plan: Vec<PlannedCommit>,
 }
 
+/// Base resume state from the `PostSpillDedup` stage, carrying the full
+/// candidate set and associated statistics.
 #[derive(Clone, Debug)]
 pub struct ScanResumeBaseState {
     pub plan: Vec<PlannedCommit>,
@@ -664,9 +726,10 @@ pub struct ScanResumeBaseState {
     pub mapping_stats: MappingStats,
 }
 
+/// Incremental pack-plan execution progress from a prefix-carrying stage.
 #[derive(Clone, Debug)]
 pub struct ScanResumePrefixState {
-    pub stage: ScanCheckpointStage,
+    pub stage: PrefixStage,
     pub completed_plan_count: usize,
     pub scanned: ScannedBlobs,
     pub skipped_candidates: Vec<SkippedCandidate>,
@@ -1353,9 +1416,11 @@ mod tests {
             artifact_fingerprint: &artifact(1),
             plan: &plan(),
         };
-        let loaded = LoadedScanCheckpoint {
-            base_state: checkpoint.encode_base_state().unwrap(),
-            prefix_state: None,
+        let loaded = LoadedScanCheckpoint::BaseOnly {
+            base_state: checkpoint
+                .encode_base_state()
+                .expect("encode")
+                .expect("PostCommitPlan produces base"),
         };
 
         let state = ScanResumeState::from_loaded(loaded, GitScanMode::OdbBlobFast, &artifact(9))
@@ -1562,9 +1627,9 @@ mod tests {
             .expect("PackPlanComplete must produce prefix state");
 
         // Round-trip through from_loaded.
-        let loaded = LoadedScanCheckpoint {
-            base_state: Some(base_state),
-            prefix_state: Some(prefix_state),
+        let loaded = LoadedScanCheckpoint::BaseAndPrefix {
+            base_state,
+            prefix_state,
         };
         let resume = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
             .expect("from_loaded should succeed")
@@ -1584,7 +1649,7 @@ mod tests {
         assert_eq!(base.tree_diff_stats.trees_loaded, 10);
 
         let prefix = prefix.expect("prefix must be present");
-        assert_eq!(prefix.stage, ScanCheckpointStage::PackPlanComplete);
+        assert_eq!(prefix.stage, PrefixStage::PackPlanComplete);
         assert_eq!(prefix.completed_plan_count, 1);
         assert_eq!(prefix.scanned.blobs.len(), 1);
         assert_eq!(prefix.scanned.finding_arena.len(), 1);
@@ -1715,9 +1780,8 @@ mod tests {
             mapping_stats,
         ) = encode_spill_dedup_base(&fp);
 
-        let loaded = LoadedScanCheckpoint {
-            base_state: Some(base_bytes),
-            prefix_state: None,
+        let loaded = LoadedScanCheckpoint::BaseOnly {
+            base_state: base_bytes,
         };
         let resume = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
             .expect("from_loaded should succeed")
@@ -1864,9 +1928,9 @@ mod tests {
             .expect("prefix encode")
             .expect("PackPlanComplete must produce prefix state");
 
-        let loaded = LoadedScanCheckpoint {
-            base_state: Some(base_bytes),
-            prefix_state: Some(prefix_bytes),
+        let loaded = LoadedScanCheckpoint::BaseAndPrefix {
+            base_state: base_bytes,
+            prefix_state: prefix_bytes,
         };
         let resume = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
             .expect("from_loaded should succeed")
@@ -1894,19 +1958,14 @@ mod tests {
         assert_eq!(prefix.common_metrics.binary_extracted, 1);
     }
 
+    /// Orphaned prefix (prefix present without base) is now structurally
+    /// unrepresentable via [`LoadedScanCheckpoint`]. The persistence layer
+    /// rejects the invalid state at construction time rather than deferring
+    /// validation to `from_loaded`.
     #[test]
-    fn from_loaded_rejects_prefix_without_base() {
-        let loaded = LoadedScanCheckpoint {
-            base_state: None,
-            prefix_state: Some(vec![0]),
-        };
-        let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &artifact(20))
-            .expect_err("should reject prefix without base");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("prefix checkpoint exists without"),
-            "unexpected error message: {msg}"
-        );
+    fn loaded_checkpoint_default_is_empty() {
+        let loaded = LoadedScanCheckpoint::default();
+        assert_eq!(loaded, LoadedScanCheckpoint::Empty);
     }
 
     #[test]
@@ -1922,9 +1981,9 @@ mod tests {
             .expect("encode")
             .expect("PostCommitPlan produces base state");
 
-        let loaded = LoadedScanCheckpoint {
-            base_state: Some(base_bytes),
-            prefix_state: Some(vec![0xFF]),
+        let loaded = LoadedScanCheckpoint::BaseAndPrefix {
+            base_state: base_bytes,
+            prefix_state: vec![0xFF],
         };
         let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
             .expect_err("should reject commit-plan with prefix");
@@ -1958,9 +2017,9 @@ mod tests {
         let prefix_bytes =
             postcard::to_allocvec(&invalid_prefix).expect("serialize invalid prefix");
 
-        let loaded = LoadedScanCheckpoint {
-            base_state: Some(base_bytes),
-            prefix_state: Some(prefix_bytes),
+        let loaded = LoadedScanCheckpoint::BaseAndPrefix {
+            base_state: base_bytes,
+            prefix_state: prefix_bytes,
         };
         let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
             .expect_err("should reject invalid prefix stage");
@@ -1984,9 +2043,8 @@ mod tests {
             .expect("encode")
             .expect("PostCommitPlan produces base state");
 
-        let loaded = LoadedScanCheckpoint {
-            base_state: Some(base_bytes),
-            prefix_state: None,
+        let loaded = LoadedScanCheckpoint::BaseOnly {
+            base_state: base_bytes,
         };
         // Load with a different scan mode than what was encoded.
         let result =
@@ -1999,9 +2057,8 @@ mod tests {
 
     #[test]
     fn deserialize_truncated_blob_restarts_fresh() {
-        let loaded = LoadedScanCheckpoint {
-            base_state: Some(vec![0xFF, 0x01, 0x02]),
-            prefix_state: None,
+        let loaded = LoadedScanCheckpoint::BaseOnly {
+            base_state: vec![0xFF, 0x01, 0x02],
         };
         let result = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &artifact(1))
             .expect("graceful decode failure returns Ok");
@@ -2015,10 +2072,7 @@ mod tests {
         // attempts to parse anything.
         let blob = vec![0u8; MAX_CHECKPOINT_BYTES + 1];
 
-        let loaded = LoadedScanCheckpoint {
-            base_state: Some(blob),
-            prefix_state: None,
-        };
+        let loaded = LoadedScanCheckpoint::BaseOnly { base_state: blob };
         let result =
             ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &artifact(0xAA))
                 .expect("graceful decode failure returns Ok");
@@ -2064,10 +2118,7 @@ mod tests {
         };
         let blob = postcard::to_allocvec(&stored).expect("encode");
 
-        let loaded = LoadedScanCheckpoint {
-            base_state: Some(blob),
-            prefix_state: None,
-        };
+        let loaded = LoadedScanCheckpoint::BaseOnly { base_state: blob };
         let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
             .expect_err("invalid OID length must fail");
         assert!(
@@ -2118,10 +2169,7 @@ mod tests {
         };
         let blob = postcard::to_allocvec(&stored).expect("encode");
 
-        let loaded = LoadedScanCheckpoint {
-            base_state: Some(blob),
-            prefix_state: None,
-        };
+        let loaded = LoadedScanCheckpoint::BaseOnly { base_state: blob };
         let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
             .expect_err("OOB ByteRef must fail");
         assert!(
@@ -2173,9 +2221,9 @@ mod tests {
         };
         let prefix_blob = postcard::to_allocvec(&prefix).expect("encode");
 
-        let loaded = LoadedScanCheckpoint {
-            base_state: Some(base_blob),
-            prefix_state: Some(prefix_blob),
+        let loaded = LoadedScanCheckpoint::BaseAndPrefix {
+            base_state: base_blob,
+            prefix_state: prefix_blob,
         };
         let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
             .expect_err("OOB FindingSpan must fail");
@@ -2186,6 +2234,145 @@ mod tests {
         assert!(
             err.to_string().contains("FindingSpan"),
             "error message should mention FindingSpan: {err}"
+        );
+    }
+
+    /// PostCommitPlan round-trip: encode → from_loaded → verify plan survives.
+    #[test]
+    fn round_trip_post_commit_plan_through_from_loaded() {
+        let fp = artifact(30);
+        let commits = plan();
+        let checkpoint = StageCheckpoint::PostCommitPlan {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &fp,
+            plan: &commits,
+        };
+        let base_state = checkpoint
+            .encode_base_state()
+            .expect("encode")
+            .expect("PostCommitPlan produces base state");
+
+        let loaded = LoadedScanCheckpoint::BaseOnly { base_state };
+        let resume = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect("from_loaded should succeed")
+            .expect("matching fingerprint should produce Some");
+
+        let (stage, base, prefix) = resume.into_parts();
+        assert_eq!(stage, ScanCheckpointStage::PostCommitPlan);
+        assert!(prefix.is_none(), "PostCommitPlan must not carry a prefix");
+
+        let base = base.expect("base must be present");
+        assert_eq!(base.plan.len(), commits.len());
+        assert_eq!(base.plan[0].pos, commits[0].pos);
+        assert_eq!(base.plan[1].snapshot_root, commits[1].snapshot_root);
+    }
+
+    /// PreFinalize round-trip: encode → from_loaded → verify stage and prefix.
+    #[test]
+    fn round_trip_pre_finalize_through_from_loaded() {
+        let fp = artifact(31);
+        let (base_bytes, _, _, _, _, _, _, _) = encode_spill_dedup_base(&fp);
+
+        let dummy_ctx = CandidateContext {
+            commit_id: 0,
+            parent_idx: 0,
+            change_kind: ChangeKind::Add,
+            ctx_flags: 0o100644,
+            cand_flags: 0,
+            path_ref: ByteRef { off: 0, len: 0 },
+        };
+        let scanned = ScannedBlobs {
+            blobs: vec![ScannedBlob {
+                oid: OidBytes::sha1([0xDD; 20]),
+                ctx: dummy_ctx,
+                findings: FindingSpan { start: 0, len: 0 },
+            }],
+            finding_arena: Vec::new(),
+        };
+        let path_arena = ByteArena::with_capacity(0);
+        let prefix_checkpoint = StageCheckpoint::PreFinalize {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &fp,
+            plan: &plan(),
+            packed: &[],
+            loose: &[],
+            path_arena: &path_arena,
+            tree_diff_stats: TreeDiffStats::default(),
+            spill_stats: SpillStats::default(),
+            mapping_stats: MappingStats::default(),
+            completed_plan_count: 2,
+            scanned: &scanned,
+            skipped_candidates: &[],
+            common_metrics: GitScanCommonMetrics::default(),
+        };
+        let prefix_state = prefix_checkpoint
+            .encode_prefix_state()
+            .expect("prefix encode")
+            .expect("PreFinalize must produce prefix state");
+
+        let loaded = LoadedScanCheckpoint::BaseAndPrefix {
+            base_state: base_bytes,
+            prefix_state,
+        };
+        let resume = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect("from_loaded should succeed")
+            .expect("matching fingerprint should produce Some");
+
+        let (stage, _base, prefix) = resume.into_parts();
+        assert_eq!(stage, ScanCheckpointStage::PreFinalize);
+
+        let prefix = prefix.expect("PreFinalize must carry a prefix");
+        assert_eq!(prefix.stage, PrefixStage::PreFinalize);
+        assert_eq!(prefix.completed_plan_count, 2);
+        assert_eq!(prefix.scanned.blobs.len(), 1);
+    }
+
+    /// Verify that `completed_plan_count` survives serialization round-trip,
+    /// ensuring the runner-level guard (`completed_plan_prefix_len > plans.len()`)
+    /// receives the correct value.
+    #[test]
+    fn completed_plan_count_fidelity_through_round_trip() {
+        let fp = artifact(32);
+        let (base_bytes, _, _, _, _, _, _, _) = encode_spill_dedup_base(&fp);
+
+        let path_arena = ByteArena::with_capacity(0);
+        let scanned = ScannedBlobs {
+            blobs: Vec::new(),
+            finding_arena: Vec::new(),
+        };
+        let prefix_checkpoint = StageCheckpoint::PackPlanComplete {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &fp,
+            plan: &plan(),
+            packed: &[],
+            loose: &[],
+            path_arena: &path_arena,
+            tree_diff_stats: TreeDiffStats::default(),
+            spill_stats: SpillStats::default(),
+            mapping_stats: MappingStats::default(),
+            completed_plan_count: 7,
+            scanned: &scanned,
+            skipped_candidates: &[],
+            common_metrics: GitScanCommonMetrics::default(),
+        };
+        let prefix_state = prefix_checkpoint
+            .encode_prefix_state()
+            .expect("prefix encode")
+            .expect("PackPlanComplete must produce prefix state");
+
+        let loaded = LoadedScanCheckpoint::BaseAndPrefix {
+            base_state: base_bytes,
+            prefix_state,
+        };
+        let resume = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect("from_loaded should succeed")
+            .expect("matching fingerprint should produce Some");
+
+        let (_stage, _base, prefix) = resume.into_parts();
+        let prefix = prefix.expect("PackPlanComplete must carry a prefix");
+        assert_eq!(
+            prefix.completed_plan_count, 7,
+            "completed_plan_count must survive serialization round-trip"
         );
     }
 }

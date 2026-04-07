@@ -1410,4 +1410,45 @@ mod tests {
             );
         }
     }
+
+    /// A checkpoint sink that returns Abort must cause `checkpoint_stage` to
+    /// return `GitScanError::CheckpointAbort`.
+    #[test]
+    fn checkpoint_stage_abort_propagates_as_error() {
+        use crate::checkpoint::{
+            CheckpointAck, LoadedScanCheckpoint, ScanCheckpointError, ScanCheckpointSink,
+            StageCheckpoint,
+        };
+        use crate::RepoArtifactFingerprint;
+
+        struct AbortingSink;
+        impl ScanCheckpointSink for AbortingSink {
+            fn load_resume_state(&self) -> Result<LoadedScanCheckpoint, ScanCheckpointError> {
+                Ok(LoadedScanCheckpoint::Empty)
+            }
+            fn notify_stage_complete(
+                &self,
+                _checkpoint: &StageCheckpoint<'_>,
+            ) -> Result<CheckpointAck, ScanCheckpointError> {
+                Ok(CheckpointAck::Abort)
+            }
+        }
+
+        let fp = RepoArtifactFingerprint {
+            packs_hash: [0xAA; 32],
+            idx_hash: [0xBB; 32],
+        };
+        let checkpoint = StageCheckpoint::PostCommitPlan {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &fp,
+            plan: &[],
+        };
+
+        let err = checkpoint_stage(&AbortingSink, &checkpoint)
+            .expect_err("Abort signal must produce an error");
+        assert!(
+            matches!(err, GitScanError::CheckpointAbort),
+            "expected CheckpointAbort, got: {err:?}"
+        );
+    }
 }

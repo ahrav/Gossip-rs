@@ -123,9 +123,10 @@ impl ByteArena {
 
     /// Reconstruct an arena from already-interned bytes.
     ///
-    /// The restored arena is read-only by construction: its capacity is set to
-    /// the current backing length because resume paths only dereference
-    /// existing `ByteRef` values and never append new paths.
+    /// The restored arena is effectively read-only: its capacity equals the
+    /// current backing length, so `intern` returns `None` for any non-empty
+    /// input. Resume paths only dereference existing `ByteRef` values and
+    /// never append new paths.
     #[must_use]
     pub fn from_backing_bytes(bytes: Vec<u8>) -> Self {
         let capacity =

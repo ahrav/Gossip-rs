@@ -457,12 +457,9 @@ pub(super) fn run_odb_blob(
     let pack_cache_bytes: u32 = pack_cache_target
         .try_into()
         .map_err(|_| io::Error::other("pack cache size exceeds u32::MAX"))?;
-    let prefix_resume = resumed_prefix.filter(|prefix| {
-        matches!(
-            prefix.stage,
-            ScanCheckpointStage::PackPlanComplete | ScanCheckpointStage::PreFinalize
-        )
-    });
+    // PrefixStage guarantees only PackPlanComplete or PreFinalize, so no
+    // filter is needed — the type makes invalid stages unrepresentable.
+    let prefix_resume = resumed_prefix;
     let checkpointing_enabled = checkpoint_sink.checkpoints_enabled() || prefix_resume.is_some();
     let mut pack_exec_reports = Vec::with_capacity(used_pack_ids.len());
     // Destructure owned prefix to move data rather than cloning multi-MiB

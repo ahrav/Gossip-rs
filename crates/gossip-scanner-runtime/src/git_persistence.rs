@@ -400,9 +400,20 @@ where
             )));
         }
         let mut values = values.into_iter();
-        Ok(LoadedScanCheckpoint {
-            base_state: values.next().flatten(),
-            prefix_state: values.next().flatten(),
+        let base_state = values.next().flatten();
+        let prefix_state = values.next().flatten();
+        Ok(match (base_state, prefix_state) {
+            (None, None) => LoadedScanCheckpoint::Empty,
+            (Some(base_state), None) => LoadedScanCheckpoint::BaseOnly { base_state },
+            (Some(base_state), Some(prefix_state)) => LoadedScanCheckpoint::BaseAndPrefix {
+                base_state,
+                prefix_state,
+            },
+            (None, Some(_)) => {
+                return Err(ScanCheckpointError::backend(
+                    "checkpoint prefix key exists without base key (orphaned prefix)",
+                ));
+            }
         })
     }
 
@@ -1637,8 +1648,10 @@ mod tests {
         let base_only = sink
             .load_resume_state()
             .expect("base checkpoint should load");
-        assert!(base_only.base_state.is_some());
-        assert!(base_only.prefix_state.is_none());
+        assert!(
+            matches!(base_only, LoadedScanCheckpoint::BaseOnly { .. }),
+            "base-only checkpoint should load as BaseOnly"
+        );
 
         let decoded_base =
             ScanResumeState::from_loaded(base_only, GitScanMode::OdbBlobFast, &fingerprint)
@@ -1669,8 +1682,10 @@ mod tests {
         let loaded = sink
             .load_resume_state()
             .expect("base and prefix checkpoints should load");
-        assert!(loaded.base_state.is_some());
-        assert!(loaded.prefix_state.is_some());
+        assert!(
+            matches!(loaded, LoadedScanCheckpoint::BaseAndPrefix { .. }),
+            "full checkpoint should load as BaseAndPrefix"
+        );
 
         let decoded_full =
             ScanResumeState::from_loaded(loaded, GitScanMode::OdbBlobFast, &fingerprint)
