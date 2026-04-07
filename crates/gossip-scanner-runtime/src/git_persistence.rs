@@ -836,8 +836,8 @@ pub mod test_support {
         pub message: &'static str,
     }
 
-    /// Categorizes a backend key by its namespace prefix for write-ordering
-    /// assertions in finalize tests.
+    /// Categorizes a backend key by its namespace prefix for phase-level
+    /// assertions (ordering, presence, absence) in finalize tests.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum KeyNamespace {
         BlobCtx,
@@ -845,10 +845,14 @@ pub mod test_support {
         SeenScope,
         SeenStaging,
         Watermark,
-        Unknown,
     }
 
     impl KeyNamespace {
+        /// Classifies a key by its namespace prefix.
+        ///
+        /// Panics on unrecognized prefixes so that new namespaces added in
+        /// production code are immediately surfaced in test failures rather
+        /// than silently falling through.
         pub fn from_key(key: &[u8]) -> Self {
             if key.starts_with(&NS_BLOB_CTX) {
                 Self::BlobCtx
@@ -861,21 +865,37 @@ pub mod test_support {
             } else if key.starts_with(&NS_REF_WATERMARK) {
                 Self::Watermark
             } else {
-                Self::Unknown
+                panic!("unrecognized namespace prefix in key: {key:02x?}")
             }
         }
     }
 
     /// One logged backend operation annotated with the key namespace it
-    /// belongs to, used to verify write-ordering invariants in finalize tests.
+    /// belongs to, used to verify write-phase invariants (ordering, presence,
+    /// absence) in finalize tests.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct SimBackendOp {
-        pub ns: KeyNamespace,
+        ns: KeyNamespace,
         pub op: GitPersistenceOp,
     }
 
+    impl SimBackendOp {
+        /// Constructs a log entry, deriving the namespace from the op's key.
+        pub fn new(op: GitPersistenceOp) -> Self {
+            Self {
+                ns: KeyNamespace::from_key(op_key(&op)),
+                op,
+            }
+        }
+
+        /// Returns the namespace this operation belongs to.
+        pub fn ns(&self) -> KeyNamespace {
+            self.ns
+        }
+    }
+
     /// Determines when a queued batch fault fires.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum BatchFaultTrigger {
         /// Fires on any `apply_batch` call regardless of key content.
         Any,
@@ -888,8 +908,12 @@ pub mod test_support {
             Self::Any
         }
 
-        pub fn key_prefix(prefix: &[u8]) -> Self {
-            Self::KeyPrefix(prefix.to_vec())
+        pub fn key_prefix(prefix: &'static [u8]) -> Self {
+            assert!(
+                !prefix.is_empty(),
+                "empty prefix matches every key; use BatchFaultTrigger::Any instead"
+            );
+            Self::KeyPrefix(prefix)
         }
     }
 
@@ -899,6 +923,8 @@ pub mod test_support {
         /// Return an error.
         Fail,
         /// Truncate each returned value to at most `max_len` bytes.
+        /// A present key with `max_len: 0` returns `Some(vec![])` (empty value),
+        /// not `None` (absent key).
         Truncate { max_len: usize },
     }
 
@@ -1013,7 +1039,13 @@ pub mod test_support {
         /// value and compute a relative offset (e.g., `backend.batch_call_count() + 3`
         /// to fail 3 calls from now).
         pub fn set_fail_on_batch_call(&self, call_no: usize) {
-            self.state.borrow_mut().fail_on_batch_call = Some(call_no);
+            let mut state = self.state.borrow_mut();
+            assert!(
+                state.batch_faults.is_empty(),
+                "set_fail_on_batch_call and set_batch_faults are mutually exclusive; \
+                 positional faults shadow content-aware faults and prevent queue advancement"
+            );
+            state.fail_on_batch_call = Some(call_no);
         }
 
         /// Clears any previously injected batch failure.
@@ -1021,15 +1053,16 @@ pub mod test_support {
             self.state.borrow_mut().fail_on_batch_call = None;
         }
 
-        /// Injects a failure when the internal `get` call counter reaches `call_no`.
+        /// Injects a failure when the internal `get` call counter reaches
+        /// `call_no` (1-indexed).
         ///
-        /// This is a convenience wrapper over the get-fault queue that enqueues
-        /// a single `GetFault::Fail` at the given call number.
+        /// Overwrites any previously enqueued get faults. Use
+        /// [`enqueue_get_fault`](Self::enqueue_get_fault) for additive semantics.
         pub fn set_fail_on_get_call(&self, call_no: usize) {
-            self.state
-                .borrow_mut()
-                .get_faults
-                .push((call_no, GetFault::Fail));
+            assert!(call_no > 0, "call_no is 1-indexed; 0 can never fire");
+            let mut state = self.state.borrow_mut();
+            state.get_faults.clear();
+            state.get_faults.push((call_no, GetFault::Fail));
         }
 
         /// Clears any previously enqueued get faults.
@@ -1055,6 +1088,11 @@ pub mod test_support {
         /// batches skip the current trigger without advancing the index.
         pub fn set_batch_faults(&self, faults: Vec<BatchFaultTrigger>) {
             let mut state = self.state.borrow_mut();
+            assert!(
+                state.fail_on_batch_call.is_none(),
+                "set_batch_faults and set_fail_on_batch_call are mutually exclusive; \
+                 positional faults shadow content-aware faults and prevent queue advancement"
+            );
             state.batch_faults = faults;
             state.batch_fault_idx = 0;
         }
@@ -1065,14 +1103,34 @@ pub mod test_support {
         }
 
         /// Enqueues a fault on the Nth `get` call (1-indexed).
+        ///
+        /// Each call number may have at most one fault; duplicates panic.
         pub fn enqueue_get_fault(&self, call_no: usize, fault: GetFault) {
-            debug_assert!(call_no > 0, "call_no is 1-indexed; 0 can never fire");
-            self.state.borrow_mut().get_faults.push((call_no, fault));
+            assert!(call_no > 0, "call_no is 1-indexed; 0 can never fire");
+            let mut state = self.state.borrow_mut();
+            assert!(
+                !state.get_faults.iter().any(|(n, _)| *n == call_no),
+                "duplicate get fault at call_no={call_no}; only the first would fire"
+            );
+            state.get_faults.push((call_no, fault));
         }
 
         /// Enqueues a fault on the Nth `multi_get` call (1-indexed).
+        ///
+        /// Each call number may have at most one fault; duplicates panic.
         pub fn enqueue_multi_get_fault(&self, call_no: usize, fault: GetFault) {
-            debug_assert!(call_no > 0, "call_no is 1-indexed; 0 can never fire");
+            assert!(call_no > 0, "call_no is 1-indexed; 0 can never fire");
+            let state = self.state.borrow();
+            assert!(
+                !state.multi_get_faults.iter().any(|(n, _)| *n == call_no),
+                "duplicate multi_get fault at call_no={call_no}; only the first would fire"
+            );
+            assert!(
+                !state.multi_get_truncate,
+                "enqueue_multi_get_fault and set_multi_get_truncate are mutually exclusive; \
+                 faults silently suppress the length-mismatch simulation"
+            );
+            drop(state);
             self.state
                 .borrow_mut()
                 .multi_get_faults
@@ -1081,15 +1139,27 @@ pub mod test_support {
 
         /// Configures `multi_get` to return one fewer result than requested.
         pub fn set_multi_get_truncate(&self, truncate: bool) {
+            let state = self.state.borrow();
+            assert!(
+                state.multi_get_faults.is_empty() || !truncate,
+                "set_multi_get_truncate and enqueue_multi_get_fault are mutually exclusive; \
+                 faults silently suppress the length-mismatch simulation"
+            );
+            drop(state);
             self.state.borrow_mut().multi_get_truncate = truncate;
         }
 
-        /// Returns recorded batches from all `apply_batch` calls.
+        /// Returns recorded batches from *successful* `apply_batch` calls.
+        /// Faulted calls do not appear here. Use [`batch_call_count`](Self::batch_call_count)
+        /// for the total call count including faulted calls.
         pub fn batches(&self) -> Vec<Vec<GitPersistenceOp>> {
             self.state.borrow().batches.clone()
         }
 
-        /// Returns the total number of `apply_batch` calls so far.
+        /// Returns the total number of `apply_batch` calls so far, including
+        /// calls rejected by fault injection. Positional faults
+        /// ([`set_fail_on_batch_call`](Self::set_fail_on_batch_call)) use this
+        /// counter to decide when to fire.
         pub fn batch_call_count(&self) -> usize {
             self.state.borrow().batch_call_count
         }
@@ -1123,16 +1193,17 @@ pub mod test_support {
             let mut state = self.state.borrow_mut();
             state.batch_call_count += 1;
 
-            // Positional fault (existing API for crash recovery tests).
+            // Positional fault: fires when the monotonic batch counter reaches a fixed target.
             if state.fail_on_batch_call == Some(state.batch_call_count) {
                 return Err(TestBackendError {
-                    message: "injected batch failure",
+                    message: "injected batch failure (positional)",
                 });
             }
 
-            // Content-aware fault queue.
-            if let Some(trigger) = state.batch_faults.get(state.batch_fault_idx).cloned() {
-                let triggered = match &trigger {
+            // Content-aware fault queue: fires when the batch contains a key
+            // matching the current trigger's prefix.
+            if let Some(&trigger) = state.batch_faults.get(state.batch_fault_idx) {
+                let triggered = match trigger {
                     BatchFaultTrigger::Any => true,
                     BatchFaultTrigger::KeyPrefix(prefix) => {
                         ops.iter().any(|op| op_key(op).starts_with(prefix))
@@ -1141,22 +1212,17 @@ pub mod test_support {
                 if triggered {
                     state.batch_fault_idx += 1;
                     return Err(TestBackendError {
-                        message: "injected batch failure",
+                        message: "injected batch failure (content-aware)",
                     });
                 }
             }
 
-            // Phase logging (opt-in).
             if state.phase_logging {
                 for op in ops {
-                    state.op_log.push(SimBackendOp {
-                        ns: KeyNamespace::from_key(op_key(op)),
-                        op: op.clone(),
-                    });
+                    state.op_log.push(SimBackendOp::new(op.clone()));
                 }
             }
 
-            // Record batch and apply KV mutations.
             state.batches.push(ops.to_vec());
             for op in ops {
                 match op {
@@ -1175,13 +1241,13 @@ pub mod test_support {
             self.atomic
         }
 
-        /// Applies faults at the operation level, not per-key.
+        /// `get` and `multi_get` maintain independent fault queues and call
+        /// counters. A fault enqueued via `enqueue_get_fault` never fires
+        /// during `multi_get`, and vice versa.
         ///
-        /// The trait default calls `get()` N times, incrementing the get-call
-        /// counter N times. This override calls the multi-get fault queue once
-        /// per invocation, modeling backend-level failures where the entire
-        /// multi-get operation fails or returns corrupted data. The `get` and
-        /// `multi_get` fault counters are independent.
+        /// Unlike the trait default (which delegates to `get()` N times),
+        /// this override processes the entire key set as a single operation,
+        /// so a `GetFault::Fail` rejects all keys at once.
         fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
             let mut state = self.state.borrow_mut();
             state.multi_get_fault_count += 1;
@@ -1197,7 +1263,7 @@ pub mod test_support {
                 .map(|key| state.kv.get(key.as_slice()).cloned())
                 .collect();
 
-            // Legacy truncation behavior (returns one fewer result).
+            // Length-mismatch simulation: returns one fewer result than requested.
             if state.multi_get_truncate && !values.is_empty() && fault.is_none() {
                 return Ok(values[..values.len() - 1].to_vec());
             }
@@ -1414,11 +1480,14 @@ mod tests {
                 put_op(&scope_key, &[0x03]),
                 delete_op(&staging_key),
                 put_op(b"rw\0wm", &[0x04]),
-                put_op(b"zz", &[0x05]),
             ])
             .expect("batch must succeed");
 
-        let phases: Vec<_> = backend.op_log().into_iter().map(|entry| entry.ns).collect();
+        let phases: Vec<_> = backend
+            .op_log()
+            .into_iter()
+            .map(|entry| entry.ns())
+            .collect();
         assert_eq!(
             phases,
             vec![
@@ -1427,7 +1496,6 @@ mod tests {
                 KeyNamespace::SeenScope,
                 KeyNamespace::SeenStaging,
                 KeyNamespace::Watermark,
-                KeyNamespace::Unknown,
             ]
         );
     }
@@ -1529,7 +1597,11 @@ mod tests {
         );
         assert_eq!(backend.get_value(b"rw\0wm"), Some(vec![0xBB]));
 
-        let namespaces: Vec<_> = backend.op_log().into_iter().map(|entry| entry.ns).collect();
+        let namespaces: Vec<_> = backend
+            .op_log()
+            .into_iter()
+            .map(|entry| entry.ns())
+            .collect();
         assert!(namespaces.contains(&KeyNamespace::BlobCtx));
 
         // Crash-safety invariant: seen-scope writes must precede watermark
@@ -1578,7 +1650,7 @@ mod tests {
             "watermarks must remain absent when the watermark batch fails"
         );
         // Phase log must contain data phases but not watermark.
-        let namespaces: Vec<_> = backend.op_log().iter().map(|e| e.ns).collect();
+        let namespaces: Vec<_> = backend.op_log().iter().map(|e| e.ns()).collect();
         assert!(namespaces.contains(&KeyNamespace::BlobCtx));
         assert!(
             !namespaces.contains(&KeyNamespace::Watermark),
@@ -1636,7 +1708,7 @@ mod tests {
         );
 
         // The finalize batch must contain all phases in a single apply_batch.
-        let namespaces: Vec<_> = backend.op_log().iter().map(|e| e.ns).collect();
+        let namespaces: Vec<_> = backend.op_log().iter().map(|e| e.ns()).collect();
         assert!(
             namespaces.contains(&KeyNamespace::BlobCtx),
             "finalize batch must contain blob context ops"
@@ -1771,9 +1843,115 @@ mod tests {
         let backend = TestBackend::non_atomic();
         backend.enable_phase_logging();
         backend
-            .apply_batch(&[delete_op(b"missing")])
+            .apply_batch(&[delete_op(b"bc\0missing")])
             .expect("delete of absent key must succeed");
         assert_eq!(backend.op_log().len(), 1, "delete is still logged");
+    }
+
+    #[test]
+    #[should_panic(expected = "set_batch_faults and set_fail_on_batch_call are mutually exclusive")]
+    fn sim_backend_rejects_positional_and_content_aware_faults_simultaneously() {
+        let backend = TestBackend::non_atomic();
+        backend.set_fail_on_batch_call(1);
+        // Must panic: positional faults shadow content-aware faults and
+        // prevent queue advancement.
+        backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
+    }
+
+    #[test]
+    fn adapter_atomic_fault_during_finalize_blocks_everything() {
+        let backend = TestBackend::atomic();
+        backend.enable_phase_logging();
+
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 60, [0x60; 32]);
+        let oid = sim_oid(0xDD);
+
+        adapter
+            .persist_seen_delta(&[oid])
+            .expect("stage seen delta");
+
+        // Install fault after staging so it targets the finalize batch.
+        backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
+
+        let err = adapter
+            .commit_finalize(&finalize_output(FinalizeOutcome::Complete))
+            .expect_err("atomic finalize fault must propagate");
+
+        assert!(format!("{err}").contains("injected batch failure"));
+        // Atomic path: single batch for all phases. No finalize data must land.
+        assert!(
+            backend.get_value(b"bc\0blob").is_none(),
+            "data must not land when the atomic finalize batch fails"
+        );
+        assert!(
+            backend.get_value(b"rw\0wm").is_none(),
+            "watermarks must not land when the atomic finalize batch fails"
+        );
+        // The op log may contain staging ops from persist_seen_delta, but
+        // must not contain any finalize-phase ops.
+        let namespaces: Vec<_> = backend.op_log().iter().map(|e| e.ns()).collect();
+        assert!(
+            !namespaces.contains(&KeyNamespace::BlobCtx),
+            "blob-ctx ops must not appear when the finalize batch was rejected"
+        );
+        assert!(
+            !namespaces.contains(&KeyNamespace::Watermark),
+            "watermark ops must not appear when the finalize batch was rejected"
+        );
+    }
+
+    #[test]
+    fn sim_backend_clear_get_faults_preserves_counter() {
+        let backend = TestBackend::non_atomic();
+        let key = b"bc\0blob".to_vec();
+        backend.set(key.clone(), vec![0x11, 0x22]);
+
+        // Fire a fault on the first get call.
+        backend.enqueue_get_fault(1, GetFault::Fail);
+        backend.get(&key).expect_err("first get must fail");
+
+        // Clear and re-enqueue. The counter is now at 1, so targeting
+        // call_no=2 should fire on the next get.
+        backend.clear_fail_on_get_call();
+        backend.enqueue_get_fault(2, GetFault::Truncate { max_len: 1 });
+
+        assert_eq!(
+            backend.get(&key).expect("second get must truncate"),
+            Some(vec![0x11]),
+            "fault at call_no=2 fires because the counter kept incrementing past clear"
+        );
+
+        // Third call: no faults remain.
+        assert_eq!(
+            backend.get(&key).expect("third get must succeed"),
+            Some(vec![0x11, 0x22])
+        );
+    }
+
+    #[test]
+    fn sim_backend_get_truncate_on_absent_key_returns_none() {
+        let backend = TestBackend::non_atomic();
+        backend.enqueue_get_fault(1, GetFault::Truncate { max_len: 0 });
+
+        // Truncation on an absent key is a no-op: None stays None.
+        assert_eq!(
+            backend.get(b"bc\0absent").expect("get must succeed"),
+            None,
+            "truncation of an absent key must return None, not Some(vec![])"
+        );
+    }
+
+    #[test]
+    fn sim_backend_phase_logging_disabled_by_default() {
+        let backend = TestBackend::non_atomic();
+        backend
+            .apply_batch(&[put_op(b"bc\0blob", &[0x01])])
+            .expect("batch must succeed");
+
+        assert!(
+            backend.op_log().is_empty(),
+            "op_log must stay empty when phase logging is not enabled"
+        );
     }
 
     #[test]
