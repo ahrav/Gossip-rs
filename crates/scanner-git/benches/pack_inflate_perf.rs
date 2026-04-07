@@ -86,6 +86,11 @@ fn build_non_delta_case(size: usize) -> (Vec<u8>, u64, Vec<u8>) {
     (pack, offsets[0], payload)
 }
 
+/// Build a synthetic OFS_DELTA pack entry for inflate-throughput measurement.
+///
+/// The delta body is arbitrary patterned bytes, not a valid git delta stream.
+/// This is sufficient for benchmarking zlib decompression, but the inflated
+/// output cannot be fed to `apply_delta`/`apply_delta_into`.
 fn build_delta_case(size: usize) -> (Vec<u8>, u64, Vec<u8>) {
     let base = patterned_bytes(size);
     let delta = patterned_bytes(size);
@@ -327,7 +332,7 @@ fn bench_inflate_entry_payload(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(payload_len as u64));
         group.bench_function(BenchmarkId::new("bucket", name), |b| {
             let mut de = flate2::Decompress::new(true);
-            let mut libde = LibdeflateDecompressor::new();
+            let mut libde = LibdeflateDecompressor::new().expect("allocate libdeflate");
             let mut out = Vec::new();
             b.iter(|| {
                 let consumed = pack_decode::inflate_entry_payload_with(
@@ -368,7 +373,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(payload.len() as u64));
         group.bench_function(BenchmarkId::new("dispatch", name), |b| {
             let mut de = flate2::Decompress::new(true);
-            let mut libde = LibdeflateDecompressor::new();
+            let mut libde = LibdeflateDecompressor::new().expect("allocate libdeflate");
             let mut out = Vec::new();
             b.iter(|| {
                 let consumed = pack_decode::inflate_entry_payload_with(
@@ -411,7 +416,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(payload.len() as u64));
         group.bench_function(BenchmarkId::new("dispatch", "large_nondelta"), |b| {
             let mut de = flate2::Decompress::new(true);
-            let mut libde = LibdeflateDecompressor::new();
+            let mut libde = LibdeflateDecompressor::new().expect("allocate libdeflate");
             let mut out = Vec::new();
             b.iter(|| {
                 let consumed = pack_decode::inflate_entry_payload_with(
@@ -454,7 +459,7 @@ fn bench_inflate_entry_payload_compare(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(payload.len() as u64));
         group.bench_function(BenchmarkId::new("dispatch", "delta_payload"), |b| {
             let mut de = flate2::Decompress::new(true);
-            let mut libde = LibdeflateDecompressor::new();
+            let mut libde = LibdeflateDecompressor::new().expect("allocate libdeflate");
             let mut out = Vec::new();
             b.iter(|| {
                 let consumed = pack_decode::inflate_entry_payload_with(
