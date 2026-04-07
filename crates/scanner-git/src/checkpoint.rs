@@ -11,7 +11,6 @@
 //! Callers load and store raw checkpoint blobs, while this module owns the
 //! encoding and decoding of runner state.
 
-use bincode::Options as _;
 use gix_commitgraph::Position;
 use serde::{Deserialize, Serialize};
 
@@ -32,15 +31,21 @@ use crate::NormHash;
 
 /// Maximum checkpoint blob size accepted during deserialization (256 MiB).
 ///
-/// Prevents a crafted blob from triggering unbounded allocation via
-/// bincode length-prefixed collections.
-const MAX_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
+/// Prevents a crafted blob from triggering unbounded allocation.
+const MAX_CHECKPOINT_BYTES: usize = 256 * 1024 * 1024;
 
-fn checkpoint_codec() -> impl bincode::Options {
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(MAX_CHECKPOINT_BYTES)
-        .allow_trailing_bytes()
+/// Deserialize a checkpoint blob with a size guard.
+///
+/// Rejects inputs exceeding [`MAX_CHECKPOINT_BYTES`] before handing them to
+/// postcard, and tolerates trailing bytes after the deserialized value.
+fn checkpoint_deserialize<'de, T: serde::Deserialize<'de>>(
+    bytes: &'de [u8],
+) -> Result<T, postcard::Error> {
+    if bytes.len() > MAX_CHECKPOINT_BYTES {
+        return Err(postcard::Error::DeserializeUnexpectedEnd);
+    }
+    let (val, _remaining) = postcard::take_from_bytes(bytes)?;
+    Ok(val)
 }
 
 /// Storage payloads returned by [`ScanCheckpointSink::load_resume_state`].
@@ -245,22 +250,21 @@ impl StageCheckpoint<'_> {
                 artifact_fingerprint,
                 plan,
             } => {
-                let encoded = checkpoint_codec()
-                    .serialize(&StoredBaseStateEnvelope {
-                        schema_version: CHECKPOINT_SCHEMA_VERSION,
-                        state: StoredBaseState::CommitPlan(StoredCommitPlanState {
-                            scan_mode: StoredGitScanMode::from(*scan_mode),
-                            artifact_fingerprint: StoredRepoArtifactFingerprint::from(
-                                *artifact_fingerprint,
-                            ),
-                            plan: plan
-                                .iter()
-                                .copied()
-                                .map(StoredPlannedCommit::from)
-                                .collect(),
-                        }),
-                    })
-                    .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
+                let encoded = postcard::to_allocvec(&StoredBaseStateEnvelope {
+                    schema_version: CHECKPOINT_SCHEMA_VERSION,
+                    state: StoredBaseState::CommitPlan(StoredCommitPlanState {
+                        scan_mode: StoredGitScanMode::from(*scan_mode),
+                        artifact_fingerprint: StoredRepoArtifactFingerprint::from(
+                            *artifact_fingerprint,
+                        ),
+                        plan: plan
+                            .iter()
+                            .copied()
+                            .map(StoredPlannedCommit::from)
+                            .collect(),
+                    }),
+                })
+                .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
                 Ok(Some(encoded))
             }
             Self::PostSpillDedup {
@@ -274,36 +278,35 @@ impl StageCheckpoint<'_> {
                 spill_stats,
                 mapping_stats,
             } => {
-                let encoded = checkpoint_codec()
-                    .serialize(&StoredBaseStateEnvelope {
-                        schema_version: CHECKPOINT_SCHEMA_VERSION,
-                        state: StoredBaseState::SpillDedup(StoredSpillDedupState {
-                            scan_mode: StoredGitScanMode::from(*scan_mode),
-                            artifact_fingerprint: StoredRepoArtifactFingerprint::from(
-                                *artifact_fingerprint,
-                            ),
-                            plan: plan
-                                .iter()
-                                .copied()
-                                .map(StoredPlannedCommit::from)
-                                .collect(),
-                            packed: packed
-                                .iter()
-                                .copied()
-                                .map(StoredPackCandidate::from)
-                                .collect(),
-                            loose: loose
-                                .iter()
-                                .copied()
-                                .map(StoredLooseCandidate::from)
-                                .collect(),
-                            path_arena: path_arena.backing_bytes().to_vec(),
-                            tree_diff_stats: StoredTreeDiffStats::from(tree_diff_stats.clone()),
-                            spill_stats: StoredSpillStats::from(spill_stats.clone()),
-                            mapping_stats: StoredMappingStats::from(*mapping_stats),
-                        }),
-                    })
-                    .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
+                let encoded = postcard::to_allocvec(&StoredBaseStateEnvelope {
+                    schema_version: CHECKPOINT_SCHEMA_VERSION,
+                    state: StoredBaseState::SpillDedup(StoredSpillDedupState {
+                        scan_mode: StoredGitScanMode::from(*scan_mode),
+                        artifact_fingerprint: StoredRepoArtifactFingerprint::from(
+                            *artifact_fingerprint,
+                        ),
+                        plan: plan
+                            .iter()
+                            .copied()
+                            .map(StoredPlannedCommit::from)
+                            .collect(),
+                        packed: packed
+                            .iter()
+                            .copied()
+                            .map(StoredPackCandidate::from)
+                            .collect(),
+                        loose: loose
+                            .iter()
+                            .copied()
+                            .map(StoredLooseCandidate::from)
+                            .collect(),
+                        path_arena: path_arena.backing_bytes().to_vec(),
+                        tree_diff_stats: StoredTreeDiffStats::from(tree_diff_stats.clone()),
+                        spill_stats: StoredSpillStats::from(spill_stats.clone()),
+                        mapping_stats: StoredMappingStats::from(*mapping_stats),
+                    }),
+                })
+                .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
                 Ok(Some(encoded))
             }
             Self::PackPlanComplete { .. } | Self::PreFinalize { .. } => Ok(None),
@@ -331,22 +334,21 @@ impl StageCheckpoint<'_> {
                 let completed_plan_count = u32::try_from(*completed_plan_count).map_err(|_| {
                     ScanCheckpointError::Encode("completed_plan_count exceeds u32::MAX".to_owned())
                 })?;
-                let encoded = checkpoint_codec()
-                    .serialize(&StoredPrefixStateEnvelope {
-                        schema_version: CHECKPOINT_SCHEMA_VERSION,
-                        state: StoredPrefixState {
-                            stage: self.stage(),
-                            completed_plan_count,
-                            scanned: StoredScannedBlobs::from(*scanned),
-                            skipped_candidates: skipped_candidates
-                                .iter()
-                                .copied()
-                                .map(StoredSkippedCandidate::from)
-                                .collect(),
-                            common_metrics: StoredGitScanCommonMetrics::from(*common_metrics),
-                        },
-                    })
-                    .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
+                let encoded = postcard::to_allocvec(&StoredPrefixStateEnvelope {
+                    schema_version: CHECKPOINT_SCHEMA_VERSION,
+                    state: StoredPrefixState {
+                        stage: self.stage(),
+                        completed_plan_count,
+                        scanned: StoredScannedBlobs::from(*scanned),
+                        skipped_candidates: skipped_candidates
+                            .iter()
+                            .copied()
+                            .map(StoredSkippedCandidate::from)
+                            .collect(),
+                        common_metrics: StoredGitScanCommonMetrics::from(*common_metrics),
+                    },
+                })
+                .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
                 Ok(Some(encoded))
             }
         }
@@ -483,7 +485,7 @@ impl ScanResumeState {
             return Ok(None);
         };
 
-        let envelope: StoredBaseStateEnvelope = match checkpoint_codec().deserialize(&base_state) {
+        let envelope: StoredBaseStateEnvelope = match checkpoint_deserialize(&base_state) {
             Ok(e) => e,
             Err(err) => {
                 tracing::warn!("checkpoint base decode failed, restarting fresh: {err}");
@@ -549,7 +551,7 @@ impl ScanResumeState {
                     return Ok(Some(Self::PostSpillDedup(base)));
                 };
                 let prefix_envelope: StoredPrefixStateEnvelope =
-                    match checkpoint_codec().deserialize(&prefix_state) {
+                    match checkpoint_deserialize(&prefix_state) {
                         Ok(e) => e,
                         Err(err) => {
                             tracing::warn!(
@@ -1953,9 +1955,8 @@ mod tests {
                 common_metrics: StoredGitScanCommonMetrics::from(GitScanCommonMetrics::default()),
             },
         };
-        let prefix_bytes = checkpoint_codec()
-            .serialize(&invalid_prefix)
-            .expect("serialize invalid prefix");
+        let prefix_bytes =
+            postcard::to_allocvec(&invalid_prefix).expect("serialize invalid prefix");
 
         let loaded = LoadedScanCheckpoint {
             base_state: Some(base_bytes),
@@ -2009,22 +2010,10 @@ mod tests {
 
     #[test]
     fn deserialize_oversized_blob_restarts_fresh() {
-        // Craft a blob that claims a Vec length exceeding the size limit.
-        // The envelope schema_version byte + StoredBaseState discriminant,
-        // then garbage that overflows deserialization.
-        let mut blob = Vec::new();
-        // schema_version = CHECKPOINT_SCHEMA_VERSION
-        blob.push(CHECKPOINT_SCHEMA_VERSION);
-        // StoredBaseState enum discriminant for SpillDedup = 1 (bincode fixint)
-        blob.extend_from_slice(&[1u8, 0, 0, 0]);
-        // scan_mode discriminant (DiffHistory = 0)
-        blob.extend_from_slice(&[0u8, 0, 0, 0]);
-        // artifact_fingerprint: packs_hash + idx_hash (64 bytes)
-        blob.extend_from_slice(&[0xAA; 64]);
-        // plan Vec length = 0
-        blob.extend_from_slice(&0u64.to_le_bytes());
-        // packed Vec length = absurdly large
-        blob.extend_from_slice(&u64::MAX.to_le_bytes());
+        // Build a blob exceeding `MAX_CHECKPOINT_BYTES` so that the size
+        // guard in `checkpoint_deserialize` rejects it before postcard
+        // attempts to parse anything.
+        let blob = vec![0u8; MAX_CHECKPOINT_BYTES + 1];
 
         let loaded = LoadedScanCheckpoint {
             base_state: Some(blob),
@@ -2073,7 +2062,7 @@ mod tests {
                 mapping_stats: StoredMappingStats::from(MappingStats::default()),
             }),
         };
-        let blob = checkpoint_codec().serialize(&stored).expect("encode");
+        let blob = postcard::to_allocvec(&stored).expect("encode");
 
         let loaded = LoadedScanCheckpoint {
             base_state: Some(blob),
@@ -2127,7 +2116,7 @@ mod tests {
                 mapping_stats: StoredMappingStats::from(MappingStats::default()),
             }),
         };
-        let blob = checkpoint_codec().serialize(&stored).expect("encode");
+        let blob = postcard::to_allocvec(&stored).expect("encode");
 
         let loaded = LoadedScanCheckpoint {
             base_state: Some(blob),
@@ -2182,7 +2171,7 @@ mod tests {
                 common_metrics: StoredGitScanCommonMetrics::from(GitScanCommonMetrics::default()),
             },
         };
-        let prefix_blob = checkpoint_codec().serialize(&prefix).expect("encode");
+        let prefix_blob = postcard::to_allocvec(&prefix).expect("encode");
 
         let loaded = LoadedScanCheckpoint {
             base_state: Some(base_blob),
