@@ -203,6 +203,13 @@ pub fn inflate_entry_payload_with(
 /// - Delta entries inflate a raw delta stream capped by
 ///   `limits.max_delta_bytes`.
 ///
+/// Small non-delta entries (those eligible for libdeflate via
+/// [`pack_inflate_libdeflate::use_libdeflate_for_header`]) are dispatched
+/// directly to the TLS libdeflate decompressor rather than delegating through
+/// `inflate_entry_payload_with(de, None, ...)`. This avoids acquiring a TLS
+/// `Decompress` for the libdeflate path and keeps the flate2 fallback
+/// self-contained within `inflate_nondelta_exact`.
+///
 /// # Returns
 /// - `Ok(consumed)` where `consumed` is the number of compressed bytes read
 ///   from `pack.slice_from(header.data_start)` until zlib stream end.
@@ -245,7 +252,7 @@ mod tests {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+
 
     fn test_limits(max_object_bytes: usize) -> PackDecodeLimits {
         PackDecodeLimits::new(64, max_object_bytes, max_object_bytes)
@@ -310,7 +317,7 @@ mod tests {
 
     #[test]
     fn exact_size_nondelta_roundtrip_returns_compressed_bytes_consumed() {
-        let payload = b"exact size roundtrip via libdeflate".to_vec();
+        let payload = b"exact size roundtrip via flate2 fallback".to_vec();
         let compressed = zlib_compress(&payload);
         let (pack_bytes, offset) = single_entry_pack(non_delta_entry(payload.len(), &compressed));
         let pack = PackFile::parse(&pack_bytes, 20).expect("parse pack");
@@ -440,16 +447,13 @@ mod tests {
         let limits = test_limits(LIBDEFLATE_THRESHOLD_BYTES);
         let header = entry_header_at(&pack, offset, &limits).expect("parse header");
 
-        let result = catch_unwind(AssertUnwindSafe(|| {
+        let (consumed, out) =
             crate::pack_inflate_libdeflate::hold_tls_borrow_for_test(|| {
                 let mut out = Vec::new();
                 let consumed =
                     inflate_entry_payload(&pack, &header, &mut out, &limits).expect("inflate");
                 (consumed, out)
-            })
-        }));
-
-        let (consumed, out) = result.expect("reentrant libdeflate path should not panic");
+            });
         assert_eq!(consumed, compressed.len());
         assert_eq!(out, payload);
     }

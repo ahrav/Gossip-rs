@@ -80,9 +80,16 @@ use scanner_git::{
     IdentityDictionaryEvent, MergeDiffMode, OidBytes,
 };
 use scanner_scheduler::events::{
-    CoreEvent, DiagnosticEvent, EventOutput, FindingEvent, NullEventOutput, ProgressEvent,
-    RedactedNormHash, SummaryEvent,
+    BLOB_OID_WIRE_LEN, CoreEvent, DiagnosticEvent, EventOutput, FindingEvent, NullEventOutput,
+    ProgressEvent, RedactedNormHash, SummaryEvent,
 };
+
+// Compile-time guarantee that the scheduler's `BLOB_OID_WIRE_LEN` agrees
+// with the canonical wire length defined on `OidBytes`.
+const _: () = assert!(
+    BLOB_OID_WIRE_LEN == OidBytes::WIRE_LEN,
+    "BLOB_OID_WIRE_LEN must equal OidBytes::WIRE_LEN"
+);
 use scanner_scheduler::source_kind::SourceKind;
 use scanner_scheduler::store::{
     FsFindingBatch, FsFindingRecord, FsRunLoss, FsStoreError, StoreProducer,

@@ -426,7 +426,7 @@ mod tests {
     fn finding_event_debug_redacts_norm_hash() {
         // Valid SHA-1 wire encoding: byte 0 = length (20), bytes 1..=20 = OID
         // content, bytes 21..=32 = zero-padding.
-        let mut wire_oid = [0u8; 33];
+        let mut wire_oid = [0u8; BLOB_OID_WIRE_LEN];
         wire_oid[0] = 20;
         wire_oid[1..=20].fill(0xAA);
 
