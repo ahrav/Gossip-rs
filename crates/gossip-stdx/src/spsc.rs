@@ -839,6 +839,8 @@ mod prop_tests {
     }
 
     proptest! {
+        #![proptest_config(crate::test_support::miri_proptest_config(16))]
+
         /// Random interleaving of push/pop on single thread preserves FIFO.
         #[test]
         fn fifo_invariant(ops in proptest::collection::vec(op_strategy(), 0..500)) {

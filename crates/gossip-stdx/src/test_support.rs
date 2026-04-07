@@ -59,17 +59,24 @@ pub fn proptest_fuzz_multiplier(default: u32) -> u32 {
     1
 }
 
-/// Returns a [`proptest::test_runner::Config`] with the given case count
-/// and Miri-safe failure persistence.
+/// Returns a [`proptest::test_runner::Config`] tuned for the current
+/// environment, with Miri-safe failure persistence.
 ///
-/// Under Miri, disables file-based failure persistence since Miri's default
-/// isolation mode blocks `getcwd` (used by proptest's file persister).
-/// Outside Miri, uses the default persistence strategy.
+/// Under Miri, uses `miri_cases` and disables file-based failure persistence
+/// (Miri's default isolation mode blocks `getcwd`, which proptest's file
+/// persister needs). Outside Miri, delegates to [`proptest_cases`] so the
+/// `PROPTEST_CASES` env var, CI detection, and local-dev throttling all
+/// apply normally.
 ///
 /// Gated behind `#[cfg(test)]` because it returns a proptest type that
 /// requires the `proptest` dev-dependency.
 #[cfg(test)]
-pub fn miri_proptest_config(cases: u32) -> proptest::test_runner::Config {
+pub fn miri_proptest_config(miri_cases: u32) -> proptest::test_runner::Config {
+    let cases = if cfg!(miri) {
+        miri_cases
+    } else {
+        proptest_cases(256)
+    };
     let mut config = proptest::test_runner::Config::with_cases(cases);
     if cfg!(miri) {
         config.failure_persistence = None;

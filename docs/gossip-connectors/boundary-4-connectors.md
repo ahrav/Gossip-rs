@@ -62,12 +62,11 @@ The crate provides four core capabilities:
 
 | File             | Role                                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------------------- |
-| `lib.rs`         | Crate root, exports `FilesystemConnector`, `InMemoryDeterministicConnector`, `GitConnector`, `MemItem`, `path_buf_from_bytes`, `FILESYSTEM_CONNECTOR_TAG`, `GIT_CONNECTOR_TAG`, `IN_MEMORY_CONNECTOR_TAG` |
+| `lib.rs`         | Crate root, exports `FilesystemConnector`, `InMemoryDeterministicConnector`, `MemItem`, `path_buf_from_bytes`, `FILESYSTEM_CONNECTOR_TAG`, `GIT_CONNECTOR_TAG`, `IN_MEMORY_CONNECTOR_TAG` |
 | `common.rs`      | Shared utilities: shard-bound validation, binary search, deadline checks, I/O error classification, path conversion |
 | `in_memory.rs`   | `InMemoryDeterministicConnector` -- deterministic in-memory fixture                                           |
 | `filesystem.rs`  | `FilesystemConnector` -- Unix-only filesystem connector                                                       |
 | `split_estimator.rs` | `StreamingSplitEstimator` -- bounded-memory byte-weighted split-point estimation                          |
-| `git.rs`         | `GitConnector` -- Git repository connector with ref enumeration and blob reading                              |
 
 ---
 
@@ -82,7 +81,6 @@ gossip-connectors
     concrete family implementations
     - FilesystemConnector
     - InMemoryDeterministicConnector
-    - GitConnector
                         │
                         ▼
 gossip-contracts::connector
@@ -104,7 +102,7 @@ gossip-contracts::identity + gossip-contracts::coordination
 | ------------------------------ | -------------------------------- | ---------------------------------------------------------------------------------- |
 | Toxic-byte validation + paging | `gossip-contracts::connector`    | `ItemKey`, `ItemRef`, `TokenBytes`, `Cursor`, `Budgets`                            |
 | Connector error types + caps   | `gossip-contracts::connector`    | `ConnectorCapabilities`, `ErrorClass`, `EnumerateError`, `ReadError`                |
-| Reference connectors           | `gossip-connectors`              | `FilesystemConnector`, `GitConnector`, `InMemoryDeterministicConnector` |
+| Reference connectors           | `gossip-connectors`              | `FilesystemConnector`, `InMemoryDeterministicConnector` |
 | Shared connector utilities     | `gossip-connectors::common`      | `lower_bound`, `upper_bound`, `resolve_bounds`                                     |
 | Streaming split estimation     | `gossip-connectors::split_estimator` | `StreamingSplitEstimator` (bounded-memory byte-weighted median)             |
 | Family runtime entry points    | `gossip-scanner-runtime`         | `scan_fs()`, `scan_git()`, execution-mode dispatch over source families |
@@ -222,11 +220,11 @@ simulation determinism.
 
 ### Capability and split methods (inherent on each connector)
 
-Each concrete connector (`FilesystemConnector`, `GitConnector`,
+Each concrete connector (`FilesystemConnector`,
 `InMemoryDeterministicConnector`) exposes the same set of inherent methods:
 
 ```rust
-impl FilesystemConnector {  // same signatures on all three connectors
+impl FilesystemConnector {  // same signatures on both connectors
     pub fn caps(&self) -> ConnectorCapabilities;
 
     pub fn choose_split_point(
@@ -250,7 +248,7 @@ Key design points:
 ### Read methods (inherent on each connector)
 
 ```rust
-impl FilesystemConnector {  // same signatures on all three connectors
+impl FilesystemConnector {  // same signatures on both connectors
     pub fn open(
         &mut self,
         item_ref: &ItemRef,
@@ -375,30 +373,6 @@ feed from page enumeration, so `split_hints` remains `false`. The
 connector exposes `choose_split_point`, but it returns `Ok(None)`
 until an external caller populates the estimator with observations.
 
-### GitConnector (`git.rs`)
-
-Real-IO connector for Git repository tracked files. Lazy indexing
-via `git ls-files -z` deferred until first connector call or read
-call. Item keys and item refs are both the raw repository-relative path
-bytes.
-
-Capabilities: `seek_by_key: true`, `token_resume: true` (default,
-configurable via `with_tokens()`), `split_hints: true`,
-`range_read: true`.
-
-Version model is weak: BLAKE3 digest over `(path, file_size,
-mtime_nanos)` — sufficient for change-detection but not content
-identity. Security hardening includes path-component filtering (rejects
-`..`), canonicalize + containment checks, and symlink rejection via
-`symlink_metadata`. Read-time opens re-canonicalize and check the repo
-boundary to prevent read-time escapes.
-
-Split hints reuse `StreamingSplitEstimator` via `from_sorted_entries`,
-bulk-loading the already-indexed sorted range on demand. Token fast-path
-provides O(1) resume when the positional token agrees with the
-key-derived position; falls back to O(log N) key-based resume on
-mismatch.
-
 ### Connector tags and public constants
 
 Each connector type carries a domain-separating `ConnectorTag` constant
@@ -408,7 +382,7 @@ types:
 | Constant                   | Value       | Used by                            |
 | -------------------------- | ----------- | ---------------------------------- |
 | `FILESYSTEM_CONNECTOR_TAG` | `"fslocal"` | `FilesystemConnector`              |
-| `GIT_CONNECTOR_TAG`        | `"gitlocal"`| `GitConnector`                     |
+| `GIT_CONNECTOR_TAG`        | `"gitlocal"`| Git repo-native pipeline (`result_translation.rs`) |
 | `IN_MEMORY_CONNECTOR_TAG`  | `"inmem"`   | `InMemoryDeterministicConnector`   |
 
 All three constants are defined via `ConnectorTag::from_ascii` and re-exported
@@ -420,8 +394,8 @@ from the crate root.
 converts raw path bytes to a `PathBuf`. On Unix, the conversion is
 lossless via `OsString::from_vec`. On non-Unix platforms, invalid UTF-8
 sequences are replaced with U+FFFD (lossy but non-panicking). This
-function is re-exported from the crate root and used by `GitConnector`
-to convert `git ls-files` output to filesystem paths.
+function is re-exported from the crate root and used by path conversion
+utilities that bridge raw byte paths to platform-native `PathBuf` values.
 
 ### Shared utilities (`common.rs`)
 
@@ -441,9 +415,9 @@ consistent across the reference connectors.
 | `is_valid_split_candidate` | Post-selection guard: split advances past cursor, stays below end |
 | `deadline_expired`         | Shared monotonic deadline check for connector-local budget gates |
 
-Filesystem, git, and in-memory connectors all use
+Filesystem and in-memory connectors all use
 `StreamingSplitEstimator` (`split_estimator.rs`) for byte-weighted split
-selection. Git and in-memory connectors bulk-load their already-sorted
+selection. In-memory connectors bulk-load their already-sorted
 ranges via `from_sorted_entries`. `FilesystemConnector` keeps the same
 estimator field for future split-hint plumbing, but it does not feed the
 estimator internally yet, so split hints remain disabled.
