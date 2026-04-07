@@ -1567,6 +1567,7 @@ dependencies = [
  "gossip-scanner-runtime",
  "gossip-stdx",
  "postgres",
+ "scanner-git",
  "scanner-scheduler",
  "tempfile",
  "thiserror",

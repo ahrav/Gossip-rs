@@ -17,7 +17,6 @@ use anyhow::Result;
 use gossip_contracts::connector::{ItemKey, ToxicDigest};
 use gossip_contracts::identity::NormHash;
 use gossip_contracts::persistence::{PersistenceFinding, WriteContext};
-use gossip_stdx::HexOid;
 use scanner_git::{GitEvent, GitEventOutput, OidBytes};
 use scanner_scheduler::events::{CoreEvent, EventOutput};
 
@@ -26,10 +25,15 @@ use crate::OwnedCoreEvent;
 /// Owned git event representation persisted by distributed sinks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoredGitEvent {
-    /// Metadata for a single commit (OID, timestamp, identity dictionary IDs).
+    /// Metadata for a single commit.
+    ///
+    /// The raw object ID bytes stay unencoded on the forwarding path so
+    /// recorder and persistence consumers can choose when to render hex.
     CommitMeta {
         commit_id: u32,
-        oid_hex: HexOid,
+        /// Raw object identifier bytes. Consumers hex-encode at the
+        /// persistence boundary when they need a textual form.
+        commit_oid: OidBytes,
         timestamp: u64,
         author_name_id: Option<u32>,
         author_email_id: Option<u32>,
@@ -152,7 +156,8 @@ pub enum StageSignal {
 pub trait CoordinationEventRecorder: Send + Sync + fmt::Debug {
     /// Persists a scanner core event (finding, progress, summary, diagnostic).
     fn record_core_event(&self, shard_id: &str, event: OwnedCoreEvent) -> Result<()>;
-    /// Persists a git-specific event (commit metadata or identity dictionary entry).
+    /// Persists a git-specific event (commit metadata with raw OID bytes or an
+    /// identity dictionary entry).
     fn record_git_event(&self, shard_id: &str, event: StoredGitEvent) -> Result<()>;
     /// Persists a commit lifecycle progress marker (begin/finish).
     fn record_commit_progress(&self, shard_id: &str, event: CommitProgressRecord) -> Result<()>;
@@ -330,7 +335,7 @@ impl GitEventOutput for CoordinationEventSink {
         let owned = match event {
             GitEvent::CommitMeta(meta) => StoredGitEvent::CommitMeta {
                 commit_id: meta.commit_id,
-                oid_hex: HexOid::from_oid_bytes(meta.commit_oid.as_slice()),
+                commit_oid: meta.commit_oid,
                 timestamp: meta.timestamp,
                 author_name_id: meta
                     .identity
@@ -742,7 +747,78 @@ mod tests {
             1,
             "inner sink should receive the git event"
         );
-        assert!(matches!(forwarded[0], StoredGitEvent::CommitMeta { .. }));
+        match &forwarded[0] {
+            StoredGitEvent::CommitMeta { commit_oid, .. } => {
+                assert_eq!(
+                    *commit_oid, oid,
+                    "stored commit metadata must preserve raw OID bytes"
+                );
+            }
+            other => panic!("expected CommitMeta, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn findings_capture_sink_preserves_identity_ids() {
+        let (sink, recorder) = make_sink_and_recorder();
+
+        sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+            commit_id: 7,
+            commit_oid: OidBytes::sha1([0x44; 20]),
+            timestamp: 1_700_000_001,
+            identity: Some(scanner_git::CommitIdentityIds {
+                author_name: 11,
+                author_email: scanner_git::SENTINEL_ID,
+                committer_name: 29,
+                committer_email: scanner_git::SENTINEL_ID,
+            }),
+        }));
+
+        let forwarded = recorder.git_events.lock().unwrap();
+        match &forwarded[0] {
+            StoredGitEvent::CommitMeta {
+                author_name_id,
+                author_email_id,
+                committer_name_id,
+                committer_email_id,
+                ..
+            } => {
+                assert_eq!(*author_name_id, Some(11));
+                assert_eq!(*author_email_id, None);
+                assert_eq!(*committer_name_id, Some(29));
+                assert_eq!(*committer_email_id, None);
+            }
+            other => panic!("expected CommitMeta, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stored_git_event_is_smaller_than_hex_oid_layout() {
+        #[allow(dead_code)]
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum LegacyStoredGitEvent {
+            CommitMeta {
+                commit_id: u32,
+                oid_hex: gossip_stdx::HexOid,
+                timestamp: u64,
+                author_name_id: Option<u32>,
+                author_email_id: Option<u32>,
+                committer_name_id: Option<u32>,
+                committer_email_id: Option<u32>,
+            },
+            IdentityDictionary {
+                id: u32,
+                value: Vec<u8>,
+            },
+        }
+
+        let current = std::mem::size_of::<StoredGitEvent>();
+        let legacy = std::mem::size_of::<LegacyStoredGitEvent>();
+
+        assert!(
+            current < legacy,
+            "raw OID storage should shrink StoredGitEvent ({current} < {legacy})"
+        );
     }
 
     #[test]

@@ -32,6 +32,7 @@ gossip-orchestrator.workspace = true
 gossip-persistence-inmemory.workspace = true
 gossip-pg-common = { workspace = true, features = ["test-support"] }
 gossip-scanner-runtime = { workspace = true, features = ["test-support"] }
+scanner-git.workspace = true
 scanner-scheduler.workspace = true
 tempfile = "3"
 wait-timeout = "0.2"

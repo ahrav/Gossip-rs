@@ -529,6 +529,9 @@ fn write_f64(line: &mut Vec<u8>, value: f64) {
     line.extend_from_slice(rendered.as_bytes());
 }
 
+/// Writes raw object ID bytes as a quoted lowercase hex JSON string.
+///
+/// This is the persistence-boundary encoder for Git object identifiers.
 fn write_oid_hex(line: &mut Vec<u8>, oid: &scanner_git::OidBytes) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     line.push(b'"');
