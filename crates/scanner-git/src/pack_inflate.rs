@@ -111,6 +111,8 @@ where
 /// captures no mutable references and only constructs a fresh value,
 /// so no partially-mutated state is observable after the unwind.
 pub(crate) fn init_decompress() -> Option<Decompress> {
+    // Manual match is intentional: the Err arm logs diagnostics in debug builds.
+    #[allow(clippy::manual_ok_err)]
     match std::panic::catch_unwind(|| Decompress::new(true)) {
         Ok(de) => Some(de),
         Err(_payload) => {

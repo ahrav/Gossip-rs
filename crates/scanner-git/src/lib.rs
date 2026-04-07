@@ -361,7 +361,7 @@ pub use events::{
 // ── Stage 7: Finalize & persist ─────────────────────────────────────────
 pub use finalize::{
     build_finalize_ops, FinalizeInput, FinalizeOutcome, FinalizeOutput, FinalizeStats, RefEntry,
-    WriteOp, NS_SEEN_BLOB,
+    WriteOp, NS_BLOB_CTX, NS_FINDING, NS_SEEN_BLOB, NS_SEEN_STAGING,
 };
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};
 pub use roaring_seen::{RoaringSeenBitmap, RoaringSeenStore};

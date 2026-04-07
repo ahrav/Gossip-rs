@@ -53,9 +53,9 @@ use super::tree_candidate::CandidateContext;
 use super::watermark_keys::{encode_ref_watermark_value, NS_REF_WATERMARK};
 
 /// Namespace prefix for blob context keys.
-pub(crate) const NS_BLOB_CTX: [u8; 3] = *b"bc\0";
+pub const NS_BLOB_CTX: [u8; 3] = *b"bc\0";
 /// Namespace prefix for finding keys.
-pub(crate) const NS_FINDING: [u8; 3] = *b"fn\0";
+pub const NS_FINDING: [u8; 3] = *b"fn\0";
 /// Namespace prefix for the seen bitmap scope key.
 pub const NS_SEEN_BLOB: [u8; 3] = *b"sb\0";
 /// Namespace prefix for the staging seen bitmap (spill checkpoints).
@@ -63,7 +63,7 @@ pub const NS_SEEN_BLOB: [u8; 3] = *b"sb\0";
 /// Spill-stage deltas are written here and folded into the live `sb\0`
 /// key only during `commit_finalize`. On crash, staging keys are orphaned
 /// and cleaned up on the next store open.
-pub(crate) const NS_SEEN_STAGING: [u8; 3] = *b"ss\0";
+pub const NS_SEEN_STAGING: [u8; 3] = *b"ss\0";
 
 // Compile-time: verify namespace lexicographic ordering.
 const _: () = {

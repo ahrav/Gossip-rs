@@ -28,9 +28,7 @@ use scanner_git::{
     StartSetResolver, WriteOp, run_git_scan,
 };
 
-const NS_BLOB_CTX: [u8; 3] = *b"bc\0";
-const NS_FINDING: [u8; 3] = *b"fn\0";
-use scanner_git::NS_SEEN_BLOB;
+use scanner_git::{NS_BLOB_CTX, NS_FINDING, NS_SEEN_BLOB};
 
 pub(crate) fn perf_stats_enabled() -> bool {
     cfg!(all(feature = "perf-stats", debug_assertions))
@@ -594,12 +592,10 @@ fn odb_blob_parallel_intro_keeps_persistence_contract_without_blob_ctx_determini
     assert_odb_parallel_contract(&serial_report, &parallel_report);
 }
 
-// NOTE: `missing_loose_object_yields_partial` was removed because the
-// in-memory artifact builder requires all commits to be in packs (`repack
-// -ad`), which also packs every blob. There is no reliable way to create a
-// loose-only blob whose commit is still in a pack using normal Git
-// operations. The `LooseMissing` code path is covered by the unit test in
-// `runner_exec_tests.rs` (see `missing_loose_object_is_skipped`).
+// The `LooseMissing` code path is covered by `missing_loose_object_is_skipped`
+// in `runner_exec_tests.rs`. In-memory artifact builds require all commits to
+// be in packs, so a loose-only blob whose commit is already packed cannot be
+// constructed via standard Git operations in an integration fixture.
 
 #[test]
 fn shallow_clone_boundary_treats_missing_parent_as_external_root() {
