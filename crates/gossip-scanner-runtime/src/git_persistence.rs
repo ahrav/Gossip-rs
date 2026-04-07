@@ -1953,6 +1953,15 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "empty prefix matches every key")]
+    fn set_batch_faults_rejects_empty_key_prefix() {
+        let backend = TestBackend::non_atomic();
+        // Direct variant construction bypasses the key_prefix() constructor
+        // guard; set_batch_faults must catch this independently.
+        backend.set_batch_faults(vec![BatchFaultTrigger::KeyPrefix(b"")]);
+    }
+
+    #[test]
     fn sim_adapter_cold_cache_batch_check_seen() {
         let backend = TestBackend::non_atomic();
         let adapter = GitPersistenceAdapter::new(backend.clone(), 42, [0x42; 32]);
