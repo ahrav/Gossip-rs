@@ -17,7 +17,6 @@ use anyhow::Result;
 use gossip_contracts::connector::{ItemKey, ToxicDigest};
 use gossip_contracts::identity::NormHash;
 use gossip_contracts::persistence::{PersistenceFinding, WriteContext};
-use gossip_stdx::HexOid;
 use scanner_git::{GitEvent, GitEventOutput, OidBytes};
 use scanner_scheduler::events::{CoreEvent, EventOutput};
 
@@ -26,10 +25,13 @@ use crate::OwnedCoreEvent;
 /// Owned git event representation persisted by distributed sinks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoredGitEvent {
-    /// Metadata for a single commit (OID, timestamp, identity dictionary IDs).
+    /// Metadata for a single commit.
+    ///
+    /// Stores raw object ID bytes without hex encoding.
     CommitMeta {
         commit_id: u32,
-        oid_hex: HexOid,
+        /// Raw object identifier bytes, stored without hex encoding.
+        commit_oid: OidBytes,
         timestamp: u64,
         author_name_id: Option<u32>,
         author_email_id: Option<u32>,
@@ -152,7 +154,8 @@ pub enum StageSignal {
 pub trait CoordinationEventRecorder: Send + Sync + fmt::Debug {
     /// Persists a scanner core event (finding, progress, summary, diagnostic).
     fn record_core_event(&self, shard_id: &str, event: OwnedCoreEvent) -> Result<()>;
-    /// Persists a git-specific event (commit metadata or identity dictionary entry).
+    /// Persists a git-specific event (commit metadata with raw OID bytes or an
+    /// identity dictionary entry).
     fn record_git_event(&self, shard_id: &str, event: StoredGitEvent) -> Result<()>;
     /// Persists a commit lifecycle progress marker (begin/finish).
     fn record_commit_progress(&self, shard_id: &str, event: CommitProgressRecord) -> Result<()>;
@@ -330,7 +333,7 @@ impl GitEventOutput for CoordinationEventSink {
         let owned = match event {
             GitEvent::CommitMeta(meta) => StoredGitEvent::CommitMeta {
                 commit_id: meta.commit_id,
-                oid_hex: HexOid::from_oid_bytes(meta.commit_oid.as_slice()),
+                commit_oid: meta.commit_oid,
                 timestamp: meta.timestamp,
                 author_name_id: meta
                     .identity
@@ -742,8 +745,108 @@ mod tests {
             1,
             "inner sink should receive the git event"
         );
-        assert!(matches!(forwarded[0], StoredGitEvent::CommitMeta { .. }));
+        match &forwarded[0] {
+            StoredGitEvent::CommitMeta { commit_oid, .. } => {
+                assert_eq!(
+                    *commit_oid, oid,
+                    "stored commit metadata must preserve raw OID bytes"
+                );
+            }
+            other => panic!("expected CommitMeta, got: {other:?}"),
+        }
     }
+
+    #[test]
+    fn findings_capture_sink_forwards_sha256_git_events() {
+        let (sink, recorder) = make_sink_and_recorder();
+        let oid = scanner_git::OidBytes::sha256([0xCD; 32]);
+        sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+            commit_id: 2,
+            commit_oid: oid,
+            timestamp: 1_700_000_000,
+            identity: None,
+        }));
+        let forwarded = recorder.git_events.lock().unwrap();
+        match &forwarded[0] {
+            StoredGitEvent::CommitMeta { commit_oid, .. } => {
+                assert_eq!(*commit_oid, oid, "SHA-256 OID must survive forwarding");
+                assert_eq!(commit_oid.len(), 32, "SHA-256 OIDs are 32 bytes");
+            }
+            other => panic!("expected CommitMeta, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn findings_capture_sink_preserves_identity_ids() {
+        let (sink, recorder) = make_sink_and_recorder();
+
+        sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+            commit_id: 7,
+            commit_oid: OidBytes::sha1([0x44; 20]),
+            timestamp: 1_700_000_001,
+            identity: Some(scanner_git::CommitIdentityIds {
+                author_name: 11,
+                author_email: scanner_git::SENTINEL_ID,
+                committer_name: 29,
+                committer_email: scanner_git::SENTINEL_ID,
+            }),
+        }));
+
+        let forwarded = recorder.git_events.lock().unwrap();
+        match &forwarded[0] {
+            StoredGitEvent::CommitMeta {
+                author_name_id,
+                author_email_id,
+                committer_name_id,
+                committer_email_id,
+                ..
+            } => {
+                assert_eq!(*author_name_id, Some(11));
+                assert_eq!(*author_email_id, None);
+                assert_eq!(*committer_name_id, Some(29));
+                assert_eq!(*committer_email_id, None);
+            }
+            other => panic!("expected CommitMeta, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn findings_capture_sink_maps_all_sentinel_ids_to_none() {
+        let (sink, recorder) = make_sink_and_recorder();
+
+        sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+            commit_id: 99,
+            commit_oid: OidBytes::sha1([0x77; 20]),
+            timestamp: 1_700_000_002,
+            identity: Some(scanner_git::CommitIdentityIds {
+                author_name: scanner_git::SENTINEL_ID,
+                author_email: scanner_git::SENTINEL_ID,
+                committer_name: scanner_git::SENTINEL_ID,
+                committer_email: scanner_git::SENTINEL_ID,
+            }),
+        }));
+
+        let forwarded = recorder.git_events.lock().unwrap();
+        match &forwarded[0] {
+            StoredGitEvent::CommitMeta {
+                author_name_id,
+                author_email_id,
+                committer_name_id,
+                committer_email_id,
+                ..
+            } => {
+                assert_eq!(*author_name_id, None);
+                assert_eq!(*author_email_id, None);
+                assert_eq!(*committer_name_id, None);
+                assert_eq!(*committer_email_id, None);
+            }
+            other => panic!("expected CommitMeta, got: {other:?}"),
+        }
+    }
+
+    /// Compile-time bound: `StoredGitEvent` must stay at or below 80 bytes.
+    /// Catches accidental field inflation from new variants or widened fields.
+    const _: () = assert!(std::mem::size_of::<StoredGitEvent>() <= 80);
 
     #[test]
     fn findings_capture_sink_skips_invalid_blob_oid_payloads() {
