@@ -2749,6 +2749,7 @@ mod tests {
         let oid_a = sim_oid(0xA1);
         let oid_b = sim_oid(0xB2);
         let oid_c = sim_oid(0xC3);
+        let oid_d = sim_oid(0xD4);
 
         let first = fresh_adapter(&backend, repo_id, policy_hash);
         first
@@ -2768,47 +2769,78 @@ mod tests {
             "watermarks must remain absent after the first crash"
         );
 
-        let second = fresh_adapter(&backend, repo_id, policy_hash);
-        second
+        // Staging-delete-phase crash: scope write succeeds but staging
+        // delete fails, leaving both scope and staging containing oid_b.
+        let staging_del = fresh_adapter(&backend, repo_id, policy_hash);
+        staging_del
             .persist_seen_delta(&[oid_b])
-            .expect("stage second crash OID");
-        backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
-        second
+            .expect("stage staging-delete crash OID");
+        backend.set_batch_faults(vec![BatchFaultTrigger::key_prefix(&NS_SEEN_STAGING)]);
+        staging_del
             .commit_finalize(&complete_finalize_with_watermark(2))
-            .expect_err("first-phase failure must propagate");
-        assert_scope_contains(&backend, repo_id, &policy_hash, &[oid_a]);
+            .expect_err("staging-delete-phase failure must propagate");
+        assert_scope_contains(&backend, repo_id, &policy_hash, &[oid_a, oid_b]);
         assert_staging_contains(&backend, repo_id, &policy_hash, &[oid_b]);
+        assert!(
+            backend.get_value(b"rw\0wm").is_none(),
+            "watermarks must remain absent after the staging-delete crash"
+        );
         assert_eq!(
             fresh_adapter(&backend, repo_id, policy_hash)
                 .batch_check_seen(&[oid_a, oid_b])
-                .expect("cold-cache reload after the second crash"),
-            vec![true, false],
-            "the recovered scope must reflect only the first durable finalize"
+                .expect("cold-cache reload after staging-delete crash"),
+            vec![true, true],
+            "scope must contain both OIDs — scope write succeeded before staging delete failed"
+        );
+
+        // Any-phase crash: persist_seen_delta merges oid_c into the stale
+        // staging {b} from the prior crash, then the entire first batch fails.
+        let third = fresh_adapter(&backend, repo_id, policy_hash);
+        third
+            .persist_seen_delta(&[oid_c])
+            .expect("stage any-phase crash OID");
+        backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
+        third
+            .commit_finalize(&complete_finalize_with_watermark(3))
+            .expect_err("any-phase failure must propagate");
+        assert_scope_contains(&backend, repo_id, &policy_hash, &[oid_a, oid_b]);
+        assert_staging_contains(&backend, repo_id, &policy_hash, &[oid_b, oid_c]);
+        assert_eq!(
+            fresh_adapter(&backend, repo_id, policy_hash)
+                .batch_check_seen(&[oid_a, oid_b, oid_c])
+                .expect("cold-cache reload after the any-phase crash"),
+            vec![true, true, false],
+            "scope must reflect only the first two durable finalizes"
         );
 
         let recovered = fresh_adapter(&backend, repo_id, policy_hash);
         recovered
-            .persist_seen_delta(&[oid_c])
+            .persist_seen_delta(&[oid_d])
             .expect("stage recovery OID");
         recovered
-            .commit_finalize(&complete_finalize_with_watermark(3))
+            .commit_finalize(&complete_finalize_with_watermark(4))
             .expect("recovery finalize must succeed");
 
         assert_eq!(
             recovered
-                .batch_check_seen(&[oid_a, oid_b, oid_c])
+                .batch_check_seen(&[oid_a, oid_b, oid_c, oid_d])
                 .expect("final seen check"),
-            vec![true, true, true],
-            "the recovered scope must contain every OID staged across both crashes"
+            vec![true, true, true, true],
+            "the recovered scope must contain every OID staged across all crashes"
         );
-        assert_scope_contains(&backend, repo_id, &policy_hash, &[oid_a, oid_b, oid_c]);
+        assert_scope_contains(
+            &backend,
+            repo_id,
+            &policy_hash,
+            &[oid_a, oid_b, oid_c, oid_d],
+        );
         assert!(
             !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
             "successful recovery must clear staging"
         );
         assert_eq!(
             backend.get_value(b"rw\0wm").as_deref(),
-            Some(&[3][..]),
+            Some(&[4][..]),
             "successful recovery must advance watermarks"
         );
     }
@@ -2886,7 +2918,8 @@ mod tests {
             let trigger = match crash_phase {
                 0 => BatchFaultTrigger::any(),
                 1 => BatchFaultTrigger::key_prefix(&NS_SEEN_STAGING),
-                _ => BatchFaultTrigger::key_prefix(&NS_REF_WATERMARK),
+                2 => BatchFaultTrigger::key_prefix(&NS_REF_WATERMARK),
+                _ => unreachable!("crash_phase strategy is 0..3"),
             };
             backend.set_batch_faults(vec![trigger]);
             crashed
