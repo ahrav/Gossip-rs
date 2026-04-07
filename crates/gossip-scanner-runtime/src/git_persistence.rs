@@ -913,12 +913,15 @@ where
             Vec::new()
         };
         let checkpoint_delete_ops: Vec<_> = if is_complete {
+            // Delete prefix before base so a crash between the two deletes on
+            // non-atomic backends leaves a valid BaseOnly state (rather than an
+            // orphaned prefix that load_resume_state rejects as an error).
             vec![
                 GitPersistenceOp::Delete {
-                    key: checkpoint_base_key.to_vec(),
+                    key: checkpoint_prefix_key.to_vec(),
                 },
                 GitPersistenceOp::Delete {
-                    key: checkpoint_prefix_key.to_vec(),
+                    key: checkpoint_base_key.to_vec(),
                 },
             ]
         } else {

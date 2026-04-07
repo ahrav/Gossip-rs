@@ -32,7 +32,26 @@ use crate::NormHash;
 /// Maximum checkpoint blob size accepted during deserialization (256 MiB).
 ///
 /// Prevents a crafted blob from triggering unbounded allocation.
+/// The same limit is enforced on the encode path so a freshly written
+/// checkpoint is always readable on the next resume.
 const MAX_CHECKPOINT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Serialize a checkpoint value with a size guard.
+///
+/// Rejects outputs exceeding [`MAX_CHECKPOINT_BYTES`] so the encode and
+/// decode paths use the same limit. Without this, a legitimately large
+/// scan could persist an oversize blob that silently fails to deserialize.
+fn checkpoint_serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ScanCheckpointError> {
+    let encoded =
+        postcard::to_allocvec(value).map_err(|err| ScanCheckpointError::Encode(err.to_string()))?;
+    if encoded.len() > MAX_CHECKPOINT_BYTES {
+        return Err(ScanCheckpointError::Encode(format!(
+            "checkpoint blob ({} bytes) exceeds {MAX_CHECKPOINT_BYTES}-byte limit",
+            encoded.len(),
+        )));
+    }
+    Ok(encoded)
+}
 
 /// Deserialize a checkpoint blob with a size guard.
 ///
@@ -293,7 +312,7 @@ impl StageCheckpoint<'_> {
                 plan,
             } => {
                 let encoded =
-                    postcard::to_allocvec(&StoredBaseState::CommitPlan(StoredCommitPlanState {
+                    checkpoint_serialize(&StoredBaseState::CommitPlan(StoredCommitPlanState {
                         scan_mode: StoredGitScanMode::from(*scan_mode),
                         artifact_fingerprint: StoredRepoArtifactFingerprint::from(
                             *artifact_fingerprint,
@@ -303,8 +322,7 @@ impl StageCheckpoint<'_> {
                             .copied()
                             .map(StoredPlannedCommit::from)
                             .collect(),
-                    }))
-                    .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
+                    }))?;
                 Ok(Some(encoded))
             }
             Self::PostSpillDedup {
@@ -319,7 +337,7 @@ impl StageCheckpoint<'_> {
                 mapping_stats,
             } => {
                 let encoded =
-                    postcard::to_allocvec(&StoredBaseState::SpillDedup(StoredSpillDedupState {
+                    checkpoint_serialize(&StoredBaseState::SpillDedup(StoredSpillDedupState {
                         scan_mode: StoredGitScanMode::from(*scan_mode),
                         artifact_fingerprint: StoredRepoArtifactFingerprint::from(
                             *artifact_fingerprint,
@@ -343,8 +361,7 @@ impl StageCheckpoint<'_> {
                         tree_diff_stats: StoredTreeDiffStats::from(tree_diff_stats.clone()),
                         spill_stats: StoredSpillStats::from(spill_stats.clone()),
                         mapping_stats: StoredMappingStats::from(*mapping_stats),
-                    }))
-                    .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
+                    }))?;
                 Ok(Some(encoded))
             }
             Self::PackPlanComplete { .. } | Self::PreFinalize { .. } => Ok(None),
@@ -372,7 +389,7 @@ impl StageCheckpoint<'_> {
                 let completed_plan_count = u32::try_from(*completed_plan_count).map_err(|_| {
                     ScanCheckpointError::Encode("completed_plan_count exceeds u32::MAX".to_owned())
                 })?;
-                let encoded = postcard::to_allocvec(&StoredPrefixState {
+                let encoded = checkpoint_serialize(&StoredPrefixState {
                     stage: self.stage(),
                     completed_plan_count,
                     scanned: StoredScannedBlobs::from(*scanned),
@@ -382,8 +399,7 @@ impl StageCheckpoint<'_> {
                         .map(StoredSkippedCandidate::from)
                         .collect(),
                     common_metrics: StoredGitScanCommonMetrics::from(*common_metrics),
-                })
-                .map_err(|error| ScanCheckpointError::Encode(error.to_string()))?;
+                })?;
                 Ok(Some(encoded))
             }
         }
@@ -519,10 +535,11 @@ pub enum ScanResumeState {
 impl ScanResumeState {
     /// Decode and validate a durable checkpoint into resume state.
     ///
-    /// Returns `Ok(None)` when the checkpoint should be discarded (empty,
-    /// schema version mismatch, stale scan mode or artifact fingerprint).
-    /// Returns `Err` when the checkpoint is structurally invalid (bad OID
-    /// lengths, out-of-bounds arena refs, invalid stage discriminator).
+    /// Returns `Ok(None)` when the checkpoint should be discarded: empty
+    /// input, decode failure, stale scan mode, or artifact fingerprint
+    /// mismatch. Returns `Err` for structural validation failures (bad OID
+    /// lengths, out-of-bounds arena refs, invalid stage discriminator,
+    /// impossible `completed_plan_count`).
     pub fn from_loaded(
         loaded: LoadedScanCheckpoint,
         scan_mode: GitScanMode,

@@ -175,6 +175,12 @@ impl OidBytes {
             len == Self::SHA1_LEN || len == Self::SHA256_LEN,
             "invalid OID len: {len}"
         );
+        let mut bytes = bytes;
+        // Enforce the zero-padding invariant documented on the struct:
+        // only `bytes[0..len]` carries valid data.
+        if len == Self::SHA1_LEN {
+            bytes[Self::SHA1_LEN as usize..].fill(0);
+        }
         Self { len, bytes }
     }
 
