@@ -5,11 +5,11 @@
 //! (data + seen-scope Put, staging Delete, watermark write) maintains crash-safety
 //! invariants when individual phases fail.
 
-use gossip_scanner_runtime::git_persistence::test_support::TestBackend;
+use gossip_scanner_runtime::git_persistence::test_support::{BatchFaultTrigger, TestBackend};
 use gossip_scanner_runtime::git_persistence::{GitPersistenceAdapter, GitPersistenceBackend};
 use scanner_git::{
-    ChangeKind, CollectingUniqueBlobSink, FinalizeOutcome, FinalizeOutput, OidBytes,
-    PersistenceStore, SeenBlobStore, SpillLimits, Spiller, WriteOp,
+    ChangeKind, CollectingUniqueBlobSink, FinalizeOutcome, FinalizeOutput, NS_REF_WATERMARK,
+    NS_SEEN_STAGING, OidBytes, PersistenceStore, SeenBlobStore, SpillLimits, Spiller, WriteOp,
 };
 use tempfile::TempDir;
 
@@ -82,10 +82,10 @@ fn spiller_recovery_skips_scope_committed_before_watermarks() {
     //
     // The non-atomic commit_finalize path issues 3 sequential apply_batch
     // calls: (1) data+seen scope Put, (2) staging Delete, (3) watermark
-    // writes. We inject a failure on the 3rd call to simulate a crash
+    // writes. Target the watermark batch by key prefix to simulate a crash
     // between seen-scope commit and watermark advancement.
     let batch_calls_before_finalize = backend.batch_call_count();
-    backend.set_fail_on_batch_call(batch_calls_before_finalize + 3);
+    backend.set_batch_faults(vec![BatchFaultTrigger::key_prefix(&NS_REF_WATERMARK)]);
     let err = adapter
         .commit_finalize(&FinalizeOutput {
             data_ops: Vec::new(),
@@ -99,13 +99,11 @@ fn spiller_recovery_skips_scope_committed_before_watermarks() {
         .unwrap_err();
     assert!(format!("{err}").contains("injected batch failure"));
 
-    // Confirm the failure hit the expected batch call (watermark phase).
+    // Confirm the failure hit the watermark batch (third finalize phase).
     assert_eq!(
         backend.batch_call_count(),
         batch_calls_before_finalize + 3,
-        "commit_finalize non-atomic path should issue exactly 3 apply_batch calls; \
-         if this fails, the internal batch sequence changed and the failure \
-         injection offset must be updated"
+        "commit_finalize non-atomic path should issue exactly 3 apply_batch calls"
     );
 
     // -- Crash-recovery state: scope durable, watermarks absent ---------------
@@ -128,7 +126,6 @@ fn spiller_recovery_skips_scope_committed_before_watermarks() {
     );
 
     // -- Recovered adapter skips committed OIDs --------------------------------
-    backend.clear_fail_on_batch_call();
     let recovered = GitPersistenceAdapter::new(backend, repo_id, policy_hash);
     assert_eq!(
         recovered.batch_check_seen(&oids).unwrap(),
@@ -234,14 +231,14 @@ fn scope_write_crash_leaves_staging_only_and_recovery_folds_from_empty() {
     //
     // The non-atomic commit_finalize path issues 3 sequential apply_batch
     // calls: (1) data+seen scope Put, (2) staging Delete, (3) watermark
-    // writes. Failing on the 1st call leaves all durable state unchanged:
+    // writes. Target the first batch to leave all durable state unchanged:
     // scope key absent, staging key still present from spill writes.
     let batch_calls_before = backend.batch_call_count();
     assert_eq!(
         batch_calls_before, 3,
         "spiller should issue exactly 3 staging writes for 6 OIDs with batch size 2"
     );
-    backend.set_fail_on_batch_call(batch_calls_before + 1);
+    backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
 
     let err = adapter
         .commit_finalize(&FinalizeOutput {
@@ -256,13 +253,11 @@ fn scope_write_crash_leaves_staging_only_and_recovery_folds_from_empty() {
         .unwrap_err();
     assert!(format!("{err}").contains("injected batch failure"));
 
-    // Confirm the failure hit the expected batch call (scope-write phase).
+    // Confirm the failure hit the scope-write batch (first finalize phase).
     assert_eq!(
         backend.batch_call_count(),
         batch_calls_before + 1,
-        "commit_finalize non-atomic path should fail on the scope-write batch; \
-         if this fails, the internal batch sequence changed and the failure \
-         injection offset must be updated"
+        "commit_finalize non-atomic path should fail on the scope-write batch"
     );
 
     // -- Post-crash state: nothing committed, staging survives ----------------
@@ -284,7 +279,6 @@ fn scope_write_crash_leaves_staging_only_and_recovery_folds_from_empty() {
     );
 
     // -- Recovered adapter folds staging into fresh scope ---------------------
-    backend.clear_fail_on_batch_call();
     let recovered = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
 
     recovered
@@ -375,14 +369,14 @@ fn staging_delete_crash_leaves_scope_durable_and_recovery_refolds_idempotently()
     //
     // The non-atomic commit_finalize path issues 3 sequential apply_batch
     // calls: (1) data+seen scope Put, (2) staging Delete, (3) watermark
-    // writes. We inject a failure on the 2nd call to simulate a crash
-    // after scope commit but before the staging key is cleaned up.
+    // writes. Target the staging-delete batch by key prefix to simulate
+    // a crash after scope commit but before the staging key is cleaned up.
     let batch_calls_before = backend.batch_call_count();
     assert_eq!(
         batch_calls_before, 3,
         "spiller should issue exactly 3 staging writes for 6 OIDs with batch size 2"
     );
-    backend.set_fail_on_batch_call(batch_calls_before + 2);
+    backend.set_batch_faults(vec![BatchFaultTrigger::key_prefix(&NS_SEEN_STAGING)]);
 
     let err = adapter
         .commit_finalize(&FinalizeOutput {
@@ -397,13 +391,11 @@ fn staging_delete_crash_leaves_scope_durable_and_recovery_refolds_idempotently()
         .unwrap_err();
     assert!(format!("{err}").contains("injected batch failure"));
 
-    // Confirm the failure hit the expected batch call (staging-delete phase).
+    // Confirm the failure hit the staging-delete batch (second finalize phase).
     assert_eq!(
         backend.batch_call_count(),
         batch_calls_before + 2,
-        "commit_finalize non-atomic path should fail on the staging-delete batch; \
-         if this fails, the internal batch sequence changed and the failure \
-         injection offset must be updated"
+        "commit_finalize non-atomic path should fail on the staging-delete batch"
     );
 
     // -- Post-crash state: scope durable, staging survives ---------------------
@@ -425,7 +417,6 @@ fn staging_delete_crash_leaves_scope_durable_and_recovery_refolds_idempotently()
     );
 
     // -- Recovered adapter sees committed OIDs ---------------------------------
-    backend.clear_fail_on_batch_call();
     let recovered = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
     assert_eq!(
         recovered.batch_check_seen(&oids).unwrap(),

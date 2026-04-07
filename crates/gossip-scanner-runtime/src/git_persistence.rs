@@ -977,7 +977,6 @@ pub mod test_support {
         pub(super) kv: BTreeMap<Vec<u8>, Vec<u8>>,
         pub(super) batches: Vec<Vec<GitPersistenceOp>>,
         pub(super) batch_call_count: usize,
-        pub(super) fail_on_batch_call: Option<usize>,
         pub(super) multi_get_truncate: bool,
         pub(super) op_log: Vec<SimBackendOp>,
         pub(super) batch_faults: Vec<BatchFaultTrigger>,
@@ -1031,32 +1030,6 @@ pub mod test_support {
             self.state.borrow().kv.get(key).cloned()
         }
 
-        /// Injects a failure when `batch_call_count` reaches `call_no`.
-        ///
-        /// The check fires when the internal monotonic counter equals `call_no`.
-        /// Use [`batch_call_count`](Self::batch_call_count) to read the current
-        /// value and compute a relative offset (e.g., `backend.batch_call_count() + 3`
-        /// to fail 3 calls from now).
-        pub fn set_fail_on_batch_call(&self, call_no: usize) {
-            let mut state = self.state.borrow_mut();
-            assert!(
-                call_no > state.batch_call_count,
-                "call_no={call_no} has already passed; next batch call is {}",
-                state.batch_call_count + 1
-            );
-            assert!(
-                state.batch_faults.is_empty(),
-                "set_fail_on_batch_call and set_batch_faults are mutually exclusive; \
-                 positional faults shadow content-aware faults and prevent queue advancement"
-            );
-            state.fail_on_batch_call = Some(call_no);
-        }
-
-        /// Clears any previously injected batch failure.
-        pub fn clear_fail_on_batch_call(&self) {
-            self.state.borrow_mut().fail_on_batch_call = None;
-        }
-
         /// Injects a failure when the internal `get` call counter reaches
         /// `call_no` (1-indexed).
         ///
@@ -1096,11 +1069,6 @@ pub mod test_support {
         /// batches skip the current trigger without advancing the index.
         pub fn set_batch_faults(&self, faults: Vec<BatchFaultTrigger>) {
             let mut state = self.state.borrow_mut();
-            assert!(
-                state.fail_on_batch_call.is_none(),
-                "set_batch_faults and set_fail_on_batch_call are mutually exclusive; \
-                 positional faults shadow content-aware faults and prevent queue advancement"
-            );
             state.batch_faults = faults;
             state.batch_fault_idx = 0;
         }
@@ -1173,9 +1141,7 @@ pub mod test_support {
         }
 
         /// Returns the total number of `apply_batch` calls so far, including
-        /// calls rejected by fault injection. Positional faults
-        /// ([`set_fail_on_batch_call`](Self::set_fail_on_batch_call)) use this
-        /// counter to decide when to fire.
+        /// calls rejected by fault injection.
         pub fn batch_call_count(&self) -> usize {
             self.state.borrow().batch_call_count
         }
@@ -1208,13 +1174,6 @@ pub mod test_support {
         fn apply_batch(&self, ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
             let mut state = self.state.borrow_mut();
             state.batch_call_count += 1;
-
-            // Positional fault: fires when the monotonic batch counter reaches a fixed target.
-            if state.fail_on_batch_call == Some(state.batch_call_count) {
-                return Err(TestBackendError {
-                    message: "injected batch failure (positional)",
-                });
-            }
 
             // Content-aware fault queue: fires when the batch contains a key
             // matching the current trigger's prefix.
@@ -1865,16 +1824,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "set_batch_faults and set_fail_on_batch_call are mutually exclusive")]
-    fn sim_backend_rejects_positional_and_content_aware_faults_simultaneously() {
-        let backend = TestBackend::non_atomic();
-        backend.set_fail_on_batch_call(1);
-        // Must panic: positional faults shadow content-aware faults and
-        // prevent queue advancement.
-        backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
-    }
-
-    #[test]
     fn adapter_atomic_fault_during_finalize_blocks_everything() {
         let backend = TestBackend::atomic();
         backend.enable_phase_logging();
@@ -2403,7 +2352,7 @@ mod tests {
     #[test]
     fn non_atomic_backend_commits_data_before_watermarks() {
         let backend = TestBackend::non_atomic();
-        backend.set_fail_on_batch_call(2);
+        backend.set_batch_faults(vec![BatchFaultTrigger::key_prefix(&NS_REF_WATERMARK)]);
         let adapter = GitPersistenceAdapter::new(backend.clone(), 14, [0xE0; 32]);
 
         let err = adapter
@@ -2435,8 +2384,8 @@ mod tests {
         // Batch 2: commit_finalize first-phase (data+seen scope)
         // Batch 3: commit_finalize staging delete
         // Batch 4: commit_finalize watermark phase
-        // Fail on batch 4 (watermarks) to prove the seen cache survives.
-        backend.set_fail_on_batch_call(4);
+        // Target the watermark batch to prove the seen cache survives.
+        backend.set_batch_faults(vec![BatchFaultTrigger::key_prefix(&NS_REF_WATERMARK)]);
         let _ = adapter
             .commit_finalize(&FinalizeOutput {
                 data_ops: Vec::new(),
@@ -2511,8 +2460,8 @@ mod tests {
             .expect("stage seen delta");
 
         // Fail the first apply_batch inside commit_finalize (data/seen
-        // phase). persist_seen_delta already consumed batch call #1.
-        backend.set_fail_on_batch_call(2);
+        // phase). The fault queue fires on the next apply_batch call.
+        backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
         let _ = adapter
             .commit_finalize(&finalize_output(FinalizeOutcome::Complete))
             .expect_err("first-phase batch should fail");
@@ -2670,7 +2619,7 @@ mod tests {
         // has oid_a; if the bug exists, merge_delta adds oid_b to the
         // cached bitmap before the write is attempted, leaving stale
         // OIDs in the cache that were never durably staged.
-        backend.set_fail_on_batch_call(2);
+        backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
         adapter
             .persist_seen_delta(&[oid_b])
             .expect_err("second persist should fail on injected batch failure");
