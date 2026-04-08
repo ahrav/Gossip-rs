@@ -27,6 +27,14 @@
 //! ├── manifest.rs         InitialShardInput, validate_manifest — shard registration validation
 //! └── limits.rs           MAX_SPLIT_CHILDREN, MAX_SPAWNED_PER_SHARD — split capacity constants
 //! ```
+//!
+//! ## Invariant contracts
+//!
+//! - Cursor positions remain monotonic within a shard and never escape the shard's current key range.
+//! - Split planning always observes the `ShardSpec` bounds that triggered the split so the replace/
+//!   residual planner never sees stale coverage.
+//! - Manifest validation rejects empty or overlapping shard intervals, keeping downstream coordination
+//!   backends safe from range assertions.
 
 /// Two-layer progress marker defining where a connector should resume.
 pub mod cursor;
@@ -52,35 +60,36 @@ pub mod shard_spec;
 /// Split planner core for replace and residual splits (backend-agnostic).
 pub mod split;
 
-// -- Progress tracking --
+/// Expose cursor advancement/validation APIs so consumers can reason about monotonic progress without touching the module internals.
+/// These helpers enforce the two-layer cursor invariants and provide lexicographic helpers for key/token successor math.
 pub use cursor::{
     CursorAdvance, CursorBoundsCheck, CursorInputError, CursorUpdate, MAX_KEY_SIZE,
     MAX_TOKEN_SIZE as CursorMaxTokenSize, check_cursor_advance, check_cursor_bounds,
     key_successor_into, prefix_successor_into,
 };
 
-// -- Split capacity limits --
+/// Split capacity constants shared between the planner and executors to keep spawn/split counts aligned.
 pub use limits::{MAX_SPAWNED_PER_SHARD, MAX_SPLIT_CHILDREN};
 
-// -- Manifest validation --
+/// Manifest validation surface ensuring shard registration payloads remain bounded and explicit.
 pub use manifest::{
     InitialShardInput, MAX_INITIAL_SHARDS, ManifestValidationError, validate_manifest,
 };
 
-// -- Arena-pooled storage --
+/// Arena-pooled wrappers for hot-path shard bytes so callers can avoid per-request allocations.
 pub use pooled::{PooledCursor, PooledShardSpec, PooledSpawned, PooledSpawnedIter};
 
-// -- Restored coordination state --
+/// Restored-state helpers for backend transitions after a fence or acquire.
 pub use restored_state::RestoredShardState;
 
-// -- Key ranges and split validation --
+/// Key-range validation primitives, shard metadata, and split coverage checks consumed by both planners and connectors.
 pub use shard_spec::{
     CursorSemantics, MAX_METADATA_SIZE as ShardSpecMaxMetadataSize, ShardArena, ShardSpec,
     ShardSpecHandle, ShardSpecInputError, ShardSpecRef, SplitValidationError,
     validate_residual_split, validate_split_coverage,
 };
 
-// -- Split planning core (execution lives in gossip-coordination) --
+/// Split planning core entry point that returns replace/residual plans modeled over abstract `ShardSpec`.
 pub use split::{
     SplitReplaceChild, SplitReplacePlan, SplitReplacePlanError, SplitReplacePlanningError,
     SplitResidualPlan, SplitResidualPlanError, SplitResidualPlanningError, plan_split_replace,
