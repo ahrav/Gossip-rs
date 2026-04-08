@@ -550,9 +550,10 @@ pub(super) struct GitRepoPersistenceInput<'a> {
     pub(super) tenant_secret_key: TenantSecretKey,
     pub(super) rule_fingerprint: &'a dyn Fn(u32) -> RuleFingerprint,
     pub(super) claim_time: LogicalTime,
-    /// Wall-clock timestamp captured after scan execution *and* persistence
-    /// finalize complete. The `(claim_time, complete_time)` interval therefore
-    /// measures claim-to-durable-finalize, not claim-to-scan-completion alone.
+    /// Wall-clock timestamp captured after scan execution completes but before
+    /// persistence submissions. The `(claim_time, complete_time)` interval
+    /// measures claim-to-scan-completion; it does not include persistence
+    /// latency.
     pub(super) complete_time: LogicalTime,
 }
 
@@ -914,9 +915,9 @@ where
 
     // External findings and done-ledger state must land before a complete Git
     // finalize advances the repo's durable scan state. The scan phase buffers
-    // complete finalizes so the git-kv commit can run after these receipts
-    // succeed; partial finalizes remain inline because they never advance
-    // watermarks.
+    // complete finalizes via `DeferredCompleteFinalizeStore` so the git-kv
+    // commit can run after these receipts succeed; partial finalizes remain
+    // inline because they never advance watermarks.
     let captured_findings = capture_sink.take_captured_findings();
     let detected_count = capture_sink.detected_finding_count();
     if detected_count != captured_findings.len() as u64 {
@@ -972,11 +973,15 @@ where
     // watermarks remain at their pre-scan position. The next lease re-scans
     // the same blobs and re-emits findings. Done-ledger and findings
     // consumers must tolerate duplicate submissions.
-    debug_assert!(
-        !matches!(execution.finalize_outcome, FinalizeOutcome::Complete)
-            || execution.deferred_finalize.is_some(),
-        "complete finalize must produce a deferred finalize output"
-    );
+    if matches!(execution.finalize_outcome, FinalizeOutcome::Complete)
+        && execution.deferred_finalize.is_none()
+    {
+        return Err(DistributedRuntimeError::Durability(anyhow!(
+            "complete finalize for shard '{}' must produce a deferred finalize output; \
+             watermarks would be silently dropped",
+            stage_sink.redacted_shard_id()
+        )));
+    }
     if let Some(finalize) = execution.deferred_finalize.as_ref() {
         execution
             .persistence

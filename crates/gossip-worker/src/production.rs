@@ -8,8 +8,8 @@
 //! - [`gossip_findings_postgres::FindingsSinkPg`]
 //! - [`gossip_git_persistence_postgres::GitPersistencePg`]
 //!
-//! The core runtime stays generic over `CoordinationFacade`, `DoneLedger`, and
-//! `FindingsSink`. This module owns startup wiring, schema readiness
+//! The core runtime stays generic over `CoordinationFacade`, `DoneLedger`,
+//! `FindingsSink`, and `GitPersistenceBackend`. This module owns startup wiring, schema readiness
 //! validation, and typed startup error classification.
 //!
 //! The DSN-based convenience constructor in this module uses
@@ -366,7 +366,9 @@ impl ProductionRuntimeBackends {
     ) -> Result<DistributedRunReport, DistributedRuntimeError> {
         let git_backend = self.git_persistence.ok_or_else(|| {
             DistributedRuntimeError::Durability(anyhow::anyhow!(
-                "git production launch requires a configured git-kv backend"
+                "git production launch requires a configured git-kv backend; \
+                 verify {} is set for Git source workers",
+                crate::config::ENV_GIT_KV_POSTGRES_DSN,
             ))
         })?;
         run_git_repo_worker(
@@ -521,6 +523,10 @@ pub fn build_production_backends_from_clients(
                 GitPersistencePgError::Migration(_)
                 | GitPersistencePgError::MutexPoisoned
                 | GitPersistencePgError::PayloadTooLarge { .. } => {
+                    tracing::error!(
+                        error = %error,
+                        "unexpected git-kv backend initialization error variant"
+                    );
                     ProductionBootstrapError::GitKvInitUnexpected(format!("{error}"))
                 }
             },
@@ -713,15 +719,12 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
     if has_connect_timeout(dsn) {
         return Client::connect(dsn, NoTls).inspect_err(|err| {
             // Log a safe category at error level; the raw driver error may
-            // echo DSN fragments so diagnostics use the same classifier.
+            // echo DSN fragments so full diagnostics stay at debug level.
             tracing::error!(
                 reason = classify_pg_error(err),
                 "PostgreSQL connection failed"
             );
-            tracing::debug!(
-                reason = classify_pg_error(err),
-                "PostgreSQL connection diagnostic"
-            );
+            tracing::debug!(error = %err, "PostgreSQL connection diagnostic");
         });
     }
 
@@ -740,10 +743,7 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
     );
     Client::connect(&timed, NoTls).inspect_err(|err| {
         tracing::warn!("PostgreSQL connection failed");
-        tracing::debug!(
-            reason = classify_pg_error(err),
-            "PostgreSQL connection diagnostic"
-        );
+        tracing::debug!(error = %err, "PostgreSQL connection diagnostic");
     })
 }
 

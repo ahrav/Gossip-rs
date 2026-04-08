@@ -194,9 +194,9 @@ impl GitScanFixture {
 
     /// Create a fixture whose repos contain no content matching `SAFE_TOKEN`.
     ///
-    /// Use this for tests that run the actual worker binary: durable Git
-    /// finding translation is not yet wired up, so the runtime rejects shards
-    /// that detect findings. Clean repos let the worker complete the shard.
+    /// Clean repos simplify expected-count assertions in the happy-path proof:
+    /// zero observations, one done-ledger row per repo, deterministic git-kv
+    /// state.
     fn clean(repo_count: usize) -> Self {
         Self::build(repo_count, false)
     }
@@ -363,10 +363,8 @@ impl SeededLaunchProof {
 
 /// Live-backend Git proof seeded through real etcd, PostgreSQL, and a local repo fixture.
 ///
-/// The fixture uses a clean repo (no rule-matching content) so the worker can
-/// complete the shard end-to-end. Durable Git finding translation is not yet
-/// wired up, so repos with matching content would cause the runtime to reject
-/// the shard before checkpoint.
+/// The fixture uses a clean repo (no rule-matching content) so the proof
+/// exercises the zero-findings path with deterministic expected counts.
 struct GitSeededLaunchProof {
     backends: SeededBackends,
     fixture: GitScanFixture,

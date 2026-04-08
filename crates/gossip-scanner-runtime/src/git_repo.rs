@@ -225,10 +225,13 @@ impl GitRepoRuntime {
         };
         let finalize_outcome = execution.result.0.finalize.outcome;
         let was_deferred = deferred_finalize_store.was_complete_deferred();
-        debug_assert!(
-            !matches!(finalize_outcome, FinalizeOutcome::Complete) || was_deferred,
-            "complete finalize outcome must produce a deferred finalize"
-        );
+        if matches!(finalize_outcome, FinalizeOutcome::Complete) && !was_deferred {
+            return Err(ScanRuntimeError::Driver(anyhow::anyhow!(
+                "complete finalize outcome for '{}' was not intercepted by the deferred \
+                 store; watermarks would be silently dropped",
+                digest_repo_path(mirror.path())
+            )));
+        }
         let (report, finalize) =
             git_report_to_scan_report(execution.result, execution.scan_elapsed);
         let deferred_finalize = if was_deferred { Some(finalize) } else { None };
@@ -476,6 +479,8 @@ pub(crate) fn scan_local_repo(
         };
 
         let debug_output = format_git_debug_output(&execution.result.0, config.debug_level);
+        // Local scans run without a git-kv backend; finalize output carries no
+        // durable ops and is safely discarded.
         let (report, _finalize) =
             git_report_to_scan_report(execution.result, execution.scan_elapsed);
         Ok((report, debug_output))

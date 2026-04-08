@@ -2019,6 +2019,58 @@ fn run_git_repo_worker_fails_cleanly_on_persistence_error() {
     );
 }
 
+/// The post-receipt `commit_finalize` failure must surface as a `Durability`
+/// error while leaving findings and done-ledger rows already persisted (the
+/// at-least-once guarantee). Scan-phase persistence succeeds; only the
+/// deferred finalize commit that advances watermarks and clears staging is
+/// injected to fail.
+#[test]
+fn run_git_repo_worker_surfaces_durability_error_on_post_receipt_finalize_failure() {
+    let repo = create_clean_git_repo_fixture();
+    let mirror_root = tempdir().expect("mirror root");
+    let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+    let backend = TestGitBackend::default();
+    backend.fail_on_finalize_commit();
+    let mut coordinator =
+        setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+    let findings = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let err = run_git_repo_worker(
+        &mut coordinator,
+        &mut mirrors,
+        git_worker_identity(repo.path()),
+        backend.clone(),
+        DistributedPersistence::new(findings.clone(), done_ledger.clone()),
+        DistributedRuntimeConfig::default(),
+    )
+    .expect_err("post-receipt finalize commit failure should propagate");
+
+    assert!(
+        matches!(err, DistributedRuntimeError::Durability(_)),
+        "expected Durability error variant, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("finalize commit failed"),
+        "error message should identify the finalize commit failure: {err}"
+    );
+
+    // Scan-phase spill writes must have succeeded before the finalize failed.
+    assert!(
+        backend.batch_call_count() > 0,
+        "scan-phase persistence batches should have succeeded before the finalize failure"
+    );
+
+    // Done-ledger and findings are submitted BEFORE commit_finalize, so they
+    // must be durable despite the finalize failure (at-least-once guarantee).
+    let done_rows = done_ledger.snapshot().expect("done-ledger snapshot");
+    assert_eq!(
+        done_rows.len(),
+        1,
+        "done-ledger row must be durable even when finalize commit fails"
+    );
+}
+
 /// Git events remain observable when the repo-frontier worker persists
 /// findings durably.
 #[test]
