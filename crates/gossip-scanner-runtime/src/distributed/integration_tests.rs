@@ -1730,6 +1730,9 @@ fn run_git_repo_worker_treats_cursor_covered_target_as_exhausted_empty() {
     );
 }
 
+/// Multi-commit secret-bearing histories must complete successfully without
+/// triggering shard parking. History depth alone is not a parking condition;
+/// only permanent errors qualify.
 #[test]
 fn run_git_repo_worker_completes_large_secret_history() {
     let repo = create_git_repo_fixture_with_secret_history(16);
@@ -1745,7 +1748,7 @@ fn run_git_repo_worker_completes_large_secret_history() {
         &mut coordinator,
         &mut mirrors,
         git_worker_identity(repo.path()),
-        backend,
+        backend.clone(),
         DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
         DistributedRuntimeConfig::default(),
     )
@@ -1754,10 +1757,36 @@ fn run_git_repo_worker_completes_large_secret_history() {
     assert_eq!(report.leases_seen, 1);
     assert_eq!(report.shards_scanned, 1);
     assert_eq!(run_progress(&coordinator).done(), 1);
+
+    let summaries = shard_summaries(&coordinator);
+    assert_eq!(summaries.len(), 1);
+    assert_ne!(
+        summaries[0].status(),
+        ShardStatus::Parked,
+        "history depth alone must not park the shard"
+    );
     assert_eq!(
-        shard_summaries(&coordinator)[0].status(),
+        summaries[0].status(),
         ShardStatus::Done,
-        "history depth alone must not park or strand the shard"
+        "history depth alone must not strand the shard"
+    );
+
+    let expected_key = git_repo_key(repo.path());
+    assert_eq!(
+        summaries[0]
+            .last_key()
+            .expect("completed shard should have a last_key"),
+        expected_key.as_bytes(),
+        "shard cursor last_key should match the singleton repo key"
+    );
+
+    assert!(
+        backend.batch_call_count() > 0,
+        "git repo worker must durably persist repo state before advancing the shard"
+    );
+    assert!(
+        !backend.stored_keys().is_empty(),
+        "persistence backend should contain durable state after a complete scan"
     );
 
     let persisted = findings_sink
@@ -1779,9 +1808,11 @@ fn run_git_repo_worker_completes_large_secret_history() {
         DoneLedgerStatus::ScannedWithFindings,
         "secret-bearing history should produce a findings-bearing done-ledger row"
     );
+    // Single object-version shard: the done-ledger's per-item findings_count
+    // equals total persisted finding rows because there is exactly one item.
     assert_eq!(
         rows[0].findings_count(),
-        persisted.len() as u32,
+        u32::try_from(persisted.len()).expect("findings count fits u32"),
         "done-ledger findings_count must match persisted findings"
     );
 }

@@ -444,7 +444,11 @@ pub(super) fn create_git_repo_fixture_with_secrets() -> tempfile::TempDir {
     dir
 }
 
-/// Git repo fixture with repeated secret-bearing commits across one file.
+/// Git repo fixture where each commit introduces a secret in a distinct file.
+///
+/// Every commit adds a new `secret-{N}.txt`, so each commit's diff independently
+/// contains a detectable secret regardless of whether the scanner operates on
+/// full blobs or diffs.
 pub(super) fn create_git_repo_fixture_with_secret_history(
     commit_count: usize,
 ) -> tempfile::TempDir {
@@ -461,8 +465,9 @@ pub(super) fn create_git_repo_fixture_with_secret_history(
     );
 
     for commit in 0..commit_count {
+        let filename = format!("secret-{commit}.txt");
         let contents = format!("{}\ncommit-{commit}\n", secret_fixture());
-        fs::write(dir.path().join("secret.txt"), contents).expect("write fixture");
+        fs::write(dir.path().join(&filename), contents).expect("write fixture");
         run_git_in(dir.path(), &["add", "."]);
         let message = format!("fixture-{commit}");
         run_git_in(dir.path(), &["commit", "-q", "-m", message.as_str()]);
