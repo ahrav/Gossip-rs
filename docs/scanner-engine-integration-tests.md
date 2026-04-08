@@ -12,9 +12,9 @@ crates/scanner-engine-integration-tests/
   src/lib.rs                          # Marker crate (no library code)
   tests/
     chunked_file_scans.rs             # Standalone: overlap + transform provenance
-    integration/                      # ~162 tests: cross-crate integration
+    integration/                      # 171 tests: cross-crate integration
     property/                         # ~100 tests + ~30 proptest cases
-    simulation/                       # ~41 tests: deterministic sim replay
+    simulation/                       # 42 tests: deterministic sim replay
       corpus/                         # Scheduler simulation replay artifacts
     diagnostic/                       # 2 tests: anchor derivation diagnostics
     smoke/                            # Deferred (tests present but commented out)
@@ -34,9 +34,9 @@ Each category is a separate test binary gated behind a Cargo feature:
 
 | Binary          | Path                       | Feature Gate         | Tests |
 | --------------- | -------------------------- | -------------------- | ----: |
-| `integration`   | `tests/integration/main.rs`| `integration-tests`  |  ~176 |
+| `integration`   | `tests/integration/main.rs`| `integration-tests`  |   176 |
 | `property`      | `tests/property/main.rs`   | `property-tests`     |  ~130 |
-| `simulation`    | `tests/simulation/main.rs` | various (see below)  |   ~42 |
+| `simulation`    | `tests/simulation/main.rs` | various (see below)  |    42 |
 | `diagnostic`    | `tests/diagnostic/main.rs` | `diagnostic-tests`   |     2 |
 | `smoke`         | `tests/smoke/main.rs`      | `smoke-tests`        |     0 |
 | *(standalone)*  | `tests/chunked_file_scans.rs` | *(none)*          |     3 |

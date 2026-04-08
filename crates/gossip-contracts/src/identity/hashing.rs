@@ -40,6 +40,10 @@
 //! one of these statics instead of re-running the key-schedule setup, making
 //! repeated same-domain derivations cheaper.
 //! All `derive_*` functions in the crate use this path.
+//! Because each cached hasher hard-codes a single domain constant from
+//! [`domain`](crate::identity::domain), the semantic pairing between a static and the ID type it
+//! serves must remain stable: deriving a `FindingId` from the wrong static still
+//! compiles but yields digests under the wrong domain tag.
 //!
 //! # Context string requirements
 //!
@@ -122,6 +126,12 @@ pub static MIRROR_PATH_HASHER: LazyLock<Hasher> =
 /// The `T: [CanonicalBytes](super::CanonicalBytes)` bound guarantees that
 /// `inputs` produces a collision-free, deterministic byte encoding, so the
 /// resulting 32-byte digest is a pure function of `(domain, inputs)`.
+///
+/// Because `base` is expected to originate from this module's cached statics,
+/// the digest stays tied to the domain that `base` represents. Mixing cached
+/// hashers across identifier families still compiles but yields digests for the
+/// wrong domain tag, so callers must keep the semantic pairing between `base`
+/// and their output type.
 #[inline]
 pub fn derive_from_cached<T: super::CanonicalBytes>(base: &Hasher, inputs: &T) -> [u8; 32] {
     let mut h = base.clone();
@@ -134,9 +144,15 @@ pub fn derive_from_cached<T: super::CanonicalBytes>(base: &Hasher, inputs: &T) -
 /// Uses BLAKE3's derive-key mode so distinct domain tags map to
 /// cryptographically independent hash domains.
 ///
-/// All domain constants in [`super::domain`] are `&str`, so this function
+/// All domain constants in [`domain`] are `&str`, so this function
 /// takes `&str` directly — UTF-8 validity is enforced by the type system
 /// with no runtime check.
+///
+/// This entry point is intended for contexts that do not already have a cached
+/// static hasher (new identifier families or tests that exercise dynamic
+/// contexts). Production derivations with fixed domains should prefer the
+/// cached statics via [`derive_from_cached`] so the derive-key setup is
+/// amortized.
 #[inline]
 pub fn domain_hasher(context: &str) -> Hasher {
     Hasher::new_derive_key(context)
@@ -147,6 +163,10 @@ pub fn domain_hasher(context: &str) -> Hasher {
 /// This is the common tail of every content-addressed derivation in the
 /// system. The `_32` suffix encodes the output width; if a different
 /// digest size is ever needed, it will be a separate function.
+///
+/// BLAKE3's `finalize` returns a borrow of the output bytes, so this helper
+/// copies them into an array while leaving the source `Hasher` available for
+/// further updates or additional finalizations.
 #[inline]
 pub fn finalize_32(hasher: &Hasher) -> [u8; 32] {
     *hasher.finalize().as_bytes()
@@ -199,25 +219,21 @@ mod tests {
         finalize_32(&hasher)
     }
 
-    // Correctness anchor: domain_hasher + finalize_32 == blake3::derive_key
-
+    /// Ensures our two-step API matches `blake3::derive_key`.
     #[test]
     fn domain_hasher_matches_blake3_derive_key() {
         let context = "gossip/test-anchor/v1";
         let payload = b"deterministic payload for correctness check";
 
-        // Our two-step API.
         let mut h = domain_hasher(context);
         h.update(payload);
         let ours = finalize_32(&h);
 
-        // Direct blake3 derive_key (single-shot, fixed 32-byte output).
+        // Compare to single-shot `blake3::derive_key`.
         let reference = blake3::derive_key(context, payload);
 
         assert_eq!(ours, reference);
     }
-
-    // Property-based: determinism across random payloads
 
     proptest! {
         #![proptest_config(crate::test_util::miri_proptest_config())]
@@ -239,8 +255,6 @@ mod tests {
             prop_assert_ne!(d1, d2);
         }
     }
-
-    // finalize_64: property-based
 
     fn hash_payload_64(domain: &str, payload: &[u8]) -> u64 {
         let mut hasher = domain_hasher(domain);

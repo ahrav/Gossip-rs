@@ -19,6 +19,7 @@ use postgres::{Client, Transaction};
 pub const ADVISORY_LOCK_KEYS: &[(&str, i64)] = &[
     ("GSDLPGM1", 0x4753444c_50474d31), // done-ledger
     ("GFPGMIG1", 0x47465047_4d494731), // findings
+    ("GGPKVM01", 0x4747504b_564d3031), // git persistence
 ];
 
 /// Default cap for DDL lock acquisition during migrations.
@@ -114,11 +115,16 @@ impl EmbeddedMigration {
 }
 
 /// Error type for PostgreSQL schema migration operations.
+///
+/// `Display` redacts IO/connection-class `postgres::Error` values to prevent
+/// connection strings, hostnames, and usernames from leaking into logs. DB
+/// errors (syntax, constraint violations, etc.) are safe to display because
+/// they never contain connection metadata -- only severity and SQLSTATE code
+/// are surfaced. Full diagnostics remain available via `Error::source()`.
 #[derive(Debug, thiserror::Error)]
 pub enum PgMigrationError {
     /// PostgreSQL driver or SQL execution error, tagged with the operation
     /// that failed.
-    #[error("postgres migration {operation} failed: {source}")]
     Postgres {
         /// Which migration step produced the error.
         operation: MigrationOperation,
@@ -128,9 +134,6 @@ pub enum PgMigrationError {
     },
     /// An already-applied migration's embedded SQL no longer matches the
     /// checksum recorded in the database.
-    #[error(
-        "migration checksum mismatch for version {version}: expected {expected_hex}, found {found_hex}"
-    )]
     ChecksumMismatch {
         /// Version string of the migration with the mismatched checksum.
         version: &'static str,
@@ -140,15 +143,50 @@ pub enum PgMigrationError {
         found_hex: String,
     },
     /// The stored checksum length is invalid for a BLAKE3 digest.
-    #[error(
-        "corrupted migration history: version {version} checksum is {found_len} bytes, expected 32"
-    )]
     CorruptedHistoryRecord {
         /// Version string of the migration with the corrupted checksum.
         version: &'static str,
         /// Actual byte length of the stored checksum.
         found_len: usize,
     },
+}
+
+impl fmt::Display for PgMigrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Postgres { operation, source } => {
+                if let Some(db_err) = source.as_db_error() {
+                    write!(
+                        f,
+                        "postgres migration {operation} failed: {} ({})",
+                        db_err.severity(),
+                        db_err.code().code()
+                    )
+                } else {
+                    // IO/connection errors may embed connection strings -- redact details.
+                    // Full diagnostics remain available via `Error::source()`.
+                    write!(
+                        f,
+                        "postgres migration {operation} failed: connection/protocol error"
+                    )
+                }
+            }
+            Self::ChecksumMismatch {
+                version,
+                expected_hex,
+                found_hex,
+            } => write!(
+                f,
+                "migration checksum mismatch for version {version}: \
+                 expected {expected_hex}, found {found_hex}"
+            ),
+            Self::CorruptedHistoryRecord { version, found_len } => write!(
+                f,
+                "migration history record for {version} has invalid checksum length \
+                 ({found_len} bytes, expected 32)"
+            ),
+        }
+    }
 }
 
 impl PgMigrationError {

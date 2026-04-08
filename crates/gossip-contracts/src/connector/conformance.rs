@@ -48,31 +48,53 @@ pub struct ObservedScanItem {
 }
 
 impl ObservedScanItem {
+    /// Returns the recorded key that the harness observed for this item.
+    ///
+    /// The key is used during drain comparisons and leak detection.
     #[must_use]
     pub fn item_key(&self) -> &ItemKey {
         &self.item_key
     }
 
+    /// Returns the recorded reference that was emitted alongside the key.
+    ///
+    /// Observing this value helps conformance detect leaked fragments in
+    /// `ItemRef` data.
     #[must_use]
     pub fn item_ref(&self) -> &ItemRef {
         &self.item_ref
     }
 
+    /// Returns the stable identifier that the source supplied for the item.
+    ///
+    /// This snapshot is compared across drains to detect duplicate or missing
+    /// records.
     #[must_use]
     pub fn stable_item_id(&self) -> StableItemId {
         self.stable_item_id
     }
 
+    /// Returns the version digest that arrived with the item.
+    ///
+    /// Included in conformance comparisons when determinism violations need to
+    /// report an emitted version.
     #[must_use]
     pub fn version(&self) -> VersionId {
         self.version
     }
 
+    /// Returns the optional size hint that the source attached to the item.
+    ///
+    /// The harness records this to help explain byte-budget-driven paging
+    /// behavior.
     #[must_use]
     pub fn size_hint(&self) -> Option<u64> {
         self.size_hint
     }
 
+    /// Returns the captured `Location` metadata for the item, if any.
+    ///
+    /// Used to verify forbidden fragments in display strings and URLs.
     #[must_use]
     pub fn location(&self) -> Option<&Location> {
         self.location.as_ref()
@@ -133,16 +155,22 @@ impl OrderedContentDrain {
         &self.items
     }
 
+    /// Returns the per-page lengths recorded during the drain.
+    ///
+    /// This preserves the partitioning that the source emitted under the
+    /// supplied budgets, allowing the harness to detect page-repacking.
     #[must_use]
     pub fn page_lengths(&self) -> &[usize] {
         &self.page_lengths
     }
 
+    /// Returns the total number of observed items stored in the drain.
     #[must_use]
     pub fn len(&self) -> usize {
         self.items.len()
     }
 
+    /// Returns `true` when the drain captured no items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()

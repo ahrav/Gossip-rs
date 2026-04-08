@@ -1,5 +1,17 @@
-//! Shared connector utilities: shard-bound validation, binary search,
-//! and split-candidate validation.
+//! Shared connector utilities used by multiple connector implementations.
+//!
+//! This module centralizes:
+//! - shard-bound validation and bound-to-index resolution,
+//! - generic key-based binary search helpers over sorted entries,
+//! - cursor/split-candidate guards shared by in-memory and filesystem paths,
+//! - platform-aware path conversions and I/O error classification.
+//!
+//! # Invariants
+//!
+//! Search helpers in this module assume input slices are sorted by
+//! `KeyedEntry::key_bytes()` in ascending byte-lexicographic order. Bound
+//! resolution is key-byte authoritative and intentionally does not decode keys
+//! beyond size validation.
 
 use std::{
     io,
@@ -66,10 +78,18 @@ pub(crate) fn borrowed_shard_bound<'a>(
 /// Enables generic binary search (`lower_bound`, `upper_bound`) over both
 /// `FileEntry` (filesystem connector) and `PreparedItem` (in-memory connector).
 pub(crate) trait KeyedEntry {
+    /// Returns the canonical key bytes used for ordering and bound checks.
+    ///
+    /// Implementations must return bytes consistent with the sorted order of
+    /// the surrounding collection whenever used with [`lower_bound`] or
+    /// [`upper_bound`].
     fn key_bytes(&self) -> &[u8];
 }
 
 /// Return the first index whose key is `>= key`.
+///
+/// `items` must be sorted in ascending byte-lexicographic key order.
+/// Runs in `O(log n)`.
 pub(crate) fn lower_bound<T: KeyedEntry>(items: &[T], key: &[u8]) -> usize {
     items.partition_point(|item| item.key_bytes() < key)
 }
@@ -77,6 +97,8 @@ pub(crate) fn lower_bound<T: KeyedEntry>(items: &[T], key: &[u8]) -> usize {
 /// Return the first index whose key is `> key`.
 ///
 /// Used for resume progression so the last emitted key is never re-emitted.
+/// `items` must be sorted in ascending byte-lexicographic key order.
+/// Runs in `O(log n)`.
 pub(crate) fn upper_bound<T: KeyedEntry>(items: &[T], key: &[u8]) -> usize {
     items.partition_point(|item| item.key_bytes() <= key)
 }
@@ -100,6 +122,10 @@ pub(crate) struct ResolvedBounds {
 /// This is the pure bound-resolution kernel shared by both page enumeration and
 /// split-point selection. It validates `start <= end` and converts byte bounds
 /// to half-open indices via [`lower_bound`].
+///
+/// `items` must be sorted in ascending byte-lexicographic key order. Given
+/// that precondition and valid bounds, the returned range satisfies
+/// `range_start <= range_end`.
 ///
 /// # Errors
 ///
@@ -130,6 +156,8 @@ pub(crate) fn resolve_bounds<T: KeyedEntry>(
 /// clamped to `range_start` when no key is present. Callers use this as the
 /// floor for resume; connector-specific token logic may advance further but
 /// never behind this position.
+///
+/// `items` must be sorted in ascending byte-lexicographic key order.
 pub(crate) fn key_resume_start<T: KeyedEntry>(
     items: &[T],
     cursor: &Cursor,

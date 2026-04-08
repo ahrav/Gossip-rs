@@ -1,26 +1,32 @@
-//! Capacity constants for split operations.
+//! Capacity limits that keep shard split coordination bounded.
 //!
-//! These constants bound the fan-out of split operations and cumulative
-//! child counts per parent shard, preventing single operations from
-//! creating unbounded shard records (SEC-4 resource exhaustion guard).
+//! The coordinator enforces these caps whenever it creates split, residual, or
+//! spawn children so that neither a single operation nor a shard's lifetime can
+//! drive unbounded allocation (resource exhaustion guard). These
+//! constants stay aligned with the split/residual machinery, and the invariants
+//! later in the module ensure the relationships remain intact.
 
-/// Maximum number of children in a single SplitReplace operation.
+/// Hard cap on the number of children a single `SplitReplace` can create.
 ///
-/// Bounds the fan-out of any single split to prevent a single coordinator
-/// operation from creating an unbounded number of shards. 256 children
-/// allows fine-grained subdivision while keeping the per-operation metadata
-/// size tractable (SEC-4: resource exhaustion guard).
+/// The coordinator never issues more than 256 child shards per split.
+/// This keeps the metadata carried in the operation and the shard map
+/// updates tractable while still permitting fine-grained subdivision.
 pub const MAX_SPLIT_CHILDREN: usize = 256;
 
-/// Maximum total spawned shards per parent shard.
+/// Lifetime cap on children and residual shards produced by one parent.
 ///
-/// Caps the cumulative number of children + residuals a parent may produce
-/// across its lifetime (multiple split-residual operations accumulate).
-/// 1024 bounds the total spawn count per parent shard (SEC-4).
+/// Every parent shard must never exceed 1024 spawned descendants, including
+/// split children and residual follow-ons that can come from later operations.
+/// This keeps a single shard from generating an unbounded tree of descendants
+/// over repeated coordinator actions and keeps resource-accounting tractable.
 pub const MAX_SPAWNED_PER_SHARD: usize = 1024;
 
-// Relationship assertion: a single split can't exceed total spawned cap.
+// Compile-time invariants that keep the capacity constants aligned.
+// A single split must not exceed the lifetime cap for its parent.
 const _: () = assert!(MAX_SPLIT_CHILDREN <= MAX_SPAWNED_PER_SHARD);
+// Each split must make progress by producing at least two children.
 const _: () = assert!(MAX_SPLIT_CHILDREN >= 2);
+// Both caps must stay positive and fit inside the 32-bit shard counters.
 const _: () = assert!(MAX_SPAWNED_PER_SHARD > 0);
+// The lifetime cap must fit within the network wire format.
 const _: () = assert!(MAX_SPAWNED_PER_SHARD <= u32::MAX as usize);

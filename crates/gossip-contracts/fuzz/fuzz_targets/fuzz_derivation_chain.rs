@@ -5,6 +5,25 @@
 //! and occurrence identity. By processing these steps sequentially from a
 //! single fuzz input, the entire pipeline is evaluated collectively.
 //!
+//! The harness interprets the first 160 bytes of every fuzz input as the fixed
+//! pieces of the derivation (tenant secret key hash, norm digest, tenant id,
+//! rule fingerprint, and connector instance identifier) while any additional
+//! bytes seed the item path so that the item identity is influenced by both
+//! deterministic and variable-width inputs.
+//!
+//! # Input Layout
+//!
+//! - **Bytes 0..32:** Tenant secret key governing `TenantSecretKey`.
+//! - **Bytes 32..64:** Norm digest mixed with tenant key to produce the
+//!   shared key secret hash.
+//! - **Bytes 64..96:** Tenant identifier used downstream by `FindingIdInputs`.
+//! - **Bytes 96..128:** Rule fingerprint that qualifies the finding derivation.
+//! - **Bytes 128..160:** Connector instance identifier that anchors the item
+//!   identity.
+//! - **Bytes 160..n:** Optional item path payload that ensures the same
+//!   fixed-width data can produce different stable item identifiers when the
+//!   variable suffix changes; defaults to `b"\x42"` when absent.
+//!
 //! # Invariants
 //!
 //! - **Determinism:** Identical inputs to the derivation functions
@@ -32,8 +51,9 @@ fuzz_target!(|data: &[u8]| {
     let rule_bytes: [u8; 32] = data[96..128].try_into().unwrap();
     let instance_id_bytes = &data[128..160];
 
-    // Variable-width path permits a single input to perturb both the fixed hashes
-    // and the item identity payload feeding subsequent derivation steps.
+    // Variable-width path stretches the same fixed hashes into multiple stable
+    // item identities by mutating the item payload that downstream inputs
+    // consume.
     let path = if data.len() > 160 {
         data[160..].to_vec()
     } else {
@@ -59,7 +79,8 @@ fuzz_target!(|data: &[u8]| {
         secret,
     };
 
-    // Validates identifier stability across multiple derivation invocations.
+    // Validates that deriving a `FindingId` twice from the same inputs remains
+    // deterministic even after fuzz inputs mutate the upstream components.
     let finding_1 = derive_finding_id(&finding_inputs);
     let finding_2 = derive_finding_id(&finding_inputs);
     assert_eq!(
@@ -75,6 +96,8 @@ fuzz_target!(|data: &[u8]| {
         byte_length: 1,
     };
 
+    // Ensures that the occurrence derivation between the same finding, version,
+    // and byte range is also stable in the face of fuzz mutations.
     let occ_1 = derive_occurrence_id(&occ_inputs);
     let occ_2 = derive_occurrence_id(&occ_inputs);
     assert_eq!(occ_1, occ_2, "OccurrenceId derivation is not deterministic");

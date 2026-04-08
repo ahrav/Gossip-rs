@@ -1154,11 +1154,11 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
 // apply_cross_rule_dedupe<F, E>(findings: &mut Vec<F>, engine: &E) -> usize;
 
 // Emit findings as structured events
-fn emit_findings<E: ScanEngine, F: FindingRecord>(
+fn emit_findings<E: ScanEngine, F: FindingWithHashRecord>(
     engine: &E,
     event_sink: &dyn EventOutput,
-    display: &[u8],
-    recs: &[F],
+    path: &[u8],
+    findings: &[F],
 );
 ```
 

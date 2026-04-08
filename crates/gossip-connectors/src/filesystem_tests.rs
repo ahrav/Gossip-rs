@@ -104,6 +104,7 @@ fn drain_keys(run: &gossip_contracts::connector::conformance::OrderedContentDrai
 // Ordered-content conformance harness
 // ---------------------------------------------------------------
 
+/// Confirms the ordered-content conformance harness accepts an empty filesystem root and produces no pages.
 #[test]
 fn ordered_content_conformance_accepts_empty_filesystem_root() {
     let dir = create_test_dir(&[]);
@@ -121,6 +122,7 @@ fn ordered_content_conformance_accepts_empty_filesystem_root() {
     assert!(run.page_lengths().is_empty());
 }
 
+/// Ensures a bounded filesystem fixture anchored by a root canary yields the expected keys and page lengths.
 #[test]
 fn ordered_content_conformance_accepts_bounded_fixture_and_root_canary() {
     let base = tempfile::tempdir().expect("create base tempdir");
@@ -149,6 +151,7 @@ fn ordered_content_conformance_accepts_bounded_fixture_and_root_canary() {
     assert_eq!(run.page_lengths(), &[2]);
 }
 
+/// Validates the conformance harness honors the intersection between the connector key range and the shard.
 #[test]
 fn ordered_content_conformance_accepts_connector_range_intersection() {
     let dir = create_test_dir(&[
@@ -176,6 +179,7 @@ fn ordered_content_conformance_accepts_connector_range_intersection() {
 proptest! {
     #![proptest_config(gossip_contracts::test_util::miri_proptest_config())]
 
+    /// Property test: random files should be enumerated in sorted order while respecting the configured page size.
     #[test]
     fn ordered_content_conformance_matches_sorted_random_files(
         ids in proptest::collection::btree_set(0u16..60000, 1..16)
@@ -218,12 +222,14 @@ proptest! {
 // Trait surface / capabilities
 // ---------------------------------------------------------------
 
+/// Compile-time assertion that `FilesystemConnector` implements `OrderedContentSource`.
 #[test]
 fn filesystem_connector_implements_ordered_content_source() {
     fn assert_ordered_source<T: OrderedContentSource>() {}
     assert_ordered_source::<FilesystemConnector>();
 }
 
+/// Verifies the connector capabilities match the ordered-content contract expectations.
 #[test]
 fn caps_reflect_ordered_content_contract() {
     let dir = create_test_dir(&[]);
@@ -244,6 +250,7 @@ fn caps_reflect_ordered_content_contract() {
 // Page fill / ordering / identity
 // ---------------------------------------------------------------
 
+/// Exercises pagination to confirm `fill_page` returns lexicographically sorted items and a resume cursor that includes the last key.
 #[test]
 fn fill_page_returns_sorted_items_and_resume_cursor() {
     let dir = create_test_dir(&[
@@ -300,6 +307,7 @@ fn fill_page_returns_sorted_items_and_resume_cursor() {
     assert!(exhausted.is_none(), "exhausted suffix should return None");
 }
 
+/// Across token states, resuming the same connector must rely only on `last_key` and ignore connector tokens.
 #[rstest]
 #[case::without_token(Cursor::with_last_key(make_key(b"b.txt")))]
 #[case::arbitrary_token(Cursor::with_token(
@@ -344,6 +352,7 @@ fn fill_page_resumes_from_last_key_for_same_connector(#[case] resume_cursor: Cur
     assert!(matches!(resumed_page.state(), PageState::Complete));
 }
 
+/// A fresh connector instance should resume from the persisted `last_key` even when provided tokens are stale.
 #[test]
 fn fresh_connector_resume_restarts_from_last_key_on_live_view() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
@@ -394,6 +403,7 @@ fn fresh_connector_resume_restarts_from_last_key_on_live_view() {
     assert!(matches!(resumed_page.state(), PageState::Complete));
 }
 
+/// Ensures shard boundaries constrain enumeration to the given range.
 #[test]
 fn fill_page_respects_shard_bounds() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
@@ -406,6 +416,7 @@ fn fill_page_respects_shard_bounds() {
     assert!(matches!(page.state(), PageState::Complete));
 }
 
+/// Confirms an item exactly matching the shard start bound is included.
 #[test]
 fn fill_page_includes_item_matching_exact_shard_start() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
@@ -418,6 +429,7 @@ fn fill_page_includes_item_matching_exact_shard_start() {
     assert!(matches!(page.state(), PageState::Complete));
 }
 
+/// Connector-level key ranges should filter enumeration regardless of the shard.
 #[test]
 fn fill_page_respects_connector_key_range() {
     let dir = create_test_dir(&[
@@ -444,6 +456,7 @@ fn fill_page_respects_connector_key_range() {
     assert!(matches!(page.state(), PageState::Complete));
 }
 
+/// Validates that enumeration advertises weak version IDs and stable IDs derived from the canonical root.
 #[test]
 fn fill_page_uses_weak_versions_and_expected_stable_ids() {
     let dir = create_test_dir(&[("nested/file.txt", b"data")]);
@@ -467,6 +480,7 @@ fn fill_page_uses_weak_versions_and_expected_stable_ids() {
     );
 }
 
+/// Identical relative paths under different roots should produce distinct stable IDs.
 #[test]
 fn stable_ids_are_root_scoped() {
     let dir_a = create_test_dir(&[("same.txt", b"value")]);
@@ -496,6 +510,7 @@ fn stable_ids_are_root_scoped() {
     assert_ne!(item_a.stable_item_id(), item_b.stable_item_id());
 }
 
+/// Verifies that item references remain relative and do not leak connector root paths.
 #[test]
 fn item_ref_is_relative_and_does_not_leak_root_identifier() {
     let base = tempfile::tempdir().expect("create base tempdir");
@@ -522,6 +537,7 @@ fn item_ref_is_relative_and_does_not_leak_root_identifier() {
     );
 }
 
+/// Byte budgets must prevent pagination from exceeding the configured max bytes.
 #[test]
 fn fill_page_stops_before_exceeding_max_bytes() {
     let dir = create_test_dir(&[("a.txt", b"aaa"), ("b.txt", b"bbbb")]);
@@ -533,6 +549,7 @@ fn fill_page_stops_before_exceeding_max_bytes() {
     assert!(matches!(page.state(), PageState::HasMore { .. }));
 }
 
+/// Even if the first item exceeds the byte budget, the connector must emit it so progress can be made.
 #[test]
 fn fill_page_emits_large_first_item_to_make_progress() {
     let dir = create_test_dir(&[("large.txt", b"12345678")]);
@@ -545,14 +562,11 @@ fn fill_page_emits_large_first_item_to_make_progress() {
     assert!(matches!(page.state(), PageState::Complete));
 }
 
+/// When `max_items` equals the remaining file count, `fill_page` should return `Complete` even though it peeks ahead without propagating the peek failure.
 #[test]
 fn max_items_exactly_matching_file_count_yields_complete_page() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
     let mut connector = FilesystemConnector::new(dir.path());
-    // When the page limit exactly matches the remaining file count,
-    // `fill_page` can peek past the terminal item and return `Complete`.
-    // The peek error is intentionally swallowed via `ok().is_some_and`
-    // rather than propagated via `?` to avoid discarding already-collected items.
     let page = fill_page_with_limits(
         &mut connector,
         &unbounded_shard(),
@@ -567,11 +581,11 @@ fn max_items_exactly_matching_file_count_yields_complete_page() {
     );
 }
 
+/// Hitting `max_items` before exhausting the directory keeps pagination open (`HasMore`).
 #[test]
 fn max_items_less_than_file_count_yields_has_more() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
     let mut connector = FilesystemConnector::new(dir.path());
-    // Hitting `max_items` before exhausting the directory keeps pagination open.
     let page = fill_page_with_limits(
         &mut connector,
         &unbounded_shard(),
@@ -586,6 +600,7 @@ fn max_items_less_than_file_count_yields_has_more() {
     );
 }
 
+/// `fill_page` should reject an already-expired deadline with a retryable error.
 #[test]
 fn fill_page_rejects_expired_deadline() {
     let dir = create_test_dir(&[("file.txt", b"data")]);
@@ -608,6 +623,7 @@ fn fill_page_rejects_expired_deadline() {
 // Read behavior
 // ---------------------------------------------------------------
 
+/// Opening without prior enumeration should trigger lazy root setup and successfully read the file.
 #[test]
 fn open_without_prior_enumerate_triggers_lazy_root_setup() {
     let dir = create_test_dir(&[("file.txt", b"data")]);
@@ -622,6 +638,7 @@ fn open_without_prior_enumerate_triggers_lazy_root_setup() {
     assert_eq!(buf, b"data");
 }
 
+/// Opening a non-existent `ItemRef` without prior enumeration should yield an ENOENT error.
 #[test]
 fn open_without_enumerate_rejects_absent_item_ref() {
     let dir = create_test_dir(&[("file.txt", b"data")]);
@@ -639,6 +656,7 @@ fn open_without_enumerate_rejects_absent_item_ref() {
     );
 }
 
+/// `open` must obey the read byte budget when streaming content.
 #[test]
 fn open_enforces_byte_budget() {
     let dir = create_test_dir(&[("file.txt", b"abcdef")]);
@@ -656,6 +674,7 @@ fn open_enforces_byte_budget() {
     assert_eq!(buf, b"abc");
 }
 
+/// `read_range` should clamp reads so that the returned byte count never exceeds the configured budget.
 #[test]
 fn read_range_clamps_to_budget() {
     let dir = create_test_dir(&[("file.txt", b"abcdef")]);
@@ -675,6 +694,7 @@ fn read_range_clamps_to_budget() {
     assert_eq!(&buf[..read], b"bc");
 }
 
+/// `open` must reject deadlines that have already expired and classify the error as retryable.
 #[test]
 fn open_rejects_expired_deadline() {
     let dir = create_test_dir(&[("file.txt", b"abcdef")]);
@@ -694,6 +714,7 @@ fn open_rejects_expired_deadline() {
     assert!(err.is_retryable(), "deadline expiry should be retryable");
 }
 
+/// `read_range` also rejects expired deadlines while signalling retryable failures.
 #[test]
 fn read_range_rejects_expired_deadline() {
     let dir = create_test_dir(&[("file.txt", b"abcdef")]);
@@ -715,6 +736,7 @@ fn read_range_rejects_expired_deadline() {
     assert!(err.is_retryable(), "deadline expiry should be retryable");
 }
 
+/// A single-file root enumerates with its basename key and allows reading the file contents.
 #[test]
 fn single_file_root_uses_basename_key_and_opens_content() {
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -747,6 +769,7 @@ fn single_file_root_uses_basename_key_and_opens_content() {
     assert_eq!(buf, b"payload");
 }
 
+/// A single-file root honors a start bound that exactly matches the basename.
 #[test]
 fn single_file_root_includes_basename_matching_exact_start_bound() {
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -772,6 +795,7 @@ fn single_file_root_includes_basename_matching_exact_start_bound() {
 // Split point and path security
 // ---------------------------------------------------------------
 
+/// Requesting a split point for an inverted range should return an error.
 #[test]
 fn inverted_range_split_returns_error() {
     let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2")]);
@@ -783,6 +807,7 @@ fn inverted_range_split_returns_error() {
     assert!(result.is_err(), "inverted range should return an error");
 }
 
+/// An inverted connector key range should make split-point selection fail with a permanent error.
 #[test]
 fn split_point_inverted_bounds_returns_permanent_error() {
     let dir = create_test_dir(&[("a.txt", b"1")]);
@@ -794,6 +819,7 @@ fn split_point_inverted_bounds_returns_permanent_error() {
     assert!(result.is_err(), "inverted bounds should produce an error");
 }
 
+/// Verifies that various malicious `ItemRef` inputs are rejected before they can escape the root.
 #[rstest]
 #[case::absolute_path(b"/etc/passwd")]
 #[case::parent_traversal(b"../etc/passwd")]
@@ -808,6 +834,7 @@ fn resolve_rejects_malicious_paths(#[case] path: &[u8]) {
     assert!(result.is_err());
 }
 
+/// Ensures canonical persistent errno values are classified as permanent errors by `is_permanent_io_error`.
 #[rstest]
 #[case::eloop(libc::ELOOP, "ELOOP")]
 #[case::enotdir(libc::ENOTDIR, "ENOTDIR")]
@@ -820,6 +847,7 @@ fn permanent_error_codes_are_classified_as_permanent(#[case] errno: i32, #[case]
     );
 }
 
+/// A transient errno like `EAGAIN` should remain retryable.
 #[test]
 fn transient_error_remains_retryable() {
     let err = io::Error::from_raw_os_error(libc::EAGAIN);
@@ -833,6 +861,7 @@ fn transient_error_remains_retryable() {
 // Root identity verification
 // ---------------------------------------------------------------
 
+/// Detects if a single-file root is replaced after initialization by rejecting the reopened item.
 #[test]
 fn single_file_open_detects_replacement_after_init() {
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -864,6 +893,7 @@ fn single_file_open_detects_replacement_after_init() {
     );
 }
 
+/// Verifies that `verify_root_identity` rejects mismatched dev/ino identifiers for a given FD.
 #[test]
 fn root_fd_identity_check_rejects_dev_ino_mismatch() {
     let dir_a = tempfile::tempdir().expect("create dir_a");
