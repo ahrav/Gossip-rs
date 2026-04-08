@@ -395,7 +395,7 @@ jobs:
       # doc-links to cfg-gated modules.
       - run: >-
           cargo doc --no-deps
-          --features gossip-contracts/test-support,gossip-coordination/test-support,gossip-coordination-etcd/test-support,gossip-pg-common/test-support,gossip-done-ledger-postgres/test-utils,gossip-findings-postgres/test-utils,gossip-persistence-inmemory/test-support,gossip-scanner-runtime/test-support,scanner-engine/test-support
+          --features gossip-contracts/test-support,gossip-coordination/test-support,gossip-coordination-etcd/test-support,gossip-git-persistence-postgres/test-utils,gossip-pg-common/test-support,gossip-done-ledger-postgres/test-utils,gossip-findings-postgres/test-utils,gossip-persistence-inmemory/test-support,gossip-scanner-runtime/test-support,scanner-engine/test-support
 
   # ── Dependency Lint (licenses, advisories, bans) ───────────────────
   deny:
