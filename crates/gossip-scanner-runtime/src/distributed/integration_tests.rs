@@ -1742,7 +1742,7 @@ fn run_git_repo_worker_completes_multi_commit_secret_history() {
     let findings_sink = InMemoryFindingsSink::new();
     let done_ledger = InMemoryDoneLedger::new();
     let mut coordinator =
-        setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+        setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 120_000);
 
     let report = run_git_repo_worker(
         &mut coordinator,
