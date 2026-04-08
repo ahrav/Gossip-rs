@@ -26,6 +26,12 @@
 //! **Dependency direction:** This crate depends on `gossip-contracts` for value
 //! types and traits. It must not depend on persistence backends or
 //! coordination backend implementations.
+//!
+//! # Platform Boundaries
+//!
+//! - Filesystem connectors are exported only on Unix (`#[cfg(unix)]`).
+//! - In-memory connectors are always available for deterministic tests and
+//!   benchmarks across platforms.
 
 mod common;
 #[cfg(unix)]
@@ -58,6 +64,11 @@ pub use in_memory::{InMemoryDeterministicConnector, MemItem};
 /// `sample_cap` is forwarded directly to
 /// `split_estimator::StreamingSplitEstimator::new`, so benchmark callers can
 /// exercise the estimator under different sampling budgets.
+///
+/// # Complexity
+///
+/// Runs in `O(count)` time and `O(sample_cap)` additional memory, matching the
+/// estimator's streaming sample budget.
 pub fn benchmark_streaming_split_estimator_observe_fixed_size(
     sample_cap: usize,
     count: usize,

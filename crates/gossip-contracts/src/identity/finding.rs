@@ -347,6 +347,12 @@ super::macros::define_canonical_input! {
 /// derive-key mode. The tenant's secret key prevents cross-tenant
 /// correlation of normalized secret values.
 ///
+/// # Guarantees
+///
+/// - Deterministic: identical `(key, norm)` inputs always produce the same output.
+/// - Non-fallible: this function cannot return an error.
+/// - Constant-size work: hashes a fixed 32-byte domain tag and 32-byte digest.
+///
 /// # Hash construction
 ///
 /// The domain tag ([`domain::SECRET_HASH_V1`]) is fed as *data* inside the
@@ -378,6 +384,12 @@ pub fn key_secret_hash(key: &TenantSecretKey, norm: &NormHash) -> SecretHash {
 ///
 /// Uses BLAKE3 derive-key mode with [`domain::FINDING_ID_V1`].
 ///
+/// # Guarantees
+///
+/// - Deterministic: identical [`FindingIdInputs`] always produce the same output.
+/// - Non-fallible: this function cannot return an error.
+/// - Constant-size work: hashes a fixed-width canonical encoding (128 bytes).
+///
 /// # Examples
 ///
 /// ```
@@ -406,6 +418,12 @@ pub fn derive_finding_id(inputs: &FindingIdInputs) -> FindingId {
 ///
 /// Uses BLAKE3 derive-key mode with [`domain::OCCURRENCE_ID_V1`].
 ///
+/// # Guarantees
+///
+/// - Deterministic: identical [`OccurrenceIdInputs`] always produce the same output.
+/// - Non-fallible: this function cannot return an error.
+/// - Constant-size work: hashes a fixed-width canonical encoding (80 bytes).
+///
 /// # Examples
 ///
 /// ```
@@ -428,6 +446,12 @@ pub fn derive_occurrence_id(inputs: &OccurrenceIdInputs) -> OccurrenceId {
 /// Derive a policy-scoped [`ObservationId`] from its inputs.
 ///
 /// Uses BLAKE3 derive-key mode with [`domain::OBSERVATION_ID_V1`].
+///
+/// # Guarantees
+///
+/// - Deterministic: identical [`ObservationIdInputs`] always produce the same output.
+/// - Non-fallible: this function cannot return an error.
+/// - Constant-size work: hashes a fixed-width canonical encoding (96 bytes).
 ///
 /// # Examples
 ///
