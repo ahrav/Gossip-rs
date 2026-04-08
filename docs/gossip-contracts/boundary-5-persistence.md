@@ -59,7 +59,7 @@ Non-negotiables (project-wide):
 
 | Trait | Purpose | Key methods |
 |-------|---------|-------------|
-| `PersistenceFinding` | Unified finding-identity surface consumed by persistence translation, regardless of source family | `rule_id(&self) -> u32`, `norm_hash(&self) -> NormHash`, `span_start(&self) -> u64`, `span_end(&self) -> u64`, `span_len(&self) -> u64` |
+| `PersistenceFinding` | Unified finding-identity surface consumed by persistence translation, regardless of source family | `rule_id(&self) -> u32`, `norm_hash(&self) -> NormHash`, `blob_offset_start(&self) -> u64`, `blob_offset_end(&self) -> u64`, `blob_offset_len(&self) -> u64` |
 | `DoneLedger` | Dedupe index: "was this object-version scanned under this policy?" | `batch_get(&self, TenantId, PolicyHash, &[OvidHash]) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error>`, `list_done_hashes(&self, TenantId, PolicyHash) -> Result<Vec<OvidHash>, Self::Error>`, `batch_upsert(&self, &[DoneLedgerRecord]) -> Result<Self::CommitHandle, Self::Error>` |
 | `FindingsSink` | Triage/query plane: findings + occurrences + observations persistence | `upsert_batch(&self, FindingsUpsertBatch<'_>) -> Result<Self::CommitHandle, Self::Error>` |
 | `CommitHandle` | Durable acknowledgement handle; `wait()` consumes self and returns a receipt | `wait(self) -> Result<Self::Receipt, Self::Error>` |
