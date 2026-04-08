@@ -73,6 +73,11 @@ fn checkpoint_serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ScanC
         );
     }
 
+    // CRC covers the postcard payload only. The 4-byte magic prefix is
+    // validated by a separate byte-equality check in checkpoint_deserialize;
+    // including it in the CRC scope would require a write-then-backfill
+    // pattern for negligible gain — header corruption that preserves the
+    // magic is astronomically unlikely for accidental bit-rot.
     let crc32 = crc32fast::hash(&payload);
     let mut encoded = Vec::with_capacity(CHECKPOINT_ENVELOPE_HEADER_LEN + payload.len());
     encoded.extend_from_slice(&CHECKPOINT_MAGIC);
@@ -2429,6 +2434,14 @@ mod tests {
                 "checkpoint decoding failed: checkpoint CRC mismatch (stored {stored_crc32:#010x}, computed {computed_crc32:#010x})"
             )
         );
+    }
+
+    #[test]
+    fn checkpoint_serialize_deserialize_round_trip() {
+        let value: u32 = 42;
+        let blob = checkpoint_serialize(&value).expect("serialize");
+        let recovered: u32 = checkpoint_deserialize(&blob).expect("deserialize");
+        assert_eq!(recovered, value);
     }
 
     #[test]
