@@ -22,7 +22,11 @@ use std::process::{Command, Output};
 /// Run `git --version` to determine whether the git CLI is available.
 #[must_use]
 pub fn git_available() -> bool {
-    Command::new("git").arg("--version").output().is_ok()
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Spawn `git -C <dir> <args>` and return the raw output. Panics on spawn

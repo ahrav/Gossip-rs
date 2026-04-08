@@ -177,9 +177,7 @@ fn prepare_repo_with_excluded_blob_paths() -> TempDir {
 /// so the in-memory artifact builders can find every commit.
 fn prepare_repo_with_duplicate_blobs() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-b", "main"]);
-    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
-    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+    init_git_repo(tmp.path(), "test@example.com", "Test User");
 
     fs::write(tmp.path().join("packed.txt"), "packed\n").unwrap();
     run_git(tmp.path(), &["add", "."]);
