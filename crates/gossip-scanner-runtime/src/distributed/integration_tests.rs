@@ -1730,6 +1730,97 @@ fn run_git_repo_worker_treats_cursor_covered_target_as_exhausted_empty() {
     );
 }
 
+/// Multi-commit secret-bearing histories must complete successfully without
+/// triggering shard parking. History depth alone is not a parking condition;
+/// only error-class conditions (permanent failures, repeated transient errors,
+/// poisoned state) qualify.
+#[test]
+fn run_git_repo_worker_completes_multi_commit_secret_history() {
+    const COMMIT_COUNT: usize = 16;
+    let repo = create_git_repo_fixture_with_secret_history(COMMIT_COUNT);
+    let mirror_root = tempdir().expect("mirror root");
+    let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+    let backend = TestGitBackend::default();
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let mut coordinator =
+        setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 120_000);
+
+    let report = run_git_repo_worker(
+        &mut coordinator,
+        &mut mirrors,
+        git_worker_identity(repo.path()),
+        backend.clone(),
+        DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
+        DistributedRuntimeConfig::default(),
+    )
+    .expect("multi-commit secret-bearing history should scan successfully");
+
+    assert_eq!(report.leases_seen, 1);
+    assert_eq!(report.shards_scanned, 1);
+    assert_eq!(run_progress(&coordinator).done(), 1);
+
+    let summaries = shard_summaries(&coordinator);
+    assert_eq!(summaries.len(), 1);
+    assert_ne!(
+        summaries[0].status(),
+        ShardStatus::Parked,
+        "history depth alone must not park the shard"
+    );
+    assert_eq!(
+        summaries[0].status(),
+        ShardStatus::Done,
+        "history depth alone must not strand the shard"
+    );
+
+    let expected_key = git_repo_key(repo.path());
+    assert_eq!(
+        summaries[0]
+            .last_key()
+            .expect("completed shard should have a last_key"),
+        expected_key.as_bytes(),
+        "shard cursor last_key should match the singleton repo key"
+    );
+
+    assert!(
+        backend.batch_call_count() > 0,
+        "git repo worker must durably persist repo state before advancing the shard"
+    );
+    assert!(
+        !backend.stored_keys().is_empty(),
+        "persistence backend should contain durable state after a complete scan"
+    );
+
+    let persisted = findings_sink
+        .findings_snapshot()
+        .expect("findings snapshot");
+    assert!(
+        persisted.len() >= COMMIT_COUNT,
+        "each of the {COMMIT_COUNT} secret-bearing commits should produce at least one \
+         persisted finding (got {})",
+        persisted.len()
+    );
+
+    let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+    assert_eq!(
+        rows.len(),
+        1,
+        "singleton repo shard produces one done-ledger row"
+    );
+    assert_eq!(
+        rows[0].status(),
+        DoneLedgerStatus::ScannedWithFindings,
+        "secret-bearing history should produce a findings-bearing done-ledger row"
+    );
+    // Single repo-frontier shard: the done-ledger's per-item findings_count
+    // equals total persisted finding rows because there is exactly one item.
+    assert_eq!(
+        rows[0].findings_count(),
+        u32::try_from(persisted.len()).expect("findings count fits u32"),
+        "done-ledger findings_count must match persisted findings"
+    );
+}
+
 /// Git repo-frontier shards require `CursorSemantics::Completed` so the
 /// checkpoint cursor represents fully-processed and durable progress.
 /// `Dispatched` semantics are rejected before any scan work begins.
