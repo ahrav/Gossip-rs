@@ -28,6 +28,17 @@
 //! - Constants are `&str` so
 //!   [`domain_hasher`](crate::identity::domain_hasher) can pass them directly to
 //!   BLAKE3's derive-key API without runtime UTF-8 validation.
+//!
+//! ## Adding a domain constant
+//!
+//! - Define the new constant under its subsystem heading with a concise description
+//!   and its hash mode so future maintainers understand where it belongs.
+//! - Append the constant to [`ALL`] in declaration order to keep the canonical list
+//!   accurate.
+//! - Extend `all_domain_constants()` with the `(name, value)` tuple so the test
+//!   fixtures cover the new entry.
+//! - Run the ASCII, naming, length, and uniqueness tests documented below to
+//!   verify the string obeys the platform-wide policy.
 
 // =========================================================================
 // Coordination subsystem
@@ -155,11 +166,13 @@ pub const GIT_MIRROR_PATH_V1: &str = "gossip/git/v1/mirror-path";
 // Authoritative constant list
 // =========================================================================
 
-/// Every domain constant in the registry, in declaration order.
+/// Every domain constant in the registry, listed in declaration order.
 ///
-/// The array length is checked at compile time — adding a constant without
-/// updating `ALL` is a compile error. Tests use this for uniqueness and
-/// coverage checks.
+/// `ALL` is the canonical ordering the test fixtures iterate, so maintaining it
+/// keeps `all_domain_constants()` aligned with the public constants and lets the
+/// ASCII, naming, length, and uniqueness checks stay reliable. The array length
+/// is checked at compile time, so forgetting to append a new constant is a
+/// compile error.
 pub const ALL: [&str; 18] = [
     SPLIT_ID_V1,
     OP_PAYLOAD_V1,
@@ -218,6 +231,10 @@ pub(crate) fn all_domain_constants() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// Sanity checks that keep the domain registry safe for cross-derivation hashing.
+/// The suite enforces ASCII-only characters, the naming convention, reasonable
+/// lengths, and duplicate-free names/values while verifying `ALL` stays in sync
+/// with the declared constants.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -19,6 +19,8 @@ use rstest::rstest;
 
 use super::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
 
+/// Asserts every `EnumerateError` constructor exposes the expected class, message,
+/// and retry hint.
 #[rstest]
 #[case::retryable(
     EnumerateError::retryable("transient outage"),
@@ -62,6 +64,8 @@ fn enumerate_error_constructors(
     assert_eq!(error.retry_after_ms(), expected_retry);
 }
 
+/// Mirrors the `ReadError` constructors to ensure their diagnostics expose the correct class,
+/// message, and optional retry hint.
 #[rstest]
 #[case::retryable(
     ReadError::retryable("temporary read failure"),
@@ -105,6 +109,7 @@ fn read_error_constructors(
     assert_eq!(error.retry_after_ms(), expected_retry);
 }
 
+/// Verifies `EnumerateError::Display` renders the expected prefix and retry hints.
 #[rstest]
 #[case::without_retry(
     EnumerateError::permanent("enumeration disabled"),
@@ -123,6 +128,7 @@ fn enumerate_error_display(#[case] error: EnumerateError, #[case] expected: &str
     assert_eq!(error.to_string(), expected);
 }
 
+/// Verifies `ReadError::Display` maintains the expected prefix and retry hints.
 #[rstest]
 #[case::without_retry(
     ReadError::retryable("temporary backend error"),
@@ -141,6 +147,7 @@ fn read_error_display(#[case] error: ReadError, #[case] expected: &str) {
     assert_eq!(error.to_string(), expected);
 }
 
+/// Confirms the default `ConnectorCapabilities` conservatively disable optional features.
 #[test]
 fn default_caps_are_conservative() {
     let capabilities = ConnectorCapabilities::default();
@@ -150,6 +157,7 @@ fn default_caps_are_conservative() {
     assert!(!capabilities.split_hints);
 }
 
+/// Asserts the connector error types implement `std::error::Error` for trait-object use.
 #[test]
 fn error_trait_impls_compile() {
     fn assert_error_impl<T: std::error::Error>() {}
@@ -158,6 +166,7 @@ fn error_trait_impls_compile() {
     assert_error_impl::<ReadError>();
 }
 
+/// Ensures display output replaces disallowed control characters while leaving allowed whitespace untouched.
 #[test]
 fn display_sanitizes_control_characters() {
     let msg = "hello\x00world\x1b[31m\x7fred";
@@ -173,12 +182,14 @@ fn display_sanitizes_control_characters() {
     assert_eq!(err2.to_string(), "permanent: line1\tline2\nline3\rline4");
 }
 
+/// Validates the `ErrorClass::is_retryable` helper remains aligned with each variant.
 #[test]
 fn error_class_is_retryable() {
     assert!(ErrorClass::Retryable.is_retryable());
     assert!(!ErrorClass::Permanent.is_retryable());
 }
 
+/// Guards that `EnumerateError` respects the retryability decision delegated to `ErrorClass`.
 #[test]
 fn enumerate_error_is_retryable_delegates_to_class() {
     assert!(EnumerateError::retryable("transient").is_retryable());
@@ -186,6 +197,7 @@ fn enumerate_error_is_retryable_delegates_to_class() {
     assert!(!EnumerateError::permanent("gone").is_retryable());
 }
 
+/// Guards that `ReadError` mirrors the `ErrorClass` retryability semantics, including `Unsupported`.
 #[test]
 fn read_error_is_retryable_delegates_to_class() {
     assert!(ReadError::retryable("transient").is_retryable());
@@ -195,14 +207,17 @@ fn read_error_is_retryable_delegates_to_class() {
 }
 
 mod proptests {
+    //! Property tests covering display invariants for every error variant.
     use proptest::prelude::*;
 
     use super::{EnumerateError, ErrorClass, ReadError};
 
+    /// Samples each `ErrorClass` variant for downstream strategies.
     fn arb_error_class() -> impl Strategy<Value = ErrorClass> {
         prop_oneof![Just(ErrorClass::Retryable), Just(ErrorClass::Permanent),]
     }
 
+    /// Constructs every possible `EnumerateError` along with optional retry hints.
     fn arb_enumerate_error() -> impl Strategy<Value = EnumerateError> {
         (arb_error_class(), ".*", proptest::option::of(any::<u64>())).prop_map(
             |(class, msg, retry)| match class {
@@ -215,6 +230,7 @@ mod proptests {
         )
     }
 
+    /// Constructs every `ReadError` variant together with optional retry hints.
     fn arb_read_error() -> impl Strategy<Value = ReadError> {
         (arb_error_class(), ".*", proptest::option::of(any::<u64>())).prop_map(
             |(class, msg, retry)| match class {
@@ -230,6 +246,7 @@ mod proptests {
     proptest! {
         #![proptest_config(crate::test_util::miri_proptest_config())]
 
+        /// Ensures any `EnumerateError` renders without panicking and keeps the reporting prefix.
         #[test]
         fn enumerate_error_display_never_panics(err in arb_enumerate_error()) {
             let display = err.to_string();
@@ -240,6 +257,7 @@ mod proptests {
             prop_assert!(display.starts_with(prefix));
         }
 
+        /// Ensures any `ReadError` renders without panicking and keeps the reporting prefix.
         #[test]
         fn read_error_display_never_panics(err in arb_read_error()) {
             let display = err.to_string();
@@ -250,6 +268,7 @@ mod proptests {
             prop_assert!(display.starts_with(prefix));
         }
 
+        /// Verifies every generated error display output only contains allowed control characters.
         #[test]
         fn display_strips_control_characters(err in arb_enumerate_error()) {
             let display = err.to_string();
