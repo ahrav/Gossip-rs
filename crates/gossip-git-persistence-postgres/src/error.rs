@@ -37,9 +37,9 @@ pub enum GitPersistencePgError {
     /// Caught before transmitting to PostgreSQL to avoid wasting a network
     /// round-trip on data the server's CHECK constraint would reject.
     PayloadTooLarge {
-        /// Byte length of the oversized key (0 if the key was within limits).
+        /// Byte length of the key in the rejected entry.
         key_len: usize,
-        /// Byte length of the oversized value (0 if the value was within limits).
+        /// Byte length of the value in the rejected entry.
         value_len: usize,
     },
 }
@@ -199,6 +199,50 @@ mod tests {
         assert!(
             !msg.contains("timeout waiting for server"),
             "migration-wrapped postgres error must not leak raw driver text, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn payload_too_large_display() {
+        let err = GitPersistencePgError::PayloadTooLarge {
+            key_len: 300,
+            value_len: 0,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("payload too large"),
+            "should describe the rejection reason: {msg}"
+        );
+        assert!(
+            msg.contains("300"),
+            "should include the key byte length: {msg}"
+        );
+    }
+
+    #[test]
+    fn payload_too_large_debug() {
+        let err = GitPersistencePgError::PayloadTooLarge {
+            key_len: 300,
+            value_len: 0,
+        };
+        let dbg = format!("{:?}", err);
+        assert!(
+            dbg.contains("PayloadTooLarge"),
+            "debug output should name the variant: {dbg}"
+        );
+        assert!(
+            dbg.contains("300"),
+            "debug output should include the key byte length: {dbg}"
+        );
+    }
+
+    #[test]
+    fn postgres_debug_redacts_connection_details() {
+        let err = GitPersistencePgError::Postgres(timeout_postgres_error());
+        let dbg = format!("{:?}", err);
+        assert!(
+            dbg.contains("<redacted>"),
+            "debug output should redact raw driver details: {dbg}"
         );
     }
 }

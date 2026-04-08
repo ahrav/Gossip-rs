@@ -50,8 +50,7 @@ use crate::{
 
 #[derive(Debug)]
 struct NormalizedBatch {
-    put_keys: Vec<Vec<u8>>,
-    put_values: Vec<Vec<u8>>,
+    puts: Vec<(Vec<u8>, Vec<u8>)>,
     delete_keys: Vec<Vec<u8>>,
 }
 
@@ -65,16 +64,14 @@ impl NormalizedBatch {
     /// into the output vectors.
     fn from_ops(ops: &[GitPersistenceOp]) -> Self {
         let mut seen = HashSet::<&[u8]>::with_capacity(ops.len());
-        let mut put_keys = Vec::with_capacity(ops.len());
-        let mut put_values = Vec::with_capacity(ops.len());
+        let mut puts = Vec::with_capacity(ops.len());
         let mut delete_keys = Vec::new();
 
         for op in ops.iter().rev() {
             match op {
                 GitPersistenceOp::Put { key, value } => {
                     if seen.insert(key.as_slice()) {
-                        put_keys.push(key.clone());
-                        put_values.push(value.clone());
+                        puts.push((key.clone(), value.clone()));
                     }
                 }
                 GitPersistenceOp::Delete { key } => {
@@ -85,15 +82,11 @@ impl NormalizedBatch {
             }
         }
 
-        Self {
-            put_keys,
-            put_values,
-            delete_keys,
-        }
+        Self { puts, delete_keys }
     }
 
     fn is_empty(&self) -> bool {
-        self.put_keys.is_empty() && self.delete_keys.is_empty()
+        self.puts.is_empty() && self.delete_keys.is_empty()
     }
 }
 
@@ -258,7 +251,10 @@ impl GitPersistenceBackend for GitPersistencePg {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
         let mut client = self.lock_client()?;
         let row = client.query_opt(&self.stmts.get, &[&key])?;
-        Ok(row.map(|row| row.get(0)))
+        match row {
+            Some(row) => Ok(Some(row.try_get(0)?)),
+            None => Ok(None),
+        }
     }
 
     fn apply_batch(&self, ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
@@ -267,7 +263,7 @@ impl GitPersistenceBackend for GitPersistencePg {
             return Ok(());
         }
 
-        for (key, value) in normalized.put_keys.iter().zip(normalized.put_values.iter()) {
+        for (key, value) in &normalized.puts {
             if key.len() > MAX_KEY_OCTETS || value.len() > MAX_VALUE_OCTETS {
                 return Err(GitPersistencePgError::PayloadTooLarge {
                     key_len: key.len(),
@@ -276,16 +272,25 @@ impl GitPersistenceBackend for GitPersistencePg {
             }
         }
 
+        for key in &normalized.delete_keys {
+            if key.len() > MAX_KEY_OCTETS {
+                return Err(GitPersistencePgError::PayloadTooLarge {
+                    key_len: key.len(),
+                    value_len: 0,
+                });
+            }
+        }
+
         let mut client = self.lock_client()?;
-        // The `postgres` crate caches prepared statements by SQL text at the
-        // connection level. Statements prepared within a transaction share the
-        // same cache. The per-call map lookup is negligible relative to network
-        // I/O, so explicit pre-preparation is not needed.
+        // Pre-prepared statement handles (self.stmts) are valid inside the
+        // transaction — the postgres crate shares its statement cache between
+        // the connection and any transactions derived from it.
         let mut tx = client.transaction()?;
 
-        if !normalized.put_keys.is_empty() {
-            let put_keys: Vec<&[u8]> = normalized.put_keys.iter().map(Vec::as_slice).collect();
-            let put_values: Vec<&[u8]> = normalized.put_values.iter().map(Vec::as_slice).collect();
+        if !normalized.puts.is_empty() {
+            let put_keys: Vec<&[u8]> = normalized.puts.iter().map(|(k, _)| k.as_slice()).collect();
+            let put_values: Vec<&[u8]> =
+                normalized.puts.iter().map(|(_, v)| v.as_slice()).collect();
             tx.execute(&self.stmts.upsert, &[&put_keys, &put_values])?;
         }
 
@@ -319,8 +324,8 @@ impl GitPersistenceBackend for GitPersistencePg {
         // the clone cost is limited to one copy per present key.
         let mut by_key = HashMap::<Vec<u8>, Vec<u8>>::with_capacity(rows.len());
         for row in rows {
-            let key: Vec<u8> = row.get(0);
-            let value: Vec<u8> = row.get(1);
+            let key: Vec<u8> = row.try_get(0)?;
+            let value: Vec<u8> = row.try_get(1)?;
             by_key.insert(key, value);
         }
 

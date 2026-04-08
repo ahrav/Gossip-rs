@@ -80,12 +80,12 @@ pub fn apply_all_migrations(client: &mut Client) -> Result<(), GitPersistencePgM
     apply_all_pg_migrations(client, MIGRATIONS, MIGRATION_CONFIG)
 }
 
-/// Apply a caller-supplied migration slice inside a single advisory-locked
-/// transaction.
+/// Apply a caller-supplied migration slice with a caller-supplied lock
+/// timeout inside a single advisory-locked transaction.
 ///
-/// This is the core entry point. [`apply_all_migrations`] delegates here with
-/// the crate-level [`MIGRATIONS`] slice, while tests can pass ad hoc migration
-/// sets without mutating the global constant.
+/// Unlike [`apply_all_migrations`], which uses the crate's default
+/// [`MIGRATIONS`] slice and lock timeout, this function accepts both as
+/// parameters — useful for tests that pass ad hoc migration sets.
 ///
 /// # Errors
 ///

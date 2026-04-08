@@ -47,7 +47,7 @@ pub use backend::GitPersistencePg;
 pub use error::{GitPersistencePgError, GitPersistencePgMigrationError, MigrationOperation};
 #[cfg(feature = "test-utils")]
 pub use migrations::connect_and_apply_migrations;
-pub use migrations::{EmbeddedMigration, MIGRATIONS, apply_all_migrations, apply_migrations};
+pub use migrations::{apply_all_migrations, apply_migrations};
 
 #[cfg(test)]
 mod test_postgres;

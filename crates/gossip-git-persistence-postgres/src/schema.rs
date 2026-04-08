@@ -48,7 +48,7 @@ pub const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x4747504b_564d3031; // "GGPKVM01"
 ///
 /// - zero rows when the key is absent;
 /// - one row with the stored `value` when the key exists.
-pub const GET_SQL: &str = r#"
+pub(crate) const GET_SQL: &str = r#"
 SELECT value FROM git_kv
 WHERE key = $1
 "#;
@@ -66,7 +66,7 @@ WHERE key = $1
 /// - missing keys are omitted;
 /// - PostgreSQL may return rows in arbitrary order, so callers restore
 ///   positional alignment in Rust.
-pub const MULTI_GET_SQL: &str = r#"
+pub(crate) const MULTI_GET_SQL: &str = r#"
 SELECT key, value FROM git_kv
 WHERE key = ANY($1::bytea[])
 "#;
@@ -82,7 +82,7 @@ WHERE key = ANY($1::bytea[])
 /// `unnest()` expands the parallel arrays into rows on the server side so the
 /// backend can write N `Put` operations in one round-trip. Conflicting keys
 /// overwrite the existing value.
-pub const UPSERT_SQL: &str = r#"
+pub(crate) const UPSERT_SQL: &str = r#"
 INSERT INTO git_kv (key, value)
 SELECT * FROM unnest($1::bytea[], $2::bytea[])
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
@@ -96,7 +96,7 @@ ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
 /// - `$1::bytea[]` — keys to remove.
 ///
 /// Deleting a key that is already absent is a no-op.
-pub const DELETE_SQL: &str = r#"
+pub(crate) const DELETE_SQL: &str = r#"
 DELETE FROM git_kv
 WHERE key = ANY($1::bytea[])
 "#;

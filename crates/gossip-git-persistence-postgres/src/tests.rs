@@ -39,7 +39,7 @@ use proptest::{
 use crate::test_postgres::{test_client, test_client_bare};
 use crate::{
     GitPersistencePg, GitPersistencePgMigrationError, apply_all_migrations, apply_migrations,
-    schema::{MAX_KEY_OCTETS, SCHEMA_MIGRATIONS_TABLE},
+    schema::{MAX_KEY_OCTETS, MAX_VALUE_OCTETS, SCHEMA_MIGRATIONS_TABLE},
 };
 use gossip_scanner_runtime::git_persistence::{
     GitPersistenceAdapter, GitPersistenceBackend, GitPersistenceOp,
@@ -489,6 +489,42 @@ fn roundtrip_max_size_key() {
         GitPersistenceBackend::get(&backend, &key).expect("get should succeed"),
         Some(vec![0x01]),
         "max-size key must round-trip"
+    );
+}
+
+#[test]
+fn apply_batch_rejects_oversized_delete_key() {
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
+    backend
+        .truncate_all_for_tests()
+        .expect("truncate should succeed before test");
+
+    let oversized_key = vec![0xAAu8; MAX_KEY_OCTETS + 1];
+    let err = GitPersistenceBackend::apply_batch(&backend, &[delete_op(&oversized_key)])
+        .expect_err("oversized delete key should reject the batch");
+
+    assert!(
+        err.to_string()
+            .contains("postgres git-persistence payload too large"),
+        "oversized delete key should produce PayloadTooLarge: {err}"
+    );
+}
+
+#[test]
+fn apply_batch_rejects_oversized_value() {
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
+    backend
+        .truncate_all_for_tests()
+        .expect("truncate should succeed before test");
+
+    let oversized_value = vec![0xBBu8; MAX_VALUE_OCTETS + 1];
+    let err = GitPersistenceBackend::apply_batch(&backend, &[put_op(b"ok-k", &oversized_value)])
+        .expect_err("oversized value should reject the batch");
+
+    assert!(
+        err.to_string()
+            .contains("postgres git-persistence payload too large"),
+        "oversized value should produce PayloadTooLarge: {err}"
     );
 }
 
