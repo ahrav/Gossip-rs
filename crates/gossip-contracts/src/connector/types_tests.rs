@@ -3,6 +3,11 @@
 //! This module verifies that domain primitives (like `ItemKey`, `ItemRef`,
 //! `Cursor`, and `ContentHints`) correctly enforce their maximum size
 //! limits, handle memory pooling safely, and reject invalid states.
+//!
+//! The suite also covers `ScanItem` builder defaults, `Budgets` creation and
+//! expiration helpers, deterministic formatting for bounded wrappers, and
+//! property-based invariants (via `toxic_bytes_tests!` and cursor roundtrips)
+//! that exercise hashing, ordering, and panic-free serialization.
 
 use std::sync::Arc;
 
@@ -12,6 +17,7 @@ use rstest::rstest;
 use super::*;
 use proptest::prelude::*;
 
+/// Ensures connector constant limits stay aligned with the coordination layer so wrappers share the same bounds.
 #[test]
 fn constants_align_with_coordination_limits() {
     use crate::coordination::{CursorMaxTokenSize, MAX_KEY_SIZE};
@@ -19,6 +25,7 @@ fn constants_align_with_coordination_limits() {
     assert_eq!(MAX_TOKEN_SIZE, CursorMaxTokenSize);
 }
 
+/// Confirms `ConnectorInputError` formatting stays stable for a representative set of failure cases.
 #[rstest]
 #[case::empty(
     ConnectorInputError::Empty { field: "ItemKey" },
@@ -40,6 +47,7 @@ fn connector_input_error_display(#[case] error: ConnectorInputError, #[case] exp
     assert_eq!(error.to_string(), expected);
 }
 
+/// Ensures an initial cursor starts without a last key or token and matches `Default`.
 #[test]
 fn cursor_initial_has_no_key_or_token() {
     let cursor = Cursor::initial();
@@ -52,6 +60,7 @@ fn cursor_initial_has_no_key_or_token() {
     assert!(update.token().is_none());
 }
 
+/// Rejects cursor updates that supply a token without a preceding last key.
 #[test]
 fn cursor_try_from_update_rejects_token_without_last_key() {
     let invalid =
@@ -62,6 +71,7 @@ fn cursor_try_from_update_rejects_token_without_last_key() {
     );
 }
 
+/// Normalizes empty cursor tokens to `None` when building from an update.
 #[test]
 fn cursor_try_from_update_normalizes_empty_token_to_none() {
     let update =
@@ -71,6 +81,7 @@ fn cursor_try_from_update_normalizes_empty_token_to_none() {
     assert!(cursor.token().is_none());
 }
 
+/// Exercises `VersionId` helpers for strong/weak variants and object version lookup.
 #[test]
 fn version_id_helpers_work() {
     let object_version = ObjectVersionId::from_version_bytes(b"v1");
@@ -82,6 +93,7 @@ fn version_id_helpers_work() {
     assert_eq!(weak.object_version_id(), object_version);
 }
 
+/// Checks that `ContentHints::try_new` exposes consistent media/encoding accessors when inputs vary.
 #[rstest]
 #[case::both_empty(Some(String::new()), Some(String::new()), None, None)]
 #[case::media_only(Some("text/plain".to_owned()), Some(String::new()), Some("text/plain"), None)]
@@ -103,6 +115,7 @@ fn content_hints_try_new_accessors(
     assert_eq!(hints.encoding(), expected_encoding);
 }
 
+/// Ensures `ContentHints` rejects inputs that exceed the media type or encoding length limits.
 #[test]
 fn content_hints_enforce_size_limits() {
     assert!(ContentHints::try_new(Some("text/plain".to_owned()), None).is_ok());
@@ -125,6 +138,7 @@ fn content_hints_enforce_size_limits() {
     );
 }
 
+/// Treats empty URL inputs as `None` while preserving the display text.
 #[test]
 fn location_normalizes_empty_url_to_none() {
     let loc = Location::try_new("ok".to_owned(), Some(String::new())).unwrap();
@@ -132,6 +146,7 @@ fn location_normalizes_empty_url_to_none() {
     assert_eq!(loc.url(), None);
 }
 
+/// Validates that `Location` enforces non-empty display strings and bounded URLs.
 #[test]
 fn location_validates_required_and_size_limited_fields() {
     assert_eq!(
@@ -166,6 +181,7 @@ fn location_validates_required_and_size_limited_fields() {
     assert_eq!(loc.url(), Some("https://example.com"));
 }
 
+/// Confirms `ItemKey`, `ItemRef`, and `TokenBytes` reject empty slice inputs.
 #[test]
 fn constructors_reject_empty_values() {
     assert_eq!(
@@ -184,9 +200,9 @@ fn constructors_reject_empty_values() {
     );
 }
 
+/// Confirms pooled constructors share one `ByteSlab` for keys, refs, and tokens while staying pooled after cloning.
 #[test]
 fn pooled_constructor_roundtrips_without_heap_owned_storage() {
-    // One page-local slab supplies key/ref/token bytes for all wrappers.
     let mut slab = ByteSlab::with_capacity(128);
     let key_slot = slab.allocate(b"item-key").expect("allocate key");
     let ref_slot = slab.allocate(b"item-ref").expect("allocate ref");
@@ -209,11 +225,9 @@ fn pooled_constructor_roundtrips_without_heap_owned_storage() {
     );
 }
 
+/// Ensures cloned pooled wrappers keep the `PooledByteSlab` alive even after the owner `Arc` is dropped.
 #[test]
 fn pooled_wrapper_survives_slab_owner_drop() {
-    // Verify that cloning a pooled wrapper keeps the slab alive even after
-    // the original Arc reference is dropped. This exercises the Arc<PooledByteSlab>
-    // lifetime semantics that the HOT page-emission path relies on.
     let mut slab = ByteSlab::with_capacity(128);
     let key_slot = slab.allocate(b"survivor-key").expect("allocate key");
     let ref_slot = slab.allocate(b"survivor-ref").expect("allocate ref");
@@ -234,10 +248,9 @@ fn pooled_wrapper_survives_slab_owner_drop() {
     assert_eq!(iref_clone.as_bytes(), b"survivor-ref");
 }
 
+/// Verifies slot-backed constructors enforce the same non-empty and size bounds as slice constructors.
 #[test]
 fn pooled_constructor_rejects_empty_and_oversized_slots() {
-    // Slot-backed constructors must enforce the same non-empty/size bounds as
-    // vec/slice constructors.
     let oversized_len = MAX_ITEM_KEY_SIZE + 1;
     let mut slab = ByteSlab::with_capacity(oversized_len.next_power_of_two());
     let oversized_bytes = vec![0xAB; oversized_len];
@@ -258,6 +271,7 @@ fn pooled_constructor_rejects_empty_and_oversized_slots() {
     );
 }
 
+/// Compares owned and pooled wrappers to confirm their equality, hashing, and ordering implementations agree.
 #[test]
 fn owned_and_pooled_satisfy_trait_consistency() {
     use std::collections::hash_map::DefaultHasher;
@@ -326,6 +340,7 @@ fn format_output_is_deterministic() {
     assert_eq!(output, expected);
 }
 
+/// Asserts `ScanItem::new` leaves optional metadata (`size_hint`, `content_hints`, and `location`) unset.
 #[test]
 fn scan_item_new_defaults_optional_fields_to_none() {
     let scan_item = ScanItem::new(
@@ -350,6 +365,7 @@ fn scan_item_new_defaults_optional_fields_to_none() {
     assert_eq!(scan_item.location(), None);
 }
 
+/// Verifies that builder helpers on `ScanItem` can chain optional entries like size hint, hints, and location.
 #[test]
 fn scan_item_builder_methods_chain() {
     let content_hints =
@@ -374,6 +390,7 @@ fn scan_item_builder_methods_chain() {
     assert_eq!(scan_item.location(), Some(&location));
 }
 
+/// Validates that `Budgets::try_new` rejects zero counts for items or bytes.
 #[rstest]
 #[case::zero_items(0, 1024, "Budgets.max_items")]
 #[case::zero_bytes(10, 0, "Budgets.max_bytes")]
@@ -390,6 +407,7 @@ fn budgets_try_new_rejects_zero(
     );
 }
 
+/// Confirms `ScanItem::into_parts` returns owned fields matching the original builder inputs.
 #[test]
 fn scan_item_into_parts_returns_owned_fields() {
     let content_hints = ContentHints::try_new(Some("text/plain".to_owned()), None).unwrap();
@@ -417,6 +435,7 @@ fn scan_item_into_parts_returns_owned_fields() {
     assert_eq!(loc.as_ref(), Some(&location));
 }
 
+/// Tests that `Budgets::is_expired_at` responds correctly before, at, and after the provided deadline.
 #[test]
 fn budgets_is_expired_at_respects_deadline() {
     use std::time::Duration;
@@ -462,7 +481,6 @@ macro_rules! toxic_bytes_tests {
                 prop_assert_eq!(val.as_bytes(), &bytes[..]);
                 prop_assert_eq!(val.as_ref(), &bytes[..]);
 
-                // Also verify try_from_slice produces identical results.
                 let from_slice = $ty::try_from_slice(&bytes).unwrap();
                 prop_assert_eq!(from_slice.as_bytes(), &bytes[..]);
 
@@ -524,6 +542,8 @@ fn arb_cursor() -> impl Strategy<Value = Cursor> {
     ]
 }
 
+// Property test ensuring cursor updates roundtrip for each cursor variant generated by
+// `arb_cursor`.
 proptest! {
     #![proptest_config(crate::test_util::miri_proptest_config())]
 
