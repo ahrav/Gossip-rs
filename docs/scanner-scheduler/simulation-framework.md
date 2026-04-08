@@ -510,3 +510,11 @@ The scheduler simulation harness (separate from the scanner simulation) uses add
 | ScannerSimRunner, RunOutcome, FailureKind | `crates/scanner-scheduler/src/sim_scanner/runner.rs` |
 | replay_artifact | `crates/scanner-scheduler/src/sim_scanner/replay.rs` |
 | VirtualPathTable | `crates/scanner-scheduler/src/sim_scanner/vpath_table.rs` |
+| Mutation engine root | `crates/scanner-scheduler/src/sim/mutation/mod.rs` |
+| Archive simulation root | `crates/scanner-scheduler/src/sim_archive/mod.rs` |
+| Simulated bzip2 archive builder | `crates/scanner-scheduler/src/sim_archive/build_bzip2.rs` |
+| Simulated gzip archive builder | `crates/scanner-scheduler/src/sim_archive/build_gzip.rs` |
+| Simulated tar archive builder | `crates/scanner-scheduler/src/sim_archive/build_tar.rs` |
+| Simulated zip archive builder | `crates/scanner-scheduler/src/sim_archive/build_zip.rs` |
+| Scanner simulation root | `crates/scanner-scheduler/src/sim_scanner/mod.rs` |
+| Unit tests for scanner simulation runner | `crates/scanner-scheduler/src/sim_scanner/runner_tests.rs` |
