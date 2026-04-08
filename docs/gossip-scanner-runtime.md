@@ -42,6 +42,9 @@ and validation, and Git connector mode uses the direct path.
 | `src/distributed/execution.rs` | Lease execution functions (`run_filesystem_lease`, `run_git_repo_lease`) and worker entry points (`run_worker`, `run_git_repo_worker`) |
 | `src/distributed/commit_bridge.rs` | `ReceiptCommitSink` adapter, receipt-driven checkpoint building, `drain_commit_stage` |
 | `src/distributed/lease_ops.rs` | Lease lifecycle: `advance_shard`, `ArmedLeaseDeadline`, `watch_lease_deadline`, `LeaseUncertaintySignal` |
+| `src/distributed/integration_tests.rs` | Distributed lease orchestration and coordination integration tests |
+| `src/distributed/test_support.rs` | Test helpers, builders, and mock fixtures for distributed execution tests |
+| `src/distributed/unit_tests.rs` | Unit tests for lease lifecycle, commit bridging, and distributed types |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_discovery.rs` | Static single-target Git repository discovery source for payload-backed repo-frontier shards |
 | `src/git_executor.rs` | Contract-level adapter that implements `GitRepoExecutor` for mirror-backed repo scans by translating `GitSelection` + `GitExecutionLimits` into `scanner-git` config, propagating repo/policy identity into persistence-aware runs, and reusing the shared runtime runner |

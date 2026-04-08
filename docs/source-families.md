@@ -157,11 +157,17 @@ and `types.rs`.
 | `crates/gossip-contracts/src/connector/api.rs` | Error taxonomy, capabilities |
 | `crates/gossip-contracts/src/connector/conformance.rs` | Ordered-content conformance harness shared by concrete connector implementations |
 | `crates/gossip-contracts/src/connector/mod.rs` | Re-export hub, canonical connector tags |
+| `crates/gossip-contracts/src/connector/api_tests.rs` | Unit tests for error taxonomy and capabilities |
+| `crates/gossip-contracts/src/connector/common_tests.rs` | Unit tests for shared paging vocabulary |
+| `crates/gossip-contracts/src/connector/types_tests.rs` | Unit tests for toxic-byte wrappers, cursor, and budgets |
 | `crates/gossip-connectors/src/lib.rs` | Crate root re-exports for concrete filesystem and in-memory connector implementations |
 | `crates/gossip-connectors/src/filesystem.rs` | Filesystem ordered-content connector |
 | `crates/gossip-connectors/src/in_memory.rs` | Deterministic in-memory test connector |
 | `crates/gossip-connectors/src/common.rs` | Shared connector utilities |
 | `crates/gossip-connectors/src/split_estimator.rs` | Streaming byte-weighted split-point estimator (internal; used by `common.rs` and `FilesystemConnector`) |
+| `crates/gossip-connectors/src/filesystem_tests.rs` | Unit tests for filesystem connector |
+| `crates/gossip-connectors/src/in_memory_tests.rs` | Unit tests for in-memory connector |
+| `crates/gossip-connectors/src/split_estimator_tests.rs` | Unit tests for split-point estimator |
 | `crates/gossip-orchestrator/src/lib.rs` | Re-export hub for filesystem and Git request normalization, planning, and run setup |
 | `crates/gossip-orchestrator/src/git_payload.rs` | Typed Git shard payload wire format for repo-frontier shards (encode/decode) |
 | `crates/gossip-orchestrator/src/git_planner.rs` | Deterministic Git initial shard geometry planner |
