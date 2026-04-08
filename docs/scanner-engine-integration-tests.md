@@ -34,7 +34,7 @@ Each category is a separate test binary gated behind a Cargo feature:
 
 | Binary          | Path                       | Feature Gate         | Tests |
 | --------------- | -------------------------- | -------------------- | ----: |
-| `integration`   | `tests/integration/main.rs`| `integration-tests`  |   171 |
+| `integration`   | `tests/integration/main.rs`| `integration-tests`  |   176 |
 | `property`      | `tests/property/main.rs`   | `property-tests`     |  ~130 |
 | `simulation`    | `tests/simulation/main.rs` | various (see below)  |    42 |
 | `diagnostic`    | `tests/diagnostic/main.rs` | `diagnostic-tests`   |     2 |

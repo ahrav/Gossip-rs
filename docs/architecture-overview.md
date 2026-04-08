@@ -205,7 +205,7 @@ gossip-contracts  (data model leaf -- identity, shard spec, connector types)
 - Policy enforcement is deterministic: `FailArchive` stops the current container, `FailRun` aborts the scan.
 - Archive entries use virtual `FileId` values (high-bit namespace) to isolate per-file engine state.
 - Archive parsing and expansion are centralized in `crates/scanner-scheduler/src/archive/scan.rs` and delegated to a sink (`ArchiveEntrySink`) for entry scanning.
-- Hardening expectations and review findings are tracked alongside the archive
+- Depth-budget enforcement and decompression-ratio guards live alongside the archive
   scanning implementation in `crates/scanner-scheduler/src/archive/`.
 
 ## Git Repo Open
