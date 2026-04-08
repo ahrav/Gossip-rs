@@ -89,10 +89,10 @@ fn checkpoint_serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ScanC
 /// Deserialize a checkpoint blob with envelope integrity verification.
 ///
 /// Verification order is: magic bytes, payload size guard, CRC32, then
-/// postcard deserialization. The CRC32 guard detects accidental corruption
-/// such as bit-rot and truncation; it does not provide tamper
-/// resistance. Uses strict-consume semantics (`from_bytes`) so that trailing
-/// garbage causes a decode failure rather than being silently ignored. Per the
+/// postcard deserialization. The CRC32 guard covers the entire payload and
+/// detects any appended or modified bytes before postcard deserializes;
+/// `postcard::from_bytes` itself does not reject trailing bytes (use
+/// `take_from_bytes` when full-consumption validation is needed). Per the
 /// no-versioning rule, format changes update all readers/writers in one pass;
 /// there is no forward-compatibility contract that would require tolerating
 /// trailing bytes.
@@ -2138,7 +2138,15 @@ mod tests {
         // Build a blob exceeding `MAX_CHECKPOINT_BYTES` so that the size
         // guard in `checkpoint_deserialize` rejects the framed payload before
         // postcard attempts to parse anything.
-        let blob = frame_checkpoint_payload(&vec![0u8; MAX_CHECKPOINT_BYTES + 1]);
+        //
+        // Construct the envelope in-place rather than framing a separate
+        // payload Vec: the size guard fires before the CRC check, so a
+        // dummy checksum suffices and avoids a second 256 MiB allocation.
+        let payload_len = MAX_CHECKPOINT_BYTES + 1;
+        let total_len = CHECKPOINT_ENVELOPE_HEADER_LEN + payload_len;
+        let mut blob = vec![0u8; total_len];
+        blob[..CHECKPOINT_MAGIC.len()].copy_from_slice(&CHECKPOINT_MAGIC);
+        // CRC bytes left as zeros — the size guard rejects before CRC validation.
 
         let loaded = LoadedScanCheckpoint::BaseOnly { base_state: blob };
         let result =
@@ -2702,5 +2710,20 @@ mod tests {
                 "checkpoint state invalid: completed_plan_count (3) exceeds packed candidate count (2)"
             );
         }
+    }
+
+    /// postcard::from_bytes silently ignores trailing bytes; the CRC32
+    /// envelope is the actual guard against appended corruption.
+    ///
+    /// Kept as a regression guard so a future postcard upgrade that
+    /// changes this behavior is detected immediately.
+    #[test]
+    fn postcard_from_bytes_ignores_trailing_bytes() {
+        let original: u32 = 42;
+        let mut buf = postcard::to_allocvec(&original).expect("serialize");
+        // Append trailing garbage — from_bytes must still succeed.
+        buf.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let recovered: u32 = postcard::from_bytes(&buf).expect("trailing bytes silently ignored");
+        assert_eq!(recovered, original);
     }
 }
