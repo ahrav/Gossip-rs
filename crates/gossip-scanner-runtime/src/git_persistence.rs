@@ -1006,6 +1006,83 @@ where
     }
 }
 
+/// Scan-time persistence shim that defers complete finalizes until the caller
+/// confirms external durability.
+///
+/// Spill-stage seen-bitmap writes still flow directly into the underlying
+/// adapter so mid-scan checkpoints remain resumable. Partial finalizes are also
+/// forwarded immediately because they never advance ref watermarks. Only a
+/// complete finalize is intercepted and suppressed, allowing the distributed
+/// runtime to commit the scanner-owned Git state after findings and done-ledger
+/// writes succeed. The actual `FinalizeOutput` is recovered from the scan
+/// result, avoiding a deep clone of the data and watermark op vectors.
+///
+/// # Partial finalize interaction with durable backends
+///
+/// Partial finalizes write data-ops seen deltas to the scope bitmap via the
+/// underlying adapter. On a durable backend (e.g., PostgreSQL), these writes
+/// survive restarts. The execution layer handles partial outcomes by either
+/// checkpointing (on cancellation) or returning an error — in both cases,
+/// the shard is not advanced. Checkpoint-based resume skips past the ref
+/// range that produced the already-committed seen deltas, so at-least-once
+/// delivery is preserved for the common case. A narrow edge case exists
+/// where a blob is reachable from both pre-checkpoint and post-checkpoint
+/// refs; in that scenario, the post-checkpoint ref path would skip the
+/// already-seen blob. This is acceptable because partial finalize implies
+/// permanently unrecoverable candidates (corrupt objects, decode failures)
+/// that produce the same outcome on retry.
+#[derive(Debug)]
+pub(crate) struct DeferredCompleteFinalizeStore<'a, B> {
+    persistence: &'a GitPersistenceAdapter<B>,
+    complete_deferred: Cell<bool>,
+}
+
+impl<'a, B> DeferredCompleteFinalizeStore<'a, B> {
+    /// Build one deferred-finalize shim over the shared Git persistence adapter.
+    pub(crate) fn new(persistence: &'a GitPersistenceAdapter<B>) -> Self {
+        Self {
+            persistence,
+            complete_deferred: Cell::new(false),
+        }
+    }
+
+    /// Whether a complete finalize was intercepted during the scan.
+    pub(crate) fn was_complete_deferred(&self) -> bool {
+        self.complete_deferred.get()
+    }
+}
+
+impl<B> SeenBitmapPersister for DeferredCompleteFinalizeStore<'_, B>
+where
+    B: GitPersistenceBackend,
+{
+    fn persist_seen_delta(&self, oids: &[OidBytes]) -> Result<(), SpillError> {
+        self.persistence.persist_seen_delta(oids)
+    }
+}
+
+impl<B> PersistenceStore for DeferredCompleteFinalizeStore<'_, B>
+where
+    B: GitPersistenceBackend,
+{
+    fn commit_finalize(&self, output: &FinalizeOutput) -> Result<(), PersistError> {
+        if matches!(output.outcome, FinalizeOutcome::Complete) {
+            if self.complete_deferred.get() {
+                return Err(PersistError::backend(
+                    "complete finalize already deferred for this scan",
+                ));
+            }
+            self.complete_deferred.set(true);
+            tracing::debug!(
+                "complete finalize intercepted; deferring until external durability confirmed"
+            );
+            return Ok(());
+        }
+
+        self.persistence.commit_finalize(output)
+    }
+}
+
 /// Identity inputs used when treating a Git repo as a persistence item.
 ///
 /// Git repos have no object-version concept at the done-ledger level, so the
@@ -1793,6 +1870,206 @@ mod tests {
         assert!(
             backend.contains_key(&base_key),
             "partial finalize must preserve base checkpoint for resume"
+        );
+    }
+
+    #[test]
+    fn deferred_complete_finalize_buffers_until_explicit_commit() {
+        let backend = TestBackend::atomic();
+        let repo_id = 80;
+        let policy_hash = [0x80; 32];
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+        let deferred = DeferredCompleteFinalizeStore::new(&adapter);
+        let oid = sim_oid(0xA0);
+
+        deferred
+            .persist_seen_delta(&[oid])
+            .expect("spill staging should still persist during scan");
+        let complete = complete_finalize_with_watermark(7);
+        deferred
+            .commit_finalize(&complete)
+            .expect("complete finalize should be intercepted instead of committing");
+
+        assert_staging_contains(&backend, repo_id, &policy_hash, &[oid]);
+        assert!(
+            backend.get_value(TEST_WATERMARK_KEY).is_none(),
+            "intercepted finalize must not advance watermarks yet"
+        );
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid])
+                .expect("staging should stay invisible until finalize commit"),
+            vec![false]
+        );
+
+        assert!(
+            deferred.was_complete_deferred(),
+            "complete finalize flag should be set"
+        );
+        adapter
+            .commit_finalize(&complete)
+            .expect("runtime should be able to commit the original finalize");
+
+        assert_scope_contains(&backend, repo_id, &policy_hash, &[oid]);
+        assert!(
+            !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
+            "successful finalize commit must clear staging"
+        );
+        assert_eq!(
+            backend.get_value(TEST_WATERMARK_KEY).as_deref(),
+            Some(&[7][..]),
+            "explicit finalize commit must advance watermarks"
+        );
+    }
+
+    #[test]
+    fn deferred_complete_finalize_forwards_partial_finalize_immediately() {
+        let backend = TestBackend::atomic();
+        let repo_id = 81;
+        let policy_hash = [0x81; 32];
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+        let deferred = DeferredCompleteFinalizeStore::new(&adapter);
+        let oid = sim_oid(0xB0);
+
+        deferred
+            .persist_seen_delta(&[oid])
+            .expect("spill staging should persist");
+        deferred
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+                stats: Default::default(),
+            })
+            .expect("partial finalize should still commit immediately");
+
+        assert!(
+            !deferred.was_complete_deferred(),
+            "partial finalize must not set the complete-deferred flag"
+        );
+        assert!(
+            !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
+            "partial finalize should discard staging immediately"
+        );
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid])
+                .expect("discarded staging must not leak into committed scope"),
+            vec![false]
+        );
+        assert!(
+            backend.get_value(TEST_WATERMARK_KEY).is_none(),
+            "partial finalize must not advance watermarks"
+        );
+    }
+
+    #[test]
+    fn deferred_complete_finalize_rejects_second_complete() {
+        let backend = TestBackend::atomic();
+        let repo_id = 82;
+        let policy_hash = [0x82; 32];
+        let adapter = GitPersistenceAdapter::new(backend, repo_id, policy_hash);
+        let deferred = DeferredCompleteFinalizeStore::new(&adapter);
+
+        deferred
+            .commit_finalize(&complete_finalize_with_watermark(1))
+            .expect("first complete finalize should be intercepted");
+        let err = deferred
+            .commit_finalize(&complete_finalize_with_watermark(2))
+            .expect_err("second complete finalize must be rejected");
+        assert!(
+            format!("{err}").contains("already deferred"),
+            "error should identify the double-complete cause: {err}"
+        );
+    }
+
+    #[test]
+    fn deferred_complete_finalize_preserves_staging_when_no_finalize_occurs() {
+        let backend = TestBackend::atomic();
+        let repo_id = 83;
+        let policy_hash = [0x83; 32];
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+        let deferred = DeferredCompleteFinalizeStore::new(&adapter);
+        let oid = sim_oid(0xC0);
+
+        deferred
+            .persist_seen_delta(&[oid])
+            .expect("staging write should succeed");
+
+        assert!(
+            !deferred.was_complete_deferred(),
+            "no finalize was called, so nothing should be pending"
+        );
+        assert_staging_contains(&backend, repo_id, &policy_hash, &[oid]);
+    }
+
+    #[test]
+    fn deferred_store_partial_then_complete_finalize() {
+        let backend = TestBackend::atomic();
+        let repo_id = 84;
+        let policy_hash = [0x84; 32];
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+        let deferred = DeferredCompleteFinalizeStore::new(&adapter);
+        let oid_a = sim_oid(0xD0);
+        let oid_b = sim_oid(0xD1);
+
+        // Spill some OIDs, then partial finalize (forwarded immediately).
+        deferred
+            .persist_seen_delta(&[oid_a])
+            .expect("first spill should succeed");
+        deferred
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+                stats: Default::default(),
+            })
+            .expect("partial finalize should forward immediately");
+
+        assert!(
+            !deferred.was_complete_deferred(),
+            "partial finalize must not set the complete-deferred flag"
+        );
+        // Partial finalize discards staging without promoting OIDs.
+        assert!(
+            !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
+            "partial finalize should clear staging"
+        );
+
+        // Second spill phase, then complete finalize (deferred).
+        deferred
+            .persist_seen_delta(&[oid_b])
+            .expect("second spill should succeed");
+        let complete = complete_finalize_with_watermark(9);
+        deferred
+            .commit_finalize(&complete)
+            .expect("complete finalize should be intercepted");
+
+        assert!(
+            deferred.was_complete_deferred(),
+            "complete finalize flag should be set after the second phase"
+        );
+        assert_staging_contains(&backend, repo_id, &policy_hash, &[oid_b]);
+        assert!(
+            backend.get_value(TEST_WATERMARK_KEY).is_none(),
+            "intercepted complete finalize must not advance watermarks yet"
+        );
+
+        // Explicit commit via the adapter promotes staging and advances
+        // watermarks.
+        adapter
+            .commit_finalize(&complete)
+            .expect("explicit commit should succeed");
+
+        assert_scope_contains(&backend, repo_id, &policy_hash, &[oid_b]);
+        assert!(
+            !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
+            "committed finalize must clear staging"
+        );
+        assert_eq!(
+            backend.get_value(TEST_WATERMARK_KEY).as_deref(),
+            Some(&[9][..]),
+            "explicit commit must advance watermarks"
         );
     }
 

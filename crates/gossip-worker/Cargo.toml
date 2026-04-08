@@ -17,6 +17,7 @@ gossip-contracts.workspace = true
 gossip-coordination-etcd.workspace = true
 gossip-done-ledger-postgres.workspace = true
 gossip-findings-postgres.workspace = true
+gossip-git-persistence-postgres.workspace = true
 gossip-scanner-runtime.workspace = true
 postgres.workspace = true
 thiserror = { workspace = true }

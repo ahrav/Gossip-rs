@@ -26,7 +26,7 @@ use gossip_contracts::{
     },
 };
 use gossip_coordination::{AcquireScratch, CoordinationFacade, CursorSemantics};
-use scanner_git::{FinalizeOutcome, GitEventOutput};
+use scanner_git::{FinalizeOutcome, GitEventOutput, PersistenceStore};
 use scanner_scheduler::events::EventOutput;
 
 use super::commit_bridge::{
@@ -550,9 +550,10 @@ pub(super) struct GitRepoPersistenceInput<'a> {
     pub(super) tenant_secret_key: TenantSecretKey,
     pub(super) rule_fingerprint: &'a dyn Fn(u32) -> RuleFingerprint,
     pub(super) claim_time: LogicalTime,
-    /// Wall-clock timestamp captured after scan execution *and* persistence
-    /// finalize complete. The `(claim_time, complete_time)` interval therefore
-    /// measures claim-to-durable-finalize, not claim-to-scan-completion alone.
+    /// Wall-clock timestamp captured after scan execution completes but before
+    /// persistence submissions. The `(claim_time, complete_time)` interval
+    /// measures claim-to-scan-completion; it does not include persistence
+    /// latency.
     pub(super) complete_time: LogicalTime,
 }
 
@@ -912,11 +913,11 @@ where
         )));
     }
 
-    // Findings must be durable BEFORE shard checkpoint advances. The in-memory
-    // GitPersistenceBackend makes post-execution batch write safe: a crash
-    // clears in-memory watermarks, causing full re-scan on re-claim. A durable
-    // GitPersistenceBackend would require splitting finalize into: seen-bitmaps
-    // → findings persistence → watermark commit.
+    // External findings and done-ledger state must land before a complete Git
+    // finalize advances the repo's durable scan state. The scan phase buffers
+    // complete finalizes via `DeferredCompleteFinalizeStore` so the git-kv
+    // commit can run after these receipts succeed; partial finalizes remain
+    // inline because they never advance watermarks.
     let captured_findings = capture_sink.take_captured_findings();
     let detected_count = capture_sink.detected_finding_count();
     if detected_count != captured_findings.len() as u64 {
@@ -965,6 +966,33 @@ where
         latency_ms: stage_metrics.durable_receipt_ms,
         receipts: GIT_REPO_RECEIPT_FAMILIES,
     });
+
+    // At-least-once guarantee: findings and done-ledger records are already
+    // durable at this point. If commit_finalize fails (connection drop,
+    // constraint violation) or the process is killed before it completes,
+    // watermarks remain at their pre-scan position. The next lease re-scans
+    // the same blobs and re-emits findings. Done-ledger and findings
+    // consumers must tolerate duplicate submissions.
+    if matches!(execution.finalize_outcome, FinalizeOutcome::Complete)
+        && execution.deferred_finalize.is_none()
+    {
+        return Err(DistributedRuntimeError::Durability(anyhow!(
+            "complete finalize for shard '{}' must produce a deferred finalize output; \
+             watermarks would be silently dropped",
+            stage_sink.redacted_shard_id()
+        )));
+    }
+    if let Some(finalize) = execution.deferred_finalize.as_ref() {
+        execution
+            .persistence
+            .commit_finalize(finalize)
+            .map_err(|error| {
+                DistributedRuntimeError::Durability(AnyError::new(error).context(format!(
+                    "git repo-frontier shard '{}' git state finalize commit failed",
+                    stage_sink.redacted_shard_id()
+                )))
+            })?;
+    }
 
     tracing::debug!(
         shard_id = %stage_sink.redacted_shard_id(),

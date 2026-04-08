@@ -4,7 +4,8 @@
 //! backends provisioned by the existing test-support helpers:
 //!
 //! - etcd via `gossip-coordination-etcd::test_support`
-//! - PostgreSQL via `gossip-pg-common::test_support`
+//! - PostgreSQL via `gossip-pg-common::test_support` for done-ledger,
+//!   findings, and Git key-value durability
 //!
 //! The happy-path checks intentionally invoke the `gossip-worker` binary
 //! rather than calling only library helpers so the full process boundary is
@@ -44,6 +45,9 @@ use gossip_findings_postgres::{
     apply_all_migrations as apply_findings_migrations, schema as findings_schema,
 };
 use gossip_frontier::hint::decode_connector_extra;
+use gossip_git_persistence_postgres::{
+    apply_all_migrations as apply_git_kv_migrations, schema as git_kv_schema,
+};
 use gossip_orchestrator::{
     FilesystemRequest, FilesystemRunSetupInput, GitInitialShardPlan, GitInitialShardPlanEntry,
     GitRequest, GitRunSetupInput, GitShardPayload, NormalizedGitSelection,
@@ -54,10 +58,10 @@ use gossip_scanner_runtime::test_fixtures::{git_stdout, init_git_repo, run_git};
 use gossip_stdx::hex_encode;
 use gossip_worker::config::{
     ENV_COMMIT_QUEUE_CAPACITY, ENV_DONE_LEDGER_POSTGRES_DSN, ENV_ETCD_ENDPOINTS,
-    ENV_ETCD_NAMESPACE, ENV_FINDINGS_POSTGRES_DSN, ENV_FS_SKIP_ARCHIVES, ENV_MAX_BYTES,
-    ENV_MAX_ITEMS, ENV_MIRROR_ROOT, ENV_POLICY_HASH, ENV_RUN_ID, ENV_STARTUP_SCHEMA_MODE,
-    ENV_TENANT_ID, ENV_TENANT_SECRET_KEY, ENV_WORKER_ANCHOR_MODE, ENV_WORKER_BACKEND,
-    ENV_WORKER_DECODE_DEPTH, ENV_WORKER_ID, ENV_WORKER_MODE, ENV_WORKER_PATH,
+    ENV_ETCD_NAMESPACE, ENV_FINDINGS_POSTGRES_DSN, ENV_FS_SKIP_ARCHIVES, ENV_GIT_KV_POSTGRES_DSN,
+    ENV_MAX_BYTES, ENV_MAX_ITEMS, ENV_MIRROR_ROOT, ENV_POLICY_HASH, ENV_RUN_ID,
+    ENV_STARTUP_SCHEMA_MODE, ENV_TENANT_ID, ENV_TENANT_SECRET_KEY, ENV_WORKER_ANCHOR_MODE,
+    ENV_WORKER_BACKEND, ENV_WORKER_DECODE_DEPTH, ENV_WORKER_ID, ENV_WORKER_MODE, ENV_WORKER_PATH,
     ENV_WORKER_RULES_FILE, ENV_WORKER_SCAN_BINARY, ENV_WORKER_SOURCE,
 };
 use postgres::{Client, NoTls};
@@ -100,6 +104,7 @@ const WORKER_ENV_KEYS: &[&str] = &[
     ENV_ETCD_NAMESPACE,
     ENV_DONE_LEDGER_POSTGRES_DSN,
     ENV_FINDINGS_POSTGRES_DSN,
+    ENV_GIT_KV_POSTGRES_DSN,
     ENV_TENANT_ID,
     ENV_RUN_ID,
     ENV_WORKER_ID,
@@ -189,9 +194,9 @@ impl GitScanFixture {
 
     /// Create a fixture whose repos contain no content matching `SAFE_TOKEN`.
     ///
-    /// Use this for tests that run the actual worker binary: durable Git
-    /// finding translation is not yet wired up, so the runtime rejects shards
-    /// that detect findings. Clean repos let the worker complete the shard.
+    /// Clean repos simplify expected-count assertions in the happy-path proof:
+    /// zero observations, one done-ledger row per repo, deterministic git-kv
+    /// state.
     fn clean(repo_count: usize) -> Self {
         Self::build(repo_count, false)
     }
@@ -277,12 +282,13 @@ fn create_committed_git_repo(
 
 /// Shared etcd + PostgreSQL test backends used by all launch proof types.
 ///
-/// Creates an isolated etcd namespace, a done-ledger database, and a findings
-/// database — all migrated and ready for shard submission.
+/// Creates an isolated etcd namespace plus the done-ledger, findings, and
+/// Git key-value databases needed for end-to-end worker proofs.
 struct SeededBackends {
     coordinator: EtcdCoordinator,
     done_ledger_dsn: String,
     findings_dsn: String,
+    git_kv_dsn: String,
 }
 
 impl SeededBackends {
@@ -291,11 +297,13 @@ impl SeededBackends {
         let coordinator = test_coordinator_in_namespace(&namespace);
         let done_ledger_dsn = create_test_db();
         let findings_dsn = create_test_db();
-        migrate_database_pair(&done_ledger_dsn, &findings_dsn);
+        let git_kv_dsn = create_test_db();
+        migrate_databases(&done_ledger_dsn, &findings_dsn, Some(&git_kv_dsn));
         Self {
             coordinator,
             done_ledger_dsn,
             findings_dsn,
+            git_kv_dsn,
         }
     }
 
@@ -308,6 +316,10 @@ impl SeededBackends {
 
     fn observation_row_count(&self) -> i64 {
         table_row_count(&self.findings_dsn, findings_schema::OBSERVATIONS_TABLE)
+    }
+
+    fn git_kv_row_count(&self) -> i64 {
+        table_row_count(&self.git_kv_dsn, git_kv_schema::GIT_KV_TABLE)
     }
 }
 
@@ -340,6 +352,7 @@ impl SeededLaunchProof {
             self.backends.coordinator.config(),
             &self.backends.done_ledger_dsn,
             &self.backends.findings_dsn,
+            None,
             WorkerLaunchTarget::Fs {
                 path: self.fixture.scan_path(),
             },
@@ -350,10 +363,8 @@ impl SeededLaunchProof {
 
 /// Live-backend Git proof seeded through real etcd, PostgreSQL, and a local repo fixture.
 ///
-/// The fixture uses a clean repo (no rule-matching content) so the worker can
-/// complete the shard end-to-end. Durable Git finding translation is not yet
-/// wired up, so repos with matching content would cause the runtime to reject
-/// the shard before checkpoint.
+/// The fixture uses a clean repo (no rule-matching content) so the proof
+/// exercises the zero-findings path with deterministic expected counts.
 struct GitSeededLaunchProof {
     backends: SeededBackends,
     fixture: GitScanFixture,
@@ -395,6 +406,7 @@ impl GitSeededLaunchProof {
             self.backends.coordinator.config(),
             &self.backends.done_ledger_dsn,
             &self.backends.findings_dsn,
+            Some(&self.backends.git_kv_dsn),
             WorkerLaunchTarget::Git {
                 path: self.fixture.primary_repo().path.as_path(),
                 mirror_root: self.fixture.mirror_root(),
@@ -713,7 +725,7 @@ fn worker_binary_path() -> PathBuf {
     }
 }
 
-fn migrate_database_pair(done_ledger_dsn: &str, findings_dsn: &str) {
+fn migrate_databases(done_ledger_dsn: &str, findings_dsn: &str, git_kv_dsn: Option<&str>) {
     std::thread::scope(|s| {
         s.spawn(|| {
             let mut client = Client::connect(done_ledger_dsn, NoTls)
@@ -726,6 +738,13 @@ fn migrate_database_pair(done_ledger_dsn: &str, findings_dsn: &str) {
                 Client::connect(findings_dsn, NoTls).expect("findings test DB should connect");
             apply_findings_migrations(&mut client).expect("findings migrations should succeed");
         });
+        if let Some(git_kv_dsn) = git_kv_dsn {
+            s.spawn(|| {
+                let mut client =
+                    Client::connect(git_kv_dsn, NoTls).expect("git-kv test DB should connect");
+                apply_git_kv_migrations(&mut client).expect("git-kv migrations should succeed");
+            });
+        }
     });
 }
 
@@ -743,6 +762,7 @@ fn run_worker_process(
     etcd_config: &EtcdCoordinatorConfig,
     done_ledger_dsn: &str,
     findings_dsn: &str,
+    git_kv_dsn: Option<&str>,
     target: WorkerLaunchTarget<'_>,
     rules_path: &Path,
 ) -> Output {
@@ -767,6 +787,10 @@ fn run_worker_process(
         .env(ENV_WORKER_RULES_FILE, rules_path)
         .env(ENV_STARTUP_SCHEMA_MODE, "validate")
         .env("RUST_LOG", "info");
+
+    if let Some(git_kv_dsn) = git_kv_dsn {
+        command.env(ENV_GIT_KV_POSTGRES_DSN, git_kv_dsn);
+    }
 
     match target {
         WorkerLaunchTarget::Fs { path } => {
@@ -1119,6 +1143,7 @@ fn git_worker_binary_happy_path_completes_shard_and_commits() {
 
     let done_ledger_rows = proof.backends.done_ledger_row_count();
     let observation_rows = proof.backends.observation_row_count();
+    let git_kv_rows = proof.backends.git_kv_row_count();
     // Git scanning produces one done-ledger entry per repository. The clean
     // fixture has no rule-matching content, so zero observations are expected.
     assert_eq!(
@@ -1128,6 +1153,10 @@ fn git_worker_binary_happy_path_completes_shard_and_commits() {
     assert_eq!(
         observation_rows, 0,
         "clean Git fixture should produce 0 observations, got {observation_rows}",
+    );
+    assert!(
+        git_kv_rows >= 2,
+        "Git worker should write at least scope + watermark rows, got {git_kv_rows}"
     );
     assert_completed_git_shard_state(&proof.backends.coordinator, proof.shard_key);
 }
@@ -1141,6 +1170,7 @@ fn git_worker_restart_is_idempotent_after_completed_shard() {
     assert_worker_success(&first, "first real-backend Git worker launch");
     let done_rows_after_first = proof.backends.done_ledger_row_count();
     let observation_rows_after_first = proof.backends.observation_row_count();
+    let git_kv_rows_after_first = proof.backends.git_kv_row_count();
     assert_eq!(
         done_rows_after_first, 1,
         "expected exactly 1 done-ledger row (one per repo in Git mode), got {done_rows_after_first}"
@@ -1148,6 +1178,10 @@ fn git_worker_restart_is_idempotent_after_completed_shard() {
     assert_eq!(
         observation_rows_after_first, 0,
         "clean Git fixture should produce 0 observations, got {observation_rows_after_first}",
+    );
+    assert!(
+        git_kv_rows_after_first >= 2,
+        "first Git launch should populate at least scope + watermark git-kv rows, got {git_kv_rows_after_first}"
     );
 
     let second = proof.run_worker_binary();
@@ -1162,6 +1196,11 @@ fn git_worker_restart_is_idempotent_after_completed_shard() {
         proof.backends.observation_row_count(),
         observation_rows_after_first,
         "restarting after Git shard completion must not duplicate findings observations"
+    );
+    assert_eq!(
+        proof.backends.git_kv_row_count(),
+        git_kv_rows_after_first,
+        "restarting after Git shard completion must not duplicate git-kv state"
     );
 
     assert_completed_git_shard_state(&proof.backends.coordinator, proof.shard_key);

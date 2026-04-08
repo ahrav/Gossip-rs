@@ -1,5 +1,37 @@
 **NEVER auto-commit, auto-add, or auto-push code to git. Only perform git operations when explicitly asked by the user.**
 
+<!-- autoresearch-git-exception-v1 -->
+
+### Exception: Autoresearch Commit/Revert Cycle
+
+The `/autoresearch` family of commands (and their OpenCode `_` variants) are
+**exempt** from the no-auto-commit policy during an active autoresearch loop.
+Autoresearch requires git commits as a core mechanism — commit-before-verify
+enables clean rollback, and git history serves as the agent's memory of what
+was tried and what failed.
+
+**Allowed git operations inside an autoresearch loop only:**
+
+| Operation | Purpose |
+| --------- | ------- |
+| `git add` + `git commit -m "experiment: ..."` | Record each atomic change before verification |
+| `git revert HEAD --no-edit` | Roll back a failed experiment |
+| `git log` / `git diff` | Read own experiment history for learning |
+
+**Still prohibited, even inside autoresearch:**
+
+- `git push` (never push experiment commits automatically)
+- `git commit --amend` or `git rebase` (never rewrite experiment history)
+- `git reset --hard` (always use `git revert` to preserve history)
+- Committing to `main`/`master` directly (create a dedicated experiment branch first)
+
+**Activation:** This exception applies only when the user explicitly invokes
+an autoresearch command (`/autoresearch`, `/autoresearch:debug`,
+`/autoresearch_fix`, etc.). Normal agent operations outside the autoresearch
+loop must still follow the no-auto-commit policy.
+
+<!-- end-autoresearch-git-exception -->
+
 ## Agent Model Inheritance — MANDATORY
 
 When dispatching subagents via the Agent tool, **NEVER set the `model` parameter**.

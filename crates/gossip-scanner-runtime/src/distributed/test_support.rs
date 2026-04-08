@@ -104,6 +104,12 @@ pub(super) struct TestGitBackendState {
     pub(super) kv: BTreeMap<Vec<u8>, Vec<u8>>,
     pub(super) batch_call_count: usize,
     pub(super) fail_after_n_batches: Option<usize>,
+    /// Fail any `apply_batch` call that contains a `Delete` op AND has more
+    /// than two operations. Complete-finalize commits include data ops,
+    /// checkpoint deletes, staging delete, and watermark puts (4+ ops).
+    /// Scan-phase checkpoint writes have at most 2 ops. This flag targets
+    /// post-scan finalize failures without knowledge of batch counts.
+    pub(super) fail_on_finalize_commit: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -124,6 +130,13 @@ impl TestGitBackend {
             .lock()
             .expect("git backend state lock")
             .fail_after_n_batches = Some(n);
+    }
+
+    pub(super) fn fail_on_finalize_commit(&self) {
+        self.state
+            .lock()
+            .expect("git backend state lock")
+            .fail_on_finalize_commit = true;
     }
 
     pub(super) fn stored_keys(&self) -> Vec<Vec<u8>> {
@@ -157,6 +170,16 @@ impl GitPersistenceBackend for TestGitBackend {
         {
             return Err(TestGitBackendError {
                 message: "injected persistence failure",
+            });
+        }
+        if state.fail_on_finalize_commit
+            && ops.len() > 2
+            && ops
+                .iter()
+                .any(|op| matches!(op, GitPersistenceOp::Delete { .. }))
+        {
+            return Err(TestGitBackendError {
+                message: "injected finalize commit failure",
             });
         }
         state.batch_call_count += 1;

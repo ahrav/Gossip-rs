@@ -38,14 +38,17 @@ use gossip_contracts::identity::RuleFingerprint;
 use gossip_contracts::persistence::WriteContext;
 use gossip_orchestrator::{GitSelectionLoweringError, GitShardPayload};
 use scanner_git::{
-    FinalizeOutcome, GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanError,
-    GitScanResult, GitScanRunContext, NativeRefResolver, NeverSeenStore, NoopCheckpointSink,
-    PersistenceStore, RefWatermark, RefWatermarkStore, RepoOpenError, RepoOpenLimits,
-    ScanCheckpointSink, SeenBlobStore, StartSetConfig, run_git_scan_with_context,
+    FinalizeOutcome, FinalizeOutput, GitEventOutput, GitScanConfig as RuntimeGitScanConfig,
+    GitScanError, GitScanResult, GitScanRunContext, NativeRefResolver, NeverSeenStore,
+    NoopCheckpointSink, PersistenceStore, RefWatermark, RefWatermarkStore, RepoOpenError,
+    RepoOpenLimits, ScanCheckpointSink, SeenBlobStore, StartSetConfig, run_git_scan_with_context,
 };
 
 use crate::git_executor::{ScannerGitExecutor, map_merge_strategy, map_scan_mode};
-use crate::git_persistence::{GitPersistenceAdapter, GitPersistenceBackend, GitRepoCheckpointSink};
+use crate::git_persistence::{
+    DeferredCompleteFinalizeStore, GitPersistenceAdapter, GitPersistenceBackend,
+    GitRepoCheckpointSink,
+};
 use crate::{
     AssignmentOutcome, CancellationToken, ChannelEventOutput, EVENT_CHANNEL_CAP, GitDebugLevel,
     GitScanConfig, ScanReport, ScanRuntimeError, build_runtime_engine, forward_git_events,
@@ -84,6 +87,8 @@ pub(crate) struct GitRepoExecutionOutcome<B> {
     /// Whether the scanner fully traversed the configured start-set
     /// (`Complete`) or stopped early due to resource limits or errors.
     pub(crate) finalize_outcome: FinalizeOutcome,
+    /// Complete finalize output deferred until external durability succeeds.
+    pub(crate) deferred_finalize: Option<FinalizeOutput>,
     /// Latest durable repo-frontier checkpoint cursor produced during the
     /// current lease, if any.
     pub(crate) resume_checkpoint: Option<Cursor>,
@@ -97,6 +102,7 @@ impl<B: fmt::Debug> fmt::Debug for GitRepoExecutionOutcome<B> {
             .field("write_context", &self.write_context)
             .field("rule_fingerprint", &"<fn>")
             .field("finalize_outcome", &self.finalize_outcome)
+            .field("deferred_finalize", &self.deferred_finalize)
             .field("resume_checkpoint", &self.resume_checkpoint)
             .finish()
     }
@@ -172,6 +178,7 @@ impl GitRepoRuntime {
             start_set_from_ref_selection(selection.refs()).id(),
         );
         let checkpoint_sink = GitRepoCheckpointSink::new(&persistence, payload.repo_key().clone());
+        let deferred_finalize_store = DeferredCompleteFinalizeStore::new(&persistence);
         let execution = match executor.run_repo_with_persistence(
             mirror,
             &selection,
@@ -181,7 +188,7 @@ impl GitRepoRuntime {
             GitRuntimeStores {
                 seen_store: &persistence,
                 watermark_store: &persistence,
-                persist_store: Some(&persistence),
+                persist_store: Some(&deferred_finalize_store),
                 checkpoint_sink: &checkpoint_sink,
             },
         ) {
@@ -203,6 +210,7 @@ impl GitRepoRuntime {
                     write_context,
                     rule_fingerprint,
                     finalize_outcome: FinalizeOutcome::Partial { skipped_count: 0 },
+                    deferred_finalize: None,
                     resume_checkpoint,
                 });
             }
@@ -216,7 +224,17 @@ impl GitRepoRuntime {
             }
         };
         let finalize_outcome = execution.result.0.finalize.outcome;
-        let report = git_report_to_scan_report(execution.result, execution.scan_elapsed);
+        let was_deferred = deferred_finalize_store.was_complete_deferred();
+        if matches!(finalize_outcome, FinalizeOutcome::Complete) && !was_deferred {
+            return Err(ScanRuntimeError::Driver(anyhow::anyhow!(
+                "complete finalize outcome for '{}' was not intercepted by the deferred \
+                 store; watermarks would be silently dropped",
+                digest_repo_path(mirror.path())
+            )));
+        }
+        let (report, finalize) =
+            git_report_to_scan_report(execution.result, execution.scan_elapsed);
+        let deferred_finalize = if was_deferred { Some(finalize) } else { None };
         let resume_checkpoint = checkpoint_sink.latest_checkpoint_cursor();
         drop(checkpoint_sink);
 
@@ -226,6 +244,7 @@ impl GitRepoRuntime {
             write_context,
             rule_fingerprint,
             finalize_outcome,
+            deferred_finalize,
             resume_checkpoint,
         })
     }
@@ -460,10 +479,11 @@ pub(crate) fn scan_local_repo(
         };
 
         let debug_output = format_git_debug_output(&execution.result.0, config.debug_level);
-        Ok((
-            git_report_to_scan_report(execution.result, execution.scan_elapsed),
-            debug_output,
-        ))
+        // Local scans run without a git-kv backend; finalize output carries no
+        // durable ops and is safely discarded.
+        let (report, _finalize) =
+            git_report_to_scan_report(execution.result, execution.scan_elapsed);
+        Ok((report, debug_output))
     })?;
 
     Ok(AssignmentOutcome {
@@ -699,28 +719,32 @@ pub(crate) fn resolve_scan_ns(
 fn git_report_to_scan_report(
     result: GitScanResult,
     scan_elapsed: std::time::Duration,
-) -> ScanReport {
+) -> (ScanReport, FinalizeOutput) {
     let report = result.0;
+    let finalize = report.finalize;
     let metrics = report.common_metrics;
     let scan_ns = resolve_scan_ns(&report.stage_nanos, scan_elapsed);
 
-    ScanReport {
-        items_scanned: metrics.objects_scanned,
-        items_deferred: 0,
-        bytes_scanned: metrics.bytes_scanned,
-        chunks_scanned: metrics.chunks_scanned,
-        findings_emitted: metrics.findings_emitted,
-        errors: metrics.errors,
-        binary_skipped: metrics.binary_skipped,
-        ext_skipped: metrics.ext_skipped,
-        lock_skipped: metrics.lock_skipped,
-        binary_extracted: metrics.binary_extracted,
-        dropped_findings: 0,
-        persist_emit_failures: 0,
-        persist_incomplete: false,
-        scan_ns,
-        persist_ns: 0,
-    }
+    (
+        ScanReport {
+            items_scanned: metrics.objects_scanned,
+            items_deferred: 0,
+            bytes_scanned: metrics.bytes_scanned,
+            chunks_scanned: metrics.chunks_scanned,
+            findings_emitted: metrics.findings_emitted,
+            errors: metrics.errors,
+            binary_skipped: metrics.binary_skipped,
+            ext_skipped: metrics.ext_skipped,
+            lock_skipped: metrics.lock_skipped,
+            binary_extracted: metrics.binary_extracted,
+            dropped_findings: 0,
+            persist_emit_failures: 0,
+            persist_incomplete: false,
+            scan_ns,
+            persist_ns: 0,
+        },
+        finalize,
+    )
 }
 
 /// Render human-readable debug diagnostics from the Git scan report.

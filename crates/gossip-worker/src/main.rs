@@ -316,6 +316,7 @@ mod tests {
             EtcdCoordinatorConfig::localhost(),
             "postgresql://scanner@localhost/done_ledger",
             "postgresql://scanner@localhost/findings",
+            None,
         )
         .expect("test production backend config should be valid");
         make_distributed_config(
@@ -329,6 +330,7 @@ mod tests {
             EtcdCoordinatorConfig::localhost(),
             "postgresql://scanner@localhost/done_ledger",
             "postgresql://scanner@localhost/findings",
+            Some("postgresql://scanner@localhost/git_kv".to_owned()),
         )
         .expect("test production backend config should be valid");
         make_distributed_config(
@@ -386,6 +388,7 @@ mod tests {
                 .expect("test etcd config should be valid"),
             "postgresql://scanner@127.0.0.1:1/done_ledger?connect_timeout=1",
             "postgresql://scanner@127.0.0.1:1/findings?connect_timeout=1",
+            None,
         )
         .expect("unreachable production backend config should be valid");
         make_distributed_config(
@@ -672,6 +675,7 @@ mod tests {
             EtcdCoordinatorConfig::localhost(),
             "postgresql://scanner@localhost/done_ledger",
             "postgresql://scanner@localhost/findings",
+            Some("postgresql://scanner@localhost/git_kv".to_owned()),
         )
         .expect("test production backend config should be valid");
         let cfg = DistributedWorkerConfig::new(
