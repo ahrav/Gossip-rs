@@ -197,6 +197,14 @@ pub enum ProductionBootstrapError {
     /// Development auto-migration of the Git key-value schema failed.
     #[error("git-kv PostgreSQL auto-migrate failed: {0}")]
     GitKvAutoMigrate(#[source] GitPersistencePgMigrationError),
+    /// Unexpected non-Postgres error during git-kv backend initialization.
+    ///
+    /// `GitPersistencePg::from_client` currently only returns `Postgres`
+    /// variants (statement preparation). This variant exists as a defensive
+    /// fallback so the worker surfaces a typed startup error instead of
+    /// panicking if `from_client` gains new error paths in the future.
+    #[error("git-kv PostgreSQL backend initialization failed unexpectedly: {0}")]
+    GitKvInitUnexpected(String),
     /// A connection thread panicked instead of returning a result.
     #[error("{backend} connection thread panicked unexpectedly")]
     ThreadPanicked { backend: &'static str },
@@ -234,6 +242,9 @@ impl fmt::Debug for ProductionBootstrapError {
             }
             Self::FindingsAutoMigrate(e) => f.debug_tuple("FindingsAutoMigrate").field(e).finish(),
             Self::GitKvAutoMigrate(e) => f.debug_tuple("GitKvAutoMigrate").field(e).finish(),
+            Self::GitKvInitUnexpected(e) => {
+                f.debug_tuple("GitKvInitUnexpected").field(e).finish()
+            }
             Self::ThreadPanicked { backend } => f
                 .debug_struct("ThreadPanicked")
                 .field("backend", backend)
@@ -502,12 +513,14 @@ pub fn build_production_backends_from_clients(
             GitPersistencePgError::Postgres(err) => ProductionBootstrapError::GitKvSchemaReadiness(
                 ProductionSchemaReadinessError::Query(err),
             ),
+            // from_client currently only returns Postgres variants (statement
+            // preparation). These arms are defensive against future changes to
+            // the git-kv crate — surfacing a typed startup error instead of
+            // panicking the worker process.
             GitPersistencePgError::Migration(_)
             | GitPersistencePgError::MutexPoisoned
             | GitPersistencePgError::PayloadTooLarge { .. } => {
-                unreachable!(
-                    "GitPersistencePg::from_client only prepares statements on a connected client"
-                )
+                ProductionBootstrapError::GitKvInitUnexpected(format!("{error}"))
             }
         })?),
         None => None,

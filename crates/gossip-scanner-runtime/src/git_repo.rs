@@ -224,8 +224,10 @@ impl GitRepoRuntime {
             }
         };
         let finalize_outcome = execution.result.0.finalize.outcome;
-        let deferred_finalize = deferred_finalize_store.into_pending_complete();
-        let report = git_report_to_scan_report(execution.result, execution.scan_elapsed);
+        let was_deferred = deferred_finalize_store.was_complete_deferred();
+        let (report, finalize) =
+            git_report_to_scan_report(execution.result, execution.scan_elapsed);
+        let deferred_finalize = if was_deferred { Some(finalize) } else { None };
         let resume_checkpoint = checkpoint_sink.latest_checkpoint_cursor();
         drop(checkpoint_sink);
 
@@ -470,10 +472,9 @@ pub(crate) fn scan_local_repo(
         };
 
         let debug_output = format_git_debug_output(&execution.result.0, config.debug_level);
-        Ok((
-            git_report_to_scan_report(execution.result, execution.scan_elapsed),
-            debug_output,
-        ))
+        let (report, _finalize) =
+            git_report_to_scan_report(execution.result, execution.scan_elapsed);
+        Ok((report, debug_output))
     })?;
 
     Ok(AssignmentOutcome {
@@ -709,28 +710,32 @@ pub(crate) fn resolve_scan_ns(
 fn git_report_to_scan_report(
     result: GitScanResult,
     scan_elapsed: std::time::Duration,
-) -> ScanReport {
+) -> (ScanReport, FinalizeOutput) {
     let report = result.0;
+    let finalize = report.finalize;
     let metrics = report.common_metrics;
     let scan_ns = resolve_scan_ns(&report.stage_nanos, scan_elapsed);
 
-    ScanReport {
-        items_scanned: metrics.objects_scanned,
-        items_deferred: 0,
-        bytes_scanned: metrics.bytes_scanned,
-        chunks_scanned: metrics.chunks_scanned,
-        findings_emitted: metrics.findings_emitted,
-        errors: metrics.errors,
-        binary_skipped: metrics.binary_skipped,
-        ext_skipped: metrics.ext_skipped,
-        lock_skipped: metrics.lock_skipped,
-        binary_extracted: metrics.binary_extracted,
-        dropped_findings: 0,
-        persist_emit_failures: 0,
-        persist_incomplete: false,
-        scan_ns,
-        persist_ns: 0,
-    }
+    (
+        ScanReport {
+            items_scanned: metrics.objects_scanned,
+            items_deferred: 0,
+            bytes_scanned: metrics.bytes_scanned,
+            chunks_scanned: metrics.chunks_scanned,
+            findings_emitted: metrics.findings_emitted,
+            errors: metrics.errors,
+            binary_skipped: metrics.binary_skipped,
+            ext_skipped: metrics.ext_skipped,
+            lock_skipped: metrics.lock_skipped,
+            binary_extracted: metrics.binary_extracted,
+            dropped_findings: 0,
+            persist_emit_failures: 0,
+            persist_incomplete: false,
+            scan_ns,
+            persist_ns: 0,
+        },
+        finalize,
+    )
 }
 
 /// Render human-readable debug diagnostics from the Git scan report.

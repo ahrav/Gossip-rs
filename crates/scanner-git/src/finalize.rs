@@ -153,7 +153,7 @@ pub enum FinalizeOutcome {
 ///
 /// Data ops are always safe to write. Watermark ops are only produced when
 /// the run is `Complete`.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 #[must_use]
 pub struct FinalizeOutput {
     /// Seen-bitmap delta + blob context + findings.

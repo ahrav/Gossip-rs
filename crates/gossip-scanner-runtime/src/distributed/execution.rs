@@ -966,6 +966,12 @@ where
         receipts: GIT_REPO_RECEIPT_FAMILIES,
     });
 
+    // At-least-once guarantee: findings and done-ledger records are already
+    // durable at this point. If commit_finalize fails (connection drop,
+    // constraint violation) or the process is killed before it completes,
+    // watermarks remain at their pre-scan position. The next lease re-scans
+    // the same blobs and re-emits findings. Done-ledger and findings
+    // consumers must tolerate duplicate submissions.
     if let Some(finalize) = execution.deferred_finalize.as_ref() {
         execution
             .persistence
