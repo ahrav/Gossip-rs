@@ -6,6 +6,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use gossip_stdx::git_test_support::run_git;
 use scanner_git::{
     acquire_midx, repo_open, ArtifactBuildLimits, ObjectStore, OidBytes, RefWatermarkStore,
     RepoOpenError, RepoOpenLimits, StartSetConfig, StartSetId, StartSetResolver, TreeDiffLimits,
@@ -13,8 +14,6 @@ use scanner_git::{
 use sha1::{Digest, Sha1};
 use std::fs;
 use std::io::Write;
-use std::path::Path;
-use std::process::Command;
 use tempfile::TempDir;
 
 struct EmptyResolver;
@@ -40,22 +39,6 @@ impl RefWatermarkStore for EmptyWatermarkStore {
     ) -> Result<Vec<Option<scanner_git::RefWatermark>>, RepoOpenError> {
         Ok(vec![None; ref_names.len()])
     }
-}
-
-fn run_git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .expect("run git command");
-    assert!(
-        output.status.success(),
-        "git {:?} failed:\nstdout:{}\nstderr:{}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 fn encode_varint(mut value: usize, out: &mut Vec<u8>) {

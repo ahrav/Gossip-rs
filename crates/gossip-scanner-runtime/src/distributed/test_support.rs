@@ -80,7 +80,7 @@ use crate::{
     git_persistence::{GitPersistenceBackend, GitPersistenceOp},
     join_scoped,
     ordered_content::OrderedContentSkipReason,
-    test_fixtures::{init_git_repo, run_git_in},
+    test_fixtures::{init_git_repo, run_git},
 };
 
 // ============================================================================
@@ -459,9 +459,9 @@ pub(super) fn create_git_repo_fixture_with_secret_history(
         let filename = format!("secret-{commit}.txt");
         let contents = format!("{}\ncommit-{commit}\n", secret_fixture());
         fs::write(dir.path().join(&filename), contents).expect("write fixture");
-        run_git_in(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["add", "."]);
         let message = format!("fixture-{commit}");
-        run_git_in(dir.path(), &["commit", "-q", "-m", message.as_str()]);
+        run_git(dir.path(), &["commit", "-q", "-m", message.as_str()]);
     }
 
     dir
@@ -476,8 +476,8 @@ pub(super) fn create_clean_git_repo_fixture() -> tempfile::TempDir {
         "Distributed Runtime Tests",
     );
     fs::write(dir.path().join("readme.txt"), "hello world\n").expect("write fixture");
-    run_git_in(dir.path(), &["add", "."]);
-    run_git_in(dir.path(), &["commit", "-q", "-m", "fixture"]);
+    run_git(dir.path(), &["add", "."]);
+    run_git(dir.path(), &["commit", "-q", "-m", "fixture"]);
     dir
 }
 
@@ -898,8 +898,8 @@ pub(super) fn create_git_repo_fixture_with_corrupt_blob() -> tempfile::TempDir {
         "Distributed Runtime Tests",
     );
     fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
-    run_git_in(dir.path(), &["add", "."]);
-    run_git_in(dir.path(), &["commit", "-q", "-m", "fixture"]);
+    run_git(dir.path(), &["add", "."]);
+    run_git(dir.path(), &["commit", "-q", "-m", "fixture"]);
 
     // Locate and corrupt the blob loose object. Walk .git/objects
     // fan-out directories looking for loose files, then use `git

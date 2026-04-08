@@ -561,7 +561,7 @@ fn classify_io_git_run_error(op: &str, path: &Path, err: &io::Error) -> GitRunEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{init_git_repo, run_git_in};
+    use crate::test_fixtures::{init_git_repo, run_git};
 
     use tempfile::tempdir;
 
@@ -642,12 +642,12 @@ mod tests {
         // Create a commit so `git gc` has objects to pack.
         let sentinel = repo_dir.path().join("sentinel.txt");
         fs::write(&sentinel, b"data").expect("write sentinel");
-        run_git_in(repo_dir.path(), &["add", "sentinel.txt"]);
-        run_git_in(
+        run_git(repo_dir.path(), &["add", "sentinel.txt"]);
+        run_git(
             repo_dir.path(),
             &["-c", "gc.auto=0", "commit", "-m", "seed"],
         );
-        run_git_in(repo_dir.path(), &["-c", "gc.auto=0", "repack", "-a", "-d"]);
+        run_git(repo_dir.path(), &["-c", "gc.auto=0", "repack", "-a", "-d"]);
 
         // Remove the commit-graph (if created) so preflight reports
         // `missing_commit_graph = true`.

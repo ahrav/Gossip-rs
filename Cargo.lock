@@ -1518,6 +1518,7 @@ dependencies = [
  "gossip-contracts",
  "gossip-coordination",
  "gossip-frontier",
+ "gossip-stdx",
  "scanner-git",
  "tempfile",
  "thiserror",
@@ -1584,6 +1585,7 @@ dependencies = [
  "crossbeam-utils",
  "loom",
  "proptest",
+ "tempfile",
 ]
 
 [[package]]

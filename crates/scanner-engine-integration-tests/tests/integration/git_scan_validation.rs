@@ -12,6 +12,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
+use crate::git_test_support::{git_available, git_stdout, init_git_repo, oid_from_hex, run_git};
 use regex::bytes::Regex;
 use tempfile::TempDir;
 
@@ -34,63 +35,10 @@ pub(crate) fn perf_stats_enabled() -> bool {
     cfg!(all(feature = "perf-stats", debug_assertions))
 }
 
-/// Returns true when the `git` CLI is available on the host.
-pub(crate) fn git_available() -> bool {
-    Command::new("git").arg("--version").output().is_ok()
-}
-
-/// Runs a git command inside `repo` and asserts success.
-fn run_git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .status()
-        .expect("failed to run git");
-    assert!(status.success(), "git command failed: {args:?}");
-}
-
-/// Runs a git command and returns UTF-8 stdout, asserting success.
-pub(crate) fn git_output(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .expect("failed to run git");
-    assert!(out.status.success(), "git command failed: {args:?}");
-    String::from_utf8(out.stdout).expect("git output not utf8")
-}
-
-/// Decode a hex string into bytes (expects even length and valid hex digits).
-fn decode_hex(hex: &str) -> Vec<u8> {
-    assert!(
-        hex.len().is_multiple_of(2),
-        "decode_hex: odd-length input ({len} bytes): {hex:?}",
-        len = hex.len()
-    );
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let bytes = hex.as_bytes();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16).unwrap();
-        let lo = (bytes[i + 1] as char).to_digit(16).unwrap();
-        out.push(((hi << 4) | lo) as u8);
-        i += 2;
-    }
-    out
-}
-
-/// Parse a Git object ID from hex output.
-pub(crate) fn oid_from_hex(hex: &str) -> OidBytes {
-    let bytes = decode_hex(hex.trim());
-    OidBytes::from_slice(&bytes)
-}
-
 /// Initialize a new repo with a deterministic user identity.
-pub(crate) fn init_repo() -> TempDir {
+pub(crate) fn create_repo() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-b", "main"]);
-    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
-    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+    init_git_repo(tmp.path(), "test@example.com", "Test User");
     tmp
 }
 
@@ -248,7 +196,7 @@ fn run_scan_with_config(
     config: GitScanConfig,
 ) -> Result<GitScanResult, GitScanError> {
     let engine = test_engine();
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark };
     #[cfg(feature = "rocksdb")]
@@ -353,14 +301,14 @@ fn loose_only_candidate_scans_complete() {
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     commit_file(tmp.path(), "base.txt", "base\n", "base");
     ensure_artifacts(tmp.path());
     // Commit after artifacts so the new blob remains loose.
     commit_file(tmp.path(), "secret.txt", "TOK_ABCDEFGH\n", "secret");
     repack_all(tmp.path());
 
-    let watermark = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD~1"]));
+    let watermark = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD~1"]));
     // Root commit in a 2-commit chain has generation 1.
     let result = run_scan(
         tmp.path(),
@@ -387,7 +335,7 @@ fn odb_blob_parallel_intro_handles_empty_midx_without_panic() {
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     // Keep all objects loose (no gc/repack), with >1 commits so parallel intro
     // is selected when blob_intro_workers > 1.
     commit_file(tmp.path(), "a.txt", "TOK_ABCDEFGH\n", "c1");
@@ -424,7 +372,7 @@ fn odb_blob_parallel_intro_handles_low_delta_cache_budget() {
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     // Keep all objects loose (no gc/repack), with >1 commits so parallel intro
     // is selected when blob_intro_workers > 1.
     commit_file(tmp.path(), "a.txt", "TOK_ABCDEFGH\n", "c1");
@@ -448,7 +396,7 @@ fn odb_blob_respects_packed_candidate_cap() {
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     commit_file(tmp.path(), "a.txt", "TOK_ABCDEFGH", "c1");
     commit_file(tmp.path(), "b.txt", "TOK_IJKLMNOP", "c2");
     ensure_artifacts(tmp.path());
@@ -480,7 +428,7 @@ fn packed_and_loose_candidates_scan_complete() {
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     commit_file(tmp.path(), "base.txt", "TOK_BASE1234\n", "base");
     ensure_artifacts(tmp.path());
     // Base blob is packed; secret blob remains loose.
@@ -506,7 +454,7 @@ fn diff_history_pack_exec_workers_preserve_deterministic_output() {
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     let payloads = [
         "TOK_ABCDEFGH\n",
         "TOK_IJKLMNOP\n",
@@ -552,7 +500,7 @@ fn odb_blob_parallel_intro_keeps_persistence_contract_without_blob_ctx_determini
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     commit_file(tmp.path(), "base.txt", "base\n", "base");
 
     // Emit the same blob across many commit/path contexts to exercise
@@ -604,7 +552,7 @@ fn shallow_clone_boundary_treats_missing_parent_as_external_root() {
         return;
     }
 
-    let source = init_repo();
+    let source = create_repo();
     commit_file(source.path(), "base.txt", "base\n", "c1");
     commit_file(source.path(), "base.txt", "TOK_ABCDEFGH\n", "c2");
 
@@ -623,14 +571,14 @@ fn shallow_clone_boundary_treats_missing_parent_as_external_root() {
     assert!(clone_status.success(), "git clone --depth 1 must succeed");
 
     assert_eq!(
-        git_output(&shallow_repo, &["rev-parse", "--is-shallow-repository"]).trim(),
+        git_stdout(&shallow_repo, &["rev-parse", "--is-shallow-repository"]),
         "true",
         "fixture must be a shallow clone"
     );
 
     // `git show --pretty=%P` respects shallow grafts and hides boundary parents.
     // Parse raw commit headers to capture the parent OID that is truly missing.
-    let head_raw = git_output(&shallow_repo, &["cat-file", "-p", "HEAD"]);
+    let head_raw = git_stdout(&shallow_repo, &["cat-file", "-p", "HEAD"]);
     let missing_parent_hex = head_raw
         .lines()
         .find_map(|line| line.strip_prefix("parent "))
@@ -661,7 +609,7 @@ fn shallow_clone_fails_fast_when_shallow_root_limit_is_exceeded() {
         return;
     }
 
-    let source = init_repo();
+    let source = create_repo();
     commit_file(source.path(), "base.txt", "base\n", "c1");
     commit_file(source.path(), "base.txt", "TOK_ABCDEFGH\n", "c2");
 
@@ -703,7 +651,7 @@ fn run_scan_with_events(
     config: GitScanConfig,
 ) -> (GitScanResult, Vec<String>) {
     let engine = test_engine();
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark };
     #[cfg(feature = "rocksdb")]
@@ -744,7 +692,7 @@ fn failed_finalize_retry_still_scans_blob() {
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     let repo = tmp.path();
     commit_file(
         repo,
@@ -754,7 +702,7 @@ fn failed_finalize_retry_still_scans_blob() {
     );
     ensure_artifacts(repo);
 
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark: None };
     let store = RetryStore {
@@ -837,7 +785,7 @@ fn aborted_scan_skips_finalize_persistence() {
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     let repo = tmp.path();
     commit_file(
         repo,
@@ -847,7 +795,7 @@ fn aborted_scan_skips_finalize_persistence() {
     );
     ensure_artifacts(repo);
 
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark: None };
     let persist_store = InMemoryPersistenceStore::default();
@@ -887,7 +835,7 @@ fn commit_meta_output_matches_findings() {
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     let repo = tmp.path();
 
     // Commit a file with a detectable secret.
@@ -980,7 +928,7 @@ fn parallel_blob_intro_aborts_on_delayed_flag() {
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     let repo = tmp.path();
 
     // Create enough commits to keep the parallel blob introduction busy
@@ -993,7 +941,7 @@ fn parallel_blob_intro_aborts_on_delayed_flag() {
     }
     ensure_artifacts(repo);
 
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark: None };
     let persist_store = InMemoryPersistenceStore::default();
@@ -1067,7 +1015,7 @@ fn mid_scan_abort_stops_execution_and_skips_finalize() {
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     let repo = tmp.path();
 
     // Create enough commits to keep the scan busy long enough for the
@@ -1082,7 +1030,7 @@ fn mid_scan_abort_stops_execution_and_skips_finalize() {
     }
     ensure_artifacts(repo);
 
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark: None };
     let persist_store = InMemoryPersistenceStore::default();
@@ -1142,7 +1090,7 @@ fn stage_boundary_abort_in_diff_history_mode() {
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     let repo = tmp.path();
 
     // Create enough commits for meaningful work in diff-history mode.
@@ -1156,7 +1104,7 @@ fn stage_boundary_abort_in_diff_history_mode() {
     }
     ensure_artifacts(repo);
 
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark: None };
     let persist_store = InMemoryPersistenceStore::default();

@@ -17,6 +17,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
+use crate::git_test_support::{git_available, git_stdout, init_git_repo, oid_from_hex, run_git};
 use scanner_git::{
     ArtifactBuildLimits, BlobIntroducer, CandidateBuffer, CandidateSink, ChangeKind,
     CollectedUniqueBlob, CollectingUniqueBlobSink, CommitGraph, CommitGraphIndex, CommitWalkLimits,
@@ -30,11 +31,6 @@ use tempfile::TempDir;
 
 static NEVER_ABORT: AtomicBool = AtomicBool::new(false);
 
-/// Returns true when the `git` CLI is available on the host.
-fn git_available() -> bool {
-    Command::new("git").arg("--version").output().is_ok()
-}
-
 /// Returns true when this git build supports the MIDX command.
 fn git_supports_midx() -> bool {
     // Some Git builds omit the multi-pack-index command; probing `--help`
@@ -44,47 +40,6 @@ fn git_supports_midx() -> bool {
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
-}
-
-/// Runs a git command inside `repo` and asserts success.
-fn run_git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .status()
-        .expect("failed to run git");
-    assert!(status.success(), "git command failed: {args:?}");
-}
-
-/// Runs a git command and returns UTF-8 stdout, asserting success.
-fn git_output(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .expect("failed to run git");
-    assert!(out.status.success(), "git command failed: {args:?}");
-    String::from_utf8(out.stdout).expect("git output not utf8")
-}
-
-/// Decode a hex string into bytes (expects even length and valid hex digits).
-fn decode_hex(hex: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let bytes = hex.as_bytes();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16).unwrap();
-        let lo = (bytes[i + 1] as char).to_digit(16).unwrap();
-        out.push(((hi << 4) | lo) as u8);
-        i += 2;
-    }
-    out
-}
-
-/// Parse a Git object ID from hex output.
-fn oid_from_hex(hex: &str) -> OidBytes {
-    let bytes = decode_hex(hex.trim());
-    OidBytes::from_slice(&bytes)
 }
 
 /// Start set resolver that returns fixed refs.
@@ -121,9 +76,7 @@ impl RefWatermarkStore for EmptyWatermarkStore {
 /// The second commit modifies, adds, and deletes paths to exercise tree diff.
 fn prepare_repo_with_commits() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-b", "main"]);
-    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
-    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+    init_git_repo(tmp.path(), "test@example.com", "Test User");
 
     fs::write(tmp.path().join("a.txt"), "one\n").unwrap();
     fs::create_dir_all(tmp.path().join("dir")).unwrap();
@@ -147,9 +100,7 @@ fn prepare_repo_with_commits() -> TempDir {
 /// Create a repo with many files to force large tree payloads.
 fn prepare_repo_with_many_files(count: usize) -> TempDir {
     let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-b", "main"]);
-    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
-    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+    init_git_repo(tmp.path(), "test@example.com", "Test User");
 
     for idx in 0..count {
         let path = tmp.path().join(format!("file_{idx:04}.txt"));
@@ -173,9 +124,7 @@ fn prepare_repo_with_many_files(count: usize) -> TempDir {
 /// Create a repo with a two-parent merge commit for merge diff tests.
 fn prepare_repo_with_merge() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-b", "main"]);
-    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
-    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+    init_git_repo(tmp.path(), "test@example.com", "Test User");
 
     fs::write(tmp.path().join("a.txt"), "base\n").unwrap();
     run_git(tmp.path(), &["add", "."]);
@@ -205,9 +154,7 @@ fn prepare_repo_with_merge() -> TempDir {
 /// Create a repo where a blob appears under an excluded path first, then a non-excluded path.
 fn prepare_repo_with_excluded_blob_paths() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-b", "main"]);
-    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
-    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+    init_git_repo(tmp.path(), "test@example.com", "Test User");
 
     let content = b"secret payload\n";
     fs::write(tmp.path().join("image.png"), content).unwrap();
@@ -230,9 +177,7 @@ fn prepare_repo_with_excluded_blob_paths() -> TempDir {
 /// so the in-memory artifact builders can find every commit.
 fn prepare_repo_with_duplicate_blobs() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-b", "main"]);
-    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
-    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+    init_git_repo(tmp.path(), "test@example.com", "Test User");
 
     fs::write(tmp.path().join("packed.txt"), "packed\n").unwrap();
     run_git(tmp.path(), &["add", "."]);
@@ -256,7 +201,7 @@ fn prepare_repo_with_duplicate_blobs() -> TempDir {
 ///
 /// Returns the mutable state with MIDX populated.
 fn open_repo_state(repo: &Path) -> RepoJobState {
-    let head = git_output(repo, &["rev-parse", "HEAD"]);
+    let head = git_stdout(repo, &["rev-parse", "HEAD"]);
     let head_oid = oid_from_hex(&head);
 
     let resolver = TestResolver {
@@ -344,11 +289,11 @@ fn tree_diff_matches_git_diff_tree() {
     let mut walker = TreeDiffWalker::new(&limits, state.object_format.oid_len());
     let mut candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
 
-    let new_tree = oid_from_hex(&git_output(
+    let new_tree = oid_from_hex(&git_stdout(
         tmp.path(),
         &["show", "-s", "--format=%T", "HEAD"],
     ));
-    let old_tree = oid_from_hex(&git_output(
+    let old_tree = oid_from_hex(&git_stdout(
         tmp.path(),
         &["show", "-s", "--format=%T", "HEAD~1"],
     ));
@@ -365,7 +310,7 @@ fn tree_diff_matches_git_diff_tree() {
         )
         .unwrap();
 
-    let diff = git_output(
+    let diff = git_stdout(
         tmp.path(),
         &[
             "diff-tree",
@@ -596,7 +541,7 @@ fn blob_introducer_dedupes_duplicate_oids() {
         )
         .unwrap();
 
-    let loose_oid = oid_from_hex(&git_output(tmp.path(), &["hash-object", "loose.txt"]));
+    let loose_oid = oid_from_hex(&git_stdout(tmp.path(), &["hash-object", "loose.txt"]));
     let mut paths = Vec::new();
     for cand in intro_candidates.iter_resolved() {
         if cand.oid == loose_oid {
@@ -628,11 +573,11 @@ fn tree_diff_spill_path_uses_spill_arena() {
     let spill = tempfile::tempdir().unwrap();
     let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
 
-    let new_tree = oid_from_hex(&git_output(
+    let new_tree = oid_from_hex(&git_stdout(
         tmp.path(),
         &["show", "-s", "--format=%T", "HEAD"],
     ));
-    let old_tree = oid_from_hex(&git_output(
+    let old_tree = oid_from_hex(&git_stdout(
         tmp.path(),
         &["show", "-s", "--format=%T", "HEAD~1"],
     ));
@@ -668,11 +613,11 @@ fn tree_diff_streaming_matches_buffered() {
     let tmp = prepare_repo_with_many_files(128);
     let state = open_repo_state(tmp.path());
 
-    let new_tree = oid_from_hex(&git_output(
+    let new_tree = oid_from_hex(&git_stdout(
         tmp.path(),
         &["show", "-s", "--format=%T", "HEAD"],
     ));
-    let old_tree = oid_from_hex(&git_output(
+    let old_tree = oid_from_hex(&git_stdout(
         tmp.path(),
         &["show", "-s", "--format=%T", "HEAD~1"],
     ));
@@ -750,9 +695,9 @@ fn merge_diff_modes_emit_expected_candidates() {
     let tmp = prepare_repo_with_merge();
     let state = open_repo_state(tmp.path());
 
-    let merge_tree = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD^{tree}"]));
-    let parent1_tree = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD^1^{tree}"]));
-    let parent2_tree = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD^2^{tree}"]));
+    let merge_tree = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD^{tree}"]));
+    let parent1_tree = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD^1^{tree}"]));
+    let parent2_tree = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD^2^{tree}"]));
 
     let limits = TreeDiffLimits::RESTRICTIVE;
     let spill = tempfile::tempdir().unwrap();

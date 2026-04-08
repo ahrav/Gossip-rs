@@ -15,8 +15,8 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
+use crate::git_test_support::{git_available, git_stdout, init_git_repo, oid_from_hex, run_git};
 use scanner_git::{
     ArtifactAcquireError, ArtifactBuildLimits, CommitGraph, CommitGraphMem, CommitLoadLimits,
     CommitPlanIter, CommitWalkLimits, GitRepoPaths, LoadedCommit, MidxBuildLimits, MidxView,
@@ -26,51 +26,6 @@ use scanner_git::{
     resolve_pack_paths_from_midx,
 };
 use tempfile::TempDir;
-
-// ============================================================================
-// Test helpers
-// ============================================================================
-
-fn git_available() -> bool {
-    Command::new("git").arg("--version").output().is_ok()
-}
-
-fn run_git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .status()
-        .expect("failed to run git");
-    assert!(status.success(), "git command failed: {args:?}");
-}
-
-fn git_output(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .expect("failed to run git");
-    assert!(out.status.success(), "git command failed: {args:?}");
-    String::from_utf8(out.stdout).expect("git output not utf8")
-}
-
-fn decode_hex(hex: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let bytes = hex.as_bytes();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16).unwrap();
-        let lo = (bytes[i + 1] as char).to_digit(16).unwrap();
-        out.push(((hi << 4) | lo) as u8);
-        i += 2;
-    }
-    out
-}
-
-fn oid_from_hex(hex: &str) -> OidBytes {
-    let bytes = decode_hex(hex.trim());
-    OidBytes::from_slice(&bytes)
-}
 
 fn load_commits_for_repo(
     paths: &GitRepoPaths,
@@ -97,19 +52,19 @@ fn load_commits_for_repo(
 
 /// Get all commit OIDs reachable from HEAD using `git rev-list`.
 fn rev_list_all(repo: &Path) -> Vec<OidBytes> {
-    let out = git_output(repo, &["rev-list", "--all"]);
+    let out = git_stdout(repo, &["rev-list", "--all"]);
     out.lines().map(oid_from_hex).collect()
 }
 
 /// Get the tree OID for a commit using `git rev-parse`.
 fn tree_oid_for_commit(repo: &Path, commit_hex: &str) -> OidBytes {
-    let out = git_output(repo, &["rev-parse", &format!("{commit_hex}^{{tree}}")]);
+    let out = git_stdout(repo, &["rev-parse", &format!("{commit_hex}^{{tree}}")]);
     oid_from_hex(&out)
 }
 
 /// Get parent commit OIDs for a commit.
 fn parent_oids(repo: &Path, commit_hex: &str) -> Vec<OidBytes> {
-    let out = git_output(repo, &["rev-parse", &format!("{commit_hex}^@")]);
+    let out = git_stdout(repo, &["rev-parse", &format!("{commit_hex}^@")]);
     if out.trim().is_empty() {
         vec![]
     } else {
@@ -120,9 +75,7 @@ fn parent_oids(repo: &Path, commit_hex: &str) -> Vec<OidBytes> {
 /// Creates a test repository with a linear history of commits containing blobs.
 fn create_repo_with_linear_history(num_commits: usize) -> TempDir {
     let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-b", "main"]);
-    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
-    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+    init_git_repo(tmp.path(), "test@example.com", "Test User");
 
     for i in 0..num_commits {
         let filename = format!("file{i}.txt");
@@ -144,9 +97,7 @@ fn create_repo_with_linear_history(num_commits: usize) -> TempDir {
 /// Creates a test repository with branches and a merge commit.
 fn create_repo_with_merge() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-b", "main"]);
-    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
-    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+    init_git_repo(tmp.path(), "test@example.com", "Test User");
 
     // Initial commit
     fs::write(tmp.path().join("base.txt"), "base content\n").unwrap();
@@ -221,7 +172,7 @@ fn midx_build_all_oids_findable() {
     let pack_dir = objects_dir.join("pack");
 
     // Get all objects from git
-    let all_objects_output = git_output(tmp.path(), &["rev-list", "--all", "--objects"]);
+    let all_objects_output = git_stdout(tmp.path(), &["rev-list", "--all", "--objects"]);
     let all_oids: Vec<OidBytes> = all_objects_output
         .lines()
         .filter_map(|line| {
@@ -415,7 +366,7 @@ fn commit_graph_mem_parent_relationships_match_git() {
 
     // Get HEAD (merge commit on main) as the tip - this is the most recent commit
     // that can reach all other commits via parent links
-    let head_hex = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    let head_hex = git_stdout(tmp.path(), &["rev-parse", "HEAD"]);
     let tip_oid = oid_from_hex(&head_hex);
 
     let pack_dirs = collect_pack_dirs(&paths);
@@ -492,7 +443,7 @@ fn inmem_artifacts_produce_correct_commit_plan() {
 
     let tmp = create_repo_with_linear_history(5);
 
-    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    let head = git_stdout(tmp.path(), &["rev-parse", "HEAD"]);
     let tip_oid = oid_from_hex(&head);
 
     let resolver = TestResolver {
@@ -602,9 +553,9 @@ fn acquire_commit_graph_loads_loose_tip_chain_not_in_midx() {
     run_git(tmp.path(), &["commit", "--allow-empty", "-m", "loose-1"]);
     run_git(tmp.path(), &["commit", "--allow-empty", "-m", "loose-2"]);
 
-    let loose_head = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
-    let loose_parent = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD~1"]));
-    let packed_base = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD~2"]));
+    let loose_head = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD"]));
+    let loose_parent = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD~1"]));
+    let packed_base = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD~2"]));
 
     let resolver = TestResolver {
         refs: vec![(b"refs/heads/main".to_vec(), loose_head)],
@@ -659,9 +610,9 @@ fn acquire_commit_graph_loads_packed_parent_with_loose_head() {
     }
 
     let tmp = create_repo_with_linear_history(2);
-    let packed_parent = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
+    let packed_parent = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD"]));
     run_git(tmp.path(), &["commit", "--allow-empty", "-m", "loose-head"]);
-    let loose_head = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
+    let loose_head = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD"]));
 
     let resolver = TestResolver {
         refs: vec![(b"refs/heads/main".to_vec(), loose_head)],
@@ -708,7 +659,7 @@ fn inmem_midx_produces_correct_offsets() {
     let tmp = create_repo_with_linear_history(3);
 
     // Get all objects from git
-    let all_objects_output = git_output(tmp.path(), &["rev-list", "--all", "--objects"]);
+    let all_objects_output = git_stdout(tmp.path(), &["rev-list", "--all", "--objects"]);
     let all_oids: Vec<OidBytes> = all_objects_output
         .lines()
         .filter_map(|line| {
@@ -772,7 +723,7 @@ fn commit_loader_loads_all_reachable_commits() {
     let pack_dirs = collect_pack_dirs(&paths);
     let pack_paths = resolve_pack_paths_from_midx(&midx, &pack_dirs).unwrap();
 
-    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    let head = git_stdout(tmp.path(), &["rev-parse", "HEAD"]);
     let tip_oid = oid_from_hex(&head);
 
     let commits = load_commits_for_repo(&paths, &midx, &pack_paths, &[tip_oid], ObjectFormat::Sha1);
@@ -803,7 +754,7 @@ fn commit_loader_tree_oids_match_git() {
     let pack_dirs = collect_pack_dirs(&paths);
     let pack_paths = resolve_pack_paths_from_midx(&midx, &pack_dirs).unwrap();
 
-    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    let head = git_stdout(tmp.path(), &["rev-parse", "HEAD"]);
     let tip_oid = oid_from_hex(&head);
 
     let commits = load_commits_for_repo(&paths, &midx, &pack_paths, &[tip_oid], ObjectFormat::Sha1);

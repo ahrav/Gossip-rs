@@ -3,9 +3,6 @@
 //! This module centralizes reusable test data builders and git repository
 //! setup helpers so runtime test modules share one command/assertion path.
 
-use std::path::Path;
-use std::process::Command;
-
 #[cfg(test)]
 use gossip_contracts::{
     connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
@@ -23,6 +20,8 @@ use crate::{
     commit_model::CompletedUnit,
     result_translation::{ItemResult, PersistenceTranslation, ScanTiming, translate_item_result},
 };
+
+pub use gossip_stdx::git_test_support::{git_stdout, init_git_repo, run_git};
 
 #[cfg(test)]
 pub(crate) fn test_rule_fingerprint(rule_id: u32) -> RuleFingerprint {
@@ -49,63 +48,6 @@ pub(crate) fn write_context_with_epoch(fence_epoch_raw: u64) -> WriteContext {
         ShardId::from_raw(44),
         FenceEpoch::from_raw(fence_epoch_raw),
     )
-}
-
-/// Run `git` inside `dir`, assert the command succeeds, and return the raw
-/// process output. Both [`run_git_in`] and [`run_git_in_stdout`] delegate here.
-fn assert_git_output(dir: &Path, args: &[&str]) -> std::process::Output {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to spawn git -C {} {}: {e}",
-                dir.display(),
-                args.join(" "),
-            )
-        });
-    assert!(
-        output.status.success(),
-        "git command failed: git -C {} {}\nstdout:{}\nstderr:{}",
-        dir.display(),
-        args.join(" "),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    output
-}
-
-/// Run `git` inside `dir` and assert the command succeeds.
-pub fn run_git_in(dir: &Path, args: &[&str]) {
-    assert_git_output(dir, args);
-}
-
-/// Run `git` inside `dir`, assert success, and return trimmed stdout.
-pub fn run_git_in_stdout(dir: &Path, args: &[&str]) -> String {
-    let output = assert_git_output(dir, args);
-    String::from_utf8(output.stdout)
-        .unwrap_or_else(|e| {
-            panic!(
-                "git -C {} {} produced non-UTF-8 stdout: {e}",
-                dir.display(),
-                args.join(" "),
-            )
-        })
-        .trim()
-        .to_owned()
-}
-
-/// Initialize a git repository with the configured author identity.
-///
-/// The `-b main` flag ensures the initial branch is always `main` regardless
-/// of the host's `init.defaultBranch` setting, making callers portable across
-/// git configurations.
-pub fn init_git_repo(dir: &Path, email: &str, name: &str) {
-    run_git_in(dir, &["init", "-q", "-b", "main"]);
-    run_git_in(dir, &["config", "user.email", email]);
-    run_git_in(dir, &["config", "user.name", name]);
 }
 
 #[cfg(test)]

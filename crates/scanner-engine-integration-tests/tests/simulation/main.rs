@@ -15,6 +15,10 @@
 //!   cargo test -p scanner-engine-integration-tests --features scheduler-sim,sim-harness,rocksdb --test simulation
 //!                                                     # both
 
+#[cfg(feature = "sim-harness")]
+#[path = "../support/git_test_support.rs"]
+mod git_test_support;
+
 #[allow(unused_imports)]
 mod scanner_rs {
     pub use scanner_engine::*;

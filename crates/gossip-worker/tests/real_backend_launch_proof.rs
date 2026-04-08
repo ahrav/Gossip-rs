@@ -50,7 +50,7 @@ use gossip_orchestrator::{
     plan_filesystem_initial_shards, plan_git_initial_shards, setup_filesystem_run, setup_git_run,
 };
 use gossip_pg_common::test_support::create_test_db;
-use gossip_scanner_runtime::test_fixtures::{init_git_repo, run_git_in, run_git_in_stdout};
+use gossip_scanner_runtime::test_fixtures::{git_stdout, init_git_repo, run_git};
 use gossip_stdx::hex_encode;
 use gossip_worker::config::{
     ENV_COMMIT_QUEUE_CAPACITY, ENV_DONE_LEDGER_POSTGRES_DSN, ENV_ETCD_ENDPOINTS,
@@ -260,11 +260,11 @@ fn create_committed_git_repo(
         format!("fixture repo {index} adds one clean file\n"),
     )
     .expect("git readme fixture should write");
-    run_git_in(&repo_path, &["add", "."]);
+    run_git(&repo_path, &["add", "."]);
     let commit_message = format!("fixture-{index}");
-    run_git_in(&repo_path, &["commit", "-q", "-m", commit_message.as_str()]);
+    run_git(&repo_path, &["commit", "-q", "-m", commit_message.as_str()]);
 
-    let head_oid = run_git_in_stdout(&repo_path, &["rev-parse", "HEAD"]);
+    let head_oid = git_stdout(&repo_path, &["rev-parse", "HEAD"]);
     assert!(
         head_oid.len() >= 40 && head_oid.chars().all(|c| c.is_ascii_hexdigit()),
         "git rev-parse HEAD returned invalid OID for repo-{index}: {head_oid:?}"
