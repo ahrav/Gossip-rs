@@ -108,6 +108,8 @@ fn equal_weight_files_split_near_midpoint() {
     );
 }
 
+/// Ensures even with a weight spike at the end, the estimator's last-key guard
+/// and rank fallback prevent an empty right shard.
 #[test]
 fn skewed_sizes_split_avoids_last_key_with_back_loaded_weight() {
     let mut estimator = StreamingSplitEstimator::new(LARGE_SAMPLE_CAP);
@@ -119,9 +121,6 @@ fn skewed_sizes_split_avoids_last_key_with_back_loaded_weight() {
         .estimate_split_key()
         .expect("should produce split");
     let split_idx = index_from_key(split);
-    // The byte-weighted candidate is key 2 (back-loaded weight), but the
-    // last-key guard prevents an empty right shard. Rank-fallback yields
-    // the midpoint key (index 1).
     assert_eq!(
         split_idx, 1,
         "last-key guard should fall back to rank midpoint, got index {}",
@@ -129,6 +128,7 @@ fn skewed_sizes_split_avoids_last_key_with_back_loaded_weight() {
     );
 }
 
+/// `estimate_split_key` must stay empty until at least two files are observed.
 #[test]
 fn estimate_requires_at_least_two_entries() {
     let mut estimator = StreamingSplitEstimator::default();
@@ -139,6 +139,7 @@ fn estimate_requires_at_least_two_entries() {
     assert!(estimator.estimate_split_key().is_none());
 }
 
+/// When a single observation satisfies both rank and byte sampling cadences, only one sample is retained.
 #[test]
 fn observe_does_not_duplicate_samples_when_rank_and_byte_triggers_overlap() {
     let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
@@ -150,6 +151,7 @@ fn observe_does_not_duplicate_samples_when_rank_and_byte_triggers_overlap() {
     );
 }
 
+/// A large first file should never become the split point even when it dominates the byte stream.
 #[test]
 fn estimator_avoids_first_item_on_heavy_lead_weight() {
     let mut estimator = StreamingSplitEstimator::new(MEDIUM_SAMPLE_CAP);
@@ -169,6 +171,7 @@ fn estimator_avoids_first_item_on_heavy_lead_weight() {
     );
 }
 
+/// Verifies a Zipf-like distribution keeps the estimated split within 1% byte-weighted error despite the skew.
 #[test]
 fn zipf_like_stream_is_within_one_percent_weight_error() {
     let count = 20_000usize;
@@ -379,10 +382,7 @@ fn from_sorted_entries_empty_produces_none() {
 // Batch-connector accuracy: ranges exceeding DEFAULT_SAMPLE_CAP
 // ---------------------------------------------------------------------------
 
-/// Batch connectors (git, in-memory) should pass the range length as
-/// sample_cap so that no compaction fires and the split is exact.  This
-/// test verifies that using `n` as the cap eliminates the drift that
-/// DEFAULT_SAMPLE_CAP introduces on large ranges.
+/// Batch connectors pass the full range length as `sample_cap`, bypassing compaction so that their split matches an exact estimator even on large datasets.
 #[test]
 fn batch_range_cap_eliminates_split_drift() {
     let n = 2_000usize;
@@ -391,7 +391,6 @@ fn batch_range_cap_eliminates_split_drift() {
         "test must exceed DEFAULT_SAMPLE_CAP to be meaningful"
     );
 
-    // Descending sizes: entry 0 is largest, entry n-1 is smallest.
     let sizes: Vec<u64> = (0..n).map(|i| (n - i) as u64).collect();
     let keys: Vec<[u8; 8]> = (0..n).map(key_for_index).collect();
 
@@ -401,20 +400,16 @@ fn batch_range_cap_eliminates_split_drift() {
             .map(|(k, &s)| (k.as_slice(), s))
     };
 
-    // Exact estimator: sample_cap = n, no compaction.
     let exact = StreamingSplitEstimator::from_sorted_entries(n, make_iter());
     let exact_key = exact
         .estimate_split_key()
         .expect("exact estimator should produce a split");
 
-    // Capped estimator: DEFAULT_SAMPLE_CAP triggers compaction and drift.
     let capped = StreamingSplitEstimator::from_sorted_entries(LARGE_SAMPLE_CAP, make_iter());
     let capped_key = capped
         .estimate_split_key()
         .expect("capped estimator should produce a split");
 
-    // This confirms the default cap can drift from the exact midpoint on
-    // sufficiently large materialized ranges.
     assert_ne!(
         index_from_key(exact_key),
         index_from_key(capped_key),
@@ -422,8 +417,6 @@ fn batch_range_cap_eliminates_split_drift() {
          cap={LARGE_SAMPLE_CAP}"
     );
 
-    // Setting `sample_cap = range.len()` disables compaction for materialized
-    // ranges and aligns the result with the exact estimator.
     let batch = StreamingSplitEstimator::from_sorted_entries(n, make_iter());
     assert_eq!(
         batch.estimate_split_key(),
@@ -509,6 +502,7 @@ fn downsampling_when_barely_exceeding_cap_keeps_split_in_range() {
     assert!(split_idx >= 1 && split_idx <= cap);
 }
 
+/// No cadence firing should leave samples and marks untouched.
 #[test]
 fn observe_leaves_marks_unchanged_when_no_cadence_fires() {
     let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
@@ -538,6 +532,7 @@ fn observe_leaves_marks_unchanged_when_no_cadence_fires() {
     );
 }
 
+/// A wide file that straddles multiple byte marks should realign the byte mark back onto the byte-stride grid.
 #[test]
 fn observe_realigns_byte_mark_after_wide_file_skips_multiple_cadences() {
     use super::align_to_stride;
@@ -576,6 +571,7 @@ fn observe_realigns_byte_mark_after_wide_file_skips_multiple_cadences() {
     );
 }
 
+/// When only the rank cadence fires, the rank mark must advance while the byte mark stays stationary.
 #[test]
 fn observe_advances_rank_mark_only_when_rank_cadence_fires_alone() {
     let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
@@ -1155,6 +1151,7 @@ fn compact_samples_at_cap_is_identity() {
 // Saturation edge-case tests
 // ---------------------------------------------------------------------------
 
+/// Observing a `u64::MAX` file still respects the first-key guard.
 #[test]
 fn observe_with_max_file_size() {
     let mut estimator = StreamingSplitEstimator::new(256);
@@ -1167,6 +1164,7 @@ fn observe_with_max_file_size() {
     assert!(split_idx >= 1, "first-key guard must hold, got {split_idx}");
 }
 
+/// Saturated byte positions must still allow the estimator to find a valid split.
 #[test]
 fn recorded_byte_position_saturation() {
     let mut estimator = StreamingSplitEstimator::new(256);
@@ -1182,6 +1180,7 @@ fn recorded_byte_position_saturation() {
     );
 }
 
+/// Saturating total bytes must realign the cadence marks to the stride grid without overflowing.
 #[test]
 fn observe_realigns_marks_after_u64_max_saturation() {
     use super::align_to_stride;
@@ -1189,20 +1188,13 @@ fn observe_realigns_marks_after_u64_max_saturation() {
     let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
     estimator.rank_stride = 4;
     estimator.byte_stride = 100;
-    // count must sit on the rank stride grid so the rank cadence fires cleanly.
-    // u64::MAX % 4 == 3, so u64::MAX - 3 is divisible by 4.
     estimator.count = u64::MAX - 3;
     estimator.total_bytes = u64::MAX - 500;
-    // Set marks so both cadences fire on the next observe.
     estimator.next_rank_sample = u64::MAX - 3;
     estimator.next_byte_mark = u64::MAX - 500;
-    // Seed a prior sample so the buffer is non-empty (mirrors realistic state).
     estimator.samples.push(Sample::new(0, 0, &key_for_index(0)));
     estimator.first_observed_key = Some(Box::from(key_for_index(0).as_slice()));
 
-    // This observe fires both cadences (rank == next_rank_sample, byte interval
-    // straddles next_byte_mark). After updating count/total_bytes, at least one
-    // of them saturates to u64::MAX, which triggers realign_sample_marks().
     estimator.observe(&key_for_index(1), 600);
 
     assert_eq!(
@@ -1232,6 +1224,7 @@ fn observe_realigns_marks_after_u64_max_saturation() {
     );
 }
 
+/// When the entry count saturates to `u64::MAX`, cadence marks must realign even without emitting a new sample.
 #[test]
 fn observe_realigns_marks_after_count_saturates_to_max() {
     use super::align_to_stride;
@@ -1239,11 +1232,8 @@ fn observe_realigns_marks_after_count_saturates_to_max() {
     let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
     estimator.rank_stride = 4;
     estimator.byte_stride = 100;
-    // Next observe will push count from MAX-1 to MAX via saturating_add.
     estimator.count = u64::MAX - 1;
     estimator.total_bytes = 5000;
-    // Set marks so neither cadence fires. This isolates the saturation guard's
-    // realignment of marks without emitting a new sample.
     estimator.next_rank_sample = u64::MAX;
     estimator.next_byte_mark = 6000;
     estimator.samples.push(Sample::new(0, 0, &key_for_index(0)));

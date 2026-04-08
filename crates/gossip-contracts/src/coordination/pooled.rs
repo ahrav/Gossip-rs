@@ -490,7 +490,12 @@ impl PooledSpawned {
     /// Stage a new slot containing the current IDs plus `additional`.
     ///
     /// Does not mutate `self`; callers install the staged slot with
-    /// [`install_slot`](Self::install_slot) once other mutations succeed.
+    /// [`install_slot`](Self::install_slot) once other mutations succeed. This
+    /// staging keeps the existing slot live until the new allocation succeeds.
+    ///
+    /// `additional` must be non-empty because an empty append would alias the
+    /// current slot, and installing it would deallocate a handle that is still
+    /// in use. The `debug_assert!` below enforces this invariant during testing.
     pub fn allocate_appended_slot(
         &self,
         additional: &[ShardId],
@@ -528,6 +533,11 @@ impl PooledSpawned {
     }
 
     /// Install a staged slot, deallocating the previous slot in-place.
+    ///
+    /// The caller must pass a `slot/len` pair that matches the encoded state
+    /// produced by `allocate_appended_slot` or equivalent staging path. The old
+    /// slot is freed before `self.slot` is overwritten so that `slab.live_count`
+    /// stays consistent with the edge between the staged and committed states.
     pub fn install_slot(&mut self, slot: ByteSlot, len: u16, slab: &mut ByteSlab) {
         slab.deallocate(self.slot);
         self.slot = slot;
@@ -535,6 +545,10 @@ impl PooledSpawned {
     }
 
     /// Release slot storage and reset to empty.
+    ///
+    /// Sets `self.len` to zero and drops the current slot back to
+    /// `ByteSlot::EMPTY`, ensuring subsequent `iter`/`bytes` calls see an empty
+    /// lineage.
     pub fn release_fields(&mut self, slab: &mut ByteSlab) {
         let slot = std::mem::replace(&mut self.slot, ByteSlot::EMPTY);
         slab.deallocate(slot);
@@ -553,6 +567,9 @@ pub struct PooledSpawnedIter<'a> {
 
 impl PooledSpawnedIter<'_> {
     /// Zero-item iterator that requires no slab reference.
+    ///
+    /// The returned iterator is backed by a `'static` zero-length slice so it
+    /// can be constructed without borrowing a `ByteSlab`.
     #[inline]
     #[must_use]
     pub fn empty() -> PooledSpawnedIter<'static> {
