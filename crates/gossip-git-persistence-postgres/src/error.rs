@@ -94,7 +94,17 @@ impl fmt::Debug for GitPersistencePgError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Postgres(_) => f.debug_tuple("Postgres").field(&"<redacted>").finish(),
-            Self::Migration(e) => f.debug_tuple("Migration").field(e).finish(),
+            Self::Migration(e) => match e {
+                // Redact nested postgres driver errors to prevent connection
+                // strings and protocol details from appearing in Debug output.
+                GitPersistencePgMigrationError::Postgres { operation, .. } => f
+                    .debug_tuple("Migration")
+                    .field(&format_args!(
+                        "Postgres {{ operation: {operation:?}, source: <redacted> }}"
+                    ))
+                    .finish(),
+                other => f.debug_tuple("Migration").field(other).finish(),
+            },
             Self::MutexPoisoned => write!(f, "MutexPoisoned"),
             Self::PayloadTooLarge { key_len, value_len } => f
                 .debug_struct("PayloadTooLarge")
@@ -243,6 +253,27 @@ mod tests {
         assert!(
             dbg.contains("<redacted>"),
             "debug output should redact raw driver details: {dbg}"
+        );
+    }
+
+    #[test]
+    fn migration_debug_redacts_nested_postgres_details() {
+        let err = GitPersistencePgError::Migration(GitPersistencePgMigrationError::postgres(
+            MigrationOperation::Connect,
+            timeout_postgres_error(),
+        ));
+        let dbg = format!("{:?}", err);
+        assert!(
+            dbg.contains("<redacted>"),
+            "migration debug must redact nested postgres driver details: {dbg}"
+        );
+        assert!(
+            !dbg.contains("timeout"),
+            "migration debug must not leak raw driver error text: {dbg}"
+        );
+        assert!(
+            dbg.contains("Connect"),
+            "migration debug should preserve the operation label: {dbg}"
         );
     }
 }

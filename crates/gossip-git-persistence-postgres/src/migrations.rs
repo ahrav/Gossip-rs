@@ -108,7 +108,7 @@ mod tests {
     fn migration_checksums_are_stable() {
         let expected: &[(&str, &str)] = &[(
             "0001_git_kv",
-            "1c250629e25a495f9b42416deca5f19bc4cb02552a1d0c0cf6c18825b26c4801",
+            "f83d394cd86762e7d82225591ee7ee0d70e2ef815c78889e0c9bb3778195cbf7",
         )];
 
         assert_eq!(

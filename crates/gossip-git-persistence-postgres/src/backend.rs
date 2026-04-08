@@ -125,9 +125,14 @@ struct PreparedStatements {
 /// | [`connect_and_migrate`](Self::connect_and_migrate) | `NoTls` | Yes | `test-utils` | Local dev with auto-schema |
 /// | [`from_client`](Self::from_client) | Caller-chosen | No | *(always)* | Production (TLS, pooling) |
 ///
-/// After calling [`from_client`](Self::from_client), use
-/// [`apply_migrations`](Self::apply_migrations) to run schema migrations if
-/// needed.
+/// For the production path, apply migrations on the raw `Client` **before**
+/// wrapping it with [`from_client`](Self::from_client):
+///
+/// ```rust,ignore
+/// let mut client = Client::connect(dsn, tls)?;
+/// gossip_git_persistence_postgres::apply_all_migrations(&mut client)?;
+/// let backend = GitPersistencePg::from_client(client)?;
+/// ```
 #[derive(Clone)]
 pub struct GitPersistencePg {
     client: Arc<Mutex<Client>>,
@@ -155,37 +160,38 @@ impl GitPersistencePg {
 
     /// Connect to PostgreSQL and apply crate-embedded migrations.
     ///
-    /// Equivalent to [`connect`](Self::connect) followed by
-    /// [`apply_migrations`](Self::apply_migrations). Uses `NoTls` —
-    /// intended for local development and integration tests only.
+    /// Runs schema migrations on the raw connection first, then prepares
+    /// backend statements. Uses `NoTls` — intended for local development
+    /// and integration tests only.
     ///
     /// Requires the `test-utils` feature.
     ///
     /// # Errors
     ///
-    /// Returns [`GitPersistencePgError::Postgres`] on connection or statement
-    /// preparation failure, or [`GitPersistencePgError::Migration`] if schema
-    /// migration fails.
+    /// Returns [`GitPersistencePgError::Migration`] if schema migration fails,
+    /// or [`GitPersistencePgError::Postgres`] on connection or statement
+    /// preparation failure.
     #[cfg(feature = "test-utils")]
     pub fn connect_and_migrate(database_url: &str) -> Result<Self, GitPersistencePgError> {
-        let client = Client::connect(database_url, NoTls)?;
-        let backend = Self::from_client(client)?;
-        backend.apply_migrations()?;
-        Ok(backend)
+        let mut client = Client::connect(database_url, NoTls)?;
+        apply_all_migrations(&mut client)?;
+        Self::from_client(client)
     }
 
     /// Wrap an already-connected PostgreSQL client and prepare backend
     /// statements.
     ///
     /// The preferred production constructor: the caller controls TLS
-    /// configuration, connection parameters, and pooling. Call
-    /// [`apply_migrations`](Self::apply_migrations) afterwards if the schema
-    /// has not yet been applied.
+    /// configuration, connection parameters, and pooling. Schema migrations
+    /// must be applied **before** calling this constructor because statement
+    /// preparation validates table existence. Use
+    /// [`apply_all_migrations`](crate::apply_all_migrations) on the raw
+    /// `Client` first.
     ///
     /// # Errors
     ///
     /// Returns [`GitPersistencePgError::Postgres`] if statement preparation
-    /// fails (e.g. the connection is broken).
+    /// fails (e.g. the table does not exist or the connection is broken).
     pub fn from_client(mut client: Client) -> Result<Self, GitPersistencePgError> {
         let stmts = PreparedStatements {
             get: client.prepare(GET_SQL)?,
@@ -200,6 +206,11 @@ impl GitPersistencePg {
     }
 
     /// Apply all embedded migrations using the held client.
+    ///
+    /// Useful for applying newly-added migrations to an already-established
+    /// schema. For fresh-database bootstrap, use the standalone
+    /// [`apply_all_migrations`](crate::apply_all_migrations) on the raw
+    /// `Client` **before** calling [`from_client`](Self::from_client).
     ///
     /// Idempotent and concurrency-safe — see [`crate::migrations`] for the
     /// advisory-lock and checksum-verification protocol.
@@ -217,11 +228,13 @@ impl GitPersistencePg {
 
     /// Remove all rows from the key/value table.
     ///
-    /// This helper is intended for crate-local integration tests.
+    /// Uses `TRUNCATE` for efficient whole-table removal without per-row
+    /// WAL overhead. This helper is intended for crate-local integration
+    /// tests.
     #[cfg(test)]
     pub(crate) fn truncate_all_for_tests(&self) -> Result<(), GitPersistencePgError> {
         let mut client = self.lock_client()?;
-        client.batch_execute(&format!("DELETE FROM {}", crate::schema::GIT_KV_TABLE))?;
+        client.batch_execute(&format!("TRUNCATE {}", crate::schema::GIT_KV_TABLE))?;
         Ok(())
     }
 

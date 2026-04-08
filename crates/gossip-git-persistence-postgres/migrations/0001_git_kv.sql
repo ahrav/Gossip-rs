@@ -15,7 +15,7 @@ CREATE TABLE git_kv (
 
     CONSTRAINT git_kv_pk PRIMARY KEY (key),
     CONSTRAINT git_kv_key_size_ck
-        CHECK (octet_length(key) <= 256),
+        CHECK (octet_length(key) <= 2048),
     CONSTRAINT git_kv_value_size_ck
         CHECK (octet_length(value) <= 16777216)
 );

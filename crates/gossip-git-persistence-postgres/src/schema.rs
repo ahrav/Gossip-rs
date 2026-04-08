@@ -17,10 +17,12 @@ pub const SCHEMA_MIGRATIONS_TABLE: &str = "git_persistence_schema_migrations";
 
 /// Maximum stored key length in bytes.
 ///
-/// Scanner-owned Git persistence keys are expected to remain well below this
-/// ceiling; the CHECK constraint exists to catch accidental misuse rather than
-/// enforce a fixed-width encoding.
-pub const MAX_KEY_OCTETS: usize = 256;
+/// Ref watermark keys are the largest at `75 + ref_name_len` bytes. With
+/// `RepoOpenLimits::DEFAULT.max_refname_bytes = 1024`, the theoretical
+/// ceiling is 1099 bytes. This limit is set to 2048 to provide headroom
+/// for potential future key formats; the CHECK constraint exists to catch
+/// accidental misuse rather than enforce a fixed-width encoding.
+pub const MAX_KEY_OCTETS: usize = 2048;
 
 /// Maximum stored value length in bytes.
 ///
