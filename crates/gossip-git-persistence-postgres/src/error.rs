@@ -61,6 +61,8 @@ impl fmt::Display for GitPersistencePgError {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::*;
 
     #[test]
@@ -79,6 +81,43 @@ mod tests {
         assert!(
             msg.contains(&"bb".repeat(32)),
             "should contain found hex: {msg}"
+        );
+    }
+
+    #[test]
+    fn checksum_mismatch_error_source_is_none() {
+        let err = GitPersistencePgMigrationError::ChecksumMismatch {
+            version: "0001_git_kv",
+            expected_hex: String::new(),
+            found_hex: String::new(),
+        };
+        assert!(
+            err.source().is_none(),
+            "ChecksumMismatch should have no source error"
+        );
+    }
+
+    #[test]
+    fn corrupted_history_record_display() {
+        let err = GitPersistencePgMigrationError::CorruptedHistoryRecord {
+            version: "0001_git_kv",
+            found_len: 31,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("0001_git_kv"), "should contain version: {msg}");
+        assert!(msg.contains("31"), "should contain actual length: {msg}");
+        assert!(msg.contains("32"), "should contain expected length: {msg}");
+    }
+
+    #[test]
+    fn corrupted_history_record_error_source_is_none() {
+        let err = GitPersistencePgMigrationError::CorruptedHistoryRecord {
+            version: "0001_git_kv",
+            found_len: 0,
+        };
+        assert!(
+            err.source().is_none(),
+            "CorruptedHistoryRecord should have no source error"
         );
     }
 }

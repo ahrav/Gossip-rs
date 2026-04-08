@@ -100,3 +100,38 @@ pub const DELETE_SQL: &str = r#"
 DELETE FROM git_kv
 WHERE key = ANY($1::bytea[])
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advisory_lock_key_matches_ascii_mnemonic() {
+        let bytes = MIGRATION_ADVISORY_LOCK_KEY.to_be_bytes();
+        let ascii = std::str::from_utf8(&bytes).expect("lock key bytes should be valid ASCII");
+        assert_eq!(ascii, "GGPKVM01");
+    }
+
+    /// All SQL query constants must embed the canonical table name.
+    /// This guards against silent drift if the table constant is renamed
+    /// but the SQL literals are not updated in lockstep.
+    #[test]
+    fn sql_constants_reference_canonical_table_name() {
+        assert!(
+            GET_SQL.contains(GIT_KV_TABLE),
+            "GET_SQL must reference the GIT_KV_TABLE constant value"
+        );
+        assert!(
+            MULTI_GET_SQL.contains(GIT_KV_TABLE),
+            "MULTI_GET_SQL must reference the GIT_KV_TABLE constant value"
+        );
+        assert!(
+            UPSERT_SQL.contains(GIT_KV_TABLE),
+            "UPSERT_SQL must reference the GIT_KV_TABLE constant value"
+        );
+        assert!(
+            DELETE_SQL.contains(GIT_KV_TABLE),
+            "DELETE_SQL must reference the GIT_KV_TABLE constant value"
+        );
+    }
+}

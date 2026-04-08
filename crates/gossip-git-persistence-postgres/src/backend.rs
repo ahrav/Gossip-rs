@@ -28,7 +28,7 @@
 //! with `None` for missing keys and duplicated results for duplicated inputs.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     fmt,
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -60,7 +60,7 @@ struct NormalizedBatch {
 
 impl NormalizedBatch {
     fn from_ops(ops: &[GitPersistenceOp]) -> Self {
-        let mut final_ops = BTreeMap::<Vec<u8>, FinalBatchOp>::new();
+        let mut final_ops = HashMap::<Vec<u8>, FinalBatchOp>::with_capacity(ops.len());
         for op in ops {
             match op {
                 GitPersistenceOp::Put { key, value } => {
