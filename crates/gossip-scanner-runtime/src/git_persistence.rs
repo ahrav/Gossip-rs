@@ -1016,6 +1016,21 @@ where
 /// runtime to commit the scanner-owned Git state after findings and done-ledger
 /// writes succeed. The actual `FinalizeOutput` is recovered from the scan
 /// result, avoiding a deep clone of the data and watermark op vectors.
+///
+/// # Partial finalize interaction with durable backends
+///
+/// Partial finalizes write data-ops seen deltas to the scope bitmap via the
+/// underlying adapter. On a durable backend (e.g., PostgreSQL), these writes
+/// survive restarts. The execution layer handles partial outcomes by either
+/// checkpointing (on cancellation) or returning an error — in both cases,
+/// the shard is not advanced. Checkpoint-based resume skips past the ref
+/// range that produced the already-committed seen deltas, so at-least-once
+/// delivery is preserved for the common case. A narrow edge case exists
+/// where a blob is reachable from both pre-checkpoint and post-checkpoint
+/// refs; in that scenario, the post-checkpoint ref path would skip the
+/// already-seen blob. This is acceptable because partial finalize implies
+/// permanently unrecoverable candidates (corrupt objects, decode failures)
+/// that produce the same outcome on retry.
 #[derive(Debug)]
 pub(crate) struct DeferredCompleteFinalizeStore<'a, B> {
     persistence: &'a GitPersistenceAdapter<B>,

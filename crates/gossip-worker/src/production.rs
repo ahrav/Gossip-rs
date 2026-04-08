@@ -512,9 +512,9 @@ pub fn build_production_backends_from_clients(
         Some(client) => Some(GitPersistencePg::from_client(client).map_err(
             |error| match error {
                 GitPersistencePgError::Postgres(err) => {
-                    ProductionBootstrapError::GitKvSchemaReadiness(
-                        ProductionSchemaReadinessError::Query(err),
-                    )
+                    ProductionBootstrapError::GitKvInitUnexpected(format!(
+                        "git-kv statement preparation failed: {err}"
+                    ))
                 }
                 // from_client currently only returns Postgres variants (statement
                 // preparation). These arms are defensive against future changes to
