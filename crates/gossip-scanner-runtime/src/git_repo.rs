@@ -38,14 +38,17 @@ use gossip_contracts::identity::RuleFingerprint;
 use gossip_contracts::persistence::WriteContext;
 use gossip_orchestrator::{GitSelectionLoweringError, GitShardPayload};
 use scanner_git::{
-    FinalizeOutcome, GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanError,
-    GitScanResult, GitScanRunContext, NativeRefResolver, NeverSeenStore, NoopCheckpointSink,
-    PersistenceStore, RefWatermark, RefWatermarkStore, RepoOpenError, RepoOpenLimits,
-    ScanCheckpointSink, SeenBlobStore, StartSetConfig, run_git_scan_with_context,
+    FinalizeOutcome, FinalizeOutput, GitEventOutput, GitScanConfig as RuntimeGitScanConfig,
+    GitScanError, GitScanResult, GitScanRunContext, NativeRefResolver, NeverSeenStore,
+    NoopCheckpointSink, PersistenceStore, RefWatermark, RefWatermarkStore, RepoOpenError,
+    RepoOpenLimits, ScanCheckpointSink, SeenBlobStore, StartSetConfig, run_git_scan_with_context,
 };
 
 use crate::git_executor::{ScannerGitExecutor, map_merge_strategy, map_scan_mode};
-use crate::git_persistence::{GitPersistenceAdapter, GitPersistenceBackend, GitRepoCheckpointSink};
+use crate::git_persistence::{
+    DeferredCompleteFinalizeStore, GitPersistenceAdapter, GitPersistenceBackend,
+    GitRepoCheckpointSink,
+};
 use crate::{
     AssignmentOutcome, CancellationToken, ChannelEventOutput, EVENT_CHANNEL_CAP, GitDebugLevel,
     GitScanConfig, ScanReport, ScanRuntimeError, build_runtime_engine, forward_git_events,
@@ -84,6 +87,8 @@ pub(crate) struct GitRepoExecutionOutcome<B> {
     /// Whether the scanner fully traversed the configured start-set
     /// (`Complete`) or stopped early due to resource limits or errors.
     pub(crate) finalize_outcome: FinalizeOutcome,
+    /// Complete finalize output deferred until external durability succeeds.
+    pub(crate) deferred_finalize: Option<FinalizeOutput>,
     /// Latest durable repo-frontier checkpoint cursor produced during the
     /// current lease, if any.
     pub(crate) resume_checkpoint: Option<Cursor>,
@@ -97,6 +102,7 @@ impl<B: fmt::Debug> fmt::Debug for GitRepoExecutionOutcome<B> {
             .field("write_context", &self.write_context)
             .field("rule_fingerprint", &"<fn>")
             .field("finalize_outcome", &self.finalize_outcome)
+            .field("deferred_finalize", &self.deferred_finalize)
             .field("resume_checkpoint", &self.resume_checkpoint)
             .finish()
     }
@@ -172,6 +178,7 @@ impl GitRepoRuntime {
             start_set_from_ref_selection(selection.refs()).id(),
         );
         let checkpoint_sink = GitRepoCheckpointSink::new(&persistence, payload.repo_key().clone());
+        let deferred_finalize_store = DeferredCompleteFinalizeStore::new(&persistence);
         let execution = match executor.run_repo_with_persistence(
             mirror,
             &selection,
@@ -181,7 +188,7 @@ impl GitRepoRuntime {
             GitRuntimeStores {
                 seen_store: &persistence,
                 watermark_store: &persistence,
-                persist_store: Some(&persistence),
+                persist_store: Some(&deferred_finalize_store),
                 checkpoint_sink: &checkpoint_sink,
             },
         ) {
@@ -203,6 +210,7 @@ impl GitRepoRuntime {
                     write_context,
                     rule_fingerprint,
                     finalize_outcome: FinalizeOutcome::Partial { skipped_count: 0 },
+                    deferred_finalize: None,
                     resume_checkpoint,
                 });
             }
@@ -216,6 +224,7 @@ impl GitRepoRuntime {
             }
         };
         let finalize_outcome = execution.result.0.finalize.outcome;
+        let deferred_finalize = deferred_finalize_store.into_pending_complete();
         let report = git_report_to_scan_report(execution.result, execution.scan_elapsed);
         let resume_checkpoint = checkpoint_sink.latest_checkpoint_cursor();
         drop(checkpoint_sink);
@@ -226,6 +235,7 @@ impl GitRepoRuntime {
             write_context,
             rule_fingerprint,
             finalize_outcome,
+            deferred_finalize,
             resume_checkpoint,
         })
     }

@@ -6,6 +6,7 @@
 //! - [`gossip_coordination_etcd::EtcdCoordinator`]
 //! - [`gossip_done_ledger_postgres::DoneLedgerPg`]
 //! - [`gossip_findings_postgres::FindingsSinkPg`]
+//! - [`gossip_git_persistence_postgres::GitPersistencePg`]
 //!
 //! The core runtime stays generic over `CoordinationFacade`, `DoneLedger`, and
 //! `FindingsSink`. This module owns startup wiring, schema readiness
@@ -20,9 +21,6 @@
 
 use std::fmt;
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
 use crate::config::{DistributedWorkerLaunch, ProductionBackendConfig};
 use gossip_contracts::connector::git::GitRunError;
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorError};
@@ -35,12 +33,16 @@ use gossip_findings_postgres::{
     FindingsPgMigrationError, FindingsSinkPg, MIGRATIONS as FINDINGS_MIGRATIONS,
     apply_all_migrations as apply_findings_migrations, schema as findings_schema,
 };
+use gossip_git_persistence_postgres::{
+    GitPersistencePg, GitPersistencePgError, GitPersistencePgMigrationError,
+    apply_all_migrations as apply_git_kv_migrations, migrations::MIGRATIONS as GIT_KV_MIGRATIONS,
+    schema as git_kv_schema,
+};
 use gossip_scanner_runtime::distributed::{
     DistributedPersistence, DistributedRunReport, DistributedRuntimeConfig,
     DistributedRuntimeError, GitWorkerIdentity, WorkerIdentity, run_git_repo_worker, run_worker,
 };
 use gossip_scanner_runtime::git_mirror::LocalMirrorManager;
-use gossip_scanner_runtime::git_persistence::{GitPersistenceBackend, GitPersistenceOp};
 use postgres::{Client, NoTls};
 
 /// Schema-readiness mode applied during backend bootstrap.
@@ -51,8 +53,8 @@ use postgres::{Client, NoTls};
 /// migrations on boot is acceptable.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StartupSchemaMode {
-    /// Require both PostgreSQL schemas to already exist and match the embedded
-    /// migration history.
+    /// Require every configured PostgreSQL schema to already exist and match
+    /// the embedded migration history.
     #[default]
     Validate,
     /// Apply embedded migrations before validating readiness.
@@ -81,8 +83,8 @@ impl ProductionStartupSettings {
         Self { schema_mode }
     }
 
-    /// Fail-closed startup: both PostgreSQL schemas and their migration
-    /// history must already exist and match the embedded checksums.
+    /// Fail-closed startup: every configured PostgreSQL schema and its
+    /// migration history must already exist and match the embedded checksums.
     #[must_use]
     pub fn validate_only() -> Self {
         Self::new(StartupSchemaMode::Validate)
@@ -165,6 +167,11 @@ pub enum ProductionBootstrapError {
     /// fragment leakage through error chain formatters.
     #[error("failed to connect findings PostgreSQL backend ({})", classify_pg_error(.0))]
     FindingsConnect(postgres::Error),
+    /// Establishing the Git key-value PostgreSQL connection failed.
+    /// Connection variants intentionally suppress `source()` to prevent DSN
+    /// fragment leakage through error chain formatters.
+    #[error("failed to connect git-kv PostgreSQL backend ({})", classify_pg_error(.0))]
+    GitKvConnect(postgres::Error),
     /// Connecting the etcd coordinator failed.  `EtcdCoordinator::connect`
     /// validates cluster health as part of the connection handshake, so this
     /// variant also covers unreachable-after-connect scenarios.
@@ -176,6 +183,9 @@ pub enum ProductionBootstrapError {
     /// The findings schema is not ready for worker startup.
     #[error("findings PostgreSQL schema is not ready for worker startup: {0}")]
     FindingsSchemaReadiness(#[source] ProductionSchemaReadinessError),
+    /// The Git key-value schema is not ready for worker startup.
+    #[error("git-kv PostgreSQL schema is not ready for worker startup: {0}")]
+    GitKvSchemaReadiness(#[source] ProductionSchemaReadinessError),
     /// Development auto-migration of the done-ledger schema failed.
     /// DevAutoMigrate runs only in local development environments where DSN
     /// exposure is acceptable.
@@ -184,6 +194,9 @@ pub enum ProductionBootstrapError {
     /// Development auto-migration of the findings schema failed.
     #[error("findings PostgreSQL auto-migrate failed: {0}")]
     FindingsAutoMigrate(#[source] FindingsPgMigrationError),
+    /// Development auto-migration of the Git key-value schema failed.
+    #[error("git-kv PostgreSQL auto-migrate failed: {0}")]
+    GitKvAutoMigrate(#[source] GitPersistencePgMigrationError),
     /// A connection thread panicked instead of returning a result.
     #[error("{backend} connection thread panicked unexpectedly")]
     ThreadPanicked { backend: &'static str },
@@ -205,6 +218,7 @@ impl fmt::Debug for ProductionBootstrapError {
                 .debug_tuple("FindingsConnect")
                 .field(&"[redacted]")
                 .finish(),
+            Self::GitKvConnect(_) => f.debug_tuple("GitKvConnect").field(&"[redacted]").finish(),
             Self::EtcdConnect(_) => f.debug_tuple("EtcdConnect").field(&"[redacted]").finish(),
             Self::DoneLedgerSchemaReadiness(e) => {
                 f.debug_tuple("DoneLedgerSchemaReadiness").field(e).finish()
@@ -212,10 +226,14 @@ impl fmt::Debug for ProductionBootstrapError {
             Self::FindingsSchemaReadiness(e) => {
                 f.debug_tuple("FindingsSchemaReadiness").field(e).finish()
             }
+            Self::GitKvSchemaReadiness(e) => {
+                f.debug_tuple("GitKvSchemaReadiness").field(e).finish()
+            }
             Self::DoneLedgerAutoMigrate(e) => {
                 f.debug_tuple("DoneLedgerAutoMigrate").field(e).finish()
             }
             Self::FindingsAutoMigrate(e) => f.debug_tuple("FindingsAutoMigrate").field(e).finish(),
+            Self::GitKvAutoMigrate(e) => f.debug_tuple("GitKvAutoMigrate").field(e).finish(),
             Self::ThreadPanicked { backend } => f
                 .debug_struct("ThreadPanicked")
                 .field("backend", backend)
@@ -262,6 +280,7 @@ impl From<DistributedRuntimeError> for ProductionWorkerError {
 pub struct ProductionRuntimeBackends {
     coordinator: EtcdCoordinator,
     persistence: DistributedPersistence<FindingsSinkPg, DoneLedgerPg>,
+    git_persistence: Option<GitPersistencePg>,
 }
 
 impl ProductionRuntimeBackends {
@@ -291,6 +310,13 @@ impl ProductionRuntimeBackends {
         &mut self.persistence
     }
 
+    /// Borrow the live Git key-value backend when configured.
+    #[inline]
+    #[must_use]
+    pub fn git_persistence(&self) -> Option<&GitPersistencePg> {
+        self.git_persistence.as_ref()
+    }
+
     /// Consume the bundle into its concrete backend parts.
     #[must_use]
     pub fn into_parts(
@@ -298,8 +324,9 @@ impl ProductionRuntimeBackends {
     ) -> (
         EtcdCoordinator,
         DistributedPersistence<FindingsSinkPg, DoneLedgerPg>,
+        Option<GitPersistencePg>,
     ) {
-        (self.coordinator, self.persistence)
+        (self.coordinator, self.persistence, self.git_persistence)
     }
 
     /// Run the generic distributed worker loop on the real backends.
@@ -318,22 +345,21 @@ impl ProductionRuntimeBackends {
 
     /// Run the distributed Git repo-frontier worker loop on the real backends.
     ///
-    /// The caller provides a concrete [`GitPersistenceBackend`] for Git
-    /// key-value durability (seen-blobs, ref watermarks, staging state).
-    /// Findings and done-ledger records are written through the same
-    /// `DistributedPersistence` handles used by the filesystem worker.
-    ///
     /// # Errors
     ///
     /// Returns [`DistributedRuntimeError`] when shard claiming, mirror sync,
     /// Git execution, durable finalize handling, or lease completion fails.
-    pub fn run_git<B: GitPersistenceBackend + Clone>(
+    pub fn run_git(
         mut self,
         mirrors: &mut LocalMirrorManager,
-        git_backend: B,
         identity: GitWorkerIdentity,
         runtime: DistributedRuntimeConfig,
     ) -> Result<DistributedRunReport, DistributedRuntimeError> {
+        let git_backend = self.git_persistence.ok_or_else(|| {
+            DistributedRuntimeError::Durability(anyhow::anyhow!(
+                "git production launch requires a configured git-kv backend"
+            ))
+        })?;
         run_git_repo_worker(
             &mut self.coordinator,
             mirrors,
@@ -342,76 +368,6 @@ impl ProductionRuntimeBackends {
             self.persistence,
             runtime,
         )
-    }
-}
-
-/// Process-local in-memory Git key-value persistence backend.
-///
-/// Stores key-value pairs in a shared [`HashMap`] behind an [`Arc`]+[`Mutex`]
-/// so clones share the same backing store. This is `Send`-safe, unlike
-/// `Rc<RefCell<…>>`, so it remains correct if `GitPersistenceBackend` gains
-/// `Send` bounds or the scan is refactored to cross thread boundaries.
-///
-/// State does not survive process restarts. This backend is suitable for
-/// single-worker development and early integration where persistence
-/// across process restarts is not required.
-// Development-only in-memory backend; does not support failure injection.
-//
-// All Mutex accesses recover from lock poisoning because HashMap internals
-// remain structurally valid after a panic in user code. A warning is logged
-// when recovery occurs to surface upstream panics in diagnostics.
-#[derive(Debug, Clone, Default)]
-struct InMemoryGitPersistence {
-    store: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
-}
-
-impl GitPersistenceBackend for InMemoryGitPersistence {
-    type Error = std::convert::Infallible;
-
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        Ok(self
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                tracing::warn!("in-memory git persistence lock was poisoned; recovering");
-                poisoned.into_inner()
-            })
-            .get(key)
-            .cloned())
-    }
-
-    /// Batch lookup under a single lock acquisition.
-    ///
-    /// The default trait implementation calls `get()` per key, which would
-    /// acquire and release the Mutex N times. This override holds the lock
-    /// once for the entire batch, avoiding O(keys) lock/unlock cycles.
-    fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
-        let store = self.store.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("in-memory git persistence lock was poisoned; recovering");
-            poisoned.into_inner()
-        });
-        Ok(keys
-            .iter()
-            .map(|key| store.get(key.as_slice()).cloned())
-            .collect())
-    }
-
-    fn apply_batch(&self, ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
-        let mut store = self.store.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("in-memory git persistence lock was poisoned; recovering");
-            poisoned.into_inner()
-        });
-        for op in ops {
-            match op {
-                GitPersistenceOp::Put { key, value } => {
-                    store.insert(key.clone(), value.clone());
-                }
-                GitPersistenceOp::Delete { key } => {
-                    store.remove(key.as_slice());
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -428,7 +384,7 @@ impl GitPersistenceBackend for InMemoryGitPersistence {
 ///
 /// # Errors
 ///
-/// Returns [`ProductionBootstrapError`] when either PostgreSQL connection
+/// Returns [`ProductionBootstrapError`] when a required PostgreSQL connection
 /// fails, the etcd coordinator cannot be constructed or remain healthy, or
 /// the selected schema-readiness policy fails.
 ///
@@ -441,21 +397,25 @@ pub fn build_production_backends(
     config: &ProductionBackendConfig,
     startup: ProductionStartupSettings,
 ) -> Result<ProductionRuntimeBackends, ProductionBootstrapError> {
-    // Connect both PostgreSQL databases in parallel. Each connection carries
-    // a 5-second default timeout, so overlapping them cuts worst-case
-    // connection time from 10s to 5s.
+    // Connect the PostgreSQL backends in parallel. Each connection carries a
+    // 5-second default timeout, so overlapping them keeps startup latency
+    // bounded by the slowest backend instead of the sum of all timeouts.
     let dl_dsn = config.done_ledger_postgres_dsn().to_owned();
     let f_dsn = config.findings_postgres_dsn().to_owned();
+    let git_kv_dsn = config.git_kv_postgres_dsn().map(ToOwned::to_owned);
 
     let dl_handle = std::thread::spawn(move || connect_postgres_client(&dl_dsn));
     let f_handle = std::thread::spawn(move || connect_postgres_client(&f_dsn));
+    let git_kv_handle =
+        git_kv_dsn.map(|dsn| std::thread::spawn(move || connect_postgres_client(&dsn)));
 
-    // Join both threads before propagating errors so that an early `?`
+    // Join all threads before propagating errors so that an early `?`
     // never drops a `JoinHandle` and silently detaches a thread still
     // blocked in `Client::connect`. Thread panics produce a typed error
     // instead of crashing the process.
     let dl_join = dl_handle.join();
     let f_join = f_handle.join();
+    let git_kv_join = git_kv_handle.map(|handle| handle.join());
 
     let dl_result = dl_join.map_err(|payload| {
         log_thread_panic("done-ledger", &payload);
@@ -469,14 +429,25 @@ pub fn build_production_backends(
             backend: "findings",
         }
     })?;
+    let git_kv_result = match git_kv_join {
+        Some(join) => Some(join.map_err(|payload| {
+            log_thread_panic("git-kv", &payload);
+            ProductionBootstrapError::ThreadPanicked { backend: "git-kv" }
+        })?),
+        None => None,
+    };
 
     let done_ledger_client = dl_result.map_err(ProductionBootstrapError::DoneLedgerConnect)?;
     let findings_client = f_result.map_err(ProductionBootstrapError::FindingsConnect)?;
+    let git_kv_client = git_kv_result
+        .transpose()
+        .map_err(ProductionBootstrapError::GitKvConnect)?;
 
     build_production_backends_from_clients(
         config.etcd().clone(),
         done_ledger_client,
         findings_client,
+        git_kv_client,
         startup,
     )
 }
@@ -492,7 +463,7 @@ pub fn build_production_backends(
 /// # Errors
 ///
 /// Returns [`ProductionBootstrapError`] when the etcd coordinator rejects
-/// the config (connection includes a cluster health check) or either
+/// the config (connection includes a cluster health check) or any configured
 /// PostgreSQL schema does not satisfy the supplied startup policy.
 ///
 /// # Panics
@@ -504,6 +475,7 @@ pub fn build_production_backends_from_clients(
     etcd: EtcdCoordinatorConfig,
     mut done_ledger_client: Client,
     mut findings_client: Client,
+    mut git_kv_client: Option<Client>,
     startup: ProductionStartupSettings,
 ) -> Result<ProductionRuntimeBackends, ProductionBootstrapError> {
     tracing::info!(schema_mode = %startup.schema_mode(), "applying startup schema policy");
@@ -518,14 +490,33 @@ pub fn build_production_backends_from_clients(
     })?;
     prepare_done_ledger_backend(&mut done_ledger_client, startup)?;
     prepare_findings_backend(&mut findings_client, startup)?;
+    if let Some(client) = git_kv_client.as_mut() {
+        prepare_git_kv_backend(client, startup)?;
+    }
     let persistence = DistributedPersistence::new(
         FindingsSinkPg::from_client(findings_client),
         DoneLedgerPg::from_client(done_ledger_client),
     );
+    let git_persistence = match git_kv_client {
+        Some(client) => Some(GitPersistencePg::from_client(client).map_err(|error| match error {
+            GitPersistencePgError::Postgres(err) => ProductionBootstrapError::GitKvSchemaReadiness(
+                ProductionSchemaReadinessError::Query(err),
+            ),
+            GitPersistencePgError::Migration(_)
+            | GitPersistencePgError::MutexPoisoned
+            | GitPersistencePgError::PayloadTooLarge { .. } => {
+                unreachable!(
+                    "GitPersistencePg::from_client only prepares statements on a connected client"
+                )
+            }
+        })?),
+        None => None,
+    };
 
     Ok(ProductionRuntimeBackends {
         coordinator,
         persistence,
+        git_persistence,
     })
 }
 
@@ -567,14 +558,8 @@ pub fn run_production_worker(
         } => {
             let mut mirrors = LocalMirrorManager::new(mirror_root)
                 .map_err(ProductionBootstrapError::GitMirrorManager)?;
-            tracing::warn!(
-                "git persistence backend is in-memory; ref watermarks and seen-bitmaps \
-                 live only for this worker process — restarting or replacing the worker \
-                 forces a full rescan"
-            );
-            let git_backend = InMemoryGitPersistence::default();
             backends
-                .run_git(&mut mirrors, git_backend, identity, runtime)
+                .run_git(&mut mirrors, identity, runtime)
                 .map_err(ProductionWorkerError::Runtime)
         }
     }
@@ -790,6 +775,28 @@ fn prepare_findings_backend(
     .map_err(ProductionBootstrapError::FindingsSchemaReadiness)
 }
 
+/// Apply the startup policy to the Git key-value database: auto-migrate first
+/// when `DevAutoMigrate` is selected, then validate table existence and
+/// migration-history integrity in both modes.
+fn prepare_git_kv_backend(
+    client: &mut Client,
+    startup: ProductionStartupSettings,
+) -> Result<(), ProductionBootstrapError> {
+    if startup.schema_mode() == StartupSchemaMode::DevAutoMigrate {
+        apply_git_kv_migrations(client).map_err(ProductionBootstrapError::GitKvAutoMigrate)?;
+    }
+    validate_schema_readiness(
+        client,
+        &[
+            git_kv_schema::GIT_KV_TABLE,
+            git_kv_schema::SCHEMA_MIGRATIONS_TABLE,
+        ],
+        GIT_KV_MIGRATIONS,
+        git_kv_schema::SCHEMA_MIGRATIONS_TABLE,
+    )
+    .map_err(ProductionBootstrapError::GitKvSchemaReadiness)
+}
+
 /// Verify that all expected tables exist and every embedded migration version
 /// is recorded with a matching checksum.
 fn validate_schema_readiness(
@@ -938,6 +945,7 @@ mod tests {
             test_async_coordinator_config(),
             create_test_db(),
             create_test_db(),
+            None,
         )
         .expect("test backend config should be valid")
     }
@@ -956,6 +964,14 @@ mod tests {
                 .expect("findings test database should accept connections"),
         )
         .expect("findings migrations should succeed");
+    }
+
+    fn migrate_git_kv_database(dsn: &str) {
+        apply_git_kv_migrations(
+            &mut Client::connect(dsn, NoTls)
+                .expect("git-kv test database should accept connections"),
+        )
+        .expect("git-kv migrations should succeed");
     }
 
     /// Create two test databases, migrate both, and return their DSNs.
@@ -977,8 +993,22 @@ mod tests {
             test_async_coordinator_config(),
             done_ledger_dsn,
             findings_dsn,
+            None,
         )
         .expect("test backend config should be valid")
+    }
+
+    fn migrated_git_backend_config() -> ProductionBackendConfig {
+        let (done_ledger_dsn, findings_dsn) = setup_migrated_test_dbs();
+        let git_kv_dsn = create_test_db();
+        migrate_git_kv_database(&git_kv_dsn);
+        ProductionBackendConfig::new(
+            test_async_coordinator_config(),
+            done_ledger_dsn,
+            findings_dsn,
+            Some(git_kv_dsn),
+        )
+        .expect("test git backend config should be valid")
     }
 
     fn production_worker_launch(path: &Path) -> DistributedWorkerLaunch {
@@ -1001,6 +1031,7 @@ mod tests {
             EtcdCoordinatorConfig::localhost(),
             "   ",
             "host=127.0.0.1 port=5432 dbname=gossip",
+            None,
         )
         .expect_err("empty done-ledger DSN must be rejected");
 
@@ -1020,6 +1051,7 @@ mod tests {
             EtcdCoordinatorConfig::localhost(),
             "host=127.0.0.1 port=5432 dbname=gossip",
             "   ",
+            None,
         )
         .expect_err("empty findings DSN must be rejected");
 
@@ -1034,12 +1066,27 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_empty_git_kv_dsn() {
+        let error = ProductionBackendConfig::new(
+            EtcdCoordinatorConfig::localhost(),
+            "host=127.0.0.1 port=5432 dbname=gossip",
+            "host=127.0.0.1 port=5432 dbname=findings",
+            Some("   ".to_owned()),
+        )
+        .expect_err("empty git-kv DSN must be rejected");
+
+        assert_eq!(error, ProductionBackendConfigError::EmptyGitKvPostgresDsn);
+        assert_eq!(error.to_string(), "git-kv PostgreSQL DSN must not be empty");
+    }
+
+    #[test]
     fn config_debug_redacts_postgres_dsns() {
         let cfg = ProductionBackendConfig::new(
             EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "/gossip/v1")
                 .expect("hard-coded etcd config should be valid"),
             "postgresql://scanner:super-secret@db.example.internal:5432/done_ledger",
             "host=db.example.internal user=scanner password=ultra-secret dbname=findings",
+            Some("postgresql://scanner:git-secret@db.example.internal:5432/git_kv".to_owned()),
         )
         .expect("backend config should be valid");
 
@@ -1051,6 +1098,10 @@ mod tests {
         assert!(
             !debug.contains("ultra-secret"),
             "Debug output must not leak the findings DSN"
+        );
+        assert!(
+            !debug.contains("git-secret"),
+            "Debug output must not leak the git-kv DSN"
         );
         assert!(
             debug.contains("[redacted]"),
@@ -1200,6 +1251,7 @@ mod tests {
             EtcdCoordinatorConfig::localhost(),
             "  host=127.0.0.1 dbname=done  ",
             "  host=127.0.0.1 dbname=findings  ",
+            Some("  host=127.0.0.1 dbname=git_kv  ".to_owned()),
         )
         .expect("valid DSNs with surrounding whitespace should be accepted");
 
@@ -1207,6 +1259,10 @@ mod tests {
         assert_eq!(
             cfg.findings_postgres_dsn(),
             "host=127.0.0.1 dbname=findings"
+        );
+        assert_eq!(
+            cfg.git_kv_postgres_dsn(),
+            Some("host=127.0.0.1 dbname=git_kv")
         );
         assert_eq!(cfg.etcd().namespace_prefix(), "/gossip/v1");
     }
@@ -1233,6 +1289,7 @@ mod tests {
             test_async_coordinator_config(),
             done_ledger_dsn,
             create_test_db(),
+            None,
         )
         .expect("backend config should be valid");
 
@@ -1263,6 +1320,7 @@ mod tests {
             test_async_coordinator_config(),
             done_ledger_dsn,
             findings_dsn,
+            None,
         )
         .expect("backend config should be valid");
 
@@ -1297,6 +1355,7 @@ mod tests {
             test_async_coordinator_config(),
             done_ledger_dsn,
             findings_dsn,
+            None,
         )
         .expect("backend config should be valid");
 
@@ -1345,6 +1404,7 @@ mod tests {
             test_async_coordinator_config(),
             done_ledger_dsn,
             findings_dsn,
+            None,
         )
         .expect("backend config should be valid");
 
@@ -1376,6 +1436,7 @@ mod tests {
             test_async_coordinator_config(),
             done_ledger_dsn,
             findings_dsn,
+            None,
         )
         .expect("backend config should be valid");
 
@@ -1434,21 +1495,30 @@ mod tests {
         let etcd = test_async_coordinator_config();
         let done_ledger_dsn = create_test_db();
         let findings_dsn = create_test_db();
+        let git_kv_dsn = create_test_db();
         migrate_done_ledger_database(&done_ledger_dsn);
         migrate_findings_database(&findings_dsn);
+        migrate_git_kv_database(&git_kv_dsn);
         let done_ledger_client = Client::connect(&done_ledger_dsn, NoTls)
             .expect("done-ledger test database should accept connections");
         let findings_client = Client::connect(&findings_dsn, NoTls)
             .expect("findings test database should accept connections");
+        let git_kv_client = Client::connect(&git_kv_dsn, NoTls)
+            .expect("git-kv test database should accept connections");
 
         let backends = build_production_backends_from_clients(
             etcd,
             done_ledger_client,
             findings_client,
+            Some(git_kv_client),
             ProductionStartupSettings::validate_only(),
         )
         .expect("live backend construction from explicit clients should succeed");
 
+        assert!(
+            backends.git_persistence().is_some(),
+            "explicit git-kv client should build the Git persistence backend"
+        );
         backends
             .persistence()
             .findings_sink
@@ -1511,6 +1581,7 @@ mod tests {
             test_async_coordinator_config(),
             "host=127.0.0.1 port=1 user=postgres password=postgres dbname=postgres connect_timeout=1",
             create_test_db(),
+            None,
         )
         .expect("backend config should be valid");
 
@@ -1529,6 +1600,7 @@ mod tests {
             test_async_coordinator_config(),
             create_test_db(),
             "host=127.0.0.1 port=1 user=postgres password=postgres dbname=postgres connect_timeout=1",
+            None,
         )
         .expect("backend config should be valid");
 
@@ -1548,6 +1620,7 @@ mod tests {
                 .expect("syntactically valid etcd config should build"),
             create_test_db(),
             create_test_db(),
+            None,
         )
         .expect("backend config should be valid");
 
@@ -1740,6 +1813,7 @@ mod tests {
             test_async_coordinator_config(),
             done_ledger_dsn,
             findings_dsn,
+            None,
         )
         .expect("backend config should be valid");
 
@@ -1754,87 +1828,6 @@ mod tests {
                 )
             ),
             "expected CorruptedAppliedMigration with 0 bytes, got {error:?}"
-        );
-    }
-
-    // --- InMemoryGitPersistence tests ---
-
-    #[test]
-    fn in_memory_git_persistence_get_absent_key_returns_none() {
-        let store = InMemoryGitPersistence::default();
-        assert_eq!(store.get(b"missing").unwrap(), None);
-    }
-
-    #[test]
-    fn in_memory_git_persistence_put_then_get() {
-        let store = InMemoryGitPersistence::default();
-        store
-            .apply_batch(&[GitPersistenceOp::Put {
-                key: b"key1".to_vec(),
-                value: b"value1".to_vec(),
-            }])
-            .unwrap();
-        assert_eq!(store.get(b"key1").unwrap(), Some(b"value1".to_vec()));
-    }
-
-    #[test]
-    fn in_memory_git_persistence_put_then_delete() {
-        let store = InMemoryGitPersistence::default();
-        store
-            .apply_batch(&[GitPersistenceOp::Put {
-                key: b"key1".to_vec(),
-                value: b"value1".to_vec(),
-            }])
-            .unwrap();
-        store
-            .apply_batch(&[GitPersistenceOp::Delete {
-                key: b"key1".to_vec(),
-            }])
-            .unwrap();
-        assert_eq!(store.get(b"key1").unwrap(), None);
-    }
-
-    #[test]
-    fn in_memory_git_persistence_multi_get_preserves_order() {
-        let store = InMemoryGitPersistence::default();
-        store
-            .apply_batch(&[
-                GitPersistenceOp::Put {
-                    key: b"a".to_vec(),
-                    value: b"val_a".to_vec(),
-                },
-                GitPersistenceOp::Put {
-                    key: b"b".to_vec(),
-                    value: b"val_b".to_vec(),
-                },
-                GitPersistenceOp::Put {
-                    key: b"c".to_vec(),
-                    value: b"val_c".to_vec(),
-                },
-            ])
-            .unwrap();
-
-        let keys = vec![b"c".to_vec(), b"missing".to_vec(), b"a".to_vec()];
-        let results = store.multi_get(&keys).unwrap();
-        assert_eq!(
-            results,
-            vec![Some(b"val_c".to_vec()), None, Some(b"val_a".to_vec()),]
-        );
-    }
-
-    #[test]
-    fn in_memory_git_persistence_clones_share_state() {
-        let original = InMemoryGitPersistence::default();
-        let cloned = original.clone();
-        cloned
-            .apply_batch(&[GitPersistenceOp::Put {
-                key: b"shared_key".to_vec(),
-                value: b"shared_val".to_vec(),
-            }])
-            .unwrap();
-        assert_eq!(
-            original.get(b"shared_key").unwrap(),
-            Some(b"shared_val".to_vec()),
         );
     }
 
@@ -1866,7 +1859,7 @@ mod tests {
         fs::write(&file_as_root, "block").expect("write sentinel file");
 
         let error = run_production_worker(
-            &migrated_backend_config(),
+            &migrated_git_backend_config(),
             ProductionStartupSettings::validate_only(),
             git_worker_launch(file_as_root),
             DistributedRuntimeConfig::default(),

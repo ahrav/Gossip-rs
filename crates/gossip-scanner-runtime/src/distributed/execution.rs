@@ -26,7 +26,7 @@ use gossip_contracts::{
     },
 };
 use gossip_coordination::{AcquireScratch, CoordinationFacade, CursorSemantics};
-use scanner_git::{FinalizeOutcome, GitEventOutput};
+use scanner_git::{FinalizeOutcome, GitEventOutput, PersistenceStore};
 use scanner_scheduler::events::EventOutput;
 
 use super::commit_bridge::{
@@ -912,11 +912,11 @@ where
         )));
     }
 
-    // Findings must be durable BEFORE shard checkpoint advances. The in-memory
-    // GitPersistenceBackend makes post-execution batch write safe: a crash
-    // clears in-memory watermarks, causing full re-scan on re-claim. A durable
-    // GitPersistenceBackend would require splitting finalize into: seen-bitmaps
-    // → findings persistence → watermark commit.
+    // External findings and done-ledger state must land before a complete Git
+    // finalize advances the repo's durable scan state. The scan phase buffers
+    // complete finalizes so the git-kv commit can run after these receipts
+    // succeed; partial finalizes remain inline because they never advance
+    // watermarks.
     let captured_findings = capture_sink.take_captured_findings();
     let detected_count = capture_sink.detected_finding_count();
     if detected_count != captured_findings.len() as u64 {
@@ -965,6 +965,18 @@ where
         latency_ms: stage_metrics.durable_receipt_ms,
         receipts: GIT_REPO_RECEIPT_FAMILIES,
     });
+
+    if let Some(finalize) = execution.deferred_finalize.as_ref() {
+        execution
+            .persistence
+            .commit_finalize(finalize)
+            .map_err(|error| {
+                DistributedRuntimeError::Durability(AnyError::new(error).context(format!(
+                    "git repo-frontier shard '{}' git state finalize commit failed",
+                    stage_sink.redacted_shard_id()
+                )))
+            })?;
+    }
 
     tracing::debug!(
         shard_id = %stage_sink.redacted_shard_id(),

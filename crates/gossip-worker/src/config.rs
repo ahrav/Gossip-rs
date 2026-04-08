@@ -45,6 +45,8 @@ pub const ENV_ETCD_NAMESPACE: &str = "GOSSIP_ETCD_NAMESPACE";
 pub const ENV_DONE_LEDGER_POSTGRES_DSN: &str = "GOSSIP_DONE_LEDGER_POSTGRES_DSN";
 /// Environment variable supplying the findings PostgreSQL DSN.
 pub const ENV_FINDINGS_POSTGRES_DSN: &str = "GOSSIP_FINDINGS_POSTGRES_DSN";
+/// Environment variable supplying the Git key-value PostgreSQL DSN.
+pub const ENV_GIT_KV_POSTGRES_DSN: &str = "GOSSIP_GIT_KV_POSTGRES_DSN";
 /// Environment variable supplying the tenant id as a 32-byte hex string.
 pub const ENV_TENANT_ID: &str = "GOSSIP_TENANT_ID";
 /// Environment variable supplying the run id as a `u64`.
@@ -536,13 +538,15 @@ impl LocalWorkerConfig {
 /// Configuration for the real backend composition root.
 ///
 /// The etcd config already performs its own validation when it is created.
-/// This type adds only the PostgreSQL routing inputs needed to build the real
-/// persistence backends.
+/// This type adds the PostgreSQL routing inputs needed to build the real
+/// persistence backends. The Git key-value DSN is optional because filesystem
+/// workers do not use the Git repo-frontier durability path.
 #[derive(Clone)]
 pub struct ProductionBackendConfig {
     etcd: EtcdCoordinatorConfig,
     done_ledger_postgres_dsn: String,
     findings_postgres_dsn: String,
+    git_kv_postgres_dsn: Option<String>,
 }
 
 impl ProductionBackendConfig {
@@ -558,13 +562,18 @@ impl ProductionBackendConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ProductionBackendConfigError`] when either PostgreSQL DSN is
-    /// empty after trimming whitespace.
-    pub fn new(
+    /// Returns [`ProductionBackendConfigError`] when any configured PostgreSQL
+    /// DSN is empty after trimming whitespace.
+    pub fn new<D, F>(
         etcd: EtcdCoordinatorConfig,
-        done_ledger_postgres_dsn: impl Into<String>,
-        findings_postgres_dsn: impl Into<String>,
-    ) -> Result<Self, ProductionBackendConfigError> {
+        done_ledger_postgres_dsn: D,
+        findings_postgres_dsn: F,
+        git_kv_postgres_dsn: Option<String>,
+    ) -> Result<Self, ProductionBackendConfigError>
+    where
+        D: Into<String>,
+        F: Into<String>,
+    {
         let done_ledger_postgres_dsn = done_ledger_postgres_dsn.into().trim().to_owned();
         if done_ledger_postgres_dsn.is_empty() {
             return Err(ProductionBackendConfigError::EmptyDoneLedgerPostgresDsn);
@@ -575,10 +584,19 @@ impl ProductionBackendConfig {
             return Err(ProductionBackendConfigError::EmptyFindingsPostgresDsn);
         }
 
+        let git_kv_postgres_dsn = match git_kv_postgres_dsn.map(|dsn| dsn.trim().to_owned()) {
+            Some(dsn) if dsn.is_empty() => {
+                return Err(ProductionBackendConfigError::EmptyGitKvPostgresDsn);
+            }
+            Some(dsn) => Some(dsn),
+            None => None,
+        };
+
         Ok(Self {
             etcd,
             done_ledger_postgres_dsn,
             findings_postgres_dsn,
+            git_kv_postgres_dsn,
         })
     }
 
@@ -602,6 +620,13 @@ impl ProductionBackendConfig {
     pub(crate) fn findings_postgres_dsn(&self) -> &str {
         &self.findings_postgres_dsn
     }
+
+    /// PostgreSQL connection string for the Git key-value backend.
+    #[inline]
+    #[must_use]
+    pub(crate) fn git_kv_postgres_dsn(&self) -> Option<&str> {
+        self.git_kv_postgres_dsn.as_deref()
+    }
 }
 
 impl fmt::Debug for ProductionBackendConfig {
@@ -610,6 +635,10 @@ impl fmt::Debug for ProductionBackendConfig {
             .field("etcd", &self.etcd)
             .field("done_ledger_postgres_dsn", &"[redacted]")
             .field("findings_postgres_dsn", &"[redacted]")
+            .field(
+                "git_kv_postgres_dsn",
+                &self.git_kv_postgres_dsn.as_ref().map(|_| "[redacted]"),
+            )
             .finish()
     }
 }
@@ -623,6 +652,9 @@ pub enum ProductionBackendConfigError {
     /// The findings PostgreSQL DSN was empty after trimming whitespace.
     #[error("findings PostgreSQL DSN must not be empty")]
     EmptyFindingsPostgresDsn,
+    /// The Git key-value PostgreSQL DSN was empty after trimming whitespace.
+    #[error("git-kv PostgreSQL DSN must not be empty")]
+    EmptyGitKvPostgresDsn,
 }
 
 /// Distributed runtime tuning parsed from worker config.
@@ -810,7 +842,8 @@ impl DistributedWorkerConfig {
     /// Returns [`WorkerConfigError`] when the configured scan budgets or
     /// commit queue capacity are invalid, or when a Git distributed source
     /// points at a mirror root that is missing from the local host, is a
-    /// dangling symlink, or is not a directory.
+    /// dangling symlink, is not a directory, or omits the Git key-value
+    /// PostgreSQL DSN required for durable repo-frontier state.
     pub fn new(
         backends: ProductionBackendConfig,
         startup: ProductionStartupSettings,
@@ -827,6 +860,13 @@ impl DistributedWorkerConfig {
             ));
         }
         if let DistributedSourceSettings::Git(source) = &source {
+            if backends.git_kv_postgres_dsn().is_none() {
+                return Err(WorkerConfigError::MissingRequiredValue {
+                    field: "git_kv_postgres_dsn",
+                    flag: "--git-kv-postgres-dsn",
+                    env: ENV_GIT_KV_POSTGRES_DSN,
+                });
+            }
             validate_directory_exists("mirror_root", source.mirror_root())?;
         }
         Ok(Self {
@@ -1110,6 +1150,7 @@ struct RawWorkerConfig {
     etcd_namespace: Option<String>,
     done_ledger_postgres_dsn: Option<String>,
     findings_postgres_dsn: Option<String>,
+    git_kv_postgres_dsn: Option<String>,
     startup_schema_mode: Option<String>,
     tenant: Option<String>,
     run: Option<String>,
@@ -1122,6 +1163,8 @@ struct RawWorkerConfig {
     cli_done_ledger_dsn: bool,
     /// Tracks whether the findings DSN was supplied via a CLI flag.
     cli_findings_dsn: bool,
+    /// Tracks whether the Git key-value DSN was supplied via a CLI flag.
+    cli_git_kv_dsn: bool,
     /// Tracks whether the etcd endpoints were supplied via a CLI flag.
     cli_etcd_endpoints: bool,
 }
@@ -1146,6 +1189,7 @@ impl fmt::Debug for RawWorkerConfig {
             .field("etcd_namespace", &self.etcd_namespace)
             .field("done_ledger_postgres_dsn", &"[redacted]")
             .field("findings_postgres_dsn", &"[redacted]")
+            .field("git_kv_postgres_dsn", &"[redacted]")
             .field("startup_schema_mode", &self.startup_schema_mode)
             .field("tenant", &self.tenant)
             .field("run", &self.run)
@@ -1155,6 +1199,7 @@ impl fmt::Debug for RawWorkerConfig {
             .field("cli_tenant_secret_key", &self.cli_tenant_secret_key)
             .field("cli_done_ledger_dsn", &self.cli_done_ledger_dsn)
             .field("cli_findings_dsn", &self.cli_findings_dsn)
+            .field("cli_git_kv_dsn", &self.cli_git_kv_dsn)
             .field("cli_etcd_endpoints", &self.cli_etcd_endpoints)
             .finish()
     }
@@ -1180,6 +1225,7 @@ impl RawWorkerConfig {
             etcd_namespace: env.get(ENV_ETCD_NAMESPACE)?,
             done_ledger_postgres_dsn: env.get(ENV_DONE_LEDGER_POSTGRES_DSN)?,
             findings_postgres_dsn: env.get(ENV_FINDINGS_POSTGRES_DSN)?,
+            git_kv_postgres_dsn: env.get(ENV_GIT_KV_POSTGRES_DSN)?,
             startup_schema_mode: env.get(ENV_STARTUP_SCHEMA_MODE)?,
             tenant: env.get(ENV_TENANT_ID)?,
             run: env.get(ENV_RUN_ID)?,
@@ -1189,6 +1235,7 @@ impl RawWorkerConfig {
             cli_tenant_secret_key: false,
             cli_done_ledger_dsn: false,
             cli_findings_dsn: false,
+            cli_git_kv_dsn: false,
             cli_etcd_endpoints: false,
         })
     }
@@ -1304,6 +1351,10 @@ impl RawWorkerConfig {
                 self.findings_postgres_dsn = Some(value.to_owned());
                 self.cli_findings_dsn = true;
             }
+            "git-kv-postgres-dsn" => {
+                self.git_kv_postgres_dsn = Some(value.to_owned());
+                self.cli_git_kv_dsn = true;
+            }
             "startup-schema-mode" => self.startup_schema_mode = Some(value.to_owned()),
             "tenant-id" => self.tenant = Some(value.to_owned()),
             "run-id" => self.run = Some(value.to_owned()),
@@ -1400,6 +1451,13 @@ impl RawWorkerConfig {
                 "credential provided via CLI flag; prefer env var to avoid process-table exposure"
             );
         }
+        if self.cli_git_kv_dsn {
+            tracing::warn!(
+                flag = "--git-kv-postgres-dsn",
+                preferred_env = ENV_GIT_KV_POSTGRES_DSN,
+                "credential provided via CLI flag; prefer env var to avoid process-table exposure"
+            );
+        }
         if self.cli_etcd_endpoints {
             tracing::warn!(
                 flag = "--etcd-endpoints",
@@ -1474,6 +1532,17 @@ impl RawWorkerConfig {
                             "--findings-postgres-dsn",
                             ENV_FINDINGS_POSTGRES_DSN,
                         )?;
+                        let git_kv_postgres_dsn = if source == WorkerSource::Git {
+                            Some(parse_required(
+                                self.git_kv_postgres_dsn.as_deref(),
+                                parse_nonempty_string_redacted,
+                                "git_kv_postgres_dsn",
+                                "--git-kv-postgres-dsn",
+                                ENV_GIT_KV_POSTGRES_DSN,
+                            )?)
+                        } else {
+                            None
+                        };
                         let startup_schema_mode = parse_optional(
                             self.startup_schema_mode.as_deref(),
                             "startup_schema_mode",
@@ -1524,6 +1593,7 @@ impl RawWorkerConfig {
                             etcd,
                             done_ledger_postgres_dsn,
                             findings_postgres_dsn,
+                            git_kv_postgres_dsn,
                         )?;
                         let source = match source {
                             WorkerSource::Fs => {
@@ -1620,7 +1690,7 @@ fn usage() -> &'static str {
     "usage: gossip-worker [--mode=direct|connector] [--backend=local|production] \\
      [--tenant-id=HEX32] [--run-id=U64] [--worker-id=U64] [--policy-hash=HEX32] \\
      [--tenant-secret-key=HEX32] [--etcd-endpoints=CSV] [--etcd-namespace=PREFIX] \\
-     [--done-ledger-postgres-dsn=DSN] [--findings-postgres-dsn=DSN] \\
+     [--done-ledger-postgres-dsn=DSN] [--findings-postgres-dsn=DSN] [--git-kv-postgres-dsn=DSN] \\
      [--mirror-root=PATH] \\
      [--startup-schema-mode=validate|dev-auto-migrate] \\
      [--rules-file=PATH] [--decode-depth=N] [--scan-binary=true|false] \\
@@ -2351,6 +2421,60 @@ mod tests {
     }
 
     #[test]
+    fn connector_git_source_requires_git_kv_postgres_dsn() {
+        let mirror_root = tempfile::tempdir().expect("tempdir");
+        let env = production_env().with(ENV_WORKER_SOURCE, "git").with(
+            ENV_MIRROR_ROOT,
+            mirror_root.path().to_str().expect("utf-8 mirror_root"),
+        );
+
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("Git connector launches must require git-kv DSN");
+
+        assert!(
+            matches!(
+                err,
+                WorkerConfigError::MissingRequiredValue {
+                    field: "git_kv_postgres_dsn",
+                    flag: "--git-kv-postgres-dsn",
+                    env: ENV_GIT_KV_POSTGRES_DSN,
+                }
+            ),
+            "expected missing git-kv DSN error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn connector_git_source_resolves_with_git_kv_postgres_dsn() {
+        let mirror_root = tempfile::tempdir().expect("tempdir");
+        let env = production_env()
+            .with(ENV_WORKER_SOURCE, "git")
+            .with(
+                ENV_MIRROR_ROOT,
+                mirror_root.path().to_str().expect("utf-8 mirror_root"),
+            )
+            .with(
+                ENV_GIT_KV_POSTGRES_DSN,
+                "host=db.example.internal user=scanner password=git-secret dbname=git_kv",
+            );
+
+        let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect("Git connector env with git-kv DSN should resolve");
+
+        let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
+            panic!("expected distributed Git config");
+        };
+        let DistributedSourceSettings::Git(source) = cfg.source() else {
+            panic!("expected Git distributed source");
+        };
+        assert_eq!(source.mirror_root(), mirror_root.path());
+        assert_eq!(
+            cfg.production_backends().git_kv_postgres_dsn(),
+            Some("host=db.example.internal user=scanner password=git-secret dbname=git_kv")
+        );
+    }
+
+    #[test]
     fn distributed_config_rejects_git_mirror_root_that_is_not_a_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file_as_root = dir.path().join("not-a-directory");
@@ -2360,6 +2484,7 @@ mod tests {
             EtcdCoordinatorConfig::localhost(),
             "host=127.0.0.1 dbname=done",
             "host=127.0.0.1 dbname=findings",
+            Some("host=127.0.0.1 dbname=git_kv".to_owned()),
         )
         .expect("backend config should be valid");
         let identity = WorkerIdentityConfig::new(
@@ -2412,6 +2537,7 @@ mod tests {
             EtcdCoordinatorConfig::localhost(),
             "host=127.0.0.1 dbname=done",
             "host=127.0.0.1 dbname=findings",
+            Some("host=127.0.0.1 dbname=git_kv".to_owned()),
         )
         .expect("backend config should be valid");
         let identity = WorkerIdentityConfig::new(
@@ -3597,6 +3723,7 @@ mod tests {
             EtcdCoordinatorConfig::localhost(),
             "host=127.0.0.1 dbname=done",
             "host=127.0.0.1 dbname=findings",
+            None,
         )
         .expect("backend config should be valid");
         let identity = WorkerIdentityConfig::new(

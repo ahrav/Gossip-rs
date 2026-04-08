@@ -1612,6 +1612,7 @@ dependencies = [
  "gossip-done-ledger-postgres",
  "gossip-findings-postgres",
  "gossip-frontier",
+ "gossip-git-persistence-postgres",
  "gossip-orchestrator",
  "gossip-persistence-inmemory",
  "gossip-pg-common",

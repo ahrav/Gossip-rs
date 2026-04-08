@@ -7,8 +7,8 @@
 - a binary entrypoint that resolves environment variables plus CLI overrides
   into an explicit local or distributed launch path
 - a library surface that exposes the worker config module and the production
-  composition root for real etcd and PostgreSQL backends, plus the
-  coordination telemetry recorder module
+  composition root for real etcd and the configured PostgreSQL backends,
+  plus the coordination telemetry recorder module
 
 The package owns only:
 
@@ -36,12 +36,12 @@ Specifically:
 - `ExecutionMode::Direct` always resolves to a local scan path
 - `ExecutionMode::Connector` defaults to the real production backend path
 - `backend=local` is only valid for direct local scans
-- `backend=production` requires all identity fields plus etcd and PostgreSQL
-  backend settings
+- `backend=production` requires all identity fields plus etcd and the
+  configured PostgreSQL backend settings
 - `backend=production` never falls back to local or in-memory doubles
 - the default launch path fails closed on missing production backend settings
-- production startup validates etcd and both PostgreSQL schemas before any
-  shard work begins
+- production startup validates etcd and every configured PostgreSQL schema
+  before any shard work begins
 - development-only startup policy can auto-apply embedded migrations before
   readiness validation
 - successful local runs log `(items_scanned, bytes_scanned, findings_emitted)`
@@ -70,6 +70,7 @@ gossip-worker
             --> gossip-coordination-etcd
             --> gossip-done-ledger-postgres
             --> gossip-findings-postgres
+            --> gossip-git-persistence-postgres
             --> gossip-scanner-runtime distributed runtime
        --> src/recorder.rs
             --> CoordinationTelemetrySink (pub(crate) sink trait)
@@ -114,10 +115,12 @@ caller
      -> build_production_backends(config, startup)
         -> connect_postgres_client(...) [done-ledger]
         -> connect_postgres_client(...) [findings]
+        -> connect_postgres_client(...) [git-kv if configured]
         -> build_production_backends_from_clients(..., startup)
            -> EtcdCoordinator::connect(...) [includes cluster health check]
            -> prepare_done_ledger_backend(...)
            -> prepare_findings_backend(...)
+           -> prepare_git_kv_backend(...) [if configured]
      -> match launch:
         Fs  -> distributed::run_worker(...)
         Git -> LocalMirrorManager::new(...) + distributed::run_git_repo_worker(...)
@@ -190,6 +193,7 @@ override environment values when both are present.
 | `GOSSIP_ETCD_NAMESPACE` | string | *(none)* | Yes (production) | etcd namespace prefix for key isolation. |
 | `GOSSIP_DONE_LEDGER_POSTGRES_DSN` | PostgreSQL DSN | *(none)* | Yes (production) | Connection string for the done-ledger database. |
 | `GOSSIP_FINDINGS_POSTGRES_DSN` | PostgreSQL DSN | *(none)* | Yes (production) | Connection string for the findings database. |
+| `GOSSIP_GIT_KV_POSTGRES_DSN` | PostgreSQL DSN | *(none)* | Yes (git connector) | Connection string for the Git key-value database used by repo-frontier scans. |
 | `GOSSIP_STARTUP_SCHEMA_MODE` | `validate` or `dev-auto-migrate` | `validate` | No | Startup schema policy. `validate` fails closed when schemas are missing or drifted; `dev-auto-migrate` applies embedded migrations first, then validates readiness. |
 | `GOSSIP_TENANT_ID` | 64 hex chars (32 bytes) | *(none)* | Yes (production) | Tenant identity. Accepts optional `0x` prefix. |
 | `GOSSIP_RUN_ID` | u64, must be >= 1 | *(none)* | Yes (production) | Run identity. Zero is the unassigned sentinel and is rejected. |
@@ -223,6 +227,7 @@ All flags use `--name=value` syntax (equals-sign required; space-separated
 | `--etcd-namespace` | `GOSSIP_ETCD_NAMESPACE` | string |
 | `--done-ledger-postgres-dsn` | `GOSSIP_DONE_LEDGER_POSTGRES_DSN` | PostgreSQL DSN |
 | `--findings-postgres-dsn` | `GOSSIP_FINDINGS_POSTGRES_DSN` | PostgreSQL DSN |
+| `--git-kv-postgres-dsn` | `GOSSIP_GIT_KV_POSTGRES_DSN` | PostgreSQL DSN |
 | `--startup-schema-mode` | `GOSSIP_STARTUP_SCHEMA_MODE` | `validate`, `dev-auto-migrate` |
 | `--tenant-id` | `GOSSIP_TENANT_ID` | 64 hex chars |
 | `--run-id` | `GOSSIP_RUN_ID` | u64, >= 1 |
@@ -384,7 +389,7 @@ enum StartupSchemaMode {
 ```
 
 Startup policy for the production composition root. `Validate` is the
-fail-closed default: both PostgreSQL schemas and their migration history
+fail-closed default: every configured PostgreSQL schema and its migration history
 tables must already exist and match the embedded checksums.
 `DevAutoMigrate` is reserved for local development and integration
 workflows where applying embedded migrations at startup is acceptable.
@@ -432,15 +437,17 @@ production fields, validation failures, and unsupported launch combinations.
 
 ### ProductionBackendConfig
 
-Validated startup bundle containing the etcd coordination config plus the two
-PostgreSQL DSNs used to build the real persistence backends. Debug output
-redacts both DSNs so credentials do not leak into logs.
+Validated startup bundle containing the etcd coordination config plus the
+done-ledger and findings PostgreSQL DSNs, and an optional Git key-value DSN
+for repo-frontier workers. Debug output redacts every configured DSN so
+credentials do not leak into logs.
 
 ### ProductionRuntimeBackends
 
 Concrete bundle of the live etcd coordinator and persistence handles passed to
 the generic distributed runtime. Construction succeeds only after etcd passes a
-status check and both PostgreSQL schemas satisfy the selected startup policy.
+status check and every configured PostgreSQL schema satisfies the selected
+startup policy.
 
 ### ProductionCoordinationEventRecorder
 
@@ -521,7 +528,7 @@ output for diagnostics).
 | `log_local_report()` | Emit local success metrics through `tracing::info!` |
 | `log_distributed_report()` | Emit distributed success metrics through `tracing::info!` |
 | `main()` | Wire together tracing, config resolution, execution, logging, and exit codes |
-| `build_production_backends()` | Connect the real etcd and PostgreSQL backends from DSNs |
+| `build_production_backends()` | Connect the real etcd and configured PostgreSQL backends from DSNs |
 | `build_production_backends_from_clients()` | Wrap caller-supplied PostgreSQL clients with the real runtime backends |
 | `run_production_worker()` | Build backends, enforce the startup schema policy, and run the distributed runtime |
 

@@ -1006,6 +1006,65 @@ where
     }
 }
 
+/// Scan-time persistence shim that defers complete finalizes until the caller
+/// confirms external durability.
+///
+/// Spill-stage seen-bitmap writes still flow directly into the underlying
+/// adapter so mid-scan checkpoints remain resumable. Partial finalizes are also
+/// forwarded immediately because they never advance ref watermarks. Only a
+/// complete finalize is buffered in memory, allowing the distributed runtime to
+/// commit the scanner-owned Git state after findings and done-ledger writes
+/// succeed.
+#[derive(Debug)]
+pub(crate) struct DeferredCompleteFinalizeStore<'a, B> {
+    persistence: &'a GitPersistenceAdapter<B>,
+    pending_complete: RefCell<Option<FinalizeOutput>>,
+}
+
+impl<'a, B> DeferredCompleteFinalizeStore<'a, B> {
+    /// Build one deferred-finalize shim over the shared Git persistence adapter.
+    pub(crate) fn new(persistence: &'a GitPersistenceAdapter<B>) -> Self {
+        Self {
+            persistence,
+            pending_complete: RefCell::new(None),
+        }
+    }
+
+    /// Consume the shim and return any complete finalize buffered during the scan.
+    pub(crate) fn into_pending_complete(self) -> Option<FinalizeOutput> {
+        self.pending_complete.into_inner()
+    }
+}
+
+impl<B> SeenBitmapPersister for DeferredCompleteFinalizeStore<'_, B>
+where
+    B: GitPersistenceBackend,
+{
+    fn persist_seen_delta(&self, oids: &[OidBytes]) -> Result<(), SpillError> {
+        self.persistence.persist_seen_delta(oids)
+    }
+}
+
+impl<B> PersistenceStore for DeferredCompleteFinalizeStore<'_, B>
+where
+    B: GitPersistenceBackend,
+{
+    fn commit_finalize(&self, output: &FinalizeOutput) -> Result<(), PersistError> {
+        if matches!(output.outcome, FinalizeOutcome::Complete) {
+            let mut pending = self.pending_complete.borrow_mut();
+            if pending.is_some() {
+                return Err(PersistError::backend(
+                    "complete finalize already deferred for this scan",
+                ));
+            }
+            *pending = Some(output.clone());
+            return Ok(());
+        }
+
+        self.persistence.commit_finalize(output)
+    }
+}
+
 /// Identity inputs used when treating a Git repo as a persistence item.
 ///
 /// Git repos have no object-version concept at the done-ledger level, so the
@@ -1793,6 +1852,94 @@ mod tests {
         assert!(
             backend.contains_key(&base_key),
             "partial finalize must preserve base checkpoint for resume"
+        );
+    }
+
+    #[test]
+    fn deferred_complete_finalize_buffers_until_explicit_commit() {
+        let backend = TestBackend::atomic();
+        let repo_id = 80;
+        let policy_hash = [0x80; 32];
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+        let deferred = DeferredCompleteFinalizeStore::new(&adapter);
+        let oid = sim_oid(0xA0);
+
+        deferred
+            .persist_seen_delta(&[oid])
+            .expect("spill staging should still persist during scan");
+        deferred
+            .commit_finalize(&complete_finalize_with_watermark(7))
+            .expect("complete finalize should buffer instead of committing");
+
+        assert_staging_contains(&backend, repo_id, &policy_hash, &[oid]);
+        assert!(
+            backend.get_value(TEST_WATERMARK_KEY).is_none(),
+            "buffered finalize must not advance watermarks yet"
+        );
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid])
+                .expect("staging should stay invisible until finalize commit"),
+            vec![false]
+        );
+
+        let pending = deferred
+            .into_pending_complete()
+            .expect("complete finalize should be returned to the runtime");
+        adapter
+            .commit_finalize(&pending)
+            .expect("runtime should be able to commit the buffered finalize");
+
+        assert_scope_contains(&backend, repo_id, &policy_hash, &[oid]);
+        assert!(
+            !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
+            "successful buffered finalize commit must clear staging"
+        );
+        assert_eq!(
+            backend.get_value(TEST_WATERMARK_KEY).as_deref(),
+            Some(&[7][..]),
+            "explicit finalize commit must advance watermarks"
+        );
+    }
+
+    #[test]
+    fn deferred_complete_finalize_forwards_partial_finalize_immediately() {
+        let backend = TestBackend::atomic();
+        let repo_id = 81;
+        let policy_hash = [0x81; 32];
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+        let deferred = DeferredCompleteFinalizeStore::new(&adapter);
+        let oid = sim_oid(0xB0);
+
+        deferred
+            .persist_seen_delta(&[oid])
+            .expect("spill staging should persist");
+        deferred
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+                stats: Default::default(),
+            })
+            .expect("partial finalize should still commit immediately");
+
+        assert!(
+            deferred.into_pending_complete().is_none(),
+            "partial finalize must not leave a buffered complete finalize"
+        );
+        assert!(
+            !backend.contains_key(&build_seen_staging_key(repo_id, &policy_hash)),
+            "partial finalize should discard staging immediately"
+        );
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid])
+                .expect("discarded staging must not leak into committed scope"),
+            vec![false]
+        );
+        assert!(
+            backend.get_value(TEST_WATERMARK_KEY).is_none(),
+            "partial finalize must not advance watermarks"
         );
     }
 
