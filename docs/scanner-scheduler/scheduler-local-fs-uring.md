@@ -1108,16 +1108,6 @@ fn io_worker_loop<E: ScanEngine>(
     archive_tx: Option<chan::Sender<ArchiveWork>>,
     extract_tx: Option<chan::Sender<ExtractWork>>,
 ) -> io::Result<UringIoStats>;
-// old signature follows for sed hack
-    _wid: usize,
-    rx: chan::Receiver<FileWork>,      // File queue
-    pool: Arc<FixedBufferPool>,         // Shared buffer pool
-    cpu: ExecutorHandle<CpuTask>,       // CPU executor handle
-    engine: Arc<E>,
-    cfg: LocalFsUringConfig,
-    stop: Arc<AtomicBool>,              // Graceful shutdown flag
-    archive_tx: Option<chan::Sender<ArchiveWork>>, // Archive routing channel
-) -> io::Result<UringIoStats>;
 
 // Archive worker loop (blocking decompression + scan)
 fn archive_worker_loop<E: ScanEngine>(
