@@ -40,6 +40,19 @@
 //!   unsanitized value.
 //! - These types are value-level contracts only. Retry scheduling, circuit
 //!   breaking, and backoff policy live in the runtime crate.
+//!
+//! ## Diagnostic hygiene
+//!
+//! - The generated `Display` impls share the private
+//!   [`fmt_sanitized_message`](fmt_sanitized_message) helper so control
+//!   characters cannot disrupt logs. Callers who observe `message()` must still
+//!   treat it as untrusted input before logging or displaying.
+//! - `Debug` output redacts connector text through `ToxicDigest`, so
+//!   instrumentation that needs the raw bytes can call [`message()`] directly.
+//! - Treat `ConnectorCapabilities` as a declaration of intent. Callers should
+//!   respect the advertised feature set but still guard each use site with the
+//!   appropriate error handling because runtime policy or connector state may
+//!   prevent the same request from succeeding later.
 
 use std::fmt;
 
@@ -311,6 +324,11 @@ impl ReadError {
     /// example, a range-read attempt against a connector that does not
     /// advertise [`ConnectorCapabilities::range_read`]. The message is
     /// formatted as `"{feature} not supported"`.
+    ///
+    /// Even when the connector declares a capability, the caller should still
+    /// guard capability-specific paths because the runtime or connector state
+    /// may reject the operation later. This helper ensures the runtime always
+    /// observes a consistent permanent error in those cases.
     #[must_use]
     pub fn unsupported(feature: &'static str) -> Self {
         Self::permanent(format!("{feature} not supported"))
@@ -332,6 +350,12 @@ impl ReadError {
 /// declare capabilities. Callers should still handle [`ReadError::unsupported`]
 /// at call time, because a capability flag is a *static declaration of
 /// intent*, not a guarantee that every call will succeed.
+///
+/// Planning and registration layers consult these flags to decide how to shard
+/// enumeration workloads and whether to emit split hints. Because the values
+/// declare intent, connectors should continue to report failures through
+/// [`ReadError::unsupported`] whenever a capability-specific path is
+/// unavailable at runtime instead of silently falling back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConnectorCapabilities {
     /// The connector can resume enumeration from an arbitrary key position.
@@ -364,4 +388,6 @@ pub struct ConnectorCapabilities {
 
 #[cfg(test)]
 #[path = "api_tests.rs"]
+/// Tests that assert the documented error constructors, sanitization helper,
+/// and capability expectations remain stable.
 mod tests;

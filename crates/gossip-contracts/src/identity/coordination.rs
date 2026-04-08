@@ -269,19 +269,20 @@ impl ::core::fmt::Display for ShardKey {
 }
 
 impl ShardKey {
-    /// Construct a new `ShardKey`.
+    /// Construct a `ShardKey` with run-major ordering so map lookups and
+    /// sorts remain deterministic even when shards reuse the same `ShardId`.
     #[inline]
     pub const fn new(run: RunId, shard: ShardId) -> Self {
         Self { run, shard }
     }
 
-    /// The run component.
+    /// Returns the run component, disambiguating shards that share a `ShardId`.
     #[inline]
     pub const fn run(&self) -> RunId {
         self.run
     }
 
-    /// The shard component.
+    /// Returns the shard component, i.e., the shard identity scoped to `run`.
     #[inline]
     pub const fn shard(&self) -> ShardId {
         self.shard
@@ -305,6 +306,7 @@ impl CanonicalBytes for ShardKey {
 
 #[cfg(test)]
 mod tests {
+    //! Smoke and property tests that lock in sentinel bounds, canonical byte stability, and ordering expectations for coordination IDs.
     use super::*;
     use crate::test_util::canonical_digest;
     use proptest::prelude::*;
