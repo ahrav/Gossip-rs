@@ -10,6 +10,7 @@
 //! The public trait surface intentionally keeps the persistence backend opaque.
 //! Callers load and store raw checkpoint blobs, while this module owns the
 //! encoding and decoding of runner state.
+//!
 //! Checkpoint blobs are framed as `[magic: 4][crc32_le: 4][postcard payload]`
 //! so resume loads can reject accidental corruption before deserializing state.
 
@@ -36,9 +37,7 @@ use crate::NormHash;
 /// Envelope layout: `[magic: 4 bytes][crc32_le: 4 bytes][postcard payload: N bytes]`.
 const CHECKPOINT_MAGIC: [u8; 4] = *b"gkpt";
 
-/// Size of the fixed checkpoint envelope prefix.
-///
-/// Envelope layout: `[magic: 4 bytes][crc32_le: 4 bytes][postcard payload: N bytes]`.
+/// Size of the fixed checkpoint envelope prefix (see [`CHECKPOINT_MAGIC`]).
 const CHECKPOINT_ENVELOPE_HEADER_LEN: usize = CHECKPOINT_MAGIC.len() + std::mem::size_of::<u32>();
 
 /// Maximum checkpoint payload size accepted during deserialization (256 MiB).
@@ -68,8 +67,9 @@ fn checkpoint_serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ScanC
         tracing::error!(
             size = payload.len(),
             limit = MAX_CHECKPOINT_BYTES,
-            "checkpoint blob exceeds decode-side size limit; \
-             the blob will be persisted but discarded on the next resume"
+            dead_on_resume = true,
+            "checkpoint payload exceeds size limit; blob will be persisted \
+             but rejected on the next resume attempt, causing a full restart"
         );
     }
 
@@ -1456,6 +1456,11 @@ mod tests {
         ]
     }
 
+    /// Frame raw bytes as a checkpoint envelope without serde serialization.
+    ///
+    /// Used for tests that need to inject pre-encoded payloads or corrupt
+    /// specific envelope fields. Must be updated in lockstep with
+    /// [`checkpoint_serialize`] if the envelope format changes.
     fn frame_checkpoint_payload(payload: &[u8]) -> Vec<u8> {
         let crc32 = crc32fast::hash(payload);
         let mut encoded = Vec::with_capacity(CHECKPOINT_ENVELOPE_HEADER_LEN + payload.len());
@@ -2374,6 +2379,26 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_deserialize_rejects_valid_envelope_with_invalid_postcard() {
+        // Exercises the postcard::from_bytes error-wrapping path (line 127):
+        // valid magic, valid CRC, within size limit, but garbage postcard bytes.
+        let garbage = &[0xFF, 0xFE, 0xFD];
+        let blob = frame_checkpoint_payload(garbage);
+
+        let err = checkpoint_deserialize::<StoredBaseState>(&blob)
+            .expect_err("garbage postcard payload must fail");
+        assert!(
+            matches!(err, ScanCheckpointError::Decode(_)),
+            "expected Decode variant, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checkpoint decoding failed"),
+            "error message should use the Decode variant prefix: {msg}"
+        );
+    }
+
+    #[test]
     fn checkpoint_deserialize_rejects_magic_mismatch() {
         let payload = postcard::to_allocvec(&123u32).expect("payload");
         let mut blob = frame_checkpoint_payload(&payload);
@@ -2403,6 +2428,36 @@ mod tests {
             format!(
                 "checkpoint decoding failed: checkpoint CRC mismatch (stored {stored_crc32:#010x}, computed {computed_crc32:#010x})"
             )
+        );
+    }
+
+    #[test]
+    fn deserialize_empty_payload_with_valid_crc_returns_decode_error() {
+        // Header-only blob: valid magic + CRC of empty payload. Passes the
+        // envelope checks but postcard cannot decode an empty byte slice into
+        // a structured type, so this exercises the postcard error mapping.
+        let blob = frame_checkpoint_payload(&[]);
+        let err = checkpoint_deserialize::<StoredBaseState>(&blob)
+            .expect_err("empty payload cannot decode to StoredBaseState");
+        assert!(matches!(err, ScanCheckpointError::Decode(_)));
+    }
+
+    #[test]
+    fn deserialize_truncated_payload_triggers_crc_mismatch() {
+        // Valid header length but payload truncated after framing: the stored
+        // CRC covers the original full payload, so truncation is detected as
+        // a CRC mismatch rather than a postcard decode error.
+        let full_blob = serialize_checkpoint_for_test(&vec![0xAAu8; 32]);
+        assert!(
+            full_blob.len() > CHECKPOINT_ENVELOPE_HEADER_LEN + 1,
+            "test value must produce a multi-byte payload"
+        );
+        let truncated = full_blob[..CHECKPOINT_ENVELOPE_HEADER_LEN + 1].to_vec();
+        let err =
+            checkpoint_deserialize::<Vec<u8>>(&truncated).expect_err("truncated payload must fail");
+        assert!(
+            err.to_string().contains("CRC mismatch"),
+            "expected CRC mismatch, got: {err}"
         );
     }
 
@@ -2508,6 +2563,11 @@ mod tests {
         #[case] completed_plan_count: usize,
         #[case] should_succeed: bool,
     ) {
+        // `encode_spill_dedup_base` produces a base with 2 packed candidates.
+        // The validation in `from_loaded` checks `completed_plan_count` against
+        // `base.packed.len()` (= 2), so count <= 2 succeeds and count > 2 fails.
+        // The `packed: &[]` in the prefix checkpoint below only controls what is
+        // serialized into the prefix blob; it is not used for validation.
         let fp = artifact(34);
         let (base_state, ..) = encode_spill_dedup_base(&fp);
         let path_arena = ByteArena::with_capacity(0);
