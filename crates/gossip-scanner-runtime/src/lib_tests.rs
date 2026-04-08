@@ -29,7 +29,7 @@ use crate::{
         CommitProgressRecord, CoordinationEventRecorder, StageSignal, StoredGitEvent,
     },
     distributed::{DistributedPersistence, DistributedRuntimeConfig, WorkerIdentity, run_worker},
-    test_fixtures::{init_git_repo, run_git_in},
+    test_fixtures::{init_git_repo, run_git},
 };
 
 fn create_test_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
@@ -49,8 +49,8 @@ fn create_test_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     }
 
     if !files.is_empty() {
-        run_git_in(dir.path(), &["add", "."]);
-        run_git_in(dir.path(), &["commit", "-q", "-m", "fixture"]);
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-q", "-m", "fixture"]);
     }
 
     dir
@@ -1344,7 +1344,7 @@ fn scan_git_with_perf_debug_handles_empty_pack_exec_reports() {
     // empty-vector path in format_git_debug_output's Perf branch.
     let repo = create_test_repo(&[]);
     // Create an empty commit so the repo has at least one ref.
-    run_git_in(
+    run_git(
         repo.path(),
         &["commit", "-q", "--allow-empty", "-m", "empty"],
     );

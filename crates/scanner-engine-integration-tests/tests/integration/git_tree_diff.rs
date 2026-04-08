@@ -17,7 +17,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
-use crate::git_test_support::{git_available, git_output, init_git_repo, oid_from_hex, run_git};
+use crate::git_test_support::{git_available, git_stdout, init_git_repo, oid_from_hex, run_git};
 use scanner_git::{
     ArtifactBuildLimits, BlobIntroducer, CandidateBuffer, CandidateSink, ChangeKind,
     CollectedUniqueBlob, CollectingUniqueBlobSink, CommitGraph, CommitGraphIndex, CommitWalkLimits,
@@ -203,7 +203,7 @@ fn prepare_repo_with_duplicate_blobs() -> TempDir {
 ///
 /// Returns the mutable state with MIDX populated.
 fn open_repo_state(repo: &Path) -> RepoJobState {
-    let head = git_output(repo, &["rev-parse", "HEAD"]);
+    let head = git_stdout(repo, &["rev-parse", "HEAD"]);
     let head_oid = oid_from_hex(&head);
 
     let resolver = TestResolver {
@@ -291,11 +291,11 @@ fn tree_diff_matches_git_diff_tree() {
     let mut walker = TreeDiffWalker::new(&limits, state.object_format.oid_len());
     let mut candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
 
-    let new_tree = oid_from_hex(&git_output(
+    let new_tree = oid_from_hex(&git_stdout(
         tmp.path(),
         &["show", "-s", "--format=%T", "HEAD"],
     ));
-    let old_tree = oid_from_hex(&git_output(
+    let old_tree = oid_from_hex(&git_stdout(
         tmp.path(),
         &["show", "-s", "--format=%T", "HEAD~1"],
     ));
@@ -312,7 +312,7 @@ fn tree_diff_matches_git_diff_tree() {
         )
         .unwrap();
 
-    let diff = git_output(
+    let diff = git_stdout(
         tmp.path(),
         &[
             "diff-tree",
@@ -543,7 +543,7 @@ fn blob_introducer_dedupes_duplicate_oids() {
         )
         .unwrap();
 
-    let loose_oid = oid_from_hex(&git_output(tmp.path(), &["hash-object", "loose.txt"]));
+    let loose_oid = oid_from_hex(&git_stdout(tmp.path(), &["hash-object", "loose.txt"]));
     let mut paths = Vec::new();
     for cand in intro_candidates.iter_resolved() {
         if cand.oid == loose_oid {
@@ -575,11 +575,11 @@ fn tree_diff_spill_path_uses_spill_arena() {
     let spill = tempfile::tempdir().unwrap();
     let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
 
-    let new_tree = oid_from_hex(&git_output(
+    let new_tree = oid_from_hex(&git_stdout(
         tmp.path(),
         &["show", "-s", "--format=%T", "HEAD"],
     ));
-    let old_tree = oid_from_hex(&git_output(
+    let old_tree = oid_from_hex(&git_stdout(
         tmp.path(),
         &["show", "-s", "--format=%T", "HEAD~1"],
     ));
@@ -615,11 +615,11 @@ fn tree_diff_streaming_matches_buffered() {
     let tmp = prepare_repo_with_many_files(128);
     let state = open_repo_state(tmp.path());
 
-    let new_tree = oid_from_hex(&git_output(
+    let new_tree = oid_from_hex(&git_stdout(
         tmp.path(),
         &["show", "-s", "--format=%T", "HEAD"],
     ));
-    let old_tree = oid_from_hex(&git_output(
+    let old_tree = oid_from_hex(&git_stdout(
         tmp.path(),
         &["show", "-s", "--format=%T", "HEAD~1"],
     ));
@@ -697,9 +697,9 @@ fn merge_diff_modes_emit_expected_candidates() {
     let tmp = prepare_repo_with_merge();
     let state = open_repo_state(tmp.path());
 
-    let merge_tree = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD^{tree}"]));
-    let parent1_tree = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD^1^{tree}"]));
-    let parent2_tree = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD^2^{tree}"]));
+    let merge_tree = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD^{tree}"]));
+    let parent1_tree = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD^1^{tree}"]));
+    let parent2_tree = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD^2^{tree}"]));
 
     let limits = TreeDiffLimits::RESTRICTIVE;
     let spill = tempfile::tempdir().unwrap();

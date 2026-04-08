@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
-use crate::git_test_support::{git_available, git_output, init_git_repo, oid_from_hex, run_git};
+use crate::git_test_support::{git_available, git_stdout, init_git_repo, oid_from_hex, run_git};
 use regex::bytes::Regex;
 use tempfile::TempDir;
 
@@ -196,7 +196,7 @@ fn run_scan_with_config(
     config: GitScanConfig,
 ) -> Result<GitScanResult, GitScanError> {
     let engine = test_engine();
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark };
     #[cfg(feature = "rocksdb")]
@@ -308,7 +308,7 @@ fn loose_only_candidate_scans_complete() {
     commit_file(tmp.path(), "secret.txt", "TOK_ABCDEFGH\n", "secret");
     repack_all(tmp.path());
 
-    let watermark = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD~1"]));
+    let watermark = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD~1"]));
     // Root commit in a 2-commit chain has generation 1.
     let result = run_scan(
         tmp.path(),
@@ -571,14 +571,14 @@ fn shallow_clone_boundary_treats_missing_parent_as_external_root() {
     assert!(clone_status.success(), "git clone --depth 1 must succeed");
 
     assert_eq!(
-        git_output(&shallow_repo, &["rev-parse", "--is-shallow-repository"]),
+        git_stdout(&shallow_repo, &["rev-parse", "--is-shallow-repository"]),
         "true",
         "fixture must be a shallow clone"
     );
 
     // `git show --pretty=%P` respects shallow grafts and hides boundary parents.
     // Parse raw commit headers to capture the parent OID that is truly missing.
-    let head_raw = git_output(&shallow_repo, &["cat-file", "-p", "HEAD"]);
+    let head_raw = git_stdout(&shallow_repo, &["cat-file", "-p", "HEAD"]);
     let missing_parent_hex = head_raw
         .lines()
         .find_map(|line| line.strip_prefix("parent "))
@@ -651,7 +651,7 @@ fn run_scan_with_events(
     config: GitScanConfig,
 ) -> (GitScanResult, Vec<String>) {
     let engine = test_engine();
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark };
     #[cfg(feature = "rocksdb")]
@@ -702,7 +702,7 @@ fn failed_finalize_retry_still_scans_blob() {
     );
     ensure_artifacts(repo);
 
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark: None };
     let store = RetryStore {
@@ -795,7 +795,7 @@ fn aborted_scan_skips_finalize_persistence() {
     );
     ensure_artifacts(repo);
 
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark: None };
     let persist_store = InMemoryPersistenceStore::default();
@@ -941,7 +941,7 @@ fn parallel_blob_intro_aborts_on_delayed_flag() {
     }
     ensure_artifacts(repo);
 
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark: None };
     let persist_store = InMemoryPersistenceStore::default();
@@ -1030,7 +1030,7 @@ fn mid_scan_abort_stops_execution_and_skips_finalize() {
     }
     ensure_artifacts(repo);
 
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark: None };
     let persist_store = InMemoryPersistenceStore::default();
@@ -1104,7 +1104,7 @@ fn stage_boundary_abort_in_diff_history_mode() {
     }
     ensure_artifacts(repo);
 
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark: None };
     let persist_store = InMemoryPersistenceStore::default();

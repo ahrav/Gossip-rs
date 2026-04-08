@@ -7,7 +7,7 @@
 //!
 //! Requires `git` on `PATH`; skips gracefully if unavailable.
 
-use crate::git_test_support::{git_available, git_output, init_git_repo, oid_from_hex, run_git};
+use crate::git_test_support::{git_available, git_stdout, init_git_repo, oid_from_hex, run_git};
 use scanner_git::OidBytes;
 use scanner_git::{
     ArtifactBuildLimits, CommitGraph, CommitWalkLimits, MidxView, RefWatermarkStore, RepoOpenError,
@@ -67,8 +67,8 @@ fn snapshot_plan_emits_ref_tips() {
 
     let tmp = init_repo_with_commits(3);
 
-    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    let prev = git_output(tmp.path(), &["rev-parse", "HEAD~1"]);
+    let head = git_stdout(tmp.path(), &["rev-parse", "HEAD"]);
+    let prev = git_stdout(tmp.path(), &["rev-parse", "HEAD~1"]);
 
     let head_oid = oid_from_hex(&head);
     let prev_oid = oid_from_hex(&prev);

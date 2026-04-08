@@ -1227,7 +1227,7 @@ mod tests {
 
     use super::*;
     use crate::git_request::{GitRequest, GitRequestSelection, GitRequestTarget};
-    use crate::test_support::{init_git_repo, run_config, run_git_in};
+    use crate::test_support::{init_git_repo, run_config, run_git};
 
     fn tenant(byte: u8) -> TenantId {
         TenantId::from_bytes([byte; 32])
@@ -1470,8 +1470,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         init_repo(dir.path());
         fs::write(dir.path().join("tracked.txt"), "v1\n").expect("write tracked file");
-        run_git_in(dir.path(), &["add", "."]);
-        run_git_in(dir.path(), &["commit", "-m", "first"]);
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "first"]);
         let commit = current_commit_oid(dir.path());
 
         let (_, payload) = payload_from_request(
@@ -1508,8 +1508,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         init_repo(dir.path());
         fs::write(dir.path().join("tracked.txt"), "v1\n").expect("write tracked file");
-        run_git_in(dir.path(), &["add", "."]);
-        run_git_in(dir.path(), &["commit", "-m", "first"]);
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "first"]);
         let commit = current_commit_oid(dir.path());
 
         let (_, payload) = payload_from_request(
@@ -1552,7 +1552,7 @@ mod tests {
     fn lowering_explicit_commit_rejects_missing_commit() {
         let dir = tempdir().expect("tempdir");
         init_repo(dir.path());
-        run_git_in(dir.path(), &["commit", "--allow-empty", "-m", "first"]);
+        run_git(dir.path(), &["commit", "--allow-empty", "-m", "first"]);
 
         let (_, payload) = payload_from_request(
             GitRequest::repo_with_explicit_commit(

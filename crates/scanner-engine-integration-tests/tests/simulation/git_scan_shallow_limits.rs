@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
-use crate::git_test_support::{git_available, git_output, init_git_repo, oid_from_hex, run_git};
+use crate::git_test_support::{git_available, git_stdout, init_git_repo, oid_from_hex, run_git};
 use regex::bytes::Regex;
 use tempfile::TempDir;
 
@@ -106,7 +106,7 @@ fn shallow_root_limit_failure_is_covered_by_sim_harness() {
         .expect("failed to run git clone");
     assert!(clone_status.success(), "git clone --depth 1 must succeed");
 
-    let tip = oid_from_hex(&git_output(&shallow_repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(&shallow_repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let persist = InMemoryPersistenceStore::default();
     let mut config = GitScanConfig {

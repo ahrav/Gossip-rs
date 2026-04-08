@@ -27,7 +27,7 @@ use super::git_scan_validation::{
     perf_stats_enabled, test_engine,
 };
 #[cfg(feature = "rocksdb")]
-use crate::git_test_support::{git_available, git_output, oid_from_hex};
+use crate::git_test_support::{git_available, git_stdout, oid_from_hex};
 
 /// Test double that records persisted ops and can simulate commit failures.
 #[derive(Default)]
@@ -224,13 +224,13 @@ fn run_git_scan_with_rocksdb_writes_incremental_seen_bitmap() {
         let contents = format!("TOK_{i:08X}\n");
         let msg = format!("c{i}");
         commit_file(repo, &name, &contents, &msg);
-        blob_hexes.push(git_output(repo, &["rev-parse", &format!("HEAD:{name}")]));
+        blob_hexes.push(git_stdout(repo, &["rev-parse", &format!("HEAD:{name}")]));
     }
     ensure_artifacts(repo);
     blob_hexes.sort_unstable();
     let blob_oids: Vec<OidBytes> = blob_hexes.iter().map(|hex| oid_from_hex(hex)).collect();
 
-    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let tip = oid_from_hex(&git_stdout(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let mut config = base_config();
     // DiffHistory mode walks commits through the spill pipeline.

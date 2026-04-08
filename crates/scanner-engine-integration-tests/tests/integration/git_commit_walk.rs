@@ -15,7 +15,7 @@ use std::fs;
 use std::num::NonZeroU32;
 use std::path::Path;
 
-use crate::git_test_support::{git_available, git_output, init_git_repo, oid_from_hex, run_git};
+use crate::git_test_support::{git_available, git_stdout, init_git_repo, oid_from_hex, run_git};
 use scanner_git::OidBytes;
 use scanner_git::{
     ArtifactAcquireError, ArtifactBuildLimits, CommitGraph, CommitGraphMem, CommitPlanIter,
@@ -25,7 +25,7 @@ use scanner_git::{
 use tempfile::TempDir;
 
 fn rev_list(repo: &Path, rev: &str) -> Vec<OidBytes> {
-    let out = git_output(repo, &["rev-list", rev]);
+    let out = git_stdout(repo, &["rev-list", rev]);
     out.lines().map(oid_from_hex).collect()
 }
 
@@ -152,9 +152,9 @@ fn commit_walk_linear_history() {
 
     let tmp = init_repo_with_commits(4);
 
-    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    let head_parent = git_output(tmp.path(), &["rev-parse", "HEAD~1"]);
-    let watermark = git_output(tmp.path(), &["rev-parse", "HEAD~2"]);
+    let head = git_stdout(tmp.path(), &["rev-parse", "HEAD"]);
+    let head_parent = git_stdout(tmp.path(), &["rev-parse", "HEAD~1"]);
+    let watermark = git_stdout(tmp.path(), &["rev-parse", "HEAD~2"]);
 
     let tip_oid = oid_from_hex(&head);
     let parent_oid = oid_from_hex(&head_parent);
@@ -211,7 +211,7 @@ fn commit_walk_missing_watermark_scans_full_history() {
     }
 
     let tmp = init_repo_with_commits(3);
-    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    let head = git_stdout(tmp.path(), &["rev-parse", "HEAD"]);
     let tip_oid = oid_from_hex(&head);
 
     let resolver = TestResolver {
@@ -257,8 +257,8 @@ fn commit_walk_watermark_not_ancestor_scans_full_history() {
     }
 
     let tmp = init_repo_with_branches();
-    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    let other = git_output(tmp.path(), &["rev-parse", "other"]);
+    let head = git_stdout(tmp.path(), &["rev-parse", "HEAD"]);
+    let other = git_stdout(tmp.path(), &["rev-parse", "other"]);
     let tip_oid = oid_from_hex(&head);
     let other_oid = oid_from_hex(&other);
 
@@ -319,7 +319,7 @@ fn commit_walk_missing_artifacts_with_resolved_start_set_is_safe() {
     let tmp = init_repo_with_commits(4);
     remove_disk_artifacts(tmp.path());
 
-    let tip_oid = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
+    let tip_oid = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD"]));
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
     let run_once = || -> Result<Vec<u32>, ArtifactAcquireError> {
         let resolver = TestResolver {
@@ -399,7 +399,7 @@ fn commit_graph_builds_with_loose_tip_chain_not_in_midx() {
     run_git(tmp.path(), &["commit", "--allow-empty", "-m", "loose-1"]);
     run_git(tmp.path(), &["commit", "--allow-empty", "-m", "loose-2"]);
 
-    let head = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
+    let head = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD"]));
     let resolver = TestResolver {
         refs: vec![(b"refs/heads/main".to_vec(), head)],
     };
@@ -445,9 +445,9 @@ fn commit_graph_builds_with_packed_parent_and_loose_head() {
     }
 
     let tmp = init_repo_with_commits(2);
-    let packed_parent = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
+    let packed_parent = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD"]));
     run_git(tmp.path(), &["commit", "--allow-empty", "-m", "loose-head"]);
-    let loose_head = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
+    let loose_head = oid_from_hex(&git_stdout(tmp.path(), &["rev-parse", "HEAD"]));
 
     let resolver = TestResolver {
         refs: vec![(b"refs/heads/main".to_vec(), loose_head)],
@@ -495,9 +495,9 @@ fn commit_walk_generation_match_incremental_scan() {
 
     let tmp = init_repo_with_commits(5);
 
-    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    let head_parent = git_output(tmp.path(), &["rev-parse", "HEAD~1"]);
-    let watermark = git_output(tmp.path(), &["rev-parse", "HEAD~2"]);
+    let head = git_stdout(tmp.path(), &["rev-parse", "HEAD"]);
+    let head_parent = git_stdout(tmp.path(), &["rev-parse", "HEAD~1"]);
+    let watermark = git_stdout(tmp.path(), &["rev-parse", "HEAD~2"]);
 
     let tip_oid = oid_from_hex(&head);
     let parent_oid = oid_from_hex(&head_parent);
@@ -560,8 +560,8 @@ fn commit_walk_generation_mismatch_scans_full_history() {
 
     let tmp = init_repo_with_commits(5);
 
-    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    let watermark = git_output(tmp.path(), &["rev-parse", "HEAD~2"]);
+    let head = git_stdout(tmp.path(), &["rev-parse", "HEAD"]);
+    let watermark = git_stdout(tmp.path(), &["rev-parse", "HEAD~2"]);
 
     let tip_oid = oid_from_hex(&head);
     let watermark_oid = oid_from_hex(&watermark);
