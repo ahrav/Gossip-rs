@@ -24,7 +24,7 @@ pub use gossip_pg_common::migration::{
 /// - **Driver/runtime** — SQL execution failures reported by `postgres`;
 /// - **Migration integrity** — checksum mismatches or corrupted history
 ///   records surfaced via [`GitPersistencePgMigrationError`].
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum GitPersistencePgError {
     /// PostgreSQL client failure.
     Postgres(#[from] postgres::Error),
@@ -32,6 +32,16 @@ pub enum GitPersistencePgError {
     Migration(#[from] GitPersistencePgMigrationError),
     /// Internal client mutex was poisoned by a panic.
     MutexPoisoned,
+    /// A key or value in the batch exceeds the schema size limits.
+    ///
+    /// Caught before transmitting to PostgreSQL to avoid wasting a network
+    /// round-trip on data the server's CHECK constraint would reject.
+    PayloadTooLarge {
+        /// Byte length of the oversized key (0 if the key was within limits).
+        key_len: usize,
+        /// Byte length of the oversized value (0 if the value was within limits).
+        value_len: usize,
+    },
 }
 
 impl fmt::Display for GitPersistencePgError {
@@ -70,6 +80,27 @@ impl fmt::Display for GitPersistencePgError {
                 other => write!(f, "postgres git-persistence migration failed: {other}"),
             },
             Self::MutexPoisoned => f.write_str("postgres git-persistence client mutex is poisoned"),
+            Self::PayloadTooLarge { key_len, value_len } => {
+                write!(
+                    f,
+                    "postgres git-persistence payload too large: key {key_len} bytes, value {value_len} bytes"
+                )
+            }
+        }
+    }
+}
+
+impl fmt::Debug for GitPersistencePgError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Postgres(_) => f.debug_tuple("Postgres").field(&"<redacted>").finish(),
+            Self::Migration(e) => f.debug_tuple("Migration").field(e).finish(),
+            Self::MutexPoisoned => write!(f, "MutexPoisoned"),
+            Self::PayloadTooLarge { key_len, value_len } => f
+                .debug_struct("PayloadTooLarge")
+                .field("key_len", key_len)
+                .field("value_len", value_len)
+                .finish(),
         }
     }
 }

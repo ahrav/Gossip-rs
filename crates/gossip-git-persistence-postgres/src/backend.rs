@@ -45,7 +45,7 @@ use gossip_scanner_runtime::git_persistence::{GitPersistenceBackend, GitPersiste
 use crate::{
     error::GitPersistencePgError,
     migrations::apply_all_migrations,
-    schema::{DELETE_SQL, GET_SQL, MULTI_GET_SQL, UPSERT_SQL},
+    schema::{DELETE_SQL, GET_SQL, MAX_KEY_OCTETS, MAX_VALUE_OCTETS, MULTI_GET_SQL, UPSERT_SQL},
 };
 
 #[derive(Debug)]
@@ -267,7 +267,20 @@ impl GitPersistenceBackend for GitPersistencePg {
             return Ok(());
         }
 
+        for (key, value) in normalized.put_keys.iter().zip(normalized.put_values.iter()) {
+            if key.len() > MAX_KEY_OCTETS || value.len() > MAX_VALUE_OCTETS {
+                return Err(GitPersistencePgError::PayloadTooLarge {
+                    key_len: key.len(),
+                    value_len: value.len(),
+                });
+            }
+        }
+
         let mut client = self.lock_client()?;
+        // The `postgres` crate caches prepared statements by SQL text at the
+        // connection level. Statements prepared within a transaction share the
+        // same cache. The per-call map lookup is negligible relative to network
+        // I/O, so explicit pre-preparation is not needed.
         let mut tx = client.transaction()?;
 
         if !normalized.put_keys.is_empty() {
@@ -300,6 +313,10 @@ impl GitPersistenceBackend for GitPersistencePg {
         let mut client = self.lock_client()?;
         let rows = client.query(&self.stmts.multi_get, &[&requested_keys])?;
 
+        // Positional alignment: build a lookup map, then project each input
+        // key to its value. Duplicate input keys produce cloned values. Current
+        // callers (watermark/checkpoint loads) always pass distinct keys, so
+        // the clone cost is limited to one copy per present key.
         let mut by_key = HashMap::<Vec<u8>, Vec<u8>>::with_capacity(rows.len());
         for row in rows {
             let key: Vec<u8> = row.get(0);

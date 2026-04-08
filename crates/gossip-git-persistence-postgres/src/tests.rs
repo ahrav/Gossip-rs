@@ -65,6 +65,28 @@ fn sim_oid(byte: u8) -> OidBytes {
     OidBytes::sha1([byte; 20])
 }
 
+fn stored_migration_versions(client: &mut postgres::Client) -> std::collections::BTreeSet<String> {
+    client
+        .query(
+            &format!(
+                "SELECT version FROM {} ORDER BY version",
+                crate::schema::SCHEMA_MIGRATIONS_TABLE
+            ),
+            &[],
+        )
+        .expect("migration version query should succeed")
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect()
+}
+
+fn row_count(client: &mut postgres::Client, table: &str) -> i64 {
+    client
+        .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+        .expect("row count query should succeed")
+        .get(0)
+}
+
 fn finalize_output() -> FinalizeOutput {
     FinalizeOutput {
         data_ops: vec![WriteOp {
@@ -137,6 +159,7 @@ fn checksum_mismatch_is_detected() {
 fn concurrent_migrations_both_succeed() {
     let url = crate::test_postgres::create_test_db();
     let url2 = url.clone();
+    let url_verify = url.clone();
 
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let b1 = barrier.clone();
@@ -161,6 +184,25 @@ fn concurrent_migrations_both_succeed() {
     t2.join()
         .expect("thread 2 panicked")
         .expect("thread 2 migration failed");
+
+    // Verify the database state: exactly one history row per migration, no
+    // duplicates and no missing entries.
+    let mut client = postgres::Client::connect(&url_verify, postgres::NoTls)
+        .expect("post-verification connection should succeed");
+    let expected_versions: std::collections::BTreeSet<String> = crate::migrations::MIGRATIONS
+        .iter()
+        .map(|m| m.version().to_owned())
+        .collect();
+    assert_eq!(
+        stored_migration_versions(&mut client),
+        expected_versions,
+        "each migration must appear exactly once regardless of concurrent application"
+    );
+    assert_eq!(
+        row_count(&mut client, crate::schema::SCHEMA_MIGRATIONS_TABLE),
+        crate::migrations::MIGRATIONS.len() as i64,
+        "history table must have exactly one row per migration (no duplicates)"
+    );
 }
 
 #[test]
@@ -416,6 +458,41 @@ fn kv_roundtrip_arbitrary_bytes() {
 }
 
 #[test]
+fn roundtrip_empty_key_and_value() {
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
+    backend
+        .truncate_all_for_tests()
+        .expect("truncate should succeed before test");
+
+    GitPersistenceBackend::apply_batch(&backend, &[put_op(b"", b"")])
+        .expect("empty key/value put should succeed");
+
+    assert_eq!(
+        GitPersistenceBackend::get(&backend, b"").expect("get should succeed"),
+        Some(vec![]),
+        "empty key with empty value must round-trip"
+    );
+}
+
+#[test]
+fn roundtrip_max_size_key() {
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
+    backend
+        .truncate_all_for_tests()
+        .expect("truncate should succeed before test");
+
+    let key = vec![0xFFu8; MAX_KEY_OCTETS];
+    GitPersistenceBackend::apply_batch(&backend, &[put_op(&key, &[0x01])])
+        .expect("max-size key put should succeed");
+
+    assert_eq!(
+        GitPersistenceBackend::get(&backend, &key).expect("get should succeed"),
+        Some(vec![0x01]),
+        "max-size key must round-trip"
+    );
+}
+
+#[test]
 fn adapter_integration_with_pg_backend() {
     let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
     backend
@@ -477,5 +554,58 @@ fn adapter_integration_with_pg_backend() {
             .expect("staging get should succeed"),
         None,
         "complete finalize must remove the staging key"
+    );
+}
+
+#[test]
+fn adapter_integration_partial_finalize_discards_staging() {
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
+    backend
+        .truncate_all_for_tests()
+        .expect("truncate should succeed before test");
+
+    let repo_id = 78;
+    let policy_hash = [0x66; 32];
+    let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+    let oid = sim_oid(0xCD);
+
+    // Stage a seen delta — this writes a staging key.
+    adapter
+        .persist_seen_delta(&[oid])
+        .expect("stage seen delta should succeed");
+
+    // Partial finalize: staging is discarded, scope key is NOT updated.
+    adapter
+        .commit_finalize(&FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+            stats: Default::default(),
+        })
+        .expect("partial finalize should succeed");
+
+    // Staging key must be removed.
+    assert_eq!(
+        GitPersistenceBackend::get(&backend, &build_seen_staging_key(repo_id, &policy_hash))
+            .expect("staging get should succeed"),
+        None,
+        "partial finalize must remove the staging key"
+    );
+
+    // Scope key must NOT have been written (staging OIDs are discarded).
+    assert_eq!(
+        GitPersistenceBackend::get(&backend, &build_seen_scope_key(repo_id, &policy_hash))
+            .expect("scope get should succeed"),
+        None,
+        "partial finalize must not update the scope key with staged OIDs"
+    );
+
+    // The OID should not be in the seen set.
+    assert_eq!(
+        adapter
+            .batch_check_seen(&[oid])
+            .expect("seen check should succeed"),
+        vec![false],
+        "partial finalize discards staged OIDs — they should not be seen"
     );
 }

@@ -117,21 +117,16 @@ mod tests {
     /// but the SQL literals are not updated in lockstep.
     #[test]
     fn sql_constants_reference_canonical_table_name() {
-        assert!(
-            GET_SQL.contains(GIT_KV_TABLE),
-            "GET_SQL must reference the GIT_KV_TABLE constant value"
-        );
-        assert!(
-            MULTI_GET_SQL.contains(GIT_KV_TABLE),
-            "MULTI_GET_SQL must reference the GIT_KV_TABLE constant value"
-        );
-        assert!(
-            UPSERT_SQL.contains(GIT_KV_TABLE),
-            "UPSERT_SQL must reference the GIT_KV_TABLE constant value"
-        );
-        assert!(
-            DELETE_SQL.contains(GIT_KV_TABLE),
-            "DELETE_SQL must reference the GIT_KV_TABLE constant value"
-        );
+        for (name, sql) in [
+            ("GET_SQL", GET_SQL),
+            ("MULTI_GET_SQL", MULTI_GET_SQL),
+            ("UPSERT_SQL", UPSERT_SQL),
+            ("DELETE_SQL", DELETE_SQL),
+        ] {
+            assert!(
+                sql.contains(GIT_KV_TABLE),
+                "{name} must reference the canonical table name '{GIT_KV_TABLE}'"
+            );
+        }
     }
 }
