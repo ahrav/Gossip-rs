@@ -343,7 +343,7 @@ CountBudget::release(1)
 - **Role**: Anchor for all metadata about an in-flight object
 - **Fields**:
   - `descriptor: ObjectDescriptor` - path, size hint, IDs
-  - `permit: ObjectPermit` - RAII slot in frontier (not readable, just held)
+  - `_permit: ObjectPermit` - RAII slot in frontier (not readable, just held)
   - `file_id: FileId` - handle for scan engine
 - **Lifetime**: Created when frontier permit acquired, dropped when last `Arc<ObjectCtx>` drops
 - **Cloning**: Wrapped in `Arc` for cheap sharing across tasks

@@ -107,8 +107,8 @@ Non-negotiables (project-wide):
 
 Source-specific finding carriers do not flow into persistence directly. The
 translation boundary consumes `PersistenceFinding`, which exposes only the
-identity-relevant fields (`rule_id`, redacted `NormHash`, `span_start`,
-`span_end`). Filesystem and Git paths are free to keep extra metadata such as
+identity-relevant fields (`rule_id`, redacted `NormHash`, `blob_offset_start`,
+`blob_offset_end`). Filesystem and Git paths are free to keep extra metadata such as
 root hints, object paths, commit IDs, or confidence scores on their local
 telemetry paths without affecting stable persistence identity.
 
