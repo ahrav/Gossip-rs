@@ -9,7 +9,7 @@ description = "Runtime orchestration APIs for scanner-rs direct and connector ex
 
 [features]
 default = []
-test-support = []
+test-support = ["gossip-stdx/git-test-support"]
 aegis-pure-rust = [
     "scanner-engine/aegis-pure-rust",
     "scanner-scheduler/aegis-pure-rust",
@@ -25,7 +25,7 @@ gossip-connectors.workspace = true
 gossip-contracts.workspace = true
 gossip-frontier.workspace = true
 gossip-orchestrator.workspace = true
-gossip-stdx = { workspace = true, features = ["git-test-support"] }
+gossip-stdx.workspace = true
 scanner-engine.workspace = true
 scanner-scheduler.workspace = true
 scanner-git.workspace = true
@@ -36,6 +36,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 gossip-persistence-inmemory.workspace = true
+gossip-stdx = { workspace = true, features = ["git-test-support"] }
 proptest.workspace = true
 rstest.workspace = true
 tempfile = "3"

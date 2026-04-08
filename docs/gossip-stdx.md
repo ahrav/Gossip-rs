@@ -491,6 +491,7 @@ During scanner-rs consolidation, duplicate container implementations are avoided
 | `kani` | Enables Kani formal verification proofs |
 | `stdx-proptest` | Enables `test_support` module and proptest-gated test modules |
 | `perf-stats` | Enables instrumentation counter updates (combined with `debug_assertions`) |
+| `git-test-support` | Enables `git_test_support` module with shared git CLI fixtures and hex decoding |
 
 ## Source of Truth
 

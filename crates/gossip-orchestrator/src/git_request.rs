@@ -782,7 +782,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::test_support::{init_git_repo, run_config, run_git_in};
+    use crate::test_support::{init_committed_repo, init_git_repo, run_config};
 
     fn tenant(byte: u8) -> TenantId {
         TenantId::from_bytes([byte; 32])
@@ -792,11 +792,8 @@ mod tests {
         init_git_repo(dir, "git-request-tests@example.com", "Git Request Tests");
     }
 
-    fn init_committed_repo(dir: &Path) {
-        init_repo(dir);
-        fs::write(dir.join("fixture.txt"), "fixture").expect("write fixture");
-        run_git_in(dir, &["add", "."]);
-        run_git_in(dir, &["commit", "-q", "-m", "fixture"]);
+    fn init_committed(dir: &Path) {
+        init_committed_repo(dir, "git-request-tests@example.com", "Git Request Tests");
     }
 
     fn default_scan_mode() -> GitScanMode {
@@ -1060,7 +1057,7 @@ mod tests {
     #[test]
     fn request_debug_redacts_repo_path_refs_commit_and_display_name() {
         let dir = tempdir().expect("tempdir");
-        init_committed_repo(dir.path());
+        init_committed(dir.path());
 
         let refs_request = GitRequest::new(
             tenant(0x90),
@@ -1096,7 +1093,7 @@ mod tests {
     #[test]
     fn normalized_debug_redacts_repo_path_refs_commit_and_display_name() {
         let dir = tempdir().expect("tempdir");
-        init_committed_repo(dir.path());
+        init_committed(dir.path());
 
         let refs_request = GitRequest::new(
             tenant(0x91),

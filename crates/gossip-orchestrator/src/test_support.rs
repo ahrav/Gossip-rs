@@ -2,7 +2,9 @@
 
 use gossip_coordination::{CursorSemantics, RunConfig};
 
-pub(crate) use gossip_stdx::git_test_support::{init_git_repo, run_git as run_git_in};
+pub(crate) use gossip_stdx::git_test_support::{
+    init_committed_repo, init_git_repo, run_git as run_git_in,
+};
 
 /// Default run configuration for orchestrator unit tests.
 pub(crate) fn run_config() -> RunConfig {

@@ -1,9 +1,20 @@
 //! Shared git CLI helpers for test and benchmark fixtures.
 //!
 //! Available under the `git-test-support` feature (for downstream crates) and
-//! under `#[cfg(test)]` (for internal gossip-stdx tests). Provides command
-//! wrappers, deterministic repository initialization, and hex decoding used by
-//! git-backed test fixtures across the workspace.
+//! under `#[cfg(test)]` (for internal gossip-stdx tests).
+//!
+//! ## API surface
+//!
+//! | Function                | Behavior                                            |
+//! |-------------------------|-----------------------------------------------------|
+//! | `run_git`               | Assert success, discard output                      |
+//! | `git_stdout`            | Assert success, return trimmed stdout                |
+//! | `git_output_raw`        | Assert success, return full `Output`                 |
+//! | `try_run_git`           | Only assert spawn, return full `Output` unchecked    |
+//! | `init_git_repo`         | `git init -b main` + author config                   |
+//! | `init_committed_repo`   | `init_git_repo` + fixture commit                     |
+//! | `git_available`         | Probe for git CLI on PATH                            |
+//! | `decode_hex`            | Hex ASCII to bytes                                   |
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -71,7 +82,10 @@ pub fn git_stdout(dir: &Path, args: &[&str]) -> String {
         .to_owned()
 }
 
-/// Run `git` inside `dir`, assert success, and return the raw process output.
+/// Run `git` inside `dir`, assert success, and return the full process output.
+///
+/// Use [`try_run_git`] when the command is expected to fail (e.g. probing
+/// whether a ref exists).
 ///
 /// # Panics
 ///
@@ -80,6 +94,31 @@ pub fn git_stdout(dir: &Path, args: &[&str]) -> String {
 #[must_use]
 pub fn git_output_raw(dir: &Path, args: &[&str]) -> Output {
     assert_git_output(dir, args)
+}
+
+/// Run `git` inside `dir` and return the raw process output **without**
+/// checking the exit status.
+///
+/// Useful for commands that are expected to fail (e.g. `git show-ref --verify`
+/// on a ref that should not exist).
+///
+/// # Panics
+///
+/// Panics only if the git process cannot be spawned.
+#[must_use]
+pub fn try_run_git(dir: &Path, args: &[&str]) -> Output {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to spawn git -C {} {}: {e}",
+                dir.display(),
+                args.join(" "),
+            )
+        })
 }
 
 /// Initialize a git repository with a deterministic local author identity.

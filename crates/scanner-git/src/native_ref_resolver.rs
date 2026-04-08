@@ -602,7 +602,7 @@ pub(crate) mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use gossip_stdx::git_test_support::{git_output_raw, git_stdout, init_git_repo};
+    use gossip_stdx::git_test_support::{git_output_raw, git_stdout, init_git_repo, try_run_git};
     use rstest::rstest;
 
     use super::*;
@@ -618,7 +618,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn try_git(repo: &Path, args: &[&str]) -> std::process::Output {
-        git_output_raw(repo, args)
+        try_run_git(repo, args)
     }
 
     pub(crate) fn resolve_with(repo: &Path, config: StartSetConfig) -> Vec<(Vec<u8>, OidBytes)> {

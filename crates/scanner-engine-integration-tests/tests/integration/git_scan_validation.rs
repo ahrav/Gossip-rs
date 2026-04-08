@@ -571,7 +571,7 @@ fn shallow_clone_boundary_treats_missing_parent_as_external_root() {
     assert!(clone_status.success(), "git clone --depth 1 must succeed");
 
     assert_eq!(
-        git_output(&shallow_repo, &["rev-parse", "--is-shallow-repository"]).trim(),
+        git_output(&shallow_repo, &["rev-parse", "--is-shallow-repository"]),
         "true",
         "fixture must be a shallow clone"
     );

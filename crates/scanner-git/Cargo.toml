@@ -16,7 +16,7 @@ undocumented_unsafe_blocks = "warn"
 [dependencies]
 scanner-engine = { workspace = true, features = ["test-support"] }
 scanner-scheduler.workspace = true
-gossip-stdx = { workspace = true, features = ["git-test-support"] }
+gossip-stdx.workspace = true
 gossip-contracts.workspace = true
 ahash.workspace = true
 postcard = { version = "1.1", features = ["alloc"] }
@@ -56,7 +56,7 @@ aegis-pure-rust = ["scanner-engine/aegis-pure-rust"]
 
 [dev-dependencies]
 criterion = "0.5"
-gossip-stdx = { workspace = true, features = ["stdx-proptest"] }
+gossip-stdx = { workspace = true, features = ["stdx-proptest", "git-test-support"] }
 proptest = "1.10"
 rstest = "0.25"
 scanner-engine = { workspace = true, features = ["test-support"] }
