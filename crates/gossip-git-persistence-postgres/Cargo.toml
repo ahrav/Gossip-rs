@@ -1,0 +1,29 @@
+[package]
+name = "gossip-git-persistence-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "PostgreSQL Git persistence backend and migrations for gossip-rs"
+
+[lib]
+
+[features]
+## Exposes plaintext NoTls convenience helpers: `connect_and_apply_migrations`,
+## `GitPersistencePg::connect`, and `GitPersistencePg::connect_and_migrate`.
+## Enable in integration tests and local dev only — production callers should
+## construct their own `Client` with TLS and use `GitPersistencePg::from_client`.
+test-utils = []
+
+[dependencies]
+gossip-pg-common.workspace = true
+gossip-scanner-runtime.workspace = true
+postgres.workspace = true
+thiserror = { workspace = true }
+
+[dev-dependencies]
+blake3 = "1.8"
+gossip-pg-common = { workspace = true, features = ["test-support"] }
+proptest.workspace = true
+scanner-git.workspace = true

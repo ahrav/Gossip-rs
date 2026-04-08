@@ -19,6 +19,7 @@ use postgres::{Client, Transaction};
 pub const ADVISORY_LOCK_KEYS: &[(&str, i64)] = &[
     ("GSDLPGM1", 0x4753444c_50474d31), // done-ledger
     ("GFPGMIG1", 0x47465047_4d494731), // findings
+    ("GGPKVM01", 0x4747504b_564d3031), // git persistence
 ];
 
 /// Default cap for DDL lock acquisition during migrations.
