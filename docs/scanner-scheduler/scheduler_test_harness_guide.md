@@ -38,7 +38,7 @@ SCHEDULER_SIM_STRESS_SEEDS=100 cargo test --features scheduler-sim scheduler_sim
 
 ## SimCase DSL Reference
 
-A `SimCase` defines a complete simulation scenario in JSON. The harness loads the case, initializes the executor, and steps through actions until completion or failure.
+A `ReproArtifact` defines a complete simulation scenario in JSON. The harness loads the case, initializes the executor, and steps through actions until completion or failure.
 
 ### Top-Level Structure
 
