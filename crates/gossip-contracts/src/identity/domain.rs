@@ -33,7 +33,7 @@
 //!
 //! - Define the new constant under its subsystem heading with a concise description
 //!   and its hash mode so future maintainers understand where it belongs.
-//! - Append the constant to [`ALL`] in declaration order to keep the canonical list
+//! - Append the constant to [`ALL`](crate::identity::domain::ALL) in declaration order to keep the canonical list
 //!   accurate.
 //! - Extend `all_domain_constants()` with the `(name, value)` tuple so the test
 //!   fixtures cover the new entry.
@@ -205,7 +205,7 @@ pub const ALL: [&str; 18] = [
 /// (e.g., `"FINDING_ID_V1"`), the second is the domain string value
 /// (e.g., `"gossip/finding/v1"`).
 ///
-/// When adding a new domain constant, you **must** add it to [`ALL`] *and*
+/// When adding a new domain constant, you **must** add it to [`ALL`](crate::identity::domain::ALL) *and*
 /// here, then bump the `ALL` array length.
 #[cfg(test)]
 pub(crate) fn all_domain_constants() -> Vec<(&'static str, &'static str)> {

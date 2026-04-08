@@ -44,7 +44,7 @@
 //!    (or `u64` for 64-bit vectors).
 //! 2. Add a `#[test]` function that constructs canonical inputs, calls the
 //!    derivation, and asserts against the const.
-//! 3. Add the derivation name to the [`ALL`] registry.
+//! 3. Add the derivation name to the [`ALL`](crate::identity::domain::ALL) registry.
 //! 4. Update the `ALL` array length (compile-time checked).
 //! 5. Update the [`registry_is_complete`] test assertion.
 

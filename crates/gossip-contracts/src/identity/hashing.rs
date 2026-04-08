@@ -41,7 +41,7 @@
 //! repeated same-domain derivations cheaper.
 //! All `derive_*` functions in the crate use this path.
 //! Because each cached hasher hard-codes a single domain constant from
-//! [`super::domain`], the semantic pairing between a static and the ID type it
+//! [`domain`](crate::identity::domain), the semantic pairing between a static and the ID type it
 //! serves must remain stable: deriving a `FindingId` from the wrong static still
 //! compiles but yields digests under the wrong domain tag.
 //!
@@ -50,15 +50,6 @@
 //! Domain constants are `&str`, so UTF-8 validity is enforced at compile time.
 //! There is no runtime validation or error path — callers cannot pass invalid
 //! context strings through the type system.
-//!
-//! # Domain stability
-//!
-//! Every domain constant in [`super::domain`] represents a published identifier
-//! family and must remain pinned to that family. The statics below cache one
-//! derive-key context per domain string, so deriving against the wrong cached
-//! hasher still compiles but produces values that are bound to the wrong tag.
-//! Keep the static/ID pairing stable to preserve the guarantees of domain
-//! separation.
 
 use std::sync::LazyLock;
 
@@ -153,7 +144,7 @@ pub fn derive_from_cached<T: super::CanonicalBytes>(base: &Hasher, inputs: &T) -
 /// Uses BLAKE3's derive-key mode so distinct domain tags map to
 /// cryptographically independent hash domains.
 ///
-/// All domain constants in [`super::domain`] are `&str`, so this function
+/// All domain constants in [`domain`] are `&str`, so this function
 /// takes `&str` directly — UTF-8 validity is enforced by the type system
 /// with no runtime check.
 ///

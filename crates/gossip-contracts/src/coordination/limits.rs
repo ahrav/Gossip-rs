@@ -2,7 +2,7 @@
 //!
 //! The coordinator enforces these caps whenever it creates split, residual, or
 //! spawn children so that neither a single operation nor a shard's lifetime can
-//! drive unbounded allocation (SEC-4: resource exhaustion guard). These
+//! drive unbounded allocation (resource exhaustion guard). These
 //! constants stay aligned with the split/residual machinery, and the invariants
 //! later in the module ensure the relationships remain intact.
 
@@ -18,7 +18,7 @@ pub const MAX_SPLIT_CHILDREN: usize = 256;
 /// Every parent shard must never exceed 1024 spawned descendants, including
 /// split children and residual follow-ons that can come from later operations.
 /// This keeps a single shard from generating an unbounded tree of descendants
-/// over repeated coordinator actions and keeps SEC-4 accountability tractable.
+/// over repeated coordinator actions and keeps resource-accounting tractable.
 pub const MAX_SPAWNED_PER_SHARD: usize = 1024;
 
 // Compile-time invariants that keep the capacity constants aligned.

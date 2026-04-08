@@ -61,9 +61,9 @@ pub trait CanonicalBytes {
     /// into the provided `blake3::Hasher`.
     ///
     /// Implementations must not allocate memory and must deterministically
-    /// output the same bytes across all platforms. The caller must ensure the
-    /// hasher is not reused for mid-stream state and should finalize after the
-    /// full identity component has been encoded.
+    /// output the same bytes across all platforms. The hasher must be dedicated
+    /// to a single derivation context; do not share it across unrelated
+    /// derivations.
     fn write_canonical(&self, hasher: &mut Hasher);
 }
 

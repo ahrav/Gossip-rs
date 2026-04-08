@@ -26,7 +26,7 @@
 //! ```
 //!
 //! `StableItemId` and `ObjectVersionId` are independent derivations with
-//! distinct BLAKE3 domain separators (see [`super::domain`]). Both are
+//! distinct BLAKE3 domain separators (see [`domain`](crate::identity::domain)). Both are
 //! consumed downstream by the finding module — `StableItemId` in
 //! `FindingId` and `ObjectVersionId` in `OccurrenceId` — but neither
 //! depends on the other.

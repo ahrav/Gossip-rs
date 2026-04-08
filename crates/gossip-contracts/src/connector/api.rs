@@ -36,7 +36,7 @@
 //!   generic retryable and permanent constructors always store `None`.
 //! - `message` is passthrough connector text. The `Display` impl replaces most
 //!   control characters with U+FFFD (preserving HT/LF/CR) to prevent log
-//!   injection, but raw field access via [`message()`] returns the original
+//!   injection, but raw field access via `message()` returns the original
 //!   unsanitized value.
 //! - These types are value-level contracts only. Retry scheduling, circuit
 //!   breaking, and backoff policy live in the runtime crate.
@@ -48,7 +48,7 @@
 //!   characters cannot disrupt logs. Callers who observe `message()` must still
 //!   treat it as untrusted input before logging or displaying.
 //! - `Debug` output redacts connector text through `ToxicDigest`, so
-//!   instrumentation that needs the raw bytes can call [`message()`] directly.
+//!   instrumentation that needs the raw bytes can call `message()` directly.
 //! - Treat `ConnectorCapabilities` as a declaration of intent. Callers should
 //!   respect the advertised feature set but still guard each use site with the
 //!   appropriate error handling because runtime policy or connector state may
@@ -388,6 +388,6 @@ pub struct ConnectorCapabilities {
 
 #[cfg(test)]
 #[path = "api_tests.rs"]
-/// Tests that assert the documented error constructors, sanitization helper,
-/// and capability expectations remain stable.
+// Tests that assert the documented error constructors, sanitization helper,
+// and capability expectations remain stable.
 mod tests;

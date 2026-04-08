@@ -1188,10 +1188,14 @@ fn observe_realigns_marks_after_u64_max_saturation() {
     let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
     estimator.rank_stride = 4;
     estimator.byte_stride = 100;
+    // u64::MAX % 4 == 3, so u64::MAX - 3 is divisible by 4 and sits on the rank-stride grid.
     estimator.count = u64::MAX - 3;
+    // u64::MAX - 500 is divisible by 100 and sits on the byte-stride grid.
     estimator.total_bytes = u64::MAX - 500;
+    // Place both cadence marks at the current counts so they fire on the next observe.
     estimator.next_rank_sample = u64::MAX - 3;
     estimator.next_byte_mark = u64::MAX - 500;
+    // Seed a prior sample so the buffer is non-empty (mirrors realistic state).
     estimator.samples.push(Sample::new(0, 0, &key_for_index(0)));
     estimator.first_observed_key = Some(Box::from(key_for_index(0).as_slice()));
 
@@ -1232,8 +1236,11 @@ fn observe_realigns_marks_after_count_saturates_to_max() {
     let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
     estimator.rank_stride = 4;
     estimator.byte_stride = 100;
+    // count is one below u64::MAX so it saturates on the next observe.
     estimator.count = u64::MAX - 1;
     estimator.total_bytes = 5000;
+    // Set rank mark at u64::MAX and byte mark well ahead so neither cadence
+    // fires — this isolates the saturation guard's realignment from sample emission.
     estimator.next_rank_sample = u64::MAX;
     estimator.next_byte_mark = 6000;
     estimator.samples.push(Sample::new(0, 0, &key_for_index(0)));
