@@ -4,22 +4,25 @@
 //! ## Architecture
 //!
 //! A single synchronous `postgres::Client` is held behind an `Arc<Mutex<_>>`,
-//! making [`GitPersistencePg`] cheaply cloneable and `Send + Sync`. Each
-//! `apply_batch` executes inside an explicit transaction, so the backend can
-//! advertise [`supports_atomic_batches`](GitPersistencePg::supports_atomic_batches)
+//! making [`GitPersistencePg`] cheaply cloneable and `Send + Sync`. The four
+//! backend SQL queries are prepared eagerly at construction and reused for
+//! every subsequent call, avoiding repeated Parse+Describe+Sync round-trips.
+//! Each `apply_batch` executes inside an explicit transaction, so the backend
+//! can advertise
+//! [`supports_atomic_batches`](GitPersistencePg::supports_atomic_batches)
 //! as `true`.
 //!
 //! ## Batch normalization
 //!
 //! One `apply_batch` call may contain repeated keys. The backend normalizes the
-//! input in submission order before issuing SQL:
+//! input in reverse-iteration order before issuing SQL:
 //!
-//! - the final operation for a given key wins;
+//! - the final operation for a given key wins (detected via reverse scan);
 //! - surviving `Put` operations are batched into one `INSERT .. ON CONFLICT`;
 //! - surviving `Delete` operations are batched into one `DELETE .. ANY()`.
 //!
-//! This preserves the sequential semantics of the in-memory test backends while
-//! still keeping the database round-trip count bounded.
+//! A borrowed `HashSet<&[u8]>` tracks seen keys during the reverse pass,
+//! avoiding intermediate key clones for duplicates.
 //!
 //! ## Positional alignment
 //!
@@ -28,14 +31,14 @@
 //! with `None` for missing keys and duplicated results for duplicated inputs.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use postgres::Client;
 #[cfg(feature = "test-utils")]
 use postgres::NoTls;
+use postgres::{Client, Statement};
 
 use gossip_scanner_runtime::git_persistence::{GitPersistenceBackend, GitPersistenceOp};
 
@@ -46,12 +49,6 @@ use crate::{
 };
 
 #[derive(Debug)]
-enum FinalBatchOp {
-    Put(Vec<u8>),
-    Delete,
-}
-
-#[derive(Debug, Default)]
 struct NormalizedBatch {
     put_keys: Vec<Vec<u8>>,
     put_values: Vec<Vec<u8>>,
@@ -59,30 +56,40 @@ struct NormalizedBatch {
 }
 
 impl NormalizedBatch {
+    /// Deduplicate a batch of persistence operations by key, preserving
+    /// last-writer-wins semantics.
+    ///
+    /// Iterates the input in reverse so the first encounter of each key
+    /// corresponds to the final operation. A borrowed `HashSet<&[u8]>` tracks
+    /// seen keys without cloning; only surviving keys and values are cloned
+    /// into the output vectors.
     fn from_ops(ops: &[GitPersistenceOp]) -> Self {
-        let mut final_ops = HashMap::<Vec<u8>, FinalBatchOp>::with_capacity(ops.len());
-        for op in ops {
+        let mut seen = HashSet::<&[u8]>::with_capacity(ops.len());
+        let mut put_keys = Vec::with_capacity(ops.len());
+        let mut put_values = Vec::with_capacity(ops.len());
+        let mut delete_keys = Vec::new();
+
+        for op in ops.iter().rev() {
             match op {
                 GitPersistenceOp::Put { key, value } => {
-                    final_ops.insert(key.clone(), FinalBatchOp::Put(value.clone()));
+                    if seen.insert(key.as_slice()) {
+                        put_keys.push(key.clone());
+                        put_values.push(value.clone());
+                    }
                 }
                 GitPersistenceOp::Delete { key } => {
-                    final_ops.insert(key.clone(), FinalBatchOp::Delete);
+                    if seen.insert(key.as_slice()) {
+                        delete_keys.push(key.clone());
+                    }
                 }
             }
         }
 
-        let mut normalized = Self::default();
-        for (key, op) in final_ops {
-            match op {
-                FinalBatchOp::Put(value) => {
-                    normalized.put_keys.push(key);
-                    normalized.put_values.push(value);
-                }
-                FinalBatchOp::Delete => normalized.delete_keys.push(key),
-            }
+        Self {
+            put_keys,
+            put_values,
+            delete_keys,
         }
-        normalized
     }
 
     fn is_empty(&self) -> bool {
@@ -90,11 +97,25 @@ impl NormalizedBatch {
     }
 }
 
+/// Pre-prepared PostgreSQL statements for the four backend queries.
+///
+/// Prepared once during [`GitPersistencePg::from_client`] and reused for every
+/// subsequent operation, avoiding a Parse+Describe+Sync server round-trip per
+/// call. [`Statement`] is `Arc`-backed and cheap to clone.
+#[derive(Clone)]
+struct PreparedStatements {
+    get: Statement,
+    multi_get: Statement,
+    upsert: Statement,
+    delete: Statement,
+}
+
 /// Synchronous PostgreSQL implementation of [`GitPersistenceBackend`].
 ///
 /// Internally wraps a `postgres::Client` in `Arc<Mutex<_>>` so that clones
 /// share the same connection and callers can use `GitPersistencePg` from
-/// multiple threads.
+/// multiple threads. Four backend queries are prepared eagerly at construction
+/// and reused across every subsequent operation.
 ///
 /// # Concurrency
 ///
@@ -117,6 +138,7 @@ impl NormalizedBatch {
 #[derive(Clone)]
 pub struct GitPersistencePg {
     client: Arc<Mutex<Client>>,
+    stmts: PreparedStatements,
 }
 
 impl GitPersistencePg {
@@ -130,11 +152,12 @@ impl GitPersistencePg {
     ///
     /// # Errors
     ///
-    /// Returns [`GitPersistencePgError::Postgres`] on connection failure.
+    /// Returns [`GitPersistencePgError::Postgres`] on connection or statement
+    /// preparation failure.
     #[cfg(feature = "test-utils")]
     pub fn connect(database_url: &str) -> Result<Self, GitPersistencePgError> {
         let client = Client::connect(database_url, NoTls)?;
-        Ok(Self::from_client(client))
+        Self::from_client(client)
     }
 
     /// Connect to PostgreSQL and apply crate-embedded migrations.
@@ -147,28 +170,40 @@ impl GitPersistencePg {
     ///
     /// # Errors
     ///
-    /// Returns [`GitPersistencePgError::Postgres`] on connection failure or
-    /// [`GitPersistencePgError::Migration`] if schema migration fails.
+    /// Returns [`GitPersistencePgError::Postgres`] on connection or statement
+    /// preparation failure, or [`GitPersistencePgError::Migration`] if schema
+    /// migration fails.
     #[cfg(feature = "test-utils")]
     pub fn connect_and_migrate(database_url: &str) -> Result<Self, GitPersistencePgError> {
         let client = Client::connect(database_url, NoTls)?;
-        let backend = Self::from_client(client);
+        let backend = Self::from_client(client)?;
         backend.apply_migrations()?;
         Ok(backend)
     }
 
-    /// Wrap an already-connected PostgreSQL client.
+    /// Wrap an already-connected PostgreSQL client and prepare backend
+    /// statements.
     ///
     /// The preferred production constructor: the caller controls TLS
     /// configuration, connection parameters, and pooling. Call
     /// [`apply_migrations`](Self::apply_migrations) afterwards if the schema
     /// has not yet been applied.
-    #[inline]
-    #[must_use]
-    pub fn from_client(client: Client) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitPersistencePgError::Postgres`] if statement preparation
+    /// fails (e.g. the connection is broken).
+    pub fn from_client(mut client: Client) -> Result<Self, GitPersistencePgError> {
+        let stmts = PreparedStatements {
+            get: client.prepare(GET_SQL)?,
+            multi_get: client.prepare(MULTI_GET_SQL)?,
+            upsert: client.prepare(UPSERT_SQL)?,
+            delete: client.prepare(DELETE_SQL)?,
+        };
+        Ok(Self {
             client: Arc::new(Mutex::new(client)),
-        }
+            stmts,
+        })
     }
 
     /// Apply all embedded migrations using the held client.
@@ -222,8 +257,7 @@ impl GitPersistenceBackend for GitPersistencePg {
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
         let mut client = self.lock_client()?;
-        let stmt = client.prepare(GET_SQL)?;
-        let row = client.query_opt(&stmt, &[&key])?;
+        let row = client.query_opt(&self.stmts.get, &[&key])?;
         Ok(row.map(|row| row.get(0)))
     }
 
@@ -239,15 +273,13 @@ impl GitPersistenceBackend for GitPersistencePg {
         if !normalized.put_keys.is_empty() {
             let put_keys: Vec<&[u8]> = normalized.put_keys.iter().map(Vec::as_slice).collect();
             let put_values: Vec<&[u8]> = normalized.put_values.iter().map(Vec::as_slice).collect();
-            let stmt = tx.prepare(UPSERT_SQL)?;
-            tx.execute(&stmt, &[&put_keys, &put_values])?;
+            tx.execute(&self.stmts.upsert, &[&put_keys, &put_values])?;
         }
 
         if !normalized.delete_keys.is_empty() {
             let delete_keys: Vec<&[u8]> =
                 normalized.delete_keys.iter().map(Vec::as_slice).collect();
-            let stmt = tx.prepare(DELETE_SQL)?;
-            tx.execute(&stmt, &[&delete_keys])?;
+            tx.execute(&self.stmts.delete, &[&delete_keys])?;
         }
 
         tx.commit()?;
@@ -266,8 +298,7 @@ impl GitPersistenceBackend for GitPersistencePg {
         let requested_keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
 
         let mut client = self.lock_client()?;
-        let stmt = client.prepare(MULTI_GET_SQL)?;
-        let rows = client.query(&stmt, &[&requested_keys])?;
+        let rows = client.query(&self.stmts.multi_get, &[&requested_keys])?;
 
         let mut by_key = HashMap::<Vec<u8>, Vec<u8>>::with_capacity(rows.len());
         for row in rows {
@@ -276,6 +307,10 @@ impl GitPersistenceBackend for GitPersistencePg {
             by_key.insert(key, value);
         }
 
+        // Clone values for positional alignment. Duplicate input keys must
+        // receive duplicated results, so `get().cloned()` is correct here;
+        // `remove()` would lose the value for subsequent occurrences of the
+        // same key.
         Ok(keys.iter().map(|key| by_key.get(key).cloned()).collect())
     }
 }

@@ -215,7 +215,7 @@ fn persisted_checksum_tamper_is_detected_on_reapply() {
 
 #[test]
 fn get_nonexistent_key_returns_none() {
-    let backend = GitPersistencePg::from_client(test_client());
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
 
     let fetched = GitPersistenceBackend::get(&backend, b"missing")
         .expect("get should succeed for absent key");
@@ -224,7 +224,7 @@ fn get_nonexistent_key_returns_none() {
 
 #[test]
 fn empty_inputs_are_noops() {
-    let backend = GitPersistencePg::from_client(test_client());
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
     backend
         .truncate_all_for_tests()
         .expect("truncate should succeed before test");
@@ -238,7 +238,7 @@ fn empty_inputs_are_noops() {
 
 #[test]
 fn put_get_delete_roundtrip() {
-    let backend = GitPersistencePg::from_client(test_client());
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
     backend
         .truncate_all_for_tests()
         .expect("truncate should succeed before test");
@@ -262,7 +262,7 @@ fn put_get_delete_roundtrip() {
 
 #[test]
 fn apply_batch_reports_atomic_and_rolls_back_failed_txn() {
-    let backend = GitPersistencePg::from_client(test_client());
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
     backend
         .truncate_all_for_tests()
         .expect("truncate should succeed before test");
@@ -299,7 +299,7 @@ fn apply_batch_reports_atomic_and_rolls_back_failed_txn() {
 
 #[test]
 fn multi_get_preserves_order_with_missing_keys_and_duplicates() {
-    let backend = GitPersistencePg::from_client(test_client());
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
     backend
         .truncate_all_for_tests()
         .expect("truncate should succeed before test");
@@ -340,7 +340,7 @@ fn multi_get_preserves_order_with_missing_keys_and_duplicates() {
 
 #[test]
 fn put_overwrites_existing_value() {
-    let backend = GitPersistencePg::from_client(test_client());
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
     backend
         .truncate_all_for_tests()
         .expect("truncate should succeed before test");
@@ -358,7 +358,7 @@ fn put_overwrites_existing_value() {
 
 #[test]
 fn apply_batch_uses_last_op_for_duplicate_keys() {
-    let backend = GitPersistencePg::from_client(test_client());
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
     backend
         .truncate_all_for_tests()
         .expect("truncate should succeed before test");
@@ -386,7 +386,7 @@ fn apply_batch_uses_last_op_for_duplicate_keys() {
 
 #[test]
 fn kv_roundtrip_arbitrary_bytes() {
-    let backend = GitPersistencePg::from_client(test_client());
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
 
     let mut runner = TestRunner::new(Config::with_cases(64));
     let strategy = (
@@ -417,7 +417,7 @@ fn kv_roundtrip_arbitrary_bytes() {
 
 #[test]
 fn adapter_integration_with_pg_backend() {
-    let backend = GitPersistencePg::from_client(test_client());
+    let backend = GitPersistencePg::from_client(test_client()).expect("from_client should succeed");
     backend
         .truncate_all_for_tests()
         .expect("truncate should succeed before test");
