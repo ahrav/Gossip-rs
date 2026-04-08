@@ -34,12 +34,12 @@ Each category is a separate test binary gated behind a Cargo feature:
 
 | Binary          | Path                       | Feature Gate         | Tests |
 | --------------- | -------------------------- | -------------------- | ----: |
-| `integration`   | `tests/integration/main.rs`| `integration-tests`  |  ~162 |
+| `integration`   | `tests/integration/main.rs`| `integration-tests`  |  ~176 |
 | `property`      | `tests/property/main.rs`   | `property-tests`     |  ~130 |
-| `simulation`    | `tests/simulation/main.rs` | various (see below)  |   ~41 |
+| `simulation`    | `tests/simulation/main.rs` | various (see below)  |   ~42 |
 | `diagnostic`    | `tests/diagnostic/main.rs` | `diagnostic-tests`   |     2 |
 | `smoke`         | `tests/smoke/main.rs`      | `smoke-tests`        |     0 |
-| *(standalone)*  | `tests/chunked_file_scans.rs` | *(none)*          |     2 |
+| *(standalone)*  | `tests/chunked_file_scans.rs` | *(none)*          |     3 |
 
 ## Feature Gates
 
@@ -105,10 +105,10 @@ scanner-git boundaries.
 | -------------------------- | ----: | -------------------------------------------------- |
 | `anchor_optimization`      |    14 | Anchor derivation and optimization                 |
 | `archive_scanning`         |    49 | Archive expansion, virtual paths, budget limits    |
-| `bench_guards`             |     0 | Guards against benchmark execution without the benchmark feature gate (no active tests) |
+| `bench_guards`             |     1 | Guards against benchmark execution without the benchmark feature gate |
 | `binary_awareness`         |    10 | Binary file detection                              |
 | `finding_json`             |     4 | JSONL finding parsing helpers used by integration assertions |
-| `git_commit_walk`          |     6 | Commit graph traversal                             |
+| `git_commit_walk`          |     8 | Commit graph traversal                             |
 | `git_engine_adapter`       |     1 | Git-to-engine adapter                              |
 | `git_inmem_artifacts`      |    13 | In-memory git artifact handling                    |
 | `git_mapping_bridge`       |     3 | MIDX mapping bridge                                |
@@ -116,12 +116,13 @@ scanner-git boundaries.
 | `git_pack_inflate`         |     4 | Pack inflation/decompression                       |
 | `git_pack_inflate_corpus`  |     5 | Pathological zlib regression corpus                |
 | `git_pack_plan`            |    14 | Pack plan computation                              |
-| `git_persist`              |     3 | Git persistence                                    |
+| `git_persist`              |     4 | Git persistence                                    |
 | `git_preflight`            |     4 | Git preflight checks                               |
 | `git_repo_open`            |     4 | Repository opening                                 |
 | `git_run_format`           |     1 | Run format validation                              |
-| `git_scan_validation`      |    10 | Git scan validation                                |
-| `git_seen_unique`          |     2 | Deduplication of seen objects                      |
+| `git_scan_validation`      |    15 | Git scan validation                                |
+| `git_seen_crash_recovery`  |     3 | Seen-bitmap crash recovery                         |
+| `git_seen_unique`          |     4 | Deduplication of seen objects                      |
 | `git_snapshot`             |     1 | Snapshot testing                                   |
 | `git_tree_diff`            |    10 | Tree diff computation                              |
 | `manual_anchors`           |     3 | Manual anchor specification                        |
@@ -148,7 +149,7 @@ contains both deterministic `#[test]` assertions and `proptest!` fuzz runs.
 | `git_spill_dedupe`                   |     3 |        2 | Spill deduplication                   |
 | `git_tree_diff`                      |     2 |        2 | Tree diff properties                  |
 | `path_policy_soundness`              |     4 |        1 | Path allow/deny soundness             |
-| `proptest_support`                   |     2 |        0 | Shared proptest helpers and shrinker guards |
+| `proptest_support`                   |     2 |        1 | Shared proptest helpers and shrinker guards |
 | `regex2anchor_soundness`             |    26 |        2 | Regex-to-anchor derivation soundness  |
 | `secret_bytes_safelist_soundness`    |     3 |        1 | Safelist soundness                    |
 | `value_suppressor_soundness`         |     2 |        1 | Value suppression soundness           |
