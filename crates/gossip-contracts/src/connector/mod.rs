@@ -39,6 +39,8 @@
 //!   to ensure connector paging state and cursor updates stay aligned.
 //! - Pooled toxic-byte wrappers retain a shared page slab (`PooledByteSlab`); key/ref/token
 //!   clones that escape a page keep that slab alive.
+//! - Connector tag byte literals are stable identity domains; changing a tag changes
+//!   every derived [`crate::identity::StableItemId`] in that connector family.
 //!
 //! # Design Trade-offs
 //!
@@ -47,6 +49,12 @@
 //!   This prevents leaking unrelated methods across distinct source families.
 //! - **Boundary Validation:** Connectors validate untrusted byte wrappers once at the boundary,
 //!   handing strongly-typed values across crate boundaries to avoid repeating raw-byte checks.
+//!
+//! # Compatibility Contract
+//!
+//! This crate intentionally keeps connector-facing cursor byte limits aligned with
+//! coordination-facing limits. If one side changes (`MAX_ITEM_KEY_SIZE`,
+//! `MAX_TOKEN_SIZE`), the other must be updated in lockstep.
 
 use crate::identity::ConnectorTag;
 
@@ -57,10 +65,11 @@ pub mod git;
 pub mod ordered;
 mod types;
 
-pub use api::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
-// Re-export for use by `define_connector_error!` macro via `$crate::connector::` path.
+/// Hidden helper re-export used by `define_connector_error!` through the
+/// `$crate::connector::` path.
 #[doc(hidden)]
 pub use api::fmt_sanitized_message;
+pub use api::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
 pub use common::{
     KeyedPageItem, PageBuf, PageSequenceViolation, PageShapeError, PageState, PagingCapabilities,
     validate_filled_page, validate_page_sequence,
@@ -75,16 +84,19 @@ pub use types::{
 ///
 /// Domain-separates [`crate::identity::StableItemId`] derivation so that
 /// identity hashes are disjoint from items produced by other connector types.
+/// The ASCII payload is part of the stable ID domain contract.
 pub const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
 
 /// Connector tag for git-sourced items.
 ///
 /// Domain-separates [`crate::identity::StableItemId`] derivation so that
 /// identity hashes are disjoint from items produced by other connector types.
+/// The ASCII payload is part of the stable ID domain contract.
 pub const GIT_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"gitlocal");
 
 /// Connector tag for the deterministic in-memory connector kind.
 ///
 /// Domain-separates [`crate::identity::StableItemId`] derivation so that
 /// identity hashes are disjoint from items produced by other connector types.
+/// The ASCII payload is part of the stable ID domain contract.
 pub const IN_MEMORY_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"inmem");
