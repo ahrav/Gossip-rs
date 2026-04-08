@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::git_test_support::{decode_hex, init_git_repo, run_git};
 use scanner_git::{
     ByteArena, ByteRef, CandidateContext, ChangeKind, OidBytes, PackCache, PackCandidate,
     PackDecodeLimits, PackPlanConfig, PackView, build_pack_plans, execute_pack_plan,
@@ -49,17 +50,6 @@ impl PackObjectSink for CollectingSink {
     }
 }
 
-/// Runs a git command in the provided repository and asserts success.
-fn run_git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()
-        .expect("git command");
-    assert!(status.success(), "git command failed: {:?}", args);
-}
-
 /// Writes a file and panics on error (test helper).
 fn write_file(path: &Path, contents: &str) {
     fs::write(path, contents).expect("write file");
@@ -80,14 +70,6 @@ fn find_pack_paths(pack_dir: &Path) -> (PathBuf, PathBuf) {
         }
     }
     (idx_path.expect("idx"), pack_path.expect("pack"))
-}
-
-/// Decodes a hex string into bytes.
-fn hex_to_bytes(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-        .collect()
 }
 
 /// Encodes bytes as lowercase hex.
@@ -118,7 +100,7 @@ fn load_verify_pack(idx_path: &Path, oid_len: usize) -> Vec<(OidBytes, u64)> {
         let kind = parts[1];
         let offset = parts[4].parse::<u64>().unwrap();
         if kind == "blob" && oid_hex.len() == oid_len * 2 {
-            let bytes = hex_to_bytes(oid_hex);
+            let bytes = decode_hex(oid_hex);
             let oid = OidBytes::from_slice(&bytes);
             out.push((oid, offset));
         }
@@ -143,10 +125,7 @@ fn pack_exec_matches_git_cat_file() {
     let tmp = tempfile::TempDir::new().unwrap();
     let repo = tmp.path();
 
-    run_git(repo, &["init"]);
-    // Configure identity locally so commits work in CI without global git config.
-    run_git(repo, &["config", "user.email", "test@example.com"]);
-    run_git(repo, &["config", "user.name", "Test User"]);
+    init_git_repo(repo, "test@example.com", "Test User");
     write_file(&repo.join("a.txt"), "alpha");
     write_file(&repo.join("b.txt"), "bravo");
     run_git(repo, &["add", "."]);

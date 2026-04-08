@@ -23,9 +23,11 @@ use scanner_git::{NullEventSink, run_git_scan};
 
 #[cfg(feature = "rocksdb")]
 use super::git_scan_validation::{
-    TestResolver, TestWatermarkStore, base_config, commit_file, ensure_artifacts, git_available,
-    git_output, init_repo, oid_from_hex, perf_stats_enabled, test_engine,
+    TestResolver, TestWatermarkStore, base_config, commit_file, create_repo, ensure_artifacts,
+    perf_stats_enabled, test_engine,
 };
+#[cfg(feature = "rocksdb")]
+use crate::git_test_support::{git_available, git_output, oid_from_hex};
 
 /// Test double that records persisted ops and can simulate commit failures.
 #[derive(Default)]
@@ -214,7 +216,7 @@ fn run_git_scan_with_rocksdb_writes_incremental_seen_bitmap() {
         return;
     }
 
-    let tmp = init_repo();
+    let tmp = create_repo();
     let repo = tmp.path();
     let mut blob_hexes = Vec::new();
     for i in 0..5 {

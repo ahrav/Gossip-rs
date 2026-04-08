@@ -601,55 +601,24 @@ fn gix_error(context: &str, err: impl std::fmt::Display) -> RepoOpenError {
 pub(crate) mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
 
+    use gossip_stdx::git_test_support::{git_output_raw, git_stdout, init_git_repo};
     use rstest::rstest;
 
     use super::*;
 
-    pub(crate) fn init_repo(tmp: &tempfile::TempDir) -> PathBuf {
-        let output = Command::new("git")
-            .args(["init", "--initial-branch=main"])
-            .arg(tmp.path())
-            .output()
-            .expect("git init");
-        assert!(
-            output.status.success(),
-            "git init failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    pub(crate) fn create_repo(tmp: &tempfile::TempDir) -> PathBuf {
         let repo = tmp.path().to_path_buf();
-        git(&repo, &["config", "user.name", "test-user"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
+        init_git_repo(&repo, "test@example.com", "test-user");
         repo
     }
 
     pub(crate) fn git(repo: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .expect("run git command");
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("utf-8 stdout")
-            .trim()
-            .to_owned()
+        git_stdout(repo, args)
     }
 
     pub(crate) fn try_git(repo: &Path, args: &[&str]) -> std::process::Output {
-        Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .expect("run git command")
+        git_output_raw(repo, args)
     }
 
     pub(crate) fn resolve_with(repo: &Path, config: StartSetConfig) -> Vec<(Vec<u8>, OidBytes)> {
@@ -687,7 +656,7 @@ pub(crate) mod tests {
     #[test]
     fn default_branch_resolves_current_branch_tip() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
 
         let resolved = resolve_default(&repo);
@@ -702,7 +671,7 @@ pub(crate) mod tests {
     #[test]
     fn detached_head_resolves_head_tip() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
         git(&repo, &["checkout", "--detach", "HEAD"]);
 
@@ -718,7 +687,7 @@ pub(crate) mod tests {
     #[test]
     fn empty_repo_returns_empty_start_set() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         let resolved = resolve_default(&repo);
         assert!(resolved.is_empty());
     }
@@ -762,7 +731,7 @@ pub(crate) mod tests {
     #[test]
     fn explicit_refs_resolves_named_branches_and_tags() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         git(&repo, &["commit", "--allow-empty", "-m", "first"]);
         git(&repo, &["branch", "feature-a"]);
         git(&repo, &["tag", "v0.1"]);
@@ -788,7 +757,7 @@ pub(crate) mod tests {
     #[test]
     fn explicit_refs_errors_on_missing_ref() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         git(&repo, &["commit", "--allow-empty", "-m", "first"]);
 
         let result = try_resolve_with(
@@ -806,7 +775,7 @@ pub(crate) mod tests {
     #[test]
     fn all_remote_branches_with_remote_filter() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         git(&repo, &["commit", "--allow-empty", "-m", "first"]);
         let oid = git(&repo, &["rev-parse", "HEAD"]);
 
@@ -827,7 +796,7 @@ pub(crate) mod tests {
     #[test]
     fn all_remote_branches_without_filter() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         git(&repo, &["commit", "--allow-empty", "-m", "first"]);
         let oid = git(&repo, &["rev-parse", "HEAD"]);
 
@@ -850,7 +819,7 @@ pub(crate) mod tests {
     #[test]
     fn branches_and_tags_includes_remotes_when_enabled() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         git(&repo, &["commit", "--allow-empty", "-m", "first"]);
         let oid = git(&repo, &["rev-parse", "HEAD"]);
         git(&repo, &["tag", "v0.1"]);
@@ -873,7 +842,7 @@ pub(crate) mod tests {
     #[test]
     fn branches_and_tags_excludes_remotes_when_disabled() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         git(&repo, &["commit", "--allow-empty", "-m", "first"]);
         let oid = git(&repo, &["rev-parse", "HEAD"]);
         git(&repo, &["tag", "v0.1"]);
@@ -901,7 +870,7 @@ pub(crate) mod tests {
     #[test]
     fn resolves_refs_in_linked_worktree() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         git(&repo, &["commit", "--allow-empty", "-m", "first"]);
         git(&repo, &["branch", "wt-branch"]);
 
@@ -924,7 +893,7 @@ pub(crate) mod tests {
     #[test]
     fn resolves_refs_in_bare_repo() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let source = init_repo(&tmp);
+        let source = create_repo(&tmp);
         git(&source, &["commit", "--allow-empty", "-m", "first"]);
 
         let bare_dir = tmp.path().join("bare.git");
@@ -949,7 +918,7 @@ pub(crate) mod tests {
     #[test]
     fn dangling_symbolic_ref_skipped_in_wildcard() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         git(&repo, &["commit", "--allow-empty", "-m", "first"]);
 
         // Create a symbolic ref pointing at a non-existent target.
@@ -983,7 +952,7 @@ pub(crate) mod tests {
     #[test]
     fn annotated_tag_resolves_to_commit_oid() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
         let commit_oid = git(&repo, &["rev-parse", "HEAD"]);
 
@@ -1023,7 +992,7 @@ pub(crate) mod tests {
     #[test]
     fn dangling_remote_head_skipped_in_wildcard_scan() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
         git(&repo, &["remote", "add", "origin", "."]);
         git(&repo, &["fetch", "origin"]);
@@ -1061,7 +1030,7 @@ pub(crate) mod tests {
     #[test]
     fn resolver_respects_caller_config_size_limits() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = init_repo(&tmp);
+        let repo = create_repo(&tmp);
         git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
 
         let config_path = repo.join(".git").join("config");

@@ -15,4 +15,5 @@ scanner-git.workspace = true
 thiserror = { workspace = true }
 
 [dev-dependencies]
+gossip-stdx = { workspace = true, features = ["git-test-support"] }
 tempfile = "3"

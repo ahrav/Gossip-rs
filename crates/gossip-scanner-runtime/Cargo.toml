@@ -25,7 +25,7 @@ gossip-connectors.workspace = true
 gossip-contracts.workspace = true
 gossip-frontier.workspace = true
 gossip-orchestrator.workspace = true
-gossip-stdx.workspace = true
+gossip-stdx = { workspace = true, features = ["git-test-support"] }
 scanner-engine.workspace = true
 scanner-scheduler.workspace = true
 scanner-git.workspace = true

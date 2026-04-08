@@ -710,7 +710,9 @@ mod tests {
     use super::*;
     use crate::delta_test_helpers::{make_add_delta, zlib_compress, SyntheticPackBuilder};
     use crate::midx_test_builder::MidxBuilder;
-    use crate::native_ref_resolver::tests::{git, init_repo, parse_oid, resolve_with, try_git};
+    use crate::native_ref_resolver::tests::{
+        create_repo as init_repo, git, parse_oid, resolve_with, try_git,
+    };
     use crate::repo::RepoKind;
     use crate::StartSetConfig;
 

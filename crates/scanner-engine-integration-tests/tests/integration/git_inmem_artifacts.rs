@@ -15,8 +15,8 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
+use crate::git_test_support::{git_available, git_output, init_git_repo, oid_from_hex, run_git};
 use scanner_git::{
     ArtifactAcquireError, ArtifactBuildLimits, CommitGraph, CommitGraphMem, CommitLoadLimits,
     CommitPlanIter, CommitWalkLimits, GitRepoPaths, LoadedCommit, MidxBuildLimits, MidxView,
@@ -26,51 +26,6 @@ use scanner_git::{
     resolve_pack_paths_from_midx,
 };
 use tempfile::TempDir;
-
-// ============================================================================
-// Test helpers
-// ============================================================================
-
-fn git_available() -> bool {
-    Command::new("git").arg("--version").output().is_ok()
-}
-
-fn run_git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .status()
-        .expect("failed to run git");
-    assert!(status.success(), "git command failed: {args:?}");
-}
-
-fn git_output(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .expect("failed to run git");
-    assert!(out.status.success(), "git command failed: {args:?}");
-    String::from_utf8(out.stdout).expect("git output not utf8")
-}
-
-fn decode_hex(hex: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let bytes = hex.as_bytes();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16).unwrap();
-        let lo = (bytes[i + 1] as char).to_digit(16).unwrap();
-        out.push(((hi << 4) | lo) as u8);
-        i += 2;
-    }
-    out
-}
-
-fn oid_from_hex(hex: &str) -> OidBytes {
-    let bytes = decode_hex(hex.trim());
-    OidBytes::from_slice(&bytes)
-}
 
 fn load_commits_for_repo(
     paths: &GitRepoPaths,
@@ -120,9 +75,7 @@ fn parent_oids(repo: &Path, commit_hex: &str) -> Vec<OidBytes> {
 /// Creates a test repository with a linear history of commits containing blobs.
 fn create_repo_with_linear_history(num_commits: usize) -> TempDir {
     let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-b", "main"]);
-    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
-    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+    init_git_repo(tmp.path(), "test@example.com", "Test User");
 
     for i in 0..num_commits {
         let filename = format!("file{i}.txt");
@@ -144,9 +97,7 @@ fn create_repo_with_linear_history(num_commits: usize) -> TempDir {
 /// Creates a test repository with branches and a merge commit.
 fn create_repo_with_merge() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-b", "main"]);
-    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
-    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+    init_git_repo(tmp.path(), "test@example.com", "Test User");
 
     // Initial commit
     fs::write(tmp.path().join("base.txt"), "base content\n").unwrap();

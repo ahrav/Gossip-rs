@@ -222,7 +222,6 @@ mod tests {
 
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
 
     use gossip_contracts::identity::{
         LogicalTime, OpId, PolicyHash, RunId, ShardId, TenantId, TenantSecretKey, WorkerId,
@@ -241,6 +240,7 @@ mod tests {
             DistributedPersistence, DistributedRuntimeError, run_worker, secret_fixture,
         },
     };
+    use gossip_stdx::git_test_support::{init_git_repo, run_git};
     use gossip_worker::config::{
         DistributedSourceSettings, DistributedWorkerLaunch, DistributedWorkerRuntimeSettings,
         FsSourceSettings, GitDistributedSourceSettings, GitSourceSettings, ProductionBackendConfig,
@@ -253,26 +253,7 @@ mod tests {
     use gossip_worker::recorder::test_support::capture_logs;
 
     fn create_git_repo(path: &Path) {
-        run_git(path, &["init", "-q"]);
-        run_git(path, &["config", "user.email", "worker-tests@example.com"]);
-        run_git(path, &["config", "user.name", "Worker Tests"]);
-    }
-
-    fn run_git(path: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(args)
-            .output()
-            .expect("git command should run");
-        assert!(
-            output.status.success(),
-            "git command failed: git -C {} {}\nstdout:{}\nstderr:{}",
-            path.display(),
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+        init_git_repo(path, "worker-tests@example.com", "Worker Tests");
     }
 
     fn tenant() -> TenantId {

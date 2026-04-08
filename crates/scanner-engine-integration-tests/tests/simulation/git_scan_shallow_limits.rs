@@ -8,6 +8,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
+use crate::git_test_support::{git_available, git_output, init_git_repo, oid_from_hex, run_git};
 use regex::bytes::Regex;
 use tempfile::TempDir;
 
@@ -19,52 +20,9 @@ use crate::scanner_rs::git_scan::{
 use crate::scanner_rs::unified::events::NullEventSink;
 use crate::scanner_rs::{AnchorPolicy, Engine, RuleSpec, ValidatorKind, demo_tuning};
 
-fn git_available() -> bool {
-    Command::new("git").arg("--version").output().is_ok()
-}
-
-fn run_git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .status()
-        .expect("failed to run git");
-    assert!(status.success(), "git command failed: {args:?}");
-}
-
-fn git_output(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .expect("failed to run git");
-    assert!(out.status.success(), "git command failed: {args:?}");
-    String::from_utf8(out.stdout).expect("git output not utf8")
-}
-
-fn decode_hex(hex: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let bytes = hex.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16).unwrap();
-        let lo = (bytes[i + 1] as char).to_digit(16).unwrap();
-        out.push(((hi << 4) | lo) as u8);
-        i += 2;
-    }
-    out
-}
-
-fn oid_from_hex(hex: &str) -> OidBytes {
-    let bytes = decode_hex(hex.trim());
-    OidBytes::from_slice(&bytes)
-}
-
-fn init_repo() -> TempDir {
+fn create_repo() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-b", "main"]);
-    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
-    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+    init_git_repo(tmp.path(), "test@example.com", "Test User");
     tmp
 }
 
@@ -131,7 +89,7 @@ fn shallow_root_limit_failure_is_covered_by_sim_harness() {
         return;
     }
 
-    let source = init_repo();
+    let source = create_repo();
     commit_file(source.path(), "base.txt", "base\n", "c1");
     commit_file(source.path(), "base.txt", "TOK_ABCDEFGH\n", "c2");
 

@@ -185,69 +185,25 @@ pub fn derive_repo_id(tenant_id: TenantId, repo_key: &RepoKey) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::process::Command;
 
     use gossip_contracts::identity::TenantId;
+    use gossip_stdx::git_test_support::{init_committed_repo, init_git_repo, run_git};
     use tempfile::tempdir;
 
     use super::*;
     use crate::limits::RepoOpenLimits;
 
+    const TEST_EMAIL: &str = "repo-identity-tests@example.com";
+    const TEST_NAME: &str = "Repo Identity Tests";
+
     fn tenant(byte: u8) -> TenantId {
         TenantId::from_bytes([byte; 32])
-    }
-
-    fn run_git_in(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .expect("run git command");
-        assert!(
-            output.status.success(),
-            "git command failed: git -C {} {}\nstdout:{}\nstderr:{}",
-            dir.display(),
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-
-    fn run_git(args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .output()
-            .expect("run git command");
-        assert!(
-            output.status.success(),
-            "git command failed: git {}\nstdout:{}\nstderr:{}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-
-    fn init_repo(dir: &Path) {
-        run_git_in(dir, &["init", "-q"]);
-        run_git_in(
-            dir,
-            &["config", "user.email", "repo-identity-tests@example.com"],
-        );
-        run_git_in(dir, &["config", "user.name", "Repo Identity Tests"]);
-    }
-
-    fn init_committed_repo(dir: &Path) {
-        init_repo(dir);
-        fs::write(dir.join("fixture.txt"), "fixture").expect("write fixture");
-        run_git_in(dir, &["add", "."]);
-        run_git_in(dir, &["commit", "-q", "-m", "fixture"]);
     }
 
     #[test]
     fn equivalent_path_spellings_normalize_to_identical_identity() {
         let dir = tempdir().expect("tempdir");
-        init_repo(dir.path());
+        init_git_repo(dir.path(), TEST_EMAIL, TEST_NAME);
 
         let left = NormalizedLocalRepoIdentity::normalize(
             tenant(0x11),
@@ -270,11 +226,11 @@ mod tests {
     #[test]
     fn linked_worktree_identity_uses_worktree_root() {
         let dir = tempdir().expect("tempdir");
-        init_committed_repo(dir.path());
-        run_git_in(dir.path(), &["branch", "wt-branch"]);
+        init_committed_repo(dir.path(), TEST_EMAIL, TEST_NAME);
+        run_git(dir.path(), &["branch", "wt-branch"]);
 
         let worktree = dir.path().join("worktree");
-        run_git_in(
+        run_git(
             dir.path(),
             &[
                 "worktree",
@@ -326,12 +282,15 @@ mod tests {
     fn bare_repo_identity_uses_bare_root() {
         let dir = tempdir().expect("tempdir");
         let bare = dir.path().join("bare.git");
-        run_git(&[
-            "init",
-            "-q",
-            "--bare",
-            bare.to_str().expect("utf-8 bare path"),
-        ]);
+        run_git(
+            dir.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                bare.to_str().expect("utf-8 bare path"),
+            ],
+        );
 
         let identity =
             NormalizedLocalRepoIdentity::normalize(tenant(0x33), &bare, &RepoOpenLimits::default())
@@ -359,8 +318,8 @@ mod tests {
         let repo_b = dir.path().join("b-repo");
         fs::create_dir_all(&repo_a).expect("create repo a");
         fs::create_dir_all(&repo_b).expect("create repo b");
-        init_repo(&repo_a);
-        init_repo(&repo_b);
+        init_git_repo(&repo_a, TEST_EMAIL, TEST_NAME);
+        init_git_repo(&repo_b, TEST_EMAIL, TEST_NAME);
 
         let sorted = normalize_local_repo_identities(
             tenant(0x44),
@@ -389,7 +348,7 @@ mod tests {
     #[test]
     fn repo_id_derivation_is_stable_and_tenant_scoped() {
         let dir = tempdir().expect("tempdir");
-        init_repo(dir.path());
+        init_git_repo(dir.path(), TEST_EMAIL, TEST_NAME);
 
         let repo_key = NormalizedLocalRepoIdentity::normalize(
             tenant(0x55),
@@ -461,7 +420,7 @@ mod tests {
     #[test]
     fn normalized_repo_identity_debug_redacts_paths() {
         let dir = tempdir().expect("tempdir");
-        init_repo(dir.path());
+        init_git_repo(dir.path(), TEST_EMAIL, TEST_NAME);
         let identity = NormalizedLocalRepoIdentity::normalize(
             tenant(0x77),
             dir.path(),

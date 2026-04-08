@@ -25,7 +25,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 gossip-coordination.workspace = true
-gossip-stdx.workspace = true
+gossip-stdx = { workspace = true, features = ["git-test-support"] }
 gossip-coordination-etcd = { workspace = true, features = ["test-support"] }
 gossip-frontier.workspace = true
 gossip-orchestrator.workspace = true
