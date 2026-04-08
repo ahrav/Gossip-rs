@@ -1512,6 +1512,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gossip-git-persistence-postgres"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "gossip-pg-common",
+ "gossip-scanner-runtime",
+ "postgres",
+ "proptest",
+ "scanner-git",
+ "thiserror",
+]
+
+[[package]]
 name = "gossip-orchestrator"
 version = "0.1.0"
 dependencies = [

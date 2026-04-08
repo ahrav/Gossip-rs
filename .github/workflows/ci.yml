@@ -163,6 +163,7 @@ jobs:
           --features test-support,perf-stats
           --exclude gossip-findings-postgres
           --exclude gossip-done-ledger-postgres
+          --exclude gossip-git-persistence-postgres
           --exclude gossip-coordination-etcd
           ${{ matrix.extra-excludes }}
           --no-run
@@ -175,6 +176,7 @@ jobs:
           --features test-support,perf-stats
           --exclude gossip-findings-postgres
           --exclude gossip-done-ledger-postgres
+          --exclude gossip-git-persistence-postgres
           --exclude gossip-coordination-etcd
           ${{ matrix.extra-excludes }}
           --profile ci
@@ -188,7 +190,7 @@ jobs:
 
   # ── Test (PostgreSQL integration) ─────────────────────────────────
   # Runs PostgreSQL-dependent tests against a real service container.
-  # GOSSIP_POSTGRES_TEST_URL bypasses testcontainers so both crates
+  # GOSSIP_POSTGRES_TEST_URL bypasses testcontainers so all PG crates
   # share the same service container instead of spinning up their own.
   test-postgres:
     name: Test (PostgreSQL)
@@ -235,6 +237,13 @@ jobs:
         run: >-
           cargo nextest run
           -p gossip-findings-postgres
+          --features test-utils
+          --profile ci
+
+      - name: Run PostgreSQL integration tests (git-persistence)
+        run: >-
+          cargo nextest run
+          -p gossip-git-persistence-postgres
           --features test-utils
           --profile ci
 
@@ -395,7 +404,7 @@ jobs:
       # doc-links to cfg-gated modules.
       - run: >-
           cargo doc --no-deps
-          --features gossip-contracts/test-support,gossip-coordination/test-support,gossip-coordination-etcd/test-support,gossip-pg-common/test-support,gossip-done-ledger-postgres/test-utils,gossip-findings-postgres/test-utils,gossip-persistence-inmemory/test-support,gossip-scanner-runtime/test-support,scanner-engine/test-support
+          --features gossip-contracts/test-support,gossip-coordination/test-support,gossip-coordination-etcd/test-support,gossip-git-persistence-postgres/test-utils,gossip-pg-common/test-support,gossip-done-ledger-postgres/test-utils,gossip-findings-postgres/test-utils,gossip-persistence-inmemory/test-support,gossip-scanner-runtime/test-support,scanner-engine/test-support
 
   # ── Dependency Lint (licenses, advisories, bans) ───────────────────
   deny:
