@@ -711,15 +711,17 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
     }
 
     if has_connect_timeout(dsn) {
-        return Client::connect(dsn, NoTls).map_err(|err| {
+        return Client::connect(dsn, NoTls).inspect_err(|err| {
             // Log a safe category at error level; the raw driver error may
-            // echo DSN fragments so full diagnostics stay at debug level.
+            // echo DSN fragments so diagnostics use the same classifier.
             tracing::error!(
-                reason = classify_pg_error(&err),
+                reason = classify_pg_error(err),
                 "PostgreSQL connection failed"
             );
-            tracing::debug!(error = %err, "PostgreSQL connection diagnostic");
-            err
+            tracing::debug!(
+                reason = classify_pg_error(err),
+                "PostgreSQL connection diagnostic"
+            );
         });
     }
 
@@ -736,10 +738,12 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
         timeout_secs = DEFAULT_CONNECT_TIMEOUT_SECS,
         "DSN omitted connect_timeout; injecting default"
     );
-    Client::connect(&timed, NoTls).map_err(|err| {
+    Client::connect(&timed, NoTls).inspect_err(|err| {
         tracing::warn!("PostgreSQL connection failed");
-        tracing::debug!(error = %err, "PostgreSQL connection diagnostic");
-        err
+        tracing::debug!(
+            reason = classify_pg_error(err),
+            "PostgreSQL connection diagnostic"
+        );
     })
 }
 

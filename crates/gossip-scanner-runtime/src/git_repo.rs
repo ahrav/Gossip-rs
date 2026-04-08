@@ -225,6 +225,10 @@ impl GitRepoRuntime {
         };
         let finalize_outcome = execution.result.0.finalize.outcome;
         let was_deferred = deferred_finalize_store.was_complete_deferred();
+        debug_assert!(
+            !matches!(finalize_outcome, FinalizeOutcome::Complete) || was_deferred,
+            "complete finalize outcome must produce a deferred finalize"
+        );
         let (report, finalize) =
             git_report_to_scan_report(execution.result, execution.scan_elapsed);
         let deferred_finalize = if was_deferred { Some(finalize) } else { None };

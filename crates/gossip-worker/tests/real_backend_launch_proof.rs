@@ -1157,8 +1157,8 @@ fn git_worker_binary_happy_path_completes_shard_and_commits() {
         "clean Git fixture should produce 0 observations, got {observation_rows}",
     );
     assert!(
-        git_kv_rows > 0,
-        "Git worker should durably write git-kv state, got {git_kv_rows} rows"
+        git_kv_rows >= 2,
+        "Git worker should write at least scope + watermark rows, got {git_kv_rows}"
     );
     assert_completed_git_shard_state(&proof.backends.coordinator, proof.shard_key);
 }
@@ -1182,8 +1182,8 @@ fn git_worker_restart_is_idempotent_after_completed_shard() {
         "clean Git fixture should produce 0 observations, got {observation_rows_after_first}",
     );
     assert!(
-        git_kv_rows_after_first > 0,
-        "first Git launch should populate git-kv state"
+        git_kv_rows_after_first >= 2,
+        "first Git launch should populate at least scope + watermark git-kv rows, got {git_kv_rows_after_first}"
     );
 
     let second = proof.run_worker_binary();

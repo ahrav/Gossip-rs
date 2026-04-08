@@ -1966,6 +1966,26 @@ mod tests {
     }
 
     #[test]
+    fn deferred_complete_finalize_preserves_staging_when_no_finalize_occurs() {
+        let backend = TestBackend::atomic();
+        let repo_id = 83;
+        let policy_hash = [0x83; 32];
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+        let deferred = DeferredCompleteFinalizeStore::new(&adapter);
+        let oid = sim_oid(0xC0);
+
+        deferred
+            .persist_seen_delta(&[oid])
+            .expect("staging write should succeed");
+
+        assert!(
+            !deferred.was_complete_deferred(),
+            "no finalize was called, so nothing should be pending"
+        );
+        assert_staging_contains(&backend, repo_id, &policy_hash, &[oid]);
+    }
+
+    #[test]
     fn sim_backend_put_get_roundtrip() {
         let backend = TestBackend::non_atomic();
         let key = b"bc\0blob".to_vec();
