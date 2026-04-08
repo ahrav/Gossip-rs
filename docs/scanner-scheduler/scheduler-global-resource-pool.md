@@ -229,7 +229,7 @@ The spill permission uses an enum to distinguish three cases:
 enum SpillGrant {
     NotRequested,           // Job didn't request spill
     Unlimited,              // Spill enabled; no slot counting
-    Limited(CountPermit),   // Spill enabled; using 1 counted slot
+    Limited { _permit: CountPermit },   // Spill enabled; using 1 counted slot
 }
 ```
 

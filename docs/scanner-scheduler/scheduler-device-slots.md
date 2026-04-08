@@ -108,7 +108,7 @@ The device slots system implements **per-device admission control**:
 
 ```rust
 pub struct DeviceSlotPermit {
-    inner: CountPermit,
+    _inner: CountPermit,
     device: DeviceId,
 }
 ```

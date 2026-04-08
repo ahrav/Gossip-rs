@@ -36,9 +36,9 @@ SCHEDULER_SIM_STRESS_SEEDS=100 cargo test --features scheduler-sim scheduler_sim
 - **Corpus**: `crates/scanner-engine-integration-tests/tests/simulation/corpus/*.json` - regression tests replayed on every run
 - **Failures**: `crates/scanner-engine-integration-tests/tests/failures/*.json` - where stress failures are written
 
-## SimCase DSL Reference
+## ReproArtifact DSL Reference
 
-A `SimCase` defines a complete simulation scenario in JSON. The harness loads the case, initializes the executor, and steps through actions until completion or failure.
+A `ReproArtifact` defines a complete simulation scenario in JSON. The harness loads the case, initializes the executor, and steps through actions until completion or failure.
 
 ### Top-Level Structure
 
