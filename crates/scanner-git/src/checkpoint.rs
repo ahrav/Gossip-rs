@@ -2518,6 +2518,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn corrupted_base_crc_discards_base_and_prefix() {
+        let fp = artifact(35);
+        let (mut base_state, _, _, _, _, _, _, _) = encode_spill_dedup_base(&fp);
+        let path_arena = ByteArena::with_capacity(0);
+        let scanned = ScannedBlobs {
+            blobs: Vec::new(),
+            finding_arena: Vec::new(),
+        };
+        let prefix_checkpoint = StageCheckpoint::PackPlanComplete {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &fp,
+            plan: &plan(),
+            packed: &[],
+            loose: &[],
+            path_arena: &path_arena,
+            tree_diff_stats: TreeDiffStats::default(),
+            spill_stats: SpillStats::default(),
+            mapping_stats: MappingStats::default(),
+            completed_plan_count: 1,
+            scanned: &scanned,
+            skipped_candidates: &[],
+            common_metrics: GitScanCommonMetrics::default(),
+        };
+        let prefix_state = prefix_checkpoint
+            .encode_prefix_state()
+            .expect("prefix encode")
+            .expect("PackPlanComplete must produce prefix state");
+
+        // Corrupt the base blob's payload so CRC verification fails.
+        base_state[CHECKPOINT_ENVELOPE_HEADER_LEN] ^= 0x01;
+
+        let loaded = LoadedScanCheckpoint::BaseAndPrefix {
+            base_state,
+            prefix_state,
+        };
+        let result = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect("graceful base decode failure returns Ok");
+        assert!(
+            result.is_none(),
+            "corrupted base CRC must discard both base and prefix (restart fresh)"
+        );
+    }
+
+    #[test]
+    fn old_format_blob_without_envelope_restarts_fresh() {
+        // Simulates the deployment upgrade scenario: a checkpoint blob written
+        // before the integrity envelope was introduced is raw postcard bytes
+        // without the [magic][crc32] header. The magic-mismatch guard in
+        // checkpoint_deserialize rejects it, and from_loaded restarts fresh.
+        let fp = artifact(36);
+        let old_format_blob =
+            postcard::to_allocvec(&StoredBaseState::CommitPlan(StoredCommitPlanState {
+                scan_mode: StoredGitScanMode::DiffHistory,
+                artifact_fingerprint: StoredRepoArtifactFingerprint::from(&fp),
+                plan: plan().into_iter().map(StoredPlannedCommit::from).collect(),
+            }))
+            .expect("old-format postcard encoding");
+
+        let loaded = LoadedScanCheckpoint::BaseOnly {
+            base_state: old_format_blob,
+        };
+        let result = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect("graceful decode failure returns Ok");
+        assert!(
+            result.is_none(),
+            "pre-envelope checkpoint blob must be discarded on upgrade (restart fresh)"
+        );
+    }
+
     /// Verify that `completed_plan_count` survives serialization round-trip,
     /// ensuring the runner-level guard (`completed_plan_prefix_len > plans.len()`)
     /// receives the correct value.
