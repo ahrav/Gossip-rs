@@ -10,6 +10,8 @@
 //! The public trait surface intentionally keeps the persistence backend opaque.
 //! Callers load and store raw checkpoint blobs, while this module owns the
 //! encoding and decoding of runner state.
+//! Checkpoint blobs are framed as `[magic: 4][crc32_le: 4][postcard payload]`
+//! so resume loads can reject accidental corruption before deserializing state.
 
 use gix_commitgraph::Position;
 use serde::{Deserialize, Serialize};
@@ -29,54 +31,100 @@ use crate::tree_candidate::{CandidateContext, ChangeKind};
 use crate::tree_diff::TreeDiffStats;
 use crate::NormHash;
 
-/// Maximum checkpoint blob size accepted during deserialization (256 MiB).
+/// Magic bytes that identify scanner-git checkpoint blobs.
+///
+/// Envelope layout: `[magic: 4 bytes][crc32_le: 4 bytes][postcard payload: N bytes]`.
+const CHECKPOINT_MAGIC: [u8; 4] = *b"gkpt";
+
+/// Size of the fixed checkpoint envelope prefix.
+///
+/// Envelope layout: `[magic: 4 bytes][crc32_le: 4 bytes][postcard payload: N bytes]`.
+const CHECKPOINT_ENVELOPE_HEADER_LEN: usize = CHECKPOINT_MAGIC.len() + std::mem::size_of::<u32>();
+
+/// Maximum checkpoint payload size accepted during deserialization (256 MiB).
 ///
 /// Prevents a crafted blob from triggering unbounded allocation.
-/// The encode path warns when this limit is exceeded but still returns the
-/// blob: the decode side discards oversize blobs gracefully via `Ok(None)`,
-/// and persisting the blob is safer than returning `None` (which the
-/// checkpoint sink interprets as "delete the prefix key", erasing the last
-/// durable resume anchor).
+/// The limit applies to the postcard payload within the integrity envelope,
+/// not to the total framed blob. The encode path logs an error when this limit
+/// is exceeded but still returns the blob: the decode side discards oversize
+/// blobs gracefully via `Ok(None)`, and persisting the blob is safer than
+/// returning `None` (which the checkpoint sink interprets as "delete the
+/// prefix key", erasing the last durable resume anchor).
 const MAX_CHECKPOINT_BYTES: usize = 256 * 1024 * 1024;
 
-/// Serialize a checkpoint value, warning if the result exceeds the decode
+/// Serialize a checkpoint value, logging an error if the payload exceeds the decode
 /// limit.
 ///
-/// Always returns the serialized bytes. The decode path in
-/// [`checkpoint_deserialize`] rejects oversize blobs by returning an error
-/// (which `from_loaded` converts to `Ok(None)`, restarting the scan fresh).
-/// Returning `None` here is deliberately avoided: the checkpoint sink
-/// treats `None` as "delete the prefix key", which would erase the last
-/// durable pack-plan frontier on large repos.
+/// Always returns the serialized bytes wrapped in the checkpoint integrity
+/// envelope. The decode path in [`checkpoint_deserialize`] rejects oversize
+/// payloads by returning an error (which `from_loaded` converts to `Ok(None)`,
+/// restarting the scan fresh). Returning `None` here is deliberately avoided:
+/// the checkpoint sink treats `None` as "delete the prefix key", which would
+/// erase the last durable pack-plan frontier on large repos.
 fn checkpoint_serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ScanCheckpointError> {
-    let encoded =
+    let payload =
         postcard::to_allocvec(value).map_err(|err| ScanCheckpointError::Encode(err.to_string()))?;
-    if encoded.len() > MAX_CHECKPOINT_BYTES {
-        tracing::warn!(
-            size = encoded.len(),
+    if payload.len() > MAX_CHECKPOINT_BYTES {
+        tracing::error!(
+            size = payload.len(),
             limit = MAX_CHECKPOINT_BYTES,
             "checkpoint blob exceeds decode-side size limit; \
              the blob will be persisted but discarded on the next resume"
         );
     }
+
+    let crc32 = crc32fast::hash(&payload);
+    let mut encoded = Vec::with_capacity(CHECKPOINT_ENVELOPE_HEADER_LEN + payload.len());
+    encoded.extend_from_slice(&CHECKPOINT_MAGIC);
+    encoded.extend_from_slice(&crc32.to_le_bytes());
+    encoded.extend_from_slice(&payload);
     Ok(encoded)
 }
 
-/// Deserialize a checkpoint blob with a size guard.
+/// Deserialize a checkpoint blob with envelope integrity verification.
 ///
-/// Rejects inputs exceeding [`MAX_CHECKPOINT_BYTES`] before handing them
-/// to postcard. Uses strict-consume semantics (`from_bytes`) so that
-/// trailing garbage causes a decode failure rather than being silently
-/// ignored. Per the no-versioning rule, format changes update all
-/// readers/writers in one pass; there is no forward-compatibility contract
-/// that would require tolerating trailing bytes.
+/// Verification order is: magic bytes, payload size guard, CRC32, then
+/// postcard deserialization. The CRC32 guard detects accidental corruption
+/// such as bit-rot, truncation, and format drift; it does not provide tamper
+/// resistance. Uses strict-consume semantics (`from_bytes`) so that trailing
+/// garbage causes a decode failure rather than being silently ignored. Per the
+/// no-versioning rule, format changes update all readers/writers in one pass;
+/// there is no forward-compatibility contract that would require tolerating
+/// trailing bytes.
 fn checkpoint_deserialize<'de, T: serde::Deserialize<'de>>(
     bytes: &'de [u8],
-) -> Result<T, postcard::Error> {
-    if bytes.len() > MAX_CHECKPOINT_BYTES {
-        return Err(postcard::Error::DeserializeUnexpectedEnd);
+) -> Result<T, ScanCheckpointError> {
+    if bytes.len() < CHECKPOINT_ENVELOPE_HEADER_LEN {
+        return Err(ScanCheckpointError::Decode(format!(
+            "checkpoint blob shorter than integrity envelope header ({CHECKPOINT_ENVELOPE_HEADER_LEN} bytes)"
+        )));
     }
-    postcard::from_bytes(bytes)
+    if bytes[..CHECKPOINT_MAGIC.len()] != CHECKPOINT_MAGIC {
+        return Err(ScanCheckpointError::Decode(
+            "checkpoint blob magic mismatch".to_owned(),
+        ));
+    }
+
+    let payload = &bytes[CHECKPOINT_ENVELOPE_HEADER_LEN..];
+    if payload.len() > MAX_CHECKPOINT_BYTES {
+        return Err(ScanCheckpointError::Decode(format!(
+            "checkpoint payload exceeds size limit ({MAX_CHECKPOINT_BYTES} bytes)"
+        )));
+    }
+
+    let stored_crc32 = u32::from_le_bytes(
+        bytes[CHECKPOINT_MAGIC.len()..CHECKPOINT_ENVELOPE_HEADER_LEN]
+            .try_into()
+            .expect("checksum slice must match the fixed envelope width"),
+    );
+    let computed_crc32 = crc32fast::hash(payload);
+    if stored_crc32 != computed_crc32 {
+        return Err(ScanCheckpointError::Decode(format!(
+            "checkpoint CRC mismatch (stored {stored_crc32:#010x}, computed {computed_crc32:#010x})"
+        )));
+    }
+
+    postcard::from_bytes(payload).map_err(|err| ScanCheckpointError::Decode(err.to_string()))
 }
 
 /// Storage payloads returned by [`ScanCheckpointSink::load_resume_state`].
@@ -548,10 +596,10 @@ impl ScanResumeState {
     /// Decode and validate a durable checkpoint into resume state.
     ///
     /// Returns `Ok(None)` when the checkpoint should be discarded: empty
-    /// input, decode failure, stale scan mode, or artifact fingerprint
-    /// mismatch. Returns `Err` for structural validation failures (bad OID
-    /// lengths, out-of-bounds arena refs, invalid stage discriminator,
-    /// impossible `completed_plan_count`).
+    /// input, envelope verification failure, decode failure, stale scan mode,
+    /// or artifact fingerprint mismatch. Returns `Err` for structural
+    /// validation failures (bad OID lengths, out-of-bounds arena refs, invalid
+    /// stage discriminator, impossible `completed_plan_count`).
     pub fn from_loaded(
         loaded: LoadedScanCheckpoint,
         scan_mode: GitScanMode,
@@ -648,10 +696,14 @@ impl ScanResumeState {
                     }
                 };
 
-                let plan_len = base.packed.len();
-                if (prefix.completed_plan_count as usize) > plan_len {
+                let packed_candidate_count = base.packed.len();
+                // Pack plans are rebuilt by grouping packed candidates by
+                // `pack_id`, so a durable prefix can never cover more pack
+                // plans than there are packed candidates even when multiple
+                // candidates collapse into the same rebuilt plan.
+                if (prefix.completed_plan_count as usize) > packed_candidate_count {
                     return Err(ScanCheckpointError::InvalidState(format!(
-                        "completed_plan_count ({}) exceeds packed candidate count ({plan_len})",
+                        "completed_plan_count ({}) exceeds packed candidate count ({packed_candidate_count})",
                         prefix.completed_plan_count,
                     )));
                 }
@@ -1382,6 +1434,7 @@ impl From<StoredGitScanCommonMetrics> for GitScanCommonMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     fn artifact(byte: u8) -> RepoArtifactFingerprint {
         RepoArtifactFingerprint {
@@ -1401,6 +1454,19 @@ mod tests {
                 snapshot_root: true,
             },
         ]
+    }
+
+    fn frame_checkpoint_payload(payload: &[u8]) -> Vec<u8> {
+        let crc32 = crc32fast::hash(payload);
+        let mut encoded = Vec::with_capacity(CHECKPOINT_ENVELOPE_HEADER_LEN + payload.len());
+        encoded.extend_from_slice(&CHECKPOINT_MAGIC);
+        encoded.extend_from_slice(&crc32.to_le_bytes());
+        encoded.extend_from_slice(payload);
+        encoded
+    }
+
+    fn serialize_checkpoint_for_test<T: serde::Serialize>(value: &T) -> Vec<u8> {
+        checkpoint_serialize(value).expect("framed checkpoint encoding should succeed")
     }
 
     #[test]
@@ -2005,8 +2071,7 @@ mod tests {
             skipped_candidates: Vec::new(),
             common_metrics: StoredGitScanCommonMetrics::from(GitScanCommonMetrics::default()),
         };
-        let prefix_bytes =
-            postcard::to_allocvec(&invalid_prefix).expect("serialize invalid prefix");
+        let prefix_bytes = serialize_checkpoint_for_test(&invalid_prefix);
 
         let loaded = LoadedScanCheckpoint::BaseAndPrefix {
             base_state: base_bytes,
@@ -2049,19 +2114,19 @@ mod tests {
     #[test]
     fn deserialize_truncated_blob_restarts_fresh() {
         let loaded = LoadedScanCheckpoint::BaseOnly {
-            base_state: vec![0xFF, 0x01, 0x02],
+            base_state: vec![b'g', b'k', b'p', b't', 0x00, 0x00],
         };
         let result = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &artifact(1))
             .expect("graceful decode failure returns Ok");
-        assert!(result.is_none(), "truncated blob must restart fresh");
+        assert!(result.is_none(), "truncated envelope must restart fresh");
     }
 
     #[test]
     fn deserialize_oversized_blob_restarts_fresh() {
         // Build a blob exceeding `MAX_CHECKPOINT_BYTES` so that the size
-        // guard in `checkpoint_deserialize` rejects it before postcard
-        // attempts to parse anything.
-        let blob = vec![0u8; MAX_CHECKPOINT_BYTES + 1];
+        // guard in `checkpoint_deserialize` rejects the framed payload before
+        // postcard attempts to parse anything.
+        let blob = frame_checkpoint_payload(&vec![0u8; MAX_CHECKPOINT_BYTES + 1]);
 
         let loaded = LoadedScanCheckpoint::BaseOnly { base_state: blob };
         let result =
@@ -2104,7 +2169,7 @@ mod tests {
             spill_stats: StoredSpillStats::from(SpillStats::default()),
             mapping_stats: StoredMappingStats::from(MappingStats::default()),
         });
-        let blob = postcard::to_allocvec(&stored).expect("encode");
+        let blob = serialize_checkpoint_for_test(&stored);
 
         let loaded = LoadedScanCheckpoint::BaseOnly { base_state: blob };
         let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
@@ -2152,7 +2217,7 @@ mod tests {
             spill_stats: StoredSpillStats::from(SpillStats::default()),
             mapping_stats: StoredMappingStats::from(MappingStats::default()),
         });
-        let blob = postcard::to_allocvec(&stored).expect("encode");
+        let blob = serialize_checkpoint_for_test(&stored);
 
         let loaded = LoadedScanCheckpoint::BaseOnly { base_state: blob };
         let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
@@ -2201,7 +2266,7 @@ mod tests {
             skipped_candidates: Vec::new(),
             common_metrics: StoredGitScanCommonMetrics::from(GitScanCommonMetrics::default()),
         };
-        let prefix_blob = postcard::to_allocvec(&prefix).expect("encode");
+        let prefix_blob = serialize_checkpoint_for_test(&prefix);
 
         let loaded = LoadedScanCheckpoint::BaseAndPrefix {
             base_state: base_blob,
@@ -2308,6 +2373,83 @@ mod tests {
         assert_eq!(prefix.scanned.blobs.len(), 1);
     }
 
+    #[test]
+    fn checkpoint_deserialize_rejects_magic_mismatch() {
+        let payload = postcard::to_allocvec(&123u32).expect("payload");
+        let mut blob = frame_checkpoint_payload(&payload);
+        blob[..CHECKPOINT_MAGIC.len()].copy_from_slice(b"nope");
+
+        let err = checkpoint_deserialize::<u32>(&blob).expect_err("bad magic must fail");
+        assert_eq!(
+            err.to_string(),
+            "checkpoint decoding failed: checkpoint blob magic mismatch"
+        );
+    }
+
+    #[test]
+    fn checkpoint_deserialize_rejects_crc_mismatch_with_safe_diagnostics() {
+        let mut blob = checkpoint_serialize(&123u32).expect("serialize");
+        let stored_crc32 = u32::from_le_bytes(
+            blob[CHECKPOINT_MAGIC.len()..CHECKPOINT_ENVELOPE_HEADER_LEN]
+                .try_into()
+                .expect("checksum slice"),
+        );
+        blob[CHECKPOINT_ENVELOPE_HEADER_LEN] ^= 0xFF;
+        let computed_crc32 = crc32fast::hash(&blob[CHECKPOINT_ENVELOPE_HEADER_LEN..]);
+
+        let err = checkpoint_deserialize::<u32>(&blob).expect_err("corrupted CRC must fail");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "checkpoint decoding failed: checkpoint CRC mismatch (stored {stored_crc32:#010x}, computed {computed_crc32:#010x})"
+            )
+        );
+    }
+
+    #[test]
+    fn corrupted_prefix_crc_falls_back_to_base_only() {
+        let fp = artifact(33);
+        let (base_state, _, _, _, _, _, _, _) = encode_spill_dedup_base(&fp);
+        let path_arena = ByteArena::with_capacity(0);
+        let scanned = ScannedBlobs {
+            blobs: Vec::new(),
+            finding_arena: Vec::new(),
+        };
+        let prefix_checkpoint = StageCheckpoint::PackPlanComplete {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &fp,
+            plan: &plan(),
+            packed: &[],
+            loose: &[],
+            path_arena: &path_arena,
+            tree_diff_stats: TreeDiffStats::default(),
+            spill_stats: SpillStats::default(),
+            mapping_stats: MappingStats::default(),
+            completed_plan_count: 1,
+            scanned: &scanned,
+            skipped_candidates: &[],
+            common_metrics: GitScanCommonMetrics::default(),
+        };
+        let mut prefix_state = prefix_checkpoint
+            .encode_prefix_state()
+            .expect("prefix encode")
+            .expect("PackPlanComplete must produce prefix state");
+        prefix_state[CHECKPOINT_ENVELOPE_HEADER_LEN] ^= 0x01;
+
+        let loaded = LoadedScanCheckpoint::BaseAndPrefix {
+            base_state,
+            prefix_state,
+        };
+        let resume = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+            .expect("load should succeed")
+            .expect("base state should remain usable");
+
+        assert!(
+            matches!(resume, ScanResumeState::PostSpillDedup(_)),
+            "corrupted prefix CRC must fall back to base-only resume"
+        );
+    }
+
     /// Verify that `completed_plan_count` survives serialization round-trip,
     /// ensuring the runner-level guard (`completed_plan_prefix_len > plans.len()`)
     /// receives the correct value.
@@ -2355,5 +2497,66 @@ mod tests {
             prefix.completed_plan_count, 2,
             "completed_plan_count must survive serialization round-trip"
         );
+    }
+
+    #[rstest]
+    #[case(0, true)]
+    #[case(1, true)]
+    #[case(2, true)]
+    #[case(3, false)]
+    fn completed_plan_count_validation_boundary(
+        #[case] completed_plan_count: usize,
+        #[case] should_succeed: bool,
+    ) {
+        let fp = artifact(34);
+        let (base_state, ..) = encode_spill_dedup_base(&fp);
+        let path_arena = ByteArena::with_capacity(0);
+        let scanned = ScannedBlobs {
+            blobs: Vec::new(),
+            finding_arena: Vec::new(),
+        };
+        let prefix_checkpoint = StageCheckpoint::PackPlanComplete {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &fp,
+            plan: &plan(),
+            packed: &[],
+            loose: &[],
+            path_arena: &path_arena,
+            tree_diff_stats: TreeDiffStats::default(),
+            spill_stats: SpillStats::default(),
+            mapping_stats: MappingStats::default(),
+            completed_plan_count,
+            scanned: &scanned,
+            skipped_candidates: &[],
+            common_metrics: GitScanCommonMetrics::default(),
+        };
+        let prefix_state = prefix_checkpoint
+            .encode_prefix_state()
+            .expect("prefix encode")
+            .expect("PackPlanComplete must produce prefix state");
+        let loaded = LoadedScanCheckpoint::BaseAndPrefix {
+            base_state,
+            prefix_state,
+        };
+
+        if should_succeed {
+            let resume = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+                .expect("within-bound prefix should load")
+                .expect("within-bound prefix should resume");
+            let (_, _, prefix) = resume.into_parts();
+            assert_eq!(
+                prefix
+                    .expect("PackPlanComplete must carry a prefix")
+                    .completed_plan_count,
+                completed_plan_count
+            );
+        } else {
+            let err = ScanResumeState::from_loaded(loaded, GitScanMode::DiffHistory, &fp)
+                .expect_err("out-of-bound prefix must fail");
+            assert_eq!(
+                err.to_string(),
+                "checkpoint state invalid: completed_plan_count (3) exceeds packed candidate count (2)"
+            );
+        }
     }
 }
