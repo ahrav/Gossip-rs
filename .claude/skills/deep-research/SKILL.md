@@ -43,6 +43,71 @@ user for the problem statement before proceeding.
 
 ---
 
+## Pre-Research Setup (Inline)
+
+Before launching Phase 1, the orchestrator (you) performs these steps inline
+(not a separate agent):
+
+### Step 0: Establish Current Date
+
+Run `date +%Y-%m-%d` via Bash. Use the returned year for all date-filtered
+searches and recency checks. Do NOT assume a year from training data.
+
+### Step 1: Quick Problem Decomposition
+
+Parse the problem statement and identify:
+- Core sub-problems (2-3 distinct questions to answer)
+- Key search terms and domain-specific vocabulary
+- Constraints from the problem statement
+
+### Step 2: Quick Codebase Scan
+
+Use Glob, Grep, and Read to gather:
+- Relevant file paths and module structure
+- Existing patterns and conventions
+- Current approach (if any) to the problem
+- Dependencies and their versions
+
+Include a brief summary of this context in every Phase 1 agent's prompt
+alongside the problem statement.
+
+---
+
+### Source Credibility Tiers
+
+Agents should weight evidence by domain credibility alongside evidence strength.
+Higher-credibility domains require less corroboration; lower ones need more.
+
+| Tier | Score | Domains | Treatment |
+|------|-------|---------|-----------|
+| **High** (80-100) | Auto-trust for factual claims | arxiv.org, usenix.org, dl.acm.org, ieee.org, nature.com, official project docs, RFC specs | Core evidence; cite directly |
+| **Moderate** (60-79) | Trust with corroboration | Engineering blogs (Cloudflare, AWS, Datadog, Discord), conference talks, arstechnica | Good lead; corroborate with another source |
+| **Low** (40-59) | Leads only | Medium posts, personal blogs, Stack Overflow, forum discussions, unknown domains | Use only when nothing stronger exists; flag as WEAK |
+| **Suspect** (<40) | Verify before citing | Content farms, SEO-optimized listicles, anonymous posts, sensational patterns | Do NOT cite unless verified against primary source |
+
+### Anti-Hallucination Protocol
+
+These rules apply to ALL agents across ALL phases. Violation makes findings
+worthless.
+
+1. **Source grounding**: Every factual claim MUST cite a concrete source (URL,
+   paper, system). Unsourced claims must be explicitly labeled as inference.
+2. **Distinguish facts from synthesis**: Use "According to [source]..." for
+   sourced facts. Use "This suggests..." for synthesis.
+3. **No vague attributions**: NEVER write "research suggests...", "studies
+   show...", or "experts believe..." without a specific citation.
+4. **Admit uncertainty**: If no sources address a question, write "No sources
+   found for X" — do NOT fabricate a reference.
+5. **Label speculation**: Any inference beyond what sources explicitly state
+   must be marked as such.
+6. **Verify before citing**: If uncertain whether a source says X, do NOT
+   cite it. Note the uncertainty instead.
+7. **Watch for hallucination patterns**: Generic academic titles without a real
+   URL, future publication dates, or anachronistic terms (AI/LLM terminology
+   in pre-2015 citations) are red flags.
+
+---
+
 ## Phase 1 — Research (3-5 Parallel Agents)
 
 Launch **5 research agents in parallel** using the Task tool with
@@ -69,6 +134,15 @@ You are Research Agent {AGENT_ID} — a {SPECIALTY} specialist.
 ## Problem Under Investigation
 {PROBLEM}
 
+## Current Date
+{CURRENT_DATE}
+
+Use this date for all recency checks and date-filtered searches. Do NOT assume
+a year from training data.
+
+## Codebase Context
+{CODEBASE_CONTEXT}
+
 ## Your Research Mission
 
 You are one of 5 independent research agents. Your job is to gather HARD
@@ -89,11 +163,15 @@ Every claim must have a source. Unsourced claims are worthless.
    - Conference talks, technical blog posts from credible sources
    - Existing open-source implementations
 
+   Launch ALL searches in parallel when possible (single message, multiple
+   tool calls). Follow promising results with targeted WebFetch deep-dives.
+
 3. **Evaluate and document**: For each piece of evidence, record:
    - Source (URL, paper title, system name)
    - Key finding or technique
    - Relevance to our specific problem
    - Evidence strength (see scale below)
+   - Source credibility tier (see below)
 
 ### Evidence Strength Scale
 
@@ -104,6 +182,26 @@ Every claim must have a source. Unsourced claims are worthless.
 | 3 | **Implemented & tested** | Open-source implementation with benchmarks/tests | Well-maintained crate with >1k stars, comprehensive test suite |
 | 2 | **Documented practice** | Technical blog from credible engineering org | Blog post from Cloudflare, Datadog, AWS engineering |
 | 1 | **Anecdotal** | Forum discussion, personal blog, Stack Overflow answer | Useful for leads but needs corroboration |
+
+### Source Credibility Tiers
+
+| Tier | Domains | Treatment |
+|------|---------|-----------|
+| High (80-100) | arxiv.org, usenix.org, dl.acm.org, ieee.org, official docs, RFCs | Core evidence; cite directly |
+| Moderate (60-79) | Engineering blogs (Cloudflare, AWS, Datadog), conf talks, arstechnica | Corroborate with another source |
+| Low (40-59) | Medium posts, personal blogs, SO, forum discussions | Flag as WEAK; use only if nothing stronger exists |
+| Suspect (<40) | Content farms, SEO listicles, anonymous posts | Do NOT cite unless verified against primary source |
+
+### Anti-Hallucination Rules
+
+- NEVER fabricate a citation. If no sources address a question, say so.
+- Distinguish FACTS (from sources: "According to [source]...") from SYNTHESIS
+  (your analysis: "This suggests...").
+- No vague attributions: NEVER write "research suggests" or "studies show"
+  without a specific citation.
+- Watch for hallucination patterns: generic academic titles without real URLs,
+  future publication dates, pre-2015 citations mentioning LLMs/transformers.
+- When uncertain whether a source says X, note the uncertainty — do not cite.
 
 ### Focus Area
 {FOCUS}
@@ -117,6 +215,7 @@ Every claim must have a source. Unsourced claims are worthless.
 - Note when evidence is from a different domain and may not transfer directly.
 - Search for COUNTER-evidence too — what are the failure modes of popular approaches?
 - If a search returns no useful results, say so. Do not fabricate references.
+- Aim for source diversity: mix academic, production, and practitioner sources.
 
 ### Output Format
 
@@ -134,19 +233,40 @@ For each piece of evidence (aim for 5-15 findings):
 
 **Finding {N}: {title}**
 - **Source**: {URL or citation}
+- **Source credibility**: {High/Moderate/Low} — {domain}
 - **Evidence strength**: {1-5} — {label}
 - **Summary**: {2-4 sentences}
 - **Key technique/insight**: {the actionable takeaway}
 - **Applicability to our problem**: {high/medium/low} — {why}
 - **Caveats**: {limitations, different assumptions, scaling concerns}
 
-#### 3. Patterns & Consensus
+#### 3. Structured Evidence Summary
+After all findings, provide a machine-readable summary for synthesis:
+
+```json
+[
+  {
+    "id": "F1",
+    "claim": "specific claim text",
+    "source_url": "https://...",
+    "source_title": "...",
+    "evidence_strength": 4,
+    "credibility_tier": "high",
+    "applicability": "high"
+  }
+]
+```
+
+This structured summary prevents synthesis fatigue when merging results from
+5 agents. Include it AFTER the narrative findings, not instead of them.
+
+#### 4. Patterns & Consensus
 What approaches appear repeatedly across sources? Where do experts agree?
 
-#### 4. Disagreements & Open Questions
+#### 5. Disagreements & Open Questions
 Where do sources contradict each other? What remains unresolved?
 
-#### 5. Recommended Reading
+#### 6. Recommended Reading
 Top 3-5 sources the team should read, ranked by relevance.
 ```
 
@@ -332,15 +452,34 @@ cross-reference their findings into a single, evidence-ranked knowledge base.
 Create a master list of ALL unique findings across all 5 agents. For
 findings reported by multiple agents, merge them and note corroboration.
 
+Use the structured evidence summaries (JSON blocks) from each agent to
+bootstrap the inventory, then enrich from the narrative findings.
+
 For each finding:
 - **ID**: F{N}
 - **Title**: {descriptive title}
 - **Sources**: {all sources citing this finding, with URLs}
 - **Corroboration**: {how many agents independently found this}
 - **Evidence strength**: {1-5, use the highest-quality source}
+- **Source credibility**: {High/Moderate/Low — from the best source}
 - **Applicability**: {high/medium/low for our specific problem}
+- **Weighted score**: {evidence_strength × credibility_multiplier × corroboration_count}
 
-### 2. Consensus Matrix
+Credibility multipliers: High=1.0, Moderate=0.8, Low=0.5, Suspect=0.1.
+
+### 2. Hallucination Check
+
+Review all findings for hallucination indicators:
+- Citations with generic academic titles but no working URL
+- Future publication dates or anachronistic terminology
+- Findings that appear in only one agent with no external corroboration and
+  evidence strength >= 3 (suspiciously high confidence from a single source)
+- Metadata mismatches (title says one thing, linked content says another)
+
+Flag any suspicious findings with: "HALLUCINATION RISK: {reason}".
+Downgrade their evidence strength to 0 and exclude from the ranking.
+
+### 3. Consensus Matrix
 
 Identify the key design decisions for this problem, then for each decision
 show where the evidence points:
@@ -351,29 +490,34 @@ show where the evidence points:
 The verdict should be: STRONG CONSENSUS, LEAN (direction), CONTESTED, or
 INSUFFICIENT EVIDENCE.
 
-### 3. Evidence-Ranked Techniques
+### 4. Evidence-Ranked Techniques
 
 Rank all discovered techniques/approaches by weighted evidence score:
 
-Score = (evidence_strength × applicability × corroboration_count)
+Score = (evidence_strength × credibility_multiplier × applicability × corroboration_count)
 
-| Rank | Technique | Score | Evidence | Applicability | Corroboration | Key Source |
-|------|-----------|-------|----------|---------------|---------------|------------|
+| Rank | Technique | Score | Evidence | Credibility | Applicability | Corroboration | Key Source |
+|------|-----------|-------|----------|-------------|---------------|---------------|------------|
 
-### 4. Risk Register
+### 5. Risk Register
 
 From the failure modes research, compile a risk register:
 
 | Risk ID | Risk | Likelihood | Impact | Mitigation | Source |
 |---------|------|------------|--------|------------|--------|
 
-### 5. Contradictions & Gaps
+### 6. Contradictions & Gaps
 
 - Where do sources disagree? What's the strongest evidence on each side?
 - What aspects of the problem have NO evidence? Where are we flying blind?
 - What evidence exists but doesn't transfer to our specific context?
 
-### 6. Key Insights
+For each critical gap, provide:
+- **Gap**: {description}
+- **Impact**: {how this gap affects design decisions}
+- **Suggested delta-queries**: {2-3 specific search queries that might fill it}
+
+### 7. Key Insights
 
 The 5-10 most important things learned from this research that should
 directly influence the design. Each must cite at least one source.
@@ -399,6 +543,26 @@ Include all sections above, plus a final section:
 3-5 bullet points capturing the most critical findings for someone who
 won't read the full report.
 ```
+
+### Gap-Triggered Delta-Queries (Between Phase 2 and Phase 3)
+
+After Phase 2 completes, the orchestrator (you) reviews the Contradictions &
+Gaps section. If the synthesis identifies a **critical gap** — a question that
+load-bearing design decisions depend on but has no evidence — trigger targeted
+retrieval before proceeding to Phase 3.
+
+**Trigger criteria**: A gap is critical when removing it would change the
+#1 or #2 ranked technique, or when INSUFFICIENT EVIDENCE appears in the
+Consensus Matrix for a fundamental design decision.
+
+**Process**:
+1. Formulate 2-4 narrow, specific WebSearch queries from the synthesizer's
+   suggested delta-queries.
+2. Launch all queries in parallel (single message).
+3. Time-box to 3 minutes total.
+4. Append results to the synthesis as a "Supplementary Evidence" section
+   before passing to Phase 3.
+5. Maximum 1 delta-query round per research run.
 
 ---
 
@@ -439,7 +603,19 @@ Map each research finding to specific locations in the codebase:
 - What existing abstractions can be reused?
 - Where do new abstractions need to be introduced?
 
-### Step 2: Implementation Plan
+### Step 2: Evidence Triage
+
+Before planning, review the synthesis for:
+- **Hallucination-flagged findings**: Do NOT base any design decision on findings
+  flagged as HALLUCINATION RISK. If a key decision depends on such a finding,
+  note it as UNJUSTIFIED and flag for additional research.
+- **Low-credibility findings**: Findings sourced only from Low/Suspect credibility
+  tiers should not be the sole basis for a design decision. Note them as
+  requiring corroboration.
+- **Unresolved gaps**: If delta-queries were run, incorporate their results.
+  If gaps remain, note them as explicit risks.
+
+### Step 3: Implementation Plan
 
 Produce a step-by-step implementation plan where EVERY design decision
 cites evidence from the synthesis:
@@ -452,28 +628,29 @@ For each step:
 - **What**: {concrete description — types, signatures, module placement}
 - **Why**: {justification citing specific findings by ID: F1, F7, etc.}
 - **Evidence**: {the specific technique/paper/system this is based on}
+- **Evidence quality**: {evidence strength + credibility tier of the key source}
 - **Files**: {exact file paths to create or modify}
 - **Risks**: {from the risk register, with mitigation}
 - **Acceptance criteria**: {how to verify this step is correct}
 
-### Step 3: Evidence Trail
+### Step 4: Evidence Trail
 
 Create a traceability matrix:
 
-| Plan Step | Research Finding(s) | Evidence Strength | Confidence |
-|-----------|--------------------|--------------------|------------|
+| Plan Step | Research Finding(s) | Evidence Strength | Credibility | Confidence |
+|-----------|--------------------|--------------------|-------------|------------|
 
 Confidence levels:
-- HIGH: Multiple strong sources agree, directly applicable
+- HIGH: Multiple strong sources agree, directly applicable, High credibility
 - MEDIUM: Evidence exists but from different context, or sources disagree
-- LOW: Limited evidence, based on extrapolation
+- LOW: Limited evidence, based on extrapolation, or Low credibility sources only
 - NOVEL: No direct evidence found — this is our own design (flag for extra review)
 
 Any step with LOW or NOVEL confidence gets a mandatory note explaining
 what additional validation is needed (benchmarks, property tests, fuzzing,
 formal verification, etc.).
 
-### Step 4: Alternative Approaches
+### Step 5: Alternative Approaches
 
 For any CONTESTED decisions from the synthesis, describe:
 - The alternative approach
@@ -481,7 +658,7 @@ For any CONTESTED decisions from the synthesis, describe:
 - Under what conditions we'd switch to it
 - How to structure the code so switching is feasible
 
-### Step 5: Validation Strategy
+### Step 6: Validation Strategy
 
 How to verify the implementation is correct:
 - What properties should be tested (unit, property-based, fuzz)?
@@ -493,6 +670,7 @@ How to verify the implementation is correct:
 
 - Every design decision MUST cite evidence. If there's no evidence for a
   choice, flag it explicitly as NOVEL/UNJUSTIFIED.
+- NEVER base a decision on a hallucination-flagged finding.
 - Be concrete: file paths, type signatures, function names. Not hand-waving.
 - Respect existing codebase conventions — don't propose patterns alien to
   the project.
@@ -524,13 +702,20 @@ After the integrator completes, present the combined output to the user:
 ### Problem
 {one-line restatement}
 
+### Current Date
+{YYYY-MM-DD used for all recency checks}
+
 ### Executive Summary
 {from the synthesizer's executive summary}
 
 ### Evidence Highlights
-| # | Finding | Evidence Strength | Sources | Applicability |
-|---|---------|-------------------|---------|---------------|
-{top 10 findings from the synthesis, ranked by score}
+| # | Finding | Evidence Strength | Credibility | Sources | Applicability |
+|---|---------|-------------------|-------------|---------|---------------|
+{top 10 findings from the synthesis, ranked by weighted score}
+
+### Hallucination Flags
+{any findings flagged as HALLUCINATION RISK by the synthesizer, with reasons}
+{if none: "No hallucination indicators detected."}
 
 ### Implementation Plan
 {the integrator's full plan}
@@ -540,6 +725,10 @@ After the integrator completes, present the combined output to the user:
 
 ### Risk Register
 {risk register from the synthesis}
+
+### Delta-Query Results
+{if gap-triggered delta-queries were run: summarize what was found}
+{if not triggered: "No critical gaps required additional retrieval."}
 
 ### Full Research (collapsed)
 <details><summary>Research Agent 1: Foundational Theory</summary>
@@ -564,6 +753,76 @@ After the integrator completes, present the combined output to the user:
 ### References
 {consolidated bibliography from integrator}
 ```
+
+---
+
+## Quality Gate Checks
+
+These standards apply to the output from each phase. The orchestrator (you)
+verifies them before proceeding to the next phase.
+
+### Phase 1 Agent Output Quality
+
+- [ ] At least 5 findings per agent (fewer only if the agent explicitly states
+      "exhaustive search yielded N results")
+- [ ] Every finding has a Source field with a real URL or citation
+- [ ] Structured evidence summary (JSON block) is present
+- [ ] No finding uses ONLY evidence strength 1-2 without flagging as WEAK
+
+### Phase 2 Synthesis Quality
+
+- [ ] Evidence Inventory covers ALL Phase 1 agents (none silently dropped)
+- [ ] Consensus Matrix has at least 3 decision points
+- [ ] Risk Register has at least 3 entries
+- [ ] Hallucination check section is present (even if no flags)
+- [ ] Every merged finding preserves original source URLs
+
+### Phase 3 Integration Quality
+
+- [ ] Every plan step cites finding IDs (steps without citations are unjustified)
+- [ ] Evidence Trail has no NOVEL entries without explicit justification
+- [ ] Acceptance criteria are verifiable, not vague ("it works")
+- [ ] No plan step is based on a hallucination-flagged finding
+
+### Writing Standards (All Phases)
+
+- **Precision**: Exact numbers over vague qualifiers. "23% faster" not
+  "significantly faster". "5 RCTs (n=1,847)" not "several studies".
+- **Economy**: No fluff words. Every sentence carries information.
+- **Directness**: State conclusions without hedging unless uncertainty is
+  genuine. "Binary search is optimal here" not "It might be the case that
+  binary search could potentially be considered".
+- **Prose-first**: Findings and synthesis should be >=80% flowing prose.
+  Bullets only for distinct enumerable lists (API names, file paths, etc.).
+
+---
+
+## Intermediate Persistence
+
+For long research runs, persist intermediate results to survive context
+compaction.
+
+### What to Persist
+
+After Phase 2 completes, write a summary file:
+
+```
+.claude/research-state/{run-id}/
+  phase1-summary.md   — Concatenated Phase 1 agent reports
+  phase2-synthesis.md  — Phase 2 output (+ any delta-query supplements)
+  phase3-plan.md       — Phase 3 implementation plan
+```
+
+### When to Persist
+
+- **Always persist** after Phase 2 (the synthesis is the most expensive to
+  recreate from 5 agents).
+- **Persist the final output** (Phase 3) always.
+
+### Run ID
+
+Use a stable identifier: `{date}-{first-5-words-of-problem-slugified}`.
+Example: `2026-04-08-lock-free-queue-design`.
 
 ---
 
