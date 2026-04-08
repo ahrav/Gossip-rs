@@ -972,6 +972,11 @@ where
     // watermarks remain at their pre-scan position. The next lease re-scans
     // the same blobs and re-emits findings. Done-ledger and findings
     // consumers must tolerate duplicate submissions.
+    debug_assert!(
+        !matches!(execution.finalize_outcome, FinalizeOutcome::Complete)
+            || execution.deferred_finalize.is_some(),
+        "complete finalize must produce a deferred finalize output"
+    );
     if let Some(finalize) = execution.deferred_finalize.as_ref() {
         execution
             .persistence

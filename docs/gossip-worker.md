@@ -605,9 +605,10 @@ The recorder module checks:
 ### Secret delivery
 
 Pass secrets exclusively through environment variables. CLI flags like
-`--tenant-secret-key`, `--done-ledger-postgres-dsn`, and
-`--findings-postgres-dsn` are visible in process listings (`ps aux`,
-`/proc/<pid>/cmdline`). Environment variables avoid this exposure.
+`--tenant-secret-key`, `--done-ledger-postgres-dsn`,
+`--findings-postgres-dsn`, and `--git-kv-postgres-dsn` are visible in
+process listings (`ps aux`, `/proc/<pid>/cmdline`). Environment variables
+avoid this exposure.
 
 ### TLS for PostgreSQL
 

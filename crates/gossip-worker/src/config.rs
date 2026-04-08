@@ -1189,7 +1189,10 @@ impl fmt::Debug for RawWorkerConfig {
             .field("etcd_namespace", &self.etcd_namespace)
             .field("done_ledger_postgres_dsn", &"[redacted]")
             .field("findings_postgres_dsn", &"[redacted]")
-            .field("git_kv_postgres_dsn", &"[redacted]")
+            .field(
+                "git_kv_postgres_dsn",
+                &self.git_kv_postgres_dsn.as_ref().map(|_| "[redacted]"),
+            )
             .field("startup_schema_mode", &self.startup_schema_mode)
             .field("tenant", &self.tenant)
             .field("run", &self.run)
@@ -2317,7 +2320,9 @@ mod tests {
 
     #[test]
     fn connector_git_source_requires_mirror_root() {
-        let env = production_env().with(ENV_WORKER_SOURCE, "git");
+        let env = production_env()
+            .with(ENV_WORKER_SOURCE, "git")
+            .with(ENV_GIT_KV_POSTGRES_DSN, "host=127.0.0.1 dbname=git_kv");
         let err = resolve_worker_config_from(Vec::<String>::new(), &env)
             .expect_err("git connector mode without mirror_root must fail");
 
@@ -2331,10 +2336,13 @@ mod tests {
     #[test]
     fn connector_git_source_resolves_with_mirror_root() {
         let mirror_dir = tempfile::tempdir().expect("tempdir for mirror root");
-        let env = production_env().with(ENV_WORKER_SOURCE, "git").with(
-            ENV_MIRROR_ROOT,
-            mirror_dir.path().to_str().expect("utf-8 path"),
-        );
+        let env = production_env()
+            .with(ENV_WORKER_SOURCE, "git")
+            .with(ENV_GIT_KV_POSTGRES_DSN, "host=127.0.0.1 dbname=git_kv")
+            .with(
+                ENV_MIRROR_ROOT,
+                mirror_dir.path().to_str().expect("utf-8 path"),
+            );
 
         let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
             .expect("git connector mode with mirror_root should resolve");
@@ -2351,10 +2359,13 @@ mod tests {
     #[test]
     fn connector_git_source_worker_launch_produces_git_variant() {
         let mirror_dir = tempfile::tempdir().expect("tempdir for mirror root");
-        let env = production_env().with(ENV_WORKER_SOURCE, "git").with(
-            ENV_MIRROR_ROOT,
-            mirror_dir.path().to_str().expect("utf-8 path"),
-        );
+        let env = production_env()
+            .with(ENV_WORKER_SOURCE, "git")
+            .with(ENV_GIT_KV_POSTGRES_DSN, "host=127.0.0.1 dbname=git_kv")
+            .with(
+                ENV_MIRROR_ROOT,
+                mirror_dir.path().to_str().expect("utf-8 path"),
+            );
 
         let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
             .expect("git connector should resolve");
@@ -2380,6 +2391,7 @@ mod tests {
     fn connector_git_source_rejects_nonexistent_mirror_root() {
         let env = production_env()
             .with(ENV_WORKER_SOURCE, "git")
+            .with(ENV_GIT_KV_POSTGRES_DSN, "host=127.0.0.1 dbname=git_kv")
             .with(ENV_MIRROR_ROOT, "/no/such/mirror/root/directory");
 
         let err = resolve_worker_config_from(Vec::<String>::new(), &env)
@@ -2404,6 +2416,7 @@ mod tests {
 
         let env = production_env()
             .with(ENV_WORKER_SOURCE, "git")
+            .with(ENV_GIT_KV_POSTGRES_DSN, "host=127.0.0.1 dbname=git_kv")
             .with(ENV_MIRROR_ROOT, file_as_root.to_str().expect("utf-8 path"));
 
         let err = resolve_worker_config_from(Vec::<String>::new(), &env)
@@ -3674,7 +3687,7 @@ mod tests {
 
     #[test]
     fn connector_git_source_via_cli_requires_mirror_root() {
-        let env = production_env();
+        let env = production_env().with(ENV_GIT_KV_POSTGRES_DSN, "host=127.0.0.1 dbname=git_kv");
         let err = resolve_worker_config_from(["git", "/tmp"], &env)
             .expect_err("git connector via CLI positional without mirror_root must fail");
 
@@ -3856,6 +3869,7 @@ mod tests {
         let mirror_dir = tempfile::tempdir().expect("tempdir for mirror root");
         let env = production_env()
             .with(ENV_WORKER_SOURCE, "git")
+            .with(ENV_GIT_KV_POSTGRES_DSN, "host=127.0.0.1 dbname=git_kv")
             .with(ENV_WORKER_PATH, "/no/such/repo/path")
             .with(
                 ENV_MIRROR_ROOT,

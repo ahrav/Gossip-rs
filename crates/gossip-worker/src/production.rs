@@ -242,9 +242,7 @@ impl fmt::Debug for ProductionBootstrapError {
             }
             Self::FindingsAutoMigrate(e) => f.debug_tuple("FindingsAutoMigrate").field(e).finish(),
             Self::GitKvAutoMigrate(e) => f.debug_tuple("GitKvAutoMigrate").field(e).finish(),
-            Self::GitKvInitUnexpected(e) => {
-                f.debug_tuple("GitKvInitUnexpected").field(e).finish()
-            }
+            Self::GitKvInitUnexpected(e) => f.debug_tuple("GitKvInitUnexpected").field(e).finish(),
             Self::ThreadPanicked { backend } => f
                 .debug_struct("ThreadPanicked")
                 .field("backend", backend)
@@ -509,20 +507,24 @@ pub fn build_production_backends_from_clients(
         DoneLedgerPg::from_client(done_ledger_client),
     );
     let git_persistence = match git_kv_client {
-        Some(client) => Some(GitPersistencePg::from_client(client).map_err(|error| match error {
-            GitPersistencePgError::Postgres(err) => ProductionBootstrapError::GitKvSchemaReadiness(
-                ProductionSchemaReadinessError::Query(err),
-            ),
-            // from_client currently only returns Postgres variants (statement
-            // preparation). These arms are defensive against future changes to
-            // the git-kv crate — surfacing a typed startup error instead of
-            // panicking the worker process.
-            GitPersistencePgError::Migration(_)
-            | GitPersistencePgError::MutexPoisoned
-            | GitPersistencePgError::PayloadTooLarge { .. } => {
-                ProductionBootstrapError::GitKvInitUnexpected(format!("{error}"))
-            }
-        })?),
+        Some(client) => Some(GitPersistencePg::from_client(client).map_err(
+            |error| match error {
+                GitPersistencePgError::Postgres(err) => {
+                    ProductionBootstrapError::GitKvSchemaReadiness(
+                        ProductionSchemaReadinessError::Query(err),
+                    )
+                }
+                // from_client currently only returns Postgres variants (statement
+                // preparation). These arms are defensive against future changes to
+                // the git-kv crate — surfacing a typed startup error instead of
+                // panicking the worker process.
+                GitPersistencePgError::Migration(_)
+                | GitPersistencePgError::MutexPoisoned
+                | GitPersistencePgError::PayloadTooLarge { .. } => {
+                    ProductionBootstrapError::GitKvInitUnexpected(format!("{error}"))
+                }
+            },
+        )?),
         None => None,
     };
 
@@ -1318,6 +1320,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_only_fails_when_git_kv_schema_is_missing() {
+        let (done_ledger_dsn, findings_dsn) = setup_migrated_test_dbs();
+        let config = ProductionBackendConfig::new(
+            test_async_coordinator_config(),
+            done_ledger_dsn,
+            findings_dsn,
+            Some(create_test_db()),
+        )
+        .expect("backend config should be valid");
+
+        let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
+            .expect_err("validate-only boot must fail when the git-kv schema is missing");
+
+        assert!(matches!(
+            error,
+            ProductionBootstrapError::GitKvSchemaReadiness(
+                ProductionSchemaReadinessError::MissingTable { .. }
+            )
+        ));
+    }
+
+    #[test]
     fn validate_only_fails_when_done_ledger_checksum_mismatches() {
         let (done_ledger_dsn, findings_dsn) = setup_migrated_test_dbs();
         let version = DONE_LEDGER_MIGRATIONS[0].version();
@@ -1623,6 +1647,28 @@ mod tests {
         assert!(
             matches!(error, ProductionBootstrapError::FindingsConnect(_)),
             "expected typed findings startup error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn build_production_backends_returns_typed_git_kv_startup_error() {
+        let config = ProductionBackendConfig::new(
+            test_async_coordinator_config(),
+            create_test_db(),
+            create_test_db(),
+            Some(
+                "host=127.0.0.1 port=1 user=postgres password=postgres dbname=postgres connect_timeout=1"
+                    .to_owned(),
+            ),
+        )
+        .expect("backend config should be valid");
+
+        let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
+            .expect_err("invalid git-kv DSN should fail startup");
+
+        assert!(
+            matches!(error, ProductionBootstrapError::GitKvConnect(_)),
+            "expected typed git-kv startup error, got {error:?}"
         );
     }
 
