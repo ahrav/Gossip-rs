@@ -37,7 +37,7 @@ use crate::NormHash;
 /// Envelope layout: `[magic: 4 bytes][crc32_le: 4 bytes][postcard payload: N bytes]`.
 const CHECKPOINT_MAGIC: [u8; 4] = *b"gkpt";
 
-/// Size of the fixed checkpoint envelope prefix (see [`CHECKPOINT_MAGIC`]).
+/// Size of the fixed checkpoint envelope header (see [`CHECKPOINT_MAGIC`]).
 const CHECKPOINT_ENVELOPE_HEADER_LEN: usize = CHECKPOINT_MAGIC.len() + std::mem::size_of::<u32>();
 
 /// Maximum checkpoint payload size accepted during deserialization (256 MiB).
@@ -45,8 +45,9 @@ const CHECKPOINT_ENVELOPE_HEADER_LEN: usize = CHECKPOINT_MAGIC.len() + std::mem:
 /// Prevents a crafted blob from triggering unbounded allocation.
 /// The limit applies to the postcard payload within the integrity envelope,
 /// not to the total framed blob. The encode path logs an error when this limit
-/// is exceeded but still returns the blob: the decode side discards oversize
-/// blobs gracefully via `Ok(None)`, and persisting the blob is safer than
+/// is exceeded but still returns the blob: the decode side rejects oversize
+/// blobs with an error (which `from_loaded` converts to `Ok(None)`,
+/// restarting the scan fresh), and persisting the blob is safer than
 /// returning `None` (which the checkpoint sink interprets as "delete the
 /// prefix key", erasing the last durable resume anchor).
 const MAX_CHECKPOINT_BYTES: usize = 256 * 1024 * 1024;
@@ -75,9 +76,8 @@ fn checkpoint_serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ScanC
 
     // CRC covers the postcard payload only. The 4-byte magic prefix is
     // validated by a separate byte-equality check in checkpoint_deserialize;
-    // including it in the CRC scope would require a write-then-backfill
-    // pattern for negligible gain — header corruption that preserves the
-    // magic is astronomically unlikely for accidental bit-rot.
+    // including it in the CRC scope adds negligible protection against
+    // accidental bit-rot that happens to preserve the magic bytes.
     let crc32 = crc32fast::hash(&payload);
     let mut encoded = Vec::with_capacity(CHECKPOINT_ENVELOPE_HEADER_LEN + payload.len());
     encoded.extend_from_slice(&CHECKPOINT_MAGIC);
@@ -90,7 +90,7 @@ fn checkpoint_serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ScanC
 ///
 /// Verification order is: magic bytes, payload size guard, CRC32, then
 /// postcard deserialization. The CRC32 guard detects accidental corruption
-/// such as bit-rot, truncation, and format drift; it does not provide tamper
+/// such as bit-rot and truncation; it does not provide tamper
 /// resistance. Uses strict-consume semantics (`from_bytes`) so that trailing
 /// garbage causes a decode failure rather than being silently ignored. Per the
 /// no-versioning rule, format changes update all readers/writers in one pass;
@@ -602,7 +602,9 @@ impl ScanResumeState {
     ///
     /// Returns `Ok(None)` when the checkpoint should be discarded: empty
     /// input, envelope verification failure, decode failure, stale scan mode,
-    /// or artifact fingerprint mismatch. Returns `Err` for structural
+    /// or artifact fingerprint mismatch. Prefix-state decode failures fall
+    /// back to base-only resume (`Ok(Some(PostSpillDedup))`) rather than
+    /// discarding the entire checkpoint. Returns `Err` for structural
     /// validation failures (bad OID lengths, out-of-bounds arena refs, invalid
     /// stage discriminator, impossible `completed_plan_count`).
     pub fn from_loaded(
@@ -2385,7 +2387,7 @@ mod tests {
 
     #[test]
     fn checkpoint_deserialize_rejects_valid_envelope_with_invalid_postcard() {
-        // Exercises the postcard::from_bytes error-wrapping path (line 127):
+        // Exercises the postcard::from_bytes error path:
         // valid magic, valid CRC, within size limit, but garbage postcard bytes.
         let garbage = &[0xFF, 0xFE, 0xFD];
         let blob = frame_checkpoint_payload(garbage);
@@ -2564,10 +2566,9 @@ mod tests {
 
     #[test]
     fn old_format_blob_without_envelope_restarts_fresh() {
-        // Simulates the deployment upgrade scenario: a checkpoint blob written
-        // before the integrity envelope was introduced is raw postcard bytes
-        // without the [magic][crc32] header. The magic-mismatch guard in
-        // checkpoint_deserialize rejects it, and from_loaded restarts fresh.
+        // A raw postcard blob without the [magic][crc32] envelope header is
+        // rejected by the magic-mismatch guard in checkpoint_deserialize,
+        // and from_loaded restarts fresh.
         let fp = artifact(36);
         let old_format_blob =
             postcard::to_allocvec(&StoredBaseState::CommitPlan(StoredCommitPlanState {
