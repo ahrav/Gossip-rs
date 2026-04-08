@@ -32,25 +32,32 @@ use crate::NormHash;
 /// Maximum checkpoint blob size accepted during deserialization (256 MiB).
 ///
 /// Prevents a crafted blob from triggering unbounded allocation.
-/// The same limit is enforced on the encode path so a freshly written
-/// checkpoint is always readable on the next resume.
+/// The encode path checks the same limit and skips the write (with a
+/// warning) rather than aborting the scan, so checkpoints degrade
+/// gracefully on very large repositories.
 const MAX_CHECKPOINT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Serialize a checkpoint value with a size guard.
 ///
-/// Rejects outputs exceeding [`MAX_CHECKPOINT_BYTES`] so the encode and
-/// decode paths use the same limit. Without this, a legitimately large
-/// scan could persist an oversize blob that silently fails to deserialize.
-fn checkpoint_serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ScanCheckpointError> {
+/// Returns `None` (with a warning) when the serialized output exceeds
+/// [`MAX_CHECKPOINT_BYTES`]. Callers treat `None` as "skip this
+/// checkpoint" — the scan continues without a durable resume anchor for
+/// this stage, matching the decode-side behavior that silently discards
+/// oversize blobs.
+fn checkpoint_serialize<T: serde::Serialize>(
+    value: &T,
+) -> Result<Option<Vec<u8>>, ScanCheckpointError> {
     let encoded =
         postcard::to_allocvec(value).map_err(|err| ScanCheckpointError::Encode(err.to_string()))?;
     if encoded.len() > MAX_CHECKPOINT_BYTES {
-        return Err(ScanCheckpointError::Encode(format!(
-            "checkpoint blob ({} bytes) exceeds {MAX_CHECKPOINT_BYTES}-byte limit",
-            encoded.len(),
-        )));
+        tracing::warn!(
+            size = encoded.len(),
+            limit = MAX_CHECKPOINT_BYTES,
+            "checkpoint blob exceeds size limit; skipping write"
+        );
+        return Ok(None);
     }
-    Ok(encoded)
+    Ok(Some(encoded))
 }
 
 /// Deserialize a checkpoint blob with a size guard.
@@ -310,21 +317,15 @@ impl StageCheckpoint<'_> {
                 scan_mode,
                 artifact_fingerprint,
                 plan,
-            } => {
-                let encoded =
-                    checkpoint_serialize(&StoredBaseState::CommitPlan(StoredCommitPlanState {
-                        scan_mode: StoredGitScanMode::from(*scan_mode),
-                        artifact_fingerprint: StoredRepoArtifactFingerprint::from(
-                            *artifact_fingerprint,
-                        ),
-                        plan: plan
-                            .iter()
-                            .copied()
-                            .map(StoredPlannedCommit::from)
-                            .collect(),
-                    }))?;
-                Ok(Some(encoded))
-            }
+            } => checkpoint_serialize(&StoredBaseState::CommitPlan(StoredCommitPlanState {
+                scan_mode: StoredGitScanMode::from(*scan_mode),
+                artifact_fingerprint: StoredRepoArtifactFingerprint::from(*artifact_fingerprint),
+                plan: plan
+                    .iter()
+                    .copied()
+                    .map(StoredPlannedCommit::from)
+                    .collect(),
+            })),
             Self::PostSpillDedup {
                 scan_mode,
                 artifact_fingerprint,
@@ -335,35 +336,29 @@ impl StageCheckpoint<'_> {
                 tree_diff_stats,
                 spill_stats,
                 mapping_stats,
-            } => {
-                let encoded =
-                    checkpoint_serialize(&StoredBaseState::SpillDedup(StoredSpillDedupState {
-                        scan_mode: StoredGitScanMode::from(*scan_mode),
-                        artifact_fingerprint: StoredRepoArtifactFingerprint::from(
-                            *artifact_fingerprint,
-                        ),
-                        plan: plan
-                            .iter()
-                            .copied()
-                            .map(StoredPlannedCommit::from)
-                            .collect(),
-                        packed: packed
-                            .iter()
-                            .copied()
-                            .map(StoredPackCandidate::from)
-                            .collect(),
-                        loose: loose
-                            .iter()
-                            .copied()
-                            .map(StoredLooseCandidate::from)
-                            .collect(),
-                        path_arena: path_arena.backing_bytes().to_vec(),
-                        tree_diff_stats: StoredTreeDiffStats::from(tree_diff_stats.clone()),
-                        spill_stats: StoredSpillStats::from(spill_stats.clone()),
-                        mapping_stats: StoredMappingStats::from(*mapping_stats),
-                    }))?;
-                Ok(Some(encoded))
-            }
+            } => checkpoint_serialize(&StoredBaseState::SpillDedup(StoredSpillDedupState {
+                scan_mode: StoredGitScanMode::from(*scan_mode),
+                artifact_fingerprint: StoredRepoArtifactFingerprint::from(*artifact_fingerprint),
+                plan: plan
+                    .iter()
+                    .copied()
+                    .map(StoredPlannedCommit::from)
+                    .collect(),
+                packed: packed
+                    .iter()
+                    .copied()
+                    .map(StoredPackCandidate::from)
+                    .collect(),
+                loose: loose
+                    .iter()
+                    .copied()
+                    .map(StoredLooseCandidate::from)
+                    .collect(),
+                path_arena: path_arena.backing_bytes().to_vec(),
+                tree_diff_stats: StoredTreeDiffStats::from(tree_diff_stats.clone()),
+                spill_stats: StoredSpillStats::from(spill_stats.clone()),
+                mapping_stats: StoredMappingStats::from(*mapping_stats),
+            })),
             Self::PackPlanComplete { .. } | Self::PreFinalize { .. } => Ok(None),
         }
     }
@@ -389,7 +384,7 @@ impl StageCheckpoint<'_> {
                 let completed_plan_count = u32::try_from(*completed_plan_count).map_err(|_| {
                     ScanCheckpointError::Encode("completed_plan_count exceeds u32::MAX".to_owned())
                 })?;
-                let encoded = checkpoint_serialize(&StoredPrefixState {
+                checkpoint_serialize(&StoredPrefixState {
                     stage: self.stage(),
                     completed_plan_count,
                     scanned: StoredScannedBlobs::from(*scanned),
@@ -399,8 +394,7 @@ impl StageCheckpoint<'_> {
                         .map(StoredSkippedCandidate::from)
                         .collect(),
                     common_metrics: StoredGitScanCommonMetrics::from(*common_metrics),
-                })?;
-                Ok(Some(encoded))
+                })
             }
         }
     }
