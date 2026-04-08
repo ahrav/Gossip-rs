@@ -1793,8 +1793,10 @@ fn run_git_repo_worker_completes_large_secret_history() {
         .findings_snapshot()
         .expect("findings snapshot");
     assert!(
-        !persisted.is_empty(),
-        "secret-bearing history should produce persisted findings"
+        persisted.len() >= 16,
+        "each of the 16 secret-bearing commits should produce at least one \
+         persisted finding (got {})",
+        persisted.len()
     );
 
     let rows = done_ledger.snapshot().expect("done-ledger snapshot");
