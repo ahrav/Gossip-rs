@@ -19,6 +19,8 @@ use rstest::rstest;
 
 use super::*;
 
+/// Build a deterministic `ScanItem` for tests by deriving the identity components from `seed`.
+/// Each call also attaches a size hint that grows with `seed` so size-based assertions remain stable.
 fn scan_item_with_key(key_bytes: &[u8], seed: u8) -> ScanItem {
     let item_key = ItemKey::try_from_slice(key_bytes).unwrap();
     let item_ref = ItemRef::try_from_vec(vec![seed.wrapping_add(1)]).unwrap();
@@ -27,6 +29,7 @@ fn scan_item_with_key(key_bytes: &[u8], seed: u8) -> ScanItem {
     ScanItem::new(item_key, item_ref, stable_item_id, version).with_size_hint(u64::from(seed) + 1)
 }
 
+/// Produce a sequence of `ScanItem`s for the provided byte slices, preserving stream order.
 fn scan_items(keys: &[&[u8]]) -> Vec<ScanItem> {
     keys.iter()
         .enumerate()
@@ -34,6 +37,7 @@ fn scan_items(keys: &[&[u8]]) -> Vec<ScanItem> {
         .collect()
 }
 
+/// Same as `scan_items` but accepts owned `Vec<u8>` inputs, making it convenient for proptest cases.
 fn scan_items_from_vecs(keys: &[Vec<u8>]) -> Vec<ScanItem> {
     keys.iter()
         .enumerate()
@@ -41,6 +45,7 @@ fn scan_items_from_vecs(keys: &[Vec<u8>]) -> Vec<ScanItem> {
         .collect()
 }
 
+/// Strategy that generates non-empty byte sequences up to 32 bytes for key construction.
 fn arb_key_bytes() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(any::<u8>(), 1..=32)
 }
@@ -314,6 +319,9 @@ fn try_new_validated_rejects_inverted_bounds() {
     );
 }
 
+// Property suite that replays canonical sorted inputs and then perturbs them
+// to prove the validator rejects duplicates, descending pairs, and
+// out-of-range keys.
 proptest! {
     #![proptest_config(crate::test_util::miri_proptest_config())]
 

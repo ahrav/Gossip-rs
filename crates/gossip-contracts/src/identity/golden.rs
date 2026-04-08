@@ -44,7 +44,7 @@
 //!    (or `u64` for 64-bit vectors).
 //! 2. Add a `#[test]` function that constructs canonical inputs, calls the
 //!    derivation, and asserts against the const.
-//! 3. Add the derivation name to the [`ALL`] registry.
+//! 3. Add the derivation name to the [`ALL`](crate::identity::domain::ALL) registry.
 //! 4. Update the `ALL` array length (compile-time checked).
 //! 5. Update the [`registry_is_complete`] test assertion.
 
@@ -60,10 +60,12 @@ use super::{
 // Registry
 // ============================================================================
 
-/// Names of all golden-vector derivation tests tracked by this module.
+/// Canonical registry of every derivation that must publish a golden vector.
 ///
-/// The explicit array length keeps the registry count self-checking once this
-/// list is updated, but the list itself is still maintained manually.
+/// The explicit array length keeps the registry self-checking, forcing
+/// compile-time failure when a golden vector is added or removed without
+/// updating the registry. Every entry must also remain non-empty to catch
+/// accidental deletions.
 const ALL: [&str; 9] = [
     "ConnectorInstanceIdHash",
     "StableItemId",
@@ -316,10 +318,11 @@ fn finalize_64_golden_value() {
 // Registry completeness
 // ============================================================================
 
-/// Ensures every derivation function has a corresponding golden vector.
+/// Confirms the golden-vector registry still matches the derivation set.
 ///
-/// The hard-coded count must match `ALL.len()`. If you add a new derivation,
-/// this test fails until you add both a golden vector *and* a registry entry.
+/// Guards against forgotten tests by asserting on both the hard-coded length
+/// and the non-emptiness of each entry. Any new derivation must update both
+/// the constants above and this test so the compile-time invariant holds.
 #[test]
 fn registry_is_complete() {
     assert_eq!(
@@ -347,8 +350,7 @@ fn registry_is_complete() {
 proptest::proptest! {
     #![proptest_config(crate::test_util::miri_proptest_config())]
 
-    /// Generate random inputs, derive the full chain `ItemIdentityKey → StableItemId →
-    /// FindingId → OccurrenceId` twice, and assert determinism.
+    /// Determinism check: deriving `ItemIdentityKey → OccurrenceId` twice with the same inputs produces the same output.
     #[test]
     fn full_chain_item_to_occurrence_is_pure(
         connector_bytes in proptest::array::uniform8(proptest::num::u8::ANY),
@@ -405,8 +407,7 @@ proptest::proptest! {
         proptest::prop_assert_eq!(occ_1, occ_2);
     }
 
-    /// Two distinct `ItemIdentityKey` inputs (different connector or locator) must
-    /// produce different `OccurrenceId` values when all other inputs are held constant.
+    /// Collision-freedom check: distinct identity keys must not collapse to the same `OccurrenceId` when other inputs are fixed.
     #[test]
     fn full_chain_collision_free(
         connector_a in proptest::array::uniform8(proptest::num::u8::ANY),
@@ -469,8 +470,7 @@ proptest::proptest! {
     }
 }
 
-/// Boundary values for `u64` fields in `OccurrenceIdInputs` must each produce
-/// a distinct `OccurrenceId`.
+/// Boundary coverage ensures extreme `byte_offset`/`byte_length` combinations produce unique `OccurrenceId`s.
 #[test]
 fn boundary_u64_occurrence_id() {
     let finding = FindingId::from_bytes([0x55; 32]);

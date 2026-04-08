@@ -799,7 +799,9 @@ impl StreamingSplitEstimator {
     ///
     /// Called when a new sample pushes the buffer past `sample_cap`. The
     /// target is half the cap so the next batch of observations has room
-    /// before the next compaction fires.
+    /// before the next compaction fires. This keeps the retained sketch small
+    /// while the stride doubling increases coarseness, preserving the estimator's
+    /// amortised-O(1) per-observation cost.
     fn grow_strides_and_compact(&mut self) {
         let target = self.downsample_target();
         compact_samples(&mut self.samples, target);
@@ -809,12 +811,11 @@ impl StreamingSplitEstimator {
     }
 
     /// Snap the next rank and byte sampling marks to the current stride grid.
-    /// Called after compaction and when `observe` needs to recover from
-    /// saturation onto the current stride grid.
     ///
-    /// This may move the next mark forward past multiple skipped positions, but
-    /// it preserves the cadence invariant that every future trigger lands on
-    /// the active stride grid.
+    /// Invoked after compaction and whenever `observe` recovers from saturated
+    /// counters. Advancing the marks may jump over several stride-aligned
+    /// positions, but the cadence invariant holds: future triggers always land
+    /// on a multiple of the active stride.
     fn realign_sample_marks(&mut self) {
         self.next_rank_sample = align_to_stride(self.count, self.rank_stride);
         self.next_byte_mark = align_to_stride(self.total_bytes, self.byte_stride);
@@ -833,7 +834,8 @@ impl StreamingSplitEstimator {
     /// position is closest to `target`, returning its key bytes.
     ///
     /// When the target falls between two samples the one with the smaller
-    /// absolute distance wins (ties go to the earlier sample).
+    /// absolute distance wins (ties go to the earlier sample). Returns `None`
+    /// when there are no samples yet, such as before any observations arrive.
     fn nearest_sample(samples: &[Sample], axis: SampleAxis, target: u64) -> Option<&[u8]> {
         if samples.is_empty() {
             return None;
