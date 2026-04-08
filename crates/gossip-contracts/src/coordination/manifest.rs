@@ -100,7 +100,10 @@ impl<'a> InitialShardInput<'a> {
 // ManifestValidationError
 // ============================================================================
 
-/// Error from `validate_manifest`.
+/// Validation failures returned by [`validate_manifest`].
+///
+/// Variants are intentionally specific so callers can map failures to
+/// actionable API errors without inspecting strings.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ManifestValidationError {
@@ -174,8 +177,14 @@ pub enum ManifestValidationError {
 /// ## Design note
 ///
 /// Overlap detection uses sorted-adjacency comparison, not pairwise
-/// comparison. This is O(N log N) (dominated by the sort) rather than
+/// comparison. This is O(N log N) (dominated by sorting) rather than
 /// O(N^2), which matters at `MAX_INITIAL_SHARDS` (10K).
+///
+/// On success this function guarantees each shard has:
+/// - a unique [`ShardId`],
+/// - a finite, valid half-open range `[start, end)`,
+/// - no overlap with peers,
+/// - and a cursor that is size-bounded and within the declared range.
 pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), ManifestValidationError> {
     if shards.len() > MAX_INITIAL_SHARDS {
         return Err(ManifestValidationError::TooManyShards {
@@ -215,6 +224,7 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         }
     }
 
+    // Reuse the same index buffer to avoid a second allocation pass.
     sorted_indices.sort_by(|&a, &b| {
         shards[a]
             .spec
@@ -242,6 +252,8 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         let b = &shards[window[1]];
         let a_end = a.spec.key_range_end();
         let b_start = b.spec.key_range_start();
+        // Adjacent ranges are valid because shard intervals are half-open:
+        // `a_end == b_start` means no overlap.
         let overlaps = a_end.is_empty() || b_start.is_empty() || a_end > b_start;
         if overlaps {
             return Err(ManifestValidationError::OverlappingRanges {
