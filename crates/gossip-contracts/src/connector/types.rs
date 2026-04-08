@@ -310,6 +310,11 @@ impl ToxicBytesStorage {
 
 /// Shared page-local slab owner for pooled toxic-byte wrappers.
 ///
+/// Enumeration pages stage bytes through this slab, then wrap it in `Arc` so
+/// the pooled handles can be cloned without additional allocations. When the
+/// last `Arc<PooledByteSlab>` drops, the slab zeroizes sensitive bytes and
+/// clears slot tracking to satisfy `ByteSlab`'s leak assertions.
+///
 /// Connectors use the two-phase API:
 /// 1. **Mutable phase:** call [`allocate`](Self::allocate) to stage byte fields.
 /// 2. **Shared phase:** wrap in `Arc` for shared read-only access
@@ -357,6 +362,9 @@ impl PooledByteSlab {
     }
 
     /// Resolves a previously allocated slot to its underlying byte slice.
+    ///
+    /// The borrow is tied to `self`, so callers must keep the owning
+    /// `Arc<PooledByteSlab>` alive for as long as they hold the slice.
     #[inline]
     fn get(&self, slot: ByteSlot) -> &[u8] {
         self.slab.get(slot)
@@ -389,6 +397,8 @@ impl fmt::Debug for PooledByteSlab {
 ///
 /// [`zeroize_used`]: gossip_stdx::ByteSlab::zeroize_used
 /// [`clear`]: gossip_stdx::ByteSlab::clear
+/// This cleanup runs when the final `Arc<PooledByteSlab>` is dropped,
+/// guaranteeing no pooled handles remain when zeroization starts.
 impl Drop for PooledByteSlab {
     fn drop(&mut self) {
         // Safety reasoning: Arc guarantees this runs only when no
@@ -749,6 +759,11 @@ impl Cursor {
     /// The `(None, Some(_))` state is unreachable because all constructors
     /// prevent token-without-key. If reached, this panics to surface the
     /// logic error rather than silently resetting cursor progress.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cursor invariant `(None, Some(_))` is observed, because
+    /// that state should never exist outside of an internal bug.
     #[inline]
     #[must_use]
     pub fn as_update(&self) -> CursorUpdate<'_> {

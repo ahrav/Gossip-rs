@@ -205,6 +205,15 @@ struct DirectoryWalker<'a> {
 }
 
 impl<'a> DirectoryWalker<'a> {
+    /// Create a walker that will enumerate files within the requested span.
+    ///
+    /// # Purpose
+    /// Lazily instantiates the bounded depth-first traversal state for a canonical
+    /// directory while honoring shard, cursor, and connector-level key bounds.
+    ///
+    /// # Guarantees
+    /// - The root frame reads and sorts a single directory at a time.
+    /// - `start`, `resume_after`, and `end` are applied before descending into any subtree.
     fn new(
         root: &Path,
         start: Option<&'a [u8]>,
@@ -226,6 +235,16 @@ impl<'a> DirectoryWalker<'a> {
         })
     }
 
+    /// Advance to the next reachable file, skipping directories and out-of-range entries.
+    ///
+    /// # Purpose
+    /// Applies the deadline and range filters while unwinding the traversal stack so callers
+    /// can resume from any cursor without losing ordering guarantees.
+    ///
+    /// # Guarantees
+    /// - Always drills into newly encountered directories before emitting their files.
+    /// - Respectfully skips files outside of `start`, `resume_after`, or `end`.
+    /// - Returns `Ok(None)` once the traversal stack is empty.
     fn next_file(&mut self) -> Result<Option<WalkFile>, EnumerateError> {
         loop {
             if deadline_expired(self.deadline) {
@@ -397,6 +416,15 @@ impl FilesystemConnector {
     }
 
     /// Canonicalize the root and cache the root mode plus identity scope.
+    ///
+    /// # Purpose
+    /// Defers root resolution until necessary, rewrites `root` to its canonical path,
+    /// and records the descriptor-based state required for secure enumeration and reads.
+    ///
+    /// # Guarantees
+    /// - The connector instance hash is derived from the canonical path.
+    /// - `root_fd` points to a verified directory (or parent directory for single files).
+    /// - `root_mode` is set to either a directory traversal mode or a single-file mode with the expected `(dev, ino)`.
     fn ensure_root_ready(&mut self) -> Result<(), EnumerateError> {
         if self.root_mode.is_some() {
             return Ok(());
@@ -476,6 +504,15 @@ impl FilesystemConnector {
             .expect("root connector instance is initialized by ensure_root_ready")
     }
 
+    /// Enumerate directory entries into a bounded page while obeying the cursor and budgets.
+    ///
+    /// # Purpose
+    /// Traverses the canonical tree lazily, collecting `ScanItem`s until the page budget is met or traversal completes.
+    ///
+    /// # Guarantees
+    /// - Honors `Cursor` resumption semantics (`resume_after`) and rejects files outside `effective_start`/`effective_end`.
+    /// - Always emits the first in-range file even when its size exceeds `max_bytes`.
+    /// - Leaves `start` and `end` limits intact so callers can construct appropriate `PageState`.
     fn fill_page_directory(
         &self,
         effective_start: Option<&[u8]>,
@@ -554,6 +591,15 @@ impl FilesystemConnector {
         .map_err(|error| EnumerateError::permanent(format!("invalid filesystem page: {error}")))
     }
 
+    /// Emit a single-item page for a connector rooted at one file, validating bounds and identity.
+    ///
+    /// # Purpose
+    /// Applies shard/cursor bounds to the lone file, rechecks its `(dev, ino)` identity,
+    /// and returns a validated `PageBuf` when the requested key is still within range.
+    ///
+    /// # Guarantees
+    /// - The page respects the requested `[effective_start, effective_end)` interval.
+    /// - Any change to the single file's identity is treated as a permanent error.
     fn fill_page_single_file(
         &self,
         file_name: &[u8],
@@ -657,6 +703,13 @@ impl FilesystemConnector {
     ///
     /// Returns `Ok(None)` when insufficient data has been observed or when the
     /// estimate does not pass cursor/bound guards.
+    ///
+    /// # Purpose
+    /// Delegates to `StreamingSplitEstimator` while intersecting shard bounds, ensuring split hints remain consistent across retries.
+    ///
+    /// # Guarantees
+    /// - Returns `Ok(None)` when the bounds are empty, the deadline expires, or the estimator lacks data.
+    /// - Validates that the selected split key advances the cursor and stays below the upper bound.
     fn choose_split_point_bounds(
         &self,
         start: Option<&[u8]>,
