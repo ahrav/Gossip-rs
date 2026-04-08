@@ -45,8 +45,8 @@ use gossip_scanner_runtime::git_persistence::{
     GitPersistenceAdapter, GitPersistenceBackend, GitPersistenceOp,
 };
 use scanner_git::{
-    FinalizeOutcome, FinalizeOutput, OidBytes, PersistenceStore, SeenBitmapPersister,
-    SeenBlobStore, WriteOp,
+    FinalizeOutcome, FinalizeOutput, OidBytes, PersistenceStore, RoaringSeenBitmap,
+    SeenBitmapPersister, SeenBlobStore, WriteOp,
     finalize::{build_seen_scope_key, build_seen_staging_key},
 };
 
@@ -440,6 +440,16 @@ fn adapter_integration_with_pg_backend() {
             .expect("seen check should succeed"),
         vec![true]
     );
+
+    let unseen_oid = sim_oid(0xCD);
+    assert_eq!(
+        adapter
+            .batch_check_seen(&[unseen_oid])
+            .expect("unseen check should succeed"),
+        vec![false],
+        "OID that was never staged must not appear as seen"
+    );
+
     assert_eq!(
         GitPersistenceBackend::get(&backend, b"bc\0blob").expect("blob get should succeed"),
         Some(vec![0xAA])
@@ -448,10 +458,19 @@ fn adapter_integration_with_pg_backend() {
         GitPersistenceBackend::get(&backend, b"rw\0wm").expect("watermark get should succeed"),
         Some(vec![0xBB])
     );
-    assert!(
+    let scope_bytes =
         GitPersistenceBackend::get(&backend, &build_seen_scope_key(repo_id, &policy_hash))
             .expect("scope get should succeed")
-            .is_some()
+            .expect("scope key must exist after complete finalize");
+    let scope_bitmap = RoaringSeenBitmap::deserialize(&scope_bytes)
+        .expect("scope value must be a valid serialized bitmap");
+    assert!(
+        scope_bitmap.contains(&oid),
+        "committed bitmap must contain the staged OID"
+    );
+    assert!(
+        !scope_bitmap.contains(&unseen_oid),
+        "committed bitmap must not contain an OID that was never staged"
     );
     assert_eq!(
         GitPersistenceBackend::get(&backend, &build_seen_staging_key(repo_id, &policy_hash))

@@ -51,9 +51,24 @@ impl fmt::Display for GitPersistencePgError {
                     write!(f, "postgres git-persistence connection/protocol error")
                 }
             }
-            Self::Migration(source) => {
-                write!(f, "postgres git-persistence migration failed: {source}")
-            }
+            Self::Migration(source) => match source {
+                GitPersistencePgMigrationError::Postgres { operation, source } => {
+                    if let Some(db_err) = source.as_db_error() {
+                        write!(
+                            f,
+                            "postgres git-persistence migration {operation} failed: {} ({})",
+                            db_err.severity(),
+                            db_err.code().code()
+                        )
+                    } else {
+                        write!(
+                            f,
+                            "postgres git-persistence migration {operation} connection/protocol error"
+                        )
+                    }
+                }
+                other => write!(f, "postgres git-persistence migration failed: {other}"),
+            },
             Self::MutexPoisoned => f.write_str("postgres git-persistence client mutex is poisoned"),
         }
     }
@@ -118,6 +133,41 @@ mod tests {
         assert!(
             err.source().is_none(),
             "CorruptedHistoryRecord should have no source error"
+        );
+    }
+
+    fn timeout_postgres_error() -> postgres::Error {
+        postgres::Error::__private_api_timeout()
+    }
+
+    #[test]
+    fn mutex_poisoned_display() {
+        let err = GitPersistencePgError::MutexPoisoned;
+        assert_eq!(
+            err.to_string(),
+            "postgres git-persistence client mutex is poisoned"
+        );
+    }
+
+    #[test]
+    fn backend_error_display_redacts_connection_details() {
+        let err = GitPersistencePgError::Postgres(timeout_postgres_error());
+        assert_eq!(
+            err.to_string(),
+            "postgres git-persistence connection/protocol error"
+        );
+    }
+
+    #[test]
+    fn backend_error_display_redacts_migration_wrapped_postgres_errors() {
+        let err = GitPersistencePgError::Migration(GitPersistencePgMigrationError::postgres(
+            MigrationOperation::Connect,
+            timeout_postgres_error(),
+        ));
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("timeout waiting for server"),
+            "migration-wrapped postgres error must not leak raw driver text, got: {msg}"
         );
     }
 }
