@@ -163,6 +163,7 @@ jobs:
           --features test-support,perf-stats
           --exclude gossip-findings-postgres
           --exclude gossip-done-ledger-postgres
+          --exclude gossip-git-persistence-postgres
           --exclude gossip-coordination-etcd
           ${{ matrix.extra-excludes }}
           --no-run
@@ -175,6 +176,7 @@ jobs:
           --features test-support,perf-stats
           --exclude gossip-findings-postgres
           --exclude gossip-done-ledger-postgres
+          --exclude gossip-git-persistence-postgres
           --exclude gossip-coordination-etcd
           ${{ matrix.extra-excludes }}
           --profile ci
@@ -188,7 +190,7 @@ jobs:
 
   # ── Test (PostgreSQL integration) ─────────────────────────────────
   # Runs PostgreSQL-dependent tests against a real service container.
-  # GOSSIP_POSTGRES_TEST_URL bypasses testcontainers so both crates
+  # GOSSIP_POSTGRES_TEST_URL bypasses testcontainers so all PG crates
   # share the same service container instead of spinning up their own.
   test-postgres:
     name: Test (PostgreSQL)
@@ -235,6 +237,13 @@ jobs:
         run: >-
           cargo nextest run
           -p gossip-findings-postgres
+          --features test-utils
+          --profile ci
+
+      - name: Run PostgreSQL integration tests (git-persistence)
+        run: >-
+          cargo nextest run
+          -p gossip-git-persistence-postgres
           --features test-utils
           --profile ci
 
