@@ -1189,6 +1189,21 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_error_from_git_kv_connect_redacts_source_chain() {
+        let bootstrap =
+            ProductionBootstrapError::GitKvConnect(unreachable_postgres_connect_error());
+        assert!(matches!(
+            bootstrap,
+            ProductionBootstrapError::GitKvConnect(_)
+        ));
+        assert!(bootstrap.source().is_none());
+        let message = bootstrap.to_string();
+        assert!(message.contains("git-kv PostgreSQL backend"));
+        assert!(!message.contains("127.0.0.1"));
+        assert!(!message.contains("postgres"));
+    }
+
+    #[test]
     fn bootstrap_error_debug_redacts_connection_variants() {
         let pg_err = unreachable_postgres_connect_error();
         let done = ProductionBootstrapError::DoneLedgerConnect(pg_err);
@@ -1411,6 +1426,40 @@ mod tests {
                     version: found_version,
                 }
             ) if history_table == findings_schema::SCHEMA_MIGRATIONS_TABLE
+                && found_version == version
+        ));
+    }
+
+    #[test]
+    fn validate_only_fails_when_git_kv_checksum_mismatches() {
+        let config = migrated_git_backend_config();
+        let git_kv_dsn = config
+            .git_kv_postgres_dsn()
+            .expect("git-kv DSN must be set");
+        let version = GIT_KV_MIGRATIONS[0].version();
+        let mut client = Client::connect(git_kv_dsn, NoTls)
+            .expect("git-kv test database should accept connections");
+        client
+            .execute(
+                &format!(
+                    "UPDATE {} SET checksum = $1 WHERE version = $2",
+                    git_kv_schema::SCHEMA_MIGRATIONS_TABLE
+                ),
+                &[&vec![0_u8; 32], &version],
+            )
+            .expect("checksum corruption update should succeed");
+
+        let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
+            .expect_err("validate-only boot must reject mismatched git-kv checksums");
+
+        assert!(matches!(
+            error,
+            ProductionBootstrapError::GitKvSchemaReadiness(
+                ProductionSchemaReadinessError::MigrationChecksumMismatch {
+                    history_table,
+                    version: found_version,
+                }
+            ) if history_table == git_kv_schema::SCHEMA_MIGRATIONS_TABLE
                 && found_version == version
         ));
     }
@@ -1935,6 +1984,61 @@ mod tests {
                 ProductionWorkerError::Startup(ProductionBootstrapError::GitMirrorManager(_))
             ),
             "expected GitMirrorManager bootstrap error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn run_git_without_git_persistence_returns_durability_error() {
+        let etcd = test_async_coordinator_config();
+        let done_ledger_dsn = create_test_db();
+        let findings_dsn = create_test_db();
+        migrate_done_ledger_database(&done_ledger_dsn);
+        migrate_findings_database(&findings_dsn);
+        let done_ledger_client = Client::connect(&done_ledger_dsn, NoTls)
+            .expect("done-ledger test database should accept connections");
+        let findings_client = Client::connect(&findings_dsn, NoTls)
+            .expect("findings test database should accept connections");
+
+        let backends = build_production_backends_from_clients(
+            etcd,
+            done_ledger_client,
+            findings_client,
+            None,
+            ProductionStartupSettings::validate_only(),
+        )
+        .expect("backend construction without git-kv should succeed");
+
+        assert!(
+            backends.git_persistence().is_none(),
+            "git_persistence must be None when no git-kv client is provided"
+        );
+
+        let dir = tempdir().expect("tempdir");
+        let mut mirrors =
+            LocalMirrorManager::new(dir.path()).expect("mirror manager should initialize");
+        let identity = GitWorkerIdentity::new(
+            TenantId::from_bytes([0x11; 32]),
+            RunId::from_raw(42),
+            WorkerId::from_raw(7),
+            PolicyHash::from_bytes([0x22; 32]),
+            TenantSecretKey::from_bytes([0x33; 32]),
+            GitScanConfig::new("/dummy/repo"),
+            Arc::new(ProductionCoordinationEventRecorder::default()),
+        );
+
+        let error = backends
+            .run_git(&mut mirrors, identity, DistributedRuntimeConfig::default())
+            .expect_err("run_git must fail when git_persistence is None");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Durability(_)),
+            "expected Durability error, got {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("git production launch requires a configured git-kv backend"),
+            "error message should identify the missing git-kv backend: {error}"
         );
     }
 }
