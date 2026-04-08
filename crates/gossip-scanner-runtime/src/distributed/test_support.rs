@@ -430,7 +430,7 @@ pub(super) fn successor_bytes(bytes: &[u8]) -> Vec<u8> {
     next
 }
 
-/// Git repo fixture seeded with a secret so scans produce at least one finding.
+/// Single-commit git repo fixture seeded with a secret so scans produce at least one finding.
 pub(super) fn create_git_repo_fixture_with_secrets() -> tempfile::TempDir {
     create_git_repo_fixture_with_secret_history(1)
 }

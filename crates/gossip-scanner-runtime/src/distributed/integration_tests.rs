@@ -1732,10 +1732,12 @@ fn run_git_repo_worker_treats_cursor_covered_target_as_exhausted_empty() {
 
 /// Multi-commit secret-bearing histories must complete successfully without
 /// triggering shard parking. History depth alone is not a parking condition;
-/// only permanent errors qualify.
+/// only error-class conditions (permanent failures, repeated transient errors,
+/// poisoned state) qualify.
 #[test]
 fn run_git_repo_worker_completes_multi_commit_secret_history() {
-    let repo = create_git_repo_fixture_with_secret_history(16);
+    const COMMIT_COUNT: usize = 16;
+    let repo = create_git_repo_fixture_with_secret_history(COMMIT_COUNT);
     let mirror_root = tempdir().expect("mirror root");
     let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
     let backend = TestGitBackend::default();
@@ -1793,8 +1795,8 @@ fn run_git_repo_worker_completes_multi_commit_secret_history() {
         .findings_snapshot()
         .expect("findings snapshot");
     assert!(
-        persisted.len() >= 16,
-        "each of the 16 secret-bearing commits should produce at least one \
+        persisted.len() >= COMMIT_COUNT,
+        "each of the {COMMIT_COUNT} secret-bearing commits should produce at least one \
          persisted finding (got {})",
         persisted.len()
     );
@@ -1810,7 +1812,7 @@ fn run_git_repo_worker_completes_multi_commit_secret_history() {
         DoneLedgerStatus::ScannedWithFindings,
         "secret-bearing history should produce a findings-bearing done-ledger row"
     );
-    // Single object-version shard: the done-ledger's per-item findings_count
+    // Single repo-frontier shard: the done-ledger's per-item findings_count
     // equals total persisted finding rows because there is exactly one item.
     assert_eq!(
         rows[0].findings_count(),
