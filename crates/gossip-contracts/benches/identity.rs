@@ -11,6 +11,12 @@
 //! Includes isolated microbenchmarks for leaf operations (e.g., `key_secret_hash`)
 //! and a `full_derivation_chain` benchmark to reflect realistic composition costs
 //! such as allocations and cascaded hashing.
+//!
+//! # Boundaries
+//! * Criterion harness overhead is shared across cases and is not interpreted as
+//!   business logic latency.
+//! * Inputs are fixed-size byte arrays or static byte strings; benchmarks do not
+//!   model parsing, network transport, or storage I/O.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
@@ -22,7 +28,9 @@ use gossip_contracts::identity::{
     key_secret_hash,
 };
 
-/// Benchmarks keyed normalization hash for tenant-scoped secrets.
+/// Benchmarks tenant-scoped secret material derivation from normalized content.
+///
+/// Uses prebuilt inputs so the benchmark isolates hashing cost rather than setup.
 fn bench_key_secret_hash(c: &mut Criterion) {
     let key = TenantSecretKey::from_bytes([0xBB; 32]);
     let norm = NormHash::from_digest([0xCC; 32]);
@@ -32,7 +40,10 @@ fn bench_key_secret_hash(c: &mut Criterion) {
     });
 }
 
-/// Benchmarks finding ID derivation with pre-normalized secret inputs.
+/// Benchmarks finding-id derivation with a precomputed key-secret hash.
+///
+/// This isolates the `derive_finding_id` path from the upstream secret-derivation
+/// cost to keep the measurement focused on record encoding and hashing for this ID.
 fn bench_derive_finding_id(c: &mut Criterion) {
     let tenant_key = TenantSecretKey::from_bytes([0xBB; 32]);
     let norm = NormHash::from_digest([0xCC; 32]);
@@ -50,7 +61,9 @@ fn bench_derive_finding_id(c: &mut Criterion) {
     });
 }
 
-/// Benchmarks occurrence ID derivation for a specific byte range in an object.
+/// Benchmarks occurrence-id derivation for a single byte range in one object version.
+///
+/// The fixed offsets ensure stable inputs and avoid data-dependent branching noise.
 fn bench_derive_occurrence_id(c: &mut Criterion) {
     let inputs = OccurrenceIdInputs {
         finding: FindingId::from_bytes([0x55; 32]),
@@ -64,7 +77,7 @@ fn bench_derive_occurrence_id(c: &mut Criterion) {
     });
 }
 
-/// Benchmarks observation ID derivation.
+/// Benchmarks observation-id derivation from tenant, policy hash, and occurrence.
 fn bench_derive_observation_id(c: &mut Criterion) {
     let inputs = ObservationIdInputs {
         tenant: TenantId::from_bytes([0x77; 32]),
@@ -76,7 +89,10 @@ fn bench_derive_observation_id(c: &mut Criterion) {
     });
 }
 
-/// Benchmarks policy hash computation for V1 keyed hashing.
+/// Benchmarks policy hash computation for keyed V1 mode.
+///
+/// Uses a fixed synthetic rules digest so the benchmark reflects the hash function
+/// and parameter mixing, not rule serialization overhead.
 fn bench_compute_policy_hash(c: &mut Criterion) {
     let inputs = PolicyHashInputs {
         policy_hash_version: 1,
@@ -90,7 +106,7 @@ fn bench_compute_policy_hash(c: &mut Criterion) {
     });
 }
 
-/// Benchmarks stable item ID derivation.
+/// Benchmarks stable-item-id derivation from connector identity components.
 fn bench_item_key_stable_id(c: &mut Criterion) {
     let key = ItemIdentityKey::new(
         ConnectorTag::from_ascii(b"github"),
@@ -103,7 +119,10 @@ fn bench_item_key_stable_id(c: &mut Criterion) {
     });
 }
 
-/// Benchmarks the end-to-end derivation chain from item key to occurrence ID.
+/// Benchmarks an end-to-end derivation chain from item identity to occurrence ID.
+///
+/// Unlike the leaf microbenchmarks, this intentionally includes path cloning to
+/// represent caller-side allocation overhead in realistic hot-path composition.
 fn bench_full_derivation_chain(c: &mut Criterion) {
     let connector = ConnectorTag::from_ascii(b"github");
     let connector_instance =

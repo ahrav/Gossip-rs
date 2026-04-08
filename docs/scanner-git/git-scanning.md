@@ -155,6 +155,13 @@ advancing ref tips past unscanned blobs.
 filtering or watermark advancement and are not a cross-worker determinism
 contract in parallel ODB-blob mode.
 
+Intermediate stage checkpoints are persisted as opaque blobs owned by
+`crates/scanner-git/src/checkpoint.rs`. Each blob is framed as
+`[magic: 4][crc32_le: 4][postcard payload]`. Resume loads verify the magic
+bytes, payload size, and CRC32 before deserializing state, and corrupt blobs
+are discarded instead of restoring unchecked runner state. CRC32 here detects
+accidental corruption; it is not a tamper-resistance mechanism.
+
 ## Simulation Harness
 
 The Git simulation harness exercises this pipeline deterministically using a

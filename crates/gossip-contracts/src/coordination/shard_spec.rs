@@ -52,7 +52,8 @@ pub use super::cursor::MAX_KEY_SIZE;
 ///
 /// Ceiling for opaque connector metadata. Observed metadata:
 /// TruffleHog (200-500 B), JWT (2-4 KB), config drift (~8 KB).
-/// 16 KiB provides 2x headroom over worst observed.
+/// 16 KiB provides 2x headroom over worst observed. Enforced by
+/// [`ShardSpec::validate_ref`] and the `with_*` / `try_with_*` constructors.
 pub const MAX_METADATA_SIZE: usize = 16_384;
 
 // ============================================================================
@@ -640,6 +641,18 @@ impl ShardSpec {
     ///
     /// Test-support helper for constructing specs from pre-built parts
     /// without re-running validation.
+    ///
+    /// # Preconditions
+    ///
+    /// Callers must preserve the same invariants enforced by validated
+    /// constructors:
+    /// - `key_range_start.len() <= MAX_KEY_SIZE`
+    /// - `key_range_end.len() <= MAX_KEY_SIZE`
+    /// - `metadata.len() <= MAX_METADATA_SIZE`
+    /// - if both bounds are non-empty, `key_range_start < key_range_end`
+    ///
+    /// Violating these invariants can produce specs that later fail
+    /// validation in unrelated call paths.
     #[cfg(any(test, feature = "test-support"))]
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_raw_parts(
@@ -1318,6 +1331,23 @@ where
 ///
 /// O(N log N) for the sort, O(N) for the linear contiguity scan,
 /// where N is the number of children.
+///
+/// # Errors
+///
+/// - [`SplitValidationError::NoChildren`] — `children` is empty.
+/// - [`SplitValidationError::SingleChild`] — `children` has length 1.
+/// - [`SplitValidationError::StartMismatch`] — first child start does not
+///   match `parent_start`.
+/// - [`SplitValidationError::EndMismatch`] — last child end does not match
+///   `parent_end`.
+/// - [`SplitValidationError::BoundaryMismatch`] — adjacent children do not
+///   share a boundary.
+/// - [`SplitValidationError::OverlappingChild`] — a non-last child has an
+///   unbounded end.
+/// - [`SplitValidationError::InvertedChild`] — at least one child has
+///   `start >= end`.
+/// - [`SplitValidationError::InvalidChildSpec`] — a child exceeds key or
+///   metadata size limits.
 #[must_use = "returns a Result that must be checked for validation errors"]
 pub fn validate_split_coverage_bounds(
     parent_start: &[u8],
@@ -1467,6 +1497,15 @@ where
 ///
 /// ## Complexity
 /// `O(1)` bounds check followed by `O(1)` delegation for 2 children.
+///
+/// # Errors
+///
+/// - [`SplitValidationError::StartMismatch`] — `new_parent` does not retain
+///   `old_parent_start`.
+/// - [`SplitValidationError::EndMismatch`] — `residual` does not retain
+///   `old_parent_end`.
+/// - Any error from [`validate_split_coverage_bounds`] for invalid
+///   child partitioning.
 #[must_use = "returns a Result that must be checked for validation errors"]
 pub fn validate_residual_split_bounds(
     old_parent_start: &[u8],

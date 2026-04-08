@@ -1,16 +1,21 @@
 //! [`CanonicalBytes`] trait and primitive implementations.
 //!
-//! This is the encoding foundation for all content-addressed identity
-//! derivation. See the trait-level docs on [`CanonicalBytes`] for the full
-//! invariant specification (collision-freedom, determinism, no allocation).
+//! Identity derivations such as `FindingId`, `OccurrenceId`, split shard IDs,
+//! and payload hashes all stream canonical bytes through `blake3::Hasher`. The
+//! trait defined here guarantees collision freedom, determinism, and
+//! zero-allocation so that each encoded fragment can be appended without
+//! ambiguous framing. See the trait-level docs on [`CanonicalBytes`] for the
+//! invariant checklist and guidance for composite types.
 
 use blake3::Hasher;
 
 /// Deterministic byte encoding for content-addressed hashing.
 ///
-/// Every type that participates in a content-addressed derivation (`FindingId`,
-/// `OccurrenceId`, `derive_split_shard_id`, payload hashes) must implement this
-/// trait.
+/// Each implementation streams bytes directly into a shared `blake3::Hasher`, so
+/// the canonical fingerprint is built without temporary buffers. Every type that
+/// participates in a content-addressed derivation (`FindingId`, `OccurrenceId`,
+/// `derive_split_shard_id`, payload hashes) must implement this trait and expose
+/// a consistent field order before handing ownership to the hasher.
 ///
 /// # Invariants
 ///
@@ -20,7 +25,8 @@ use blake3::Hasher;
 /// must use unambiguous framing.
 ///
 /// **Determinism**: output must be identical across platforms, byte orders, and
-/// Rust versions. Use fixed-endian encoding (little-endian by convention).
+/// Rust versions. Use fixed-endian encoding (little-endian by convention) and
+/// avoid runtime-configurable data such as native pointer sizes or thread IDs.
 ///
 /// **No allocation**: implementations must feed bytes directly into the hasher
 /// without intermediate heap allocation. Identity derivation runs on hot paths
@@ -55,11 +61,16 @@ pub trait CanonicalBytes {
     /// into the provided `blake3::Hasher`.
     ///
     /// Implementations must not allocate memory and must deterministically
-    /// output the same bytes across all platforms.
+    /// output the same bytes across all platforms. The hasher must be dedicated
+    /// to a single derivation context; do not share it across unrelated
+    /// derivations.
     fn write_canonical(&self, hasher: &mut Hasher);
 }
 
 /// Single-byte encoding: no length prefix needed (fixed 1-byte width).
+///
+/// Useful for small tags, version markers, or enumerations where stability in
+/// width guarantees the framing of adjacent fields.
 impl CanonicalBytes for u8 {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
@@ -68,6 +79,9 @@ impl CanonicalBytes for u8 {
 }
 
 /// 4-byte little-endian encoding: no length prefix needed (fixed width).
+///
+/// Fixed-width counters, timestamps, and lengths are written in little-endian so
+/// the resulting hashes do not depend on the host endianness.
 impl CanonicalBytes for u32 {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
@@ -76,6 +90,9 @@ impl CanonicalBytes for u32 {
 }
 
 /// 8-byte little-endian encoding: no length prefix needed (fixed width).
+///
+/// Use little endian so multi-word values behave consistently across CPUs
+/// without runtime byte-order detection.
 impl CanonicalBytes for u64 {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
@@ -86,6 +103,10 @@ impl CanonicalBytes for u64 {
 /// Variable-length byte slices use a 4-byte LE length prefix to prevent
 /// concatenation ambiguity. For example, `[0x41, 0x42]` encodes as
 /// `[2, 0, 0, 0, 0x41, 0x42]`.
+///
+/// This is the canonical representation for variable-length inputs such as
+/// serialized payloads or identifiers that need framing relative to other
+/// fields.
 ///
 /// # Panics
 ///
@@ -102,6 +123,9 @@ impl CanonicalBytes for [u8] {
 }
 
 /// Fixed-length 32-byte arrays need no length prefix (fixed width).
+///
+/// Matches the size of `blake3::OUT_LEN`, so hashed digests and other fixed
+/// 32-byte identity components can be re-used verbatim without extra framing.
 impl CanonicalBytes for [u8; 32] {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
@@ -111,14 +135,14 @@ impl CanonicalBytes for [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    //! Verifies determinism, collision freedom, and structural assumptions for
+    //! the primitive canonical encodings.
     use super::*;
     use blake3::Hasher;
     use proptest::array::uniform32;
     use proptest::prelude::*;
 
-    // ---------------------------------------------------------------
     // Property-based invariant tests — Determinism
-    // ---------------------------------------------------------------
 
     proptest! {
         #![proptest_config(crate::test_util::miri_proptest_config())]
@@ -169,9 +193,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // Property-based invariant tests — Collision-freedom
-    // ---------------------------------------------------------------
 
     proptest! {
         #![proptest_config(crate::test_util::miri_proptest_config())]
@@ -234,9 +256,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // Encoding format verification
-    // ---------------------------------------------------------------
 
     #[test]
     fn u8_writes_single_byte() {
@@ -286,9 +306,7 @@ mod tests {
         assert_eq!(h1.finalize(), h2.finalize());
     }
 
-    // ---------------------------------------------------------------
     // Structural anti-pattern tests
-    // ---------------------------------------------------------------
 
     #[test]
     fn slice_length_prefixed() {

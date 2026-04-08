@@ -233,6 +233,11 @@ impl InMemoryDeterministicConnector {
     /// bounds and the cursor resume position. Returns `None` when fewer than
     /// two keys remain, the estimator produces no candidate, or the candidate
     /// fails validation.
+    ///
+    /// The optional `start` and `end` byte bounds passed here are already
+    /// interpreted in the surrounding helper, so this method can focus on
+    /// resuming from the cursor and feeding the estimator with ordered bytes
+    /// and size hints for the remaining range.
     fn choose_split_point_bounds(
         &self,
         start: Option<&[u8]>,
@@ -261,6 +266,10 @@ impl InMemoryDeterministicConnector {
     /// `ItemRef` values are interpreted as big-endian indices into the sorted
     /// prepared-item array. This keeps references compact and deterministic,
     /// but also means references are connector-instance-local.
+    ///
+    /// The method validates the encoded index fits into `usize` and still
+    /// points inside the prepared array before returning a reference, issuing
+    /// `ReadError::permanent` for malformed or out-of-range values.
     fn open_ref_internal(&self, item_ref: &ItemRef) -> Result<&Arc<[u8]>, ReadError> {
         let idx_u64 = parse_u64_be(item_ref.as_bytes())
             .ok_or_else(|| ReadError::permanent("invalid item_ref encoding"))?;
@@ -361,6 +370,7 @@ impl InMemoryDeterministicConnector {
         }
 
         let max_bytes = usize::try_from(budgets.max_bytes()).unwrap_or(usize::MAX);
+        // Budgets are advisory caps; clamp the requested copy length rather than treating it as an error.
         let allowed = dst.len().min(max_bytes);
         if allowed == 0 {
             return Ok(0);

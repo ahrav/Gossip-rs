@@ -1,9 +1,19 @@
-//! Tests for shard specifications, cursors, and shard arenas.
+//! Integration-style tests for shard specs, split validation, cursors, and shard arenas.
 //!
-//! This module verifies the correctness of `ShardSpec` and `ShardArena` operations,
-//! including bounds validation, canonical hashing stability, split coverage contiguity,
-//! and memory-safe arena allocations. It enforces invariants such as proper key
-//! ordering, size constraints on keys and metadata, and correct error generation.
+//! The core problem under test is preserving shard-range correctness across three layers:
+//! value construction (`ShardSpec`/`ShardSpecRef`), split and residual validation, and
+//! arena-backed storage (`ShardArena` handles and slab allocation).
+//!
+//! Key invariants covered by this module:
+//! - key ranges are half-open and well-formed (`start < end` unless unbounded),
+//! - key and metadata byte lengths stay within configured maxima,
+//! - child splits are contiguous and exactly cover the parent range,
+//! - canonical digests stay stable and change when semantic inputs change,
+//! - stale or foreign arena handles are rejected.
+//!
+//! Boundaries exercised here include panic constructors vs fallible constructors,
+//! deterministic unit checks vs property tests, and owned/ref conversions that must
+//! preserve canonical representation.
 
 use rstest::rstest;
 
@@ -459,6 +469,7 @@ fn with_range_and_metadata_stores_and_hashes_metadata() {
 proptest! {
     #![proptest_config(crate::test_util::miri_proptest_config())]
 
+    // Hashing must be deterministic for identical input values.
 
     #[test]
     fn shard_spec_canonical_bytes_stable(
@@ -797,9 +808,8 @@ fn validate_ref_accepts_valid_spec() {
 
 #[test]
 fn split_coverage_rejects_child_with_oversized_metadata() {
-    // Children with valid key ranges but oversized metadata should be
-    // rejected by split coverage validation to prevent downstream
-    // panics in AcquireScratch::write_spec.
+    // Reject oversized metadata at split validation time so acquire paths
+    // do not reach downstream panics in `AcquireScratch::write_spec`.
     let oversized_meta = vec![0xAA; MAX_METADATA_SIZE + 1];
     let child1 = ShardSpecRef::new(b"a", b"m", &oversized_meta);
     let child2 = ShardSpecRef::new(b"m", b"z", &[]);

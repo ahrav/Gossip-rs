@@ -8,6 +8,14 @@
 //!
 //! The benchmark hook is only exported on Unix (the split estimator depends on
 //! Unix filesystem APIs), so this file compiles as a no-op on other platforms.
+//!
+//! Benchmark invariants:
+//! - Input stream cardinality is fixed at one million observations.
+//! - Key width and file-size shape are fixed by the benchmark hook.
+//! - Only `sample_cap` varies across runs.
+//!
+//! These constraints keep comparisons stable across commits by isolating the
+//! estimator's hot-path `observe` cost from dataset-shape drift.
 
 #[cfg(unix)]
 mod unix_bench {
@@ -20,6 +28,9 @@ mod unix_bench {
     /// The workload shape is fixed to the same one-million-item stream used by
     /// the allocation regression test so throughput and allocation regressions
     /// can be compared against the same estimator inputs over time.
+    ///
+    /// This benchmark varies only the estimator `sample_cap`; it does not model
+    /// filesystem traversal or randomized key distributions.
     pub fn bench_observe(c: &mut Criterion) {
         let mut group = c.benchmark_group("streaming_split_estimator_observe");
         // Keep the benchmark's stream shape pinned to the allocation guard so
@@ -61,4 +72,6 @@ criterion::criterion_main!(unix_bench::benches);
 // On non-Unix platforms the estimator (and its benchmark hook) is unavailable,
 // so the bench binary compiles but does nothing.
 #[cfg(not(unix))]
+/// No-op entrypoint for non-Unix targets where the estimator benchmark hook is
+/// not exported.
 fn main() {}

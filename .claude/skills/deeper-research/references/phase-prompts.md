@@ -36,6 +36,12 @@ of a comprehensive research funnel.
 ## Research Brief
 {RESEARCH_BRIEF}
 
+## Current Date
+{CURRENT_DATE}
+
+Use this date for all recency checks and date-filtered searches. Do NOT assume
+a year from training data.
+
 ## Your Research Mission
 
 You are one of {N} independent research agents. Your job is to gather HARD
@@ -56,11 +62,15 @@ Every claim must have a source. Unsourced claims are worthless.
    - Conference talks, technical blog posts from credible sources
    - Existing open-source implementations
 
+   Launch ALL searches in parallel when possible (single message, multiple
+   tool calls). Follow promising results with targeted WebFetch deep-dives.
+
 3. **Evaluate and document**: For each piece of evidence, record:
    - Source (URL, paper title, system name)
    - Key finding or technique
    - Relevance to our specific problem
    - Evidence strength (see scale below)
+   - Source credibility tier (see below)
 
 ### Evidence Strength Scale
 
@@ -71,6 +81,26 @@ Every claim must have a source. Unsourced claims are worthless.
 | 3 | Implemented & tested | Open-source with benchmarks/tests |
 | 2 | Documented practice | Tech blog from credible org |
 | 1 | Anecdotal | Forum/blog, needs corroboration |
+
+### Source Credibility Tiers
+
+| Tier | Domains | Treatment |
+|------|---------|-----------|
+| High (80-100) | arxiv.org, usenix.org, dl.acm.org, ieee.org, official docs, RFCs | Core evidence; cite directly |
+| Moderate (60-79) | Engineering blogs (Cloudflare, AWS, Datadog), conf talks, arstechnica | Corroborate with another source |
+| Low (40-59) | Medium posts, personal blogs, SO, forum discussions | Flag as WEAK; use only if nothing stronger exists |
+| Suspect (<40) | Content farms, SEO listicles, anonymous posts | Do NOT cite unless verified against primary source |
+
+### Anti-Hallucination Rules
+
+- NEVER fabricate a citation. If no sources address a question, say so.
+- Distinguish FACTS (from sources: "According to [source]...") from
+  SYNTHESIS (your analysis: "This suggests...").
+- No vague attributions: NEVER write "research suggests" or "studies show"
+  without a specific citation.
+- Watch for hallucination patterns: generic academic titles without real URLs,
+  future publication dates, pre-2015 citations mentioning LLMs/transformers.
+- When uncertain whether a source says X, note the uncertainty — do not cite.
 
 ### Focus Area
 {FOCUS}
@@ -84,6 +114,7 @@ Every claim must have a source. Unsourced claims are worthless.
 - Note when evidence is from a different domain and may not transfer directly.
 - Search for COUNTER-evidence too — what are the failure modes?
 - If a search returns no useful results, say so. Do not fabricate references.
+- Aim for source diversity: mix academic, production, and practitioner sources.
 - Stay within your budget: aim for ~3000 tokens of output.
 
 ### Output Format
@@ -102,19 +133,40 @@ For each piece of evidence (aim for 5-12 findings):
 
 **P1.{AGENT_ID}.F{N}: {title}**
 - **Source**: {URL or citation}
+- **Source credibility**: {High/Moderate/Low} — {domain}
 - **Evidence strength**: {1-5} — {label}
 - **Summary**: {2-4 sentences}
 - **Key technique/insight**: {the actionable takeaway}
 - **Applicability**: {high/medium/low} — {why}
 - **Caveats**: {limitations, different assumptions}
 
-#### 3. Patterns & Consensus
+#### 3. Structured Evidence Summary
+After all findings, provide a machine-readable summary for synthesis:
+
+```json
+[
+  {
+    "id": "P1.{AGENT_ID}.F1",
+    "claim": "specific claim text",
+    "source_url": "https://...",
+    "source_title": "...",
+    "evidence_strength": 4,
+    "credibility_tier": "high",
+    "applicability": "high"
+  }
+]
+```
+
+This structured summary prevents synthesis fatigue when merging results from
+8-10 agents. Include it AFTER the narrative findings, not instead of them.
+
+#### 4. Patterns & Consensus
 What approaches appear repeatedly across your sources? Where do experts agree?
 
-#### 4. Disagreements & Open Questions
+#### 5. Disagreements & Open Questions
 Where do sources contradict each other? What remains unresolved?
 
-#### 5. Recommended Reading
+#### 6. Recommended Reading
 Top 3-5 sources the team should read, ranked by relevance.
 ```
 
@@ -432,6 +484,9 @@ Create a master list of ALL unique findings across all agents. For findings
 reported by multiple agents, merge them and note corroboration. Preserve
 the original finding IDs (P1.{agent#}.F{n}) for traceability.
 
+Use the structured evidence summaries (JSON blocks) from each agent to
+bootstrap the inventory, then enrich from the narrative findings.
+
 For each merged finding:
 - **ID**: S1.F{N}
 - **Title**: {descriptive title}
@@ -439,7 +494,11 @@ For each merged finding:
 - **Sources**: {all sources citing this finding, with URLs}
 - **Corroboration**: {how many agents independently found this}
 - **Evidence strength**: {1-5, use the highest-quality source}
+- **Source credibility**: {High/Moderate/Low — from the best source}
 - **Applicability**: {high/medium/low for our specific problem}
+- **Weighted score**: {evidence_strength × credibility_multiplier × corroboration_count}
+
+Credibility multipliers: High=1.0, Moderate=0.8, Low=0.5, Suspect=0.1.
 
 ### 2. Consensus Matrix
 
@@ -455,10 +514,10 @@ Verdict: STRONG CONSENSUS, LEAN (direction), CONTESTED, or INSUFFICIENT EVIDENCE
 
 Rank all discovered techniques/approaches by weighted evidence score:
 
-Score = (evidence_strength x applicability x corroboration_count)
+Score = (evidence_strength x credibility_multiplier x applicability x corroboration_count)
 
-| Rank | Technique | Score | Evidence | Applicability | Corroboration | Key Source |
-|------|-----------|-------|----------|---------------|---------------|------------|
+| Rank | Technique | Score | Evidence | Credibility | Applicability | Corroboration | Key Source |
+|------|-----------|-------|----------|-------------|---------------|---------------|------------|
 
 ### 4. Risk Register
 
@@ -673,6 +732,7 @@ is WRONG or will fail in our specific context.
 ```
 {MANDATE}: Verify the top 7-10 factual claims from the synthesis against
 primary sources. Check that citations actually say what they're claimed to say.
+Also detect potential hallucinated citations.
 
 {AGENT_ID}: 2
 
@@ -687,18 +747,30 @@ primary sources. Check that citations actually say what they're claimed to say.
    d. Look for errata or corrections published after the original.
 3. Rate each claim: VERIFIED, PARTIALLY VERIFIED, UNVERIFIABLE, or REFUTED.
 
+### Hallucination Detection
+
+Flag citations that exhibit these patterns:
+- Generic academic titles ("A Comprehensive Survey of...") with no real URL
+- Future publication dates or anachronistic terminology
+- URLs that return 404 or redirect to unrelated content
+- Metadata mismatches (title says one thing, linked content says another)
+- Overly perfect templated titles ("X: A Complete Guide to Y")
+
+For each flagged citation, note: "HALLUCINATION RISK: {reason}"
+
 ### Output Format
 
 `# P4 Adversarial — Agent 2: Cross-Validator`
 
-| # | Claim (finding ID) | Source | Verdict | Notes |
-|---|-------------------|--------|---------|-------|
+| # | Claim (finding ID) | Source | Verdict | Hallucination Risk | Notes |
+|---|-------------------|--------|---------|-------------------|-------|
 
 **P4.2.F{N}**: {each verification finding, using standard format}
 
-For any PARTIALLY VERIFIED or REFUTED claims, provide detailed explanation.
+For any PARTIALLY VERIFIED, REFUTED, or HALLUCINATION RISK claims, provide
+detailed explanation.
 
-**Summary**: {X of Y claims verified, Z partially, W refuted}
+**Summary**: {X of Y claims verified, Z partially, W refuted, H flagged for hallucination risk}
 ```
 
 ---
@@ -846,6 +918,8 @@ Re-rank all techniques, incorporating:
 Based on the cross-validator's work:
 - **Verified (build on these)**: {list with finding IDs}
 - **Challenged (proceed with caution)**: {list with finding IDs and concerns}
+- **Hallucination flagged (remove or replace)**: {list with finding IDs — these
+  MUST be removed from the evidence base or replaced with verified alternatives}
 - **Unverifiable (note the uncertainty)**: {list}
 
 ### 4. Assumption Risk Matrix
@@ -1035,13 +1109,16 @@ After the integrator (Phase 6) completes, present the combined output:
 ### Problem
 {one-line restatement}
 
+### Current Date
+{YYYY-MM-DD used for all recency checks}
+
 ### Executive Summary
 {from the final synthesizer's executive summary — Phase 5}
 
 ### Evidence Highlights
-| # | Finding | Evidence Strength | Corroboration | Adversarial Status | Sources |
-|---|---------|-------------------|---------------|--------------------|---------|
-{top 10-15 findings from the final synthesis, ranked by score}
+| # | Finding | Evidence Strength | Credibility | Corroboration | Adversarial Status | Sources |
+|---|---------|-------------------|-------------|---------------|--------------------|---------|
+{top 10-15 findings from the final synthesis, ranked by weighted score}
 
 ### Implementation Plan
 {the integrator's full plan from Phase 6}
@@ -1056,9 +1133,18 @@ After the integrator (Phase 6) completes, present the combined output:
 | Adversarial Agent | Key Challenge | Impact on Recommendations |
 |-------------------|---------------|---------------------------|
 | Devil's Advocate  | ...           | ...                       |
-| Cross-Validator   | X/Y verified  | ...                       |
+| Cross-Validator   | X/Y verified, H flagged hallucination | ...    |
 | Assumptions Auditor | N risky assumptions | ...              |
 | Contrarian Searcher | ...         | ...                       |
+
+### Scope Refinement Log
+{If scope was refined between Phase 2 and Phase 3/4:}
+- **Original scope**: {brief summary}
+- **What changed**: {specific additions/removals}
+- **Why**: {evidence that drove the change, citing Phase 2 finding IDs}
+- **Delta-queries run**: {if loop-back was triggered, list queries and results}
+
+{If no refinement: "Scope unchanged — Phase 1 evidence aligned with original brief."}
 
 ### Traceability
 {evidence trail table from the integrator}
@@ -1086,6 +1172,7 @@ After the integrator (Phase 6) completes, present the combined output:
 
 <details><summary>Phase 4: Adversarial Reports</summary>
 {all adversarial reports}
+{if loop-back triggered: include Supplementary Evidence section}
 </details>
 
 <details><summary>Phase 5: Final Synthesis</summary>

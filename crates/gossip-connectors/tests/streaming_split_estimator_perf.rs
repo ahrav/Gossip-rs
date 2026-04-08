@@ -28,12 +28,18 @@ use gossip_connectors::benchmark_streaming_split_estimator_observe_fixed_size;
 use scanner_scheduler::{CountingAllocator, alloc_stats};
 
 #[global_allocator]
+/// Process-wide allocator instrumentation for this integration test.
+///
+/// Integration tests run in a separate process, so this override does not affect
+/// allocators in other test binaries.
 static GLOBAL_ALLOC: CountingAllocator = CountingAllocator;
 
 /// Calculates a conservative heap-traffic bound for the fixed-size streaming workload.
 ///
 /// # What it does
 /// Determines the maximum allowed heap allocation operations for a stream of a given length.
+/// The `+ 4` phase slack intentionally absorbs setup and teardown effects so the
+/// bound remains resilient to minor implementation details.
 ///
 /// # Complexity
 /// The estimator doubles its sampling strides after each compaction, so the
@@ -61,6 +67,11 @@ fn observe_allocation_upper_bound(sample_cap: usize, count: usize) -> u64 {
 /// # Guarantees
 /// - Asserts that a valid split is generated for the 1M-item stream.
 /// - Asserts that the sum of `allocs` and `reallocs` remains bounded sublinearly.
+///
+/// # Test Isolation
+/// Because this file installs a process-wide allocator, this assertion should
+/// run without concurrently mutating allocator-heavy workloads in the same test
+/// process.
 #[test]
 fn observe_one_million_items_allocates_sublinearly() {
     let sample_cap = 128usize;

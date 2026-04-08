@@ -114,6 +114,7 @@ graph TB
 | **EventOutput**                | `crates/scanner-scheduler/src/events.rs`                                                 | Thread-safe structured event emission to stdout sinks                                                           |
 | **BufferPool**                 | `crates/scanner-scheduler/src/runtime.rs`                                                | Fixed-capacity aligned buffer pool (single-threaded runtime path)                                               |
 | **TsBufferPool**               | `crates/scanner-scheduler/src/scheduler/ts_buffer_pool.rs`                               | Thread-safe buffer pool used by scheduler workers                                                               |
+| **Global Resource Pool**       | `crates/scanner-scheduler/src/scheduler/global_resource_pool.rs`                         | Global resource management for fat jobs                                                                         |
 | **NodePoolType**               | `crates/scanner-engine/src/pool/node_pool.rs`                                            | Generic pre-allocated node pool                                                                                 |
 | **RingBuffer**                 | `crates/gossip-stdx/src/ring_buffer.rs`                                                  | Fixed-capacity SPSC queue                                                                                       |
 | **DynamicBitSet**              | `crates/gossip-stdx/src/bitset.rs`                                                       | Runtime-sized bitset for pool tracking                                                                          |
@@ -204,7 +205,7 @@ gossip-contracts  (data model leaf -- identity, shard spec, connector types)
 - Policy enforcement is deterministic: `FailArchive` stops the current container, `FailRun` aborts the scan.
 - Archive entries use virtual `FileId` values (high-bit namespace) to isolate per-file engine state.
 - Archive parsing and expansion are centralized in `crates/scanner-scheduler/src/archive/scan.rs` and delegated to a sink (`ArchiveEntrySink`) for entry scanning.
-- Hardening expectations and review findings are tracked alongside the archive
+- Depth-budget enforcement and decompression-ratio guards live alongside the archive
   scanning implementation in `crates/scanner-scheduler/src/archive/`.
 
 ## Git Repo Open

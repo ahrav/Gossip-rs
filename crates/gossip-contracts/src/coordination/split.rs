@@ -253,7 +253,10 @@ pub fn plan_split_replace<'a>(
 ///
 /// The function preflights fan-out before materializing children or invoking
 /// `cursor_for_child`; if `MAX_SPLIT_CHILDREN` would be exceeded, the callback
-/// is never called.
+/// is never called. `cursor_for_child` receives the `index` of the child
+/// currently being built along with the child's [`ShardSpecRef`]; it must
+/// return the cursor payload that the caller wants the child to inherit,
+/// giving callers control over deterministic cursor materialization.
 ///
 /// # Errors
 ///
@@ -298,6 +301,9 @@ pub fn plan_split_replace_at_points<'a>(
 }
 
 /// Derives a split-replace plan, initializing all child cursors to their starting positions.
+///
+/// Every child receives `CursorUpdate::initial()` so the plan represents a
+/// cold split rather than resuming work mid-range.
 ///
 /// # Errors
 ///
@@ -439,10 +445,11 @@ pub enum SplitResidualPlanningError {
     /// Cursor-derived split point falls outside the parent range.
     #[error("cursor successor falls outside parent range")]
     SplitPointOutOfBounds,
-    /// Residual plan shape invariants failed.
+    /// Residual plan shape invariants failed (the parent and residual specs must differ).
+    /// This wraps the [`SplitResidualPlanError`] returned by [`SplitResidualPlan::try_new`].
     #[error("{0}")]
     InvalidPlan(#[source] SplitResidualPlanError),
-    /// Residual partition validation failed against the parent range.
+    /// Residual partition validation failed against the parent range (see [`validate_residual_split`]).
     #[error("{0}")]
     InvalidCoverage(#[source] SplitValidationError),
 }

@@ -20,6 +20,7 @@ use rstest::rstest;
 use super::*;
 use crate::common::test_util::{default_budgets, make_key};
 
+/// Build a `MemItem` by canonicalizing the byte key and cloning its payload.
 fn make_item(key: &[u8], data: &[u8]) -> MemItem {
     MemItem::new(make_key(key), Vec::from(data))
 }
@@ -31,6 +32,7 @@ fn make_item(key: &[u8], data: &[u8]) -> MemItem {
     vec![make_item(b"a", b"1"), make_item(b"b", b"2"), make_item(b"c", b"3")],
     Cursor::with_last_key(make_key(b"b")),
 )]
+/// Ensures `choose_split_point_range` yields `None` when the split cannot advance (too few items, empty set, or cursor past midpoint).
 fn split_point_returns_none(#[case] items: Vec<MemItem>, #[case] cursor: Cursor) {
     let mut c = InMemoryDeterministicConnector::new(items);
     let split = c
@@ -44,6 +46,7 @@ const BAD_INDEX_BYTES: [u8; 8] = 999u64.to_be_bytes();
 #[rstest]
 #[case::out_of_bounds(&BAD_INDEX_BYTES)]
 #[case::malformed(b"short")]
+/// Invalid reference bytes must cause both `open` and `read_range` to return errors without panic.
 fn invalid_item_ref_returns_error(#[case] ref_bytes: &[u8]) {
     let mut c = InMemoryDeterministicConnector::new(vec![make_item(b"key", b"data")]);
     let bad_ref = ItemRef::try_from_slice(ref_bytes).unwrap();
@@ -57,12 +60,14 @@ fn invalid_item_ref_returns_error(#[case] ref_bytes: &[u8]) {
 
 #[test]
 #[should_panic(expected = "unique item keys")]
+/// Confirms that constructing the connector panics when duplicate keys are provided.
 fn duplicate_keys_panic() {
     let items = vec![make_item(b"dup", b"first"), make_item(b"dup", b"second")];
     InMemoryDeterministicConnector::new(items);
 }
 
 #[test]
+/// Verifies the duplicate-key panic message references the contract while redacting raw key bytes.
 fn duplicate_keys_panic_redacts_item_key() {
     // Use a non-printable byte (\xff) so the negative assertions guard against
     // both `{:?}` byte-array leaks *and* any `from_utf8_lossy` string-form leaks.
@@ -106,6 +111,7 @@ fn duplicate_keys_panic_redacts_item_key() {
 }
 
 #[test]
+/// Passing a shard with `start > end` triggers an error instead of producing a split.
 fn inverted_range_split_returns_error() {
     let items = vec![make_item(b"a", b"1"), make_item(b"b", b"2")];
     let mut c = InMemoryDeterministicConnector::new(items);
@@ -117,6 +123,7 @@ fn inverted_range_split_returns_error() {
 }
 
 #[test]
+/// A valid bounded range should produce a split strictly between the start and end keys.
 fn split_point_valid_returns_key_between_bounds() {
     let items = vec![
         make_item(b"a", b"1"),
@@ -137,6 +144,7 @@ fn split_point_valid_returns_key_between_bounds() {
 }
 
 #[test]
+/// Byte-weighted splitting favors heavy items even when count-based midpoints would differ.
 fn split_point_byte_weight_favors_heavy_items() {
     // Items: a=1 byte, b=1 byte, c=1000 bytes, d=1 byte.
     // Total bytes = 1003. Half = 501.
@@ -161,6 +169,7 @@ fn split_point_byte_weight_favors_heavy_items() {
 }
 
 #[test]
+/// Token-resume capability reflects the connector's `with_tokens` configuration.
 fn caps_reflect_token_setting() {
     let c_with = InMemoryDeterministicConnector::new(vec![]);
     assert!(c_with.caps().token_resume);
@@ -170,6 +179,7 @@ fn caps_reflect_token_setting() {
 }
 
 #[test]
+/// Different connector tags produce distinct stable IDs for the same key/instance.
 fn different_tags_produce_different_stable_ids() {
     use gossip_contracts::identity::{ConnectorTag, ItemIdentityKey};
 
@@ -185,6 +195,7 @@ fn different_tags_produce_different_stable_ids() {
 }
 
 #[test]
+/// Different connector instances (even with the same tag) yield unique stable IDs.
 fn different_instances_produce_different_stable_ids() {
     use crate::IN_MEMORY_CONNECTOR_TAG;
     use gossip_contracts::identity::ItemIdentityKey;
@@ -203,6 +214,7 @@ fn different_instances_produce_different_stable_ids() {
 }
 
 #[test]
+/// `choose_split_point` with a scoped `ShardSpec` should return a split hint when items exist.
 fn choose_split_point_via_shard_spec() {
     let items = vec![
         make_item(b"a", b"1"),
@@ -220,6 +232,7 @@ fn choose_split_point_via_shard_spec() {
 }
 
 #[test]
+/// Unbounded and one-sided shard specs must still expose a split hint if possible.
 fn choose_split_point_via_shard_spec_unbounded_and_one_sided() {
     let items = vec![
         make_item(b"a", b"1"),
@@ -252,6 +265,7 @@ fn choose_split_point_via_shard_spec_unbounded_and_one_sided() {
 }
 
 #[test]
+/// When a byte-weighted median would not advance the shard, the connector falls back to the count midpoint.
 fn split_point_degenerate_first_item_heavy() {
     // When the byte-weighted median lands on the first eligible item, the
     // connector must fall back to a count-based midpoint so the split still
@@ -301,6 +315,7 @@ mod prop {
         #![proptest_config(ProptestConfig::with_cases(proptest_cases(64)))]
 
         #[test]
+        /// Proptest ensures any returned split stays strictly between the cursor and end bounds.
         fn split_point_strictly_between_cursor_and_end(
             items in item_vec_strategy(30),
         ) {
