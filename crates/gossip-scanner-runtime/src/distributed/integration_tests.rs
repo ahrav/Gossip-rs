@@ -1734,7 +1734,7 @@ fn run_git_repo_worker_treats_cursor_covered_target_as_exhausted_empty() {
 /// triggering shard parking. History depth alone is not a parking condition;
 /// only permanent errors qualify.
 #[test]
-fn run_git_repo_worker_completes_large_secret_history() {
+fn run_git_repo_worker_completes_multi_commit_secret_history() {
     let repo = create_git_repo_fixture_with_secret_history(16);
     let mirror_root = tempdir().expect("mirror root");
     let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
@@ -1752,7 +1752,7 @@ fn run_git_repo_worker_completes_large_secret_history() {
         DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
         DistributedRuntimeConfig::default(),
     )
-    .expect("large secret-bearing history should scan successfully");
+    .expect("multi-commit secret-bearing history should scan successfully");
 
     assert_eq!(report.leases_seen, 1);
     assert_eq!(report.shards_scanned, 1);
