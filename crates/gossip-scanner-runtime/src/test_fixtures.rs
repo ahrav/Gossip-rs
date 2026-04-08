@@ -21,12 +21,7 @@ use crate::{
     result_translation::{ItemResult, PersistenceTranslation, ScanTiming, translate_item_result},
 };
 
-/// Run `git` inside `dir`, assert success, and return trimmed stdout.
-pub use gossip_stdx::git_test_support::git_stdout;
-/// Initialize a git repository with the configured author identity.
-pub use gossip_stdx::git_test_support::init_git_repo;
-/// Run `git` inside `dir` and assert the command succeeds.
-pub use gossip_stdx::git_test_support::run_git;
+pub use gossip_stdx::git_test_support::{git_stdout, init_git_repo, run_git};
 
 #[cfg(test)]
 pub(crate) fn test_rule_fingerprint(rule_id: u32) -> RuleFingerprint {

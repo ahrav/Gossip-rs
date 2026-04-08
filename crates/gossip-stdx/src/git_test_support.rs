@@ -25,10 +25,10 @@ pub fn git_available() -> bool {
     Command::new("git").arg("--version").output().is_ok()
 }
 
-/// Run `git` inside `dir`, assert the command succeeds, and return the raw
-/// process output.
-fn assert_git_output(dir: &Path, args: &[&str]) -> Output {
-    let output = Command::new("git")
+/// Spawn `git -C <dir> <args>` and return the raw output. Panics on spawn
+/// failure but does **not** check the exit status.
+fn spawn_git(dir: &Path, args: &[&str]) -> Output {
+    Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -39,7 +39,13 @@ fn assert_git_output(dir: &Path, args: &[&str]) -> Output {
                 dir.display(),
                 args.join(" "),
             )
-        });
+        })
+}
+
+/// Spawn `git -C <dir> <args>`, assert exit-status success, and return the
+/// raw output.
+fn assert_git_output(dir: &Path, args: &[&str]) -> Output {
+    let output = spawn_git(dir, args);
     assert!(
         output.status.success(),
         "git command failed: git -C {} {}\nstdout:{}\nstderr:{}",
@@ -107,18 +113,7 @@ pub fn git_output_raw(dir: &Path, args: &[&str]) -> Output {
 /// Panics only if the git process cannot be spawned.
 #[must_use]
 pub fn try_run_git(dir: &Path, args: &[&str]) -> Output {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to spawn git -C {} {}: {e}",
-                dir.display(),
-                args.join(" "),
-            )
-        })
+    spawn_git(dir, args)
 }
 
 /// Initialize a git repository with a deterministic local author identity.
