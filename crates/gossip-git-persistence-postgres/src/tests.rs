@@ -325,17 +325,17 @@ fn apply_batch_reports_atomic_and_rolls_back_failed_txn() {
             },
         ],
     )
-    .expect_err("constraint violation should reject the whole transaction");
+    .expect_err("oversized key should reject the batch");
 
     assert!(
         err.to_string()
-            .contains("postgres git-persistence operation failed"),
-        "error should be surfaced through the redacted display path: {err}"
+            .contains("postgres git-persistence payload too large"),
+        "oversized payload should be caught before hitting PostgreSQL: {err}"
     );
     assert_eq!(
         GitPersistenceBackend::get(&backend, b"good-key").expect("get should succeed"),
         None,
-        "the successful put must roll back with the failing one"
+        "no keys should be written when the batch is rejected"
     );
 }
 
