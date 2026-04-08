@@ -884,6 +884,26 @@ where
     let (execution, mut stage_metrics) = execution?;
     let complete_time = wall_clock_now();
     if !matches!(execution.finalize_outcome, FinalizeOutcome::Complete) {
+        // Only checkpoint when the scan was externally interrupted (cooperative
+        // abort via the cancellation token). A natural Partial finalize (e.g.,
+        // corrupt blobs, decode failures) is permanent — retrying from a
+        // checkpoint loops indefinitely on the same unrecoverable errors.
+        if cancel.is_cancelled() {
+            let checkpoint = execution.resume_checkpoint.clone().or_else(|| {
+                lease
+                    .resume_cursor()
+                    .last_key()
+                    .map(|_| lease.resume_cursor().clone())
+            });
+            if let Some(checkpoint) = checkpoint {
+                ensure_post_drain_lease_trust(&lease_uncertainty)?;
+                return Ok((
+                    execution.report,
+                    ShardCompletionOutcome::Checkpoint { checkpoint },
+                    stage_metrics,
+                ));
+            }
+        }
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow!(
                 "git repo-frontier shard '{}' finalized partially; outer repo-frontier progress requires a complete durable repo receipt",

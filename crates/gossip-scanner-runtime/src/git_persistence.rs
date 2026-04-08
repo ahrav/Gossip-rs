@@ -42,6 +42,7 @@ use std::num::NonZeroU64;
 use gossip_contracts::persistence::derive_ovid_hash;
 use gossip_contracts::{
     connector::Cursor,
+    connector::TokenBytes,
     connector::VersionId,
     connector::git::RepoKey,
     identity::{ObjectVersionId, StableItemId},
@@ -51,9 +52,10 @@ use gossip_contracts::{
     },
 };
 use scanner_git::{
-    FinalizeOutcome, FinalizeOutput, NS_SEEN_BLOB, OidBytes, PersistError, PersistenceStore,
-    RefWatermark, RefWatermarkStore, RepoOpenError, SeenBitmapDelta, SeenBitmapPersister,
-    SeenBlobStore, SpillError, StartSetId, WriteOp, decode_ref_watermark_value,
+    CheckpointAck, FinalizeOutcome, FinalizeOutput, LoadedScanCheckpoint, NS_SEEN_BLOB, OidBytes,
+    PersistError, PersistenceStore, RefWatermark, RefWatermarkStore, RepoOpenError,
+    ScanCheckpointError, ScanCheckpointSink, SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore,
+    SpillError, StageCheckpoint, StartSetId, WriteOp, decode_ref_watermark_value,
     finalize::{build_ref_wm_key, build_seen_scope_key, build_seen_staging_key},
     roaring_seen::{RoaringSeenBitmap, RoaringSeenStore},
 };
@@ -62,6 +64,31 @@ use crate::commit_model::{
     BoundaryMismatchError, CheckpointAggregatorInput, CompletedUnit, KindMismatchError,
     UnitCommitReceipt,
 };
+
+/// Durable base-state checkpoint key namespace for Git scan resume.
+const NS_GIT_SCAN_CHECKPOINT_BASE: [u8; 4] = *b"gcb\0";
+/// Durable prefix-state checkpoint key namespace for Git scan resume.
+const NS_GIT_SCAN_CHECKPOINT_PREFIX: [u8; 4] = *b"gcp\0";
+
+/// Fixed-size checkpoint key: namespace(4) + repo_id(8) + policy_hash(32) + start_set_id(32) = 76 bytes.
+const GIT_SCAN_CHECKPOINT_KEY_LEN: usize = 4 + 8 + 32 + 32;
+
+/// Stack-allocated checkpoint key that avoids per-call heap allocation.
+type CheckpointKey = [u8; GIT_SCAN_CHECKPOINT_KEY_LEN];
+
+fn build_git_scan_checkpoint_key(
+    namespace: &[u8; 4],
+    repo_id: u64,
+    policy_hash: &[u8; 32],
+    start_set_id: &StartSetId,
+) -> CheckpointKey {
+    let mut key = [0u8; GIT_SCAN_CHECKPOINT_KEY_LEN];
+    key[..4].copy_from_slice(namespace);
+    key[4..12].copy_from_slice(&repo_id.to_le_bytes());
+    key[12..44].copy_from_slice(policy_hash);
+    key[44..76].copy_from_slice(start_set_id);
+    key
+}
 
 /// One backend operation applied by [`GitPersistenceBackend::apply_batch`].
 ///
@@ -174,6 +201,7 @@ pub struct GitPersistenceAdapter<B> {
     backend: B,
     repo_id: u64,
     policy_hash: [u8; 32],
+    start_set_id: StartSetId,
     seen_store: RefCell<Option<RoaringSeenStore>>,
     staging_seen: RefCell<Option<RoaringSeenBitmap>>,
     finalizing: Cell<bool>,
@@ -183,10 +211,23 @@ impl<B> GitPersistenceAdapter<B> {
     /// Construct a runtime Git persistence adapter for one `(repo_id, policy_hash)` scope.
     #[must_use]
     pub fn new(backend: B, repo_id: u64, policy_hash: [u8; 32]) -> Self {
+        Self::new_with_start_set(backend, repo_id, policy_hash, [0; 32])
+    }
+
+    /// Construct a runtime Git persistence adapter for one
+    /// `(repo_id, policy_hash, start_set_id)` scope.
+    #[must_use]
+    pub fn new_with_start_set(
+        backend: B,
+        repo_id: u64,
+        policy_hash: [u8; 32],
+        start_set_id: StartSetId,
+    ) -> Self {
         Self {
             backend,
             repo_id,
             policy_hash,
+            start_set_id,
             seen_store: RefCell::new(None),
             staging_seen: RefCell::new(None),
             finalizing: Cell::new(false),
@@ -197,6 +238,26 @@ impl<B> GitPersistenceAdapter<B> {
     #[must_use]
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// Build the durable base-state checkpoint key for this scan scope.
+    fn checkpoint_base_key(&self) -> CheckpointKey {
+        build_git_scan_checkpoint_key(
+            &NS_GIT_SCAN_CHECKPOINT_BASE,
+            self.repo_id,
+            &self.policy_hash,
+            &self.start_set_id,
+        )
+    }
+
+    /// Build the durable prefix-state checkpoint key for this scan scope.
+    fn checkpoint_prefix_key(&self) -> CheckpointKey {
+        build_git_scan_checkpoint_key(
+            &NS_GIT_SCAN_CHECKPOINT_PREFIX,
+            self.repo_id,
+            &self.policy_hash,
+            &self.start_set_id,
+        )
     }
 
     /// Build the repo-frontier durable receipt for one already-committed finalize.
@@ -289,6 +350,120 @@ impl<B> GitPersistenceAdapter<B> {
     }
 }
 
+/// Distributed Git scan checkpoint sink backed by the persistence backend.
+///
+/// The sink writes scanner-owned base/prefix blobs into backend keys scoped by
+/// `(repo_id, policy_hash, start_set_id)` and remembers the latest
+/// repo-frontier cursor token for the current lease. The token itself is
+/// coordinator-owned; the backend stores only the opaque scanner resume blobs.
+pub(crate) struct GitRepoCheckpointSink<'a, B> {
+    persistence: &'a GitPersistenceAdapter<B>,
+    repo_key: RepoKey,
+    latest_cursor: RefCell<Option<Cursor>>,
+}
+
+impl<'a, B> GitRepoCheckpointSink<'a, B> {
+    /// Build a checkpoint sink for one repo-frontier lease.
+    pub(crate) fn new(persistence: &'a GitPersistenceAdapter<B>, repo_key: RepoKey) -> Self {
+        Self {
+            persistence,
+            repo_key,
+            latest_cursor: RefCell::new(None),
+        }
+    }
+
+    /// Return the latest durable repo-frontier cursor produced by this lease.
+    pub(crate) fn latest_checkpoint_cursor(&self) -> Option<Cursor> {
+        self.latest_cursor.borrow().clone()
+    }
+}
+
+impl<B> ScanCheckpointSink for GitRepoCheckpointSink<'_, B>
+where
+    B: GitPersistenceBackend,
+{
+    fn load_resume_state(&self) -> Result<LoadedScanCheckpoint, ScanCheckpointError> {
+        let keys = vec![
+            self.persistence.checkpoint_base_key().to_vec(),
+            self.persistence.checkpoint_prefix_key().to_vec(),
+        ];
+        let values = self
+            .persistence
+            .backend
+            .multi_get(&keys)
+            .map_err(|error| ScanCheckpointError::backend(error.to_string()))?;
+        if values.len() != keys.len() {
+            return Err(ScanCheckpointError::backend(format!(
+                "checkpoint multi_get returned {} values for {} keys",
+                values.len(),
+                keys.len()
+            )));
+        }
+        let mut values = values.into_iter();
+        let base_state = values.next().flatten();
+        let prefix_state = values.next().flatten();
+        Ok(match (base_state, prefix_state) {
+            (None, None) => LoadedScanCheckpoint::Empty,
+            (Some(base_state), None) => LoadedScanCheckpoint::BaseOnly { base_state },
+            (Some(base_state), Some(prefix_state)) => LoadedScanCheckpoint::BaseAndPrefix {
+                base_state,
+                prefix_state,
+            },
+            (None, Some(_)) => {
+                return Err(ScanCheckpointError::backend(
+                    "checkpoint prefix key exists without base key (orphaned prefix)",
+                ));
+            }
+        })
+    }
+
+    fn notify_stage_complete(
+        &self,
+        checkpoint: &StageCheckpoint<'_>,
+    ) -> Result<CheckpointAck, ScanCheckpointError> {
+        let base_key = self.persistence.checkpoint_base_key();
+        let prefix_key = self.persistence.checkpoint_prefix_key();
+        let mut ops = Vec::with_capacity(2);
+
+        // Crash-consistency note: for non-atomic backends, the ops within
+        // apply_batch may be partially applied. Prefix ops are ordered before
+        // base ops so that the worst-case partial state is "no prefix + old
+        // base" (resumes from PostSpillDedup, which is correct) rather than
+        // "stale prefix + new base" (potential deserialization mismatch).
+        // For atomic backends the ordering is irrelevant — the batch is
+        // all-or-nothing.
+        if let Some(prefix_state) = checkpoint.encode_prefix_state()? {
+            ops.push(GitPersistenceOp::Put {
+                key: prefix_key.to_vec(),
+                value: prefix_state,
+            });
+        } else {
+            ops.push(GitPersistenceOp::Delete {
+                key: prefix_key.to_vec(),
+            });
+        }
+        if let Some(base_state) = checkpoint.encode_base_state()? {
+            ops.push(GitPersistenceOp::Put {
+                key: base_key.to_vec(),
+                value: base_state,
+            });
+        }
+
+        self.persistence
+            .backend
+            .apply_batch(&ops)
+            .map_err(|error| ScanCheckpointError::backend(error.to_string()))?;
+
+        let token = TokenBytes::try_from_vec(checkpoint.resume_token()?)
+            .map_err(|error| ScanCheckpointError::backend(error.to_string()))?;
+        *self.latest_cursor.borrow_mut() = Some(Cursor::with_token(
+            self.repo_key.clone().into_item_key(),
+            token,
+        ));
+        Ok(CheckpointAck::Continue)
+    }
+}
+
 /// Cloned adapters share the backend but start with empty seen-bitmap and
 /// staging caches plus a fresh `finalizing` flag. This deliberate reset
 /// enforces the single-writer invariant: each adapter instance independently
@@ -304,7 +479,12 @@ where
     B: Clone,
 {
     fn clone(&self) -> Self {
-        Self::new(self.backend.clone(), self.repo_id, self.policy_hash)
+        Self::new_with_start_set(
+            self.backend.clone(),
+            self.repo_id,
+            self.policy_hash,
+            self.start_set_id,
+        )
     }
 }
 
@@ -626,6 +806,8 @@ where
 
         let seen_scope_key = self.seen_scope_key();
         let seen_staging_key = self.seen_staging_key();
+        let checkpoint_base_key = self.checkpoint_base_key();
+        let checkpoint_prefix_key = self.checkpoint_prefix_key();
         let seen_namespace = NS_SEEN_BLOB.as_slice();
 
         // Step 2: partition data ops into non-seen ops (forwarded as-is)
@@ -730,9 +912,27 @@ where
         } else {
             Vec::new()
         };
+        let checkpoint_delete_ops: Vec<_> = if is_complete {
+            // Delete prefix before base so a crash between the two deletes on
+            // non-atomic backends leaves a valid BaseOnly state (rather than an
+            // orphaned prefix that load_resume_state rejects as an error).
+            vec![
+                GitPersistenceOp::Delete {
+                    key: checkpoint_prefix_key.to_vec(),
+                },
+                GitPersistenceOp::Delete {
+                    key: checkpoint_base_key.to_vec(),
+                },
+            ]
+        } else {
+            // Partial finalize: preserve checkpoint keys so the next reclaim
+            // can resume from the durable mid-scan anchor.
+            Vec::new()
+        };
 
         if self.backend.supports_atomic_batches() {
             let mut all_ops = first_phase_ops;
+            all_ops.extend(checkpoint_delete_ops.iter().cloned());
             if has_staging {
                 all_ops.push(GitPersistenceOp::Delete {
                     key: seen_staging_key,
@@ -750,7 +950,8 @@ where
             return Ok(());
         }
 
-        // Non-atomic path: write data+seen first, then advance watermarks.
+        // Non-atomic path: write data+seen first, then advance watermarks,
+        // then delete checkpoint keys last.
         //
         // For complete finalize, the staging Delete is in a separate batch
         // AFTER the seen scope Put so a crash between batches cannot lose
@@ -767,6 +968,10 @@ where
         // bitmap from the backend while watermarks remain at the old
         // position. The next scan re-walks the same commit range but skips
         // already-seen blobs, producing no duplicate findings.
+        //
+        // Checkpoint deletes are applied in a final batch so that a crash
+        // before watermarks are durable leaves the checkpoint intact for
+        // resume instead of forcing a full re-scan.
         if has_staging && !is_complete {
             first_phase_ops.push(GitPersistenceOp::Delete {
                 key: seen_staging_key.clone(),
@@ -790,6 +995,11 @@ where
         if !watermark_ops.is_empty() {
             self.backend
                 .apply_batch(&watermark_ops)
+                .map_err(|err| PersistError::backend(err.to_string()))?;
+        }
+        if !checkpoint_delete_ops.is_empty() {
+            self.backend
+                .apply_batch(&checkpoint_delete_ops)
                 .map_err(|err| PersistError::backend(err.to_string()))?;
         }
         Ok(())
@@ -826,7 +1036,10 @@ pub mod test_support {
 
     use scanner_git::{NS_BLOB_CTX, NS_FINDING, NS_REF_WATERMARK, NS_SEEN_STAGING};
 
-    use super::{GitPersistenceBackend, GitPersistenceOp, NS_SEEN_BLOB};
+    use super::{
+        GitPersistenceBackend, GitPersistenceOp, NS_GIT_SCAN_CHECKPOINT_BASE,
+        NS_GIT_SCAN_CHECKPOINT_PREFIX, NS_SEEN_BLOB,
+    };
 
     /// Error type returned by [`TestBackend`] when fault injection fires.
     #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -842,6 +1055,8 @@ pub mod test_support {
     pub enum KeyNamespace {
         BlobCtx,
         Finding,
+        CheckpointBase,
+        CheckpointPrefix,
         SeenScope,
         SeenStaging,
         Watermark,
@@ -858,6 +1073,10 @@ pub mod test_support {
                 Self::BlobCtx
             } else if key.starts_with(&NS_FINDING) {
                 Self::Finding
+            } else if key.starts_with(&NS_GIT_SCAN_CHECKPOINT_BASE) {
+                Self::CheckpointBase
+            } else if key.starts_with(&NS_GIT_SCAN_CHECKPOINT_PREFIX) {
+                Self::CheckpointPrefix
             } else if key.starts_with(&NS_SEEN_BLOB) {
                 Self::SeenScope
             } else if key.starts_with(&NS_SEEN_STAGING) {
@@ -1276,7 +1495,11 @@ mod tests {
 
     use super::test_support::*;
     use super::*;
-    use scanner_git::{NS_REF_WATERMARK, NS_SEEN_STAGING};
+    use scanner_git::{
+        ByteArena, GitScanCommonMetrics, GitScanMode, MappingStats, NS_REF_WATERMARK,
+        NS_SEEN_STAGING, RepoArtifactFingerprint, ScanResumeState, ScannedBlobs, SpillStats,
+        TreeDiffStats,
+    };
 
     fn write_context() -> WriteContext {
         WriteContext::new(
@@ -1290,6 +1513,10 @@ mod tests {
 
     fn repo_key() -> RepoKey {
         RepoKey::for_local_path(b"/tmp/runtime-repo.git").expect("repo key")
+    }
+
+    fn start_set_id(byte: u8) -> StartSetId {
+        [byte; 32]
     }
 
     fn finalize_output(outcome: FinalizeOutcome) -> FinalizeOutput {
@@ -1395,6 +1622,177 @@ mod tests {
             &build_seen_staging_key(repo_id, policy_hash),
             "staging",
             oids,
+        );
+    }
+
+    #[test]
+    fn checkpoint_sink_round_trips_base_and_prefix_payloads() {
+        let backend = TestBackend::atomic();
+        let adapter =
+            GitPersistenceAdapter::new_with_start_set(backend, 77, [0x77; 32], start_set_id(0x33));
+        let sink = GitRepoCheckpointSink::new(&adapter, repo_key());
+        let plan = Vec::<scanner_git::PlannedCommit>::new();
+        let path_arena = ByteArena::with_capacity(0);
+        let scanned = ScannedBlobs {
+            blobs: Vec::new(),
+            finding_arena: Vec::new(),
+        };
+
+        let fingerprint = RepoArtifactFingerprint {
+            packs_hash: [0x11; 32],
+            idx_hash: [0x22; 32],
+        };
+
+        sink.notify_stage_complete(&StageCheckpoint::PostSpillDedup {
+            scan_mode: GitScanMode::OdbBlobFast,
+            artifact_fingerprint: &fingerprint,
+            plan: &plan,
+            packed: &[],
+            loose: &[],
+            path_arena: &path_arena,
+            tree_diff_stats: TreeDiffStats::default(),
+            spill_stats: SpillStats::default(),
+            mapping_stats: MappingStats::default(),
+        })
+        .expect("base checkpoint should persist");
+
+        let base_only = sink
+            .load_resume_state()
+            .expect("base checkpoint should load");
+        assert!(
+            matches!(base_only, LoadedScanCheckpoint::BaseOnly { .. }),
+            "base-only checkpoint should load as BaseOnly"
+        );
+
+        let decoded_base =
+            ScanResumeState::from_loaded(base_only, GitScanMode::OdbBlobFast, &fingerprint)
+                .expect("base decode must succeed")
+                .expect("base state must be present");
+        assert!(
+            matches!(decoded_base, ScanResumeState::PostSpillDedup(..)),
+            "base-only checkpoint should decode as PostSpillDedup"
+        );
+
+        sink.notify_stage_complete(&StageCheckpoint::PackPlanComplete {
+            scan_mode: GitScanMode::OdbBlobFast,
+            artifact_fingerprint: &fingerprint,
+            plan: &plan,
+            packed: &[],
+            loose: &[],
+            path_arena: &path_arena,
+            tree_diff_stats: TreeDiffStats::default(),
+            spill_stats: SpillStats::default(),
+            mapping_stats: MappingStats::default(),
+            completed_plan_count: 0,
+            scanned: &scanned,
+            skipped_candidates: &[],
+            common_metrics: GitScanCommonMetrics::default(),
+        })
+        .expect("prefix checkpoint should persist");
+
+        let loaded = sink
+            .load_resume_state()
+            .expect("base and prefix checkpoints should load");
+        assert!(
+            matches!(loaded, LoadedScanCheckpoint::BaseAndPrefix { .. }),
+            "full checkpoint should load as BaseAndPrefix"
+        );
+
+        let decoded_full =
+            ScanResumeState::from_loaded(loaded, GitScanMode::OdbBlobFast, &fingerprint)
+                .expect("full decode must succeed")
+                .expect("full state must be present");
+        match &decoded_full {
+            ScanResumeState::PackPlanComplete { prefix, .. } => {
+                assert_eq!(
+                    prefix.completed_plan_count, 0,
+                    "completed_plan_count must match the value set during checkpoint"
+                );
+            }
+            other => panic!(
+                "expected PackPlanComplete, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+
+        let cursor = sink
+            .latest_checkpoint_cursor()
+            .expect("checkpoint cursor should be captured");
+        assert_eq!(cursor.last_key(), Some(&repo_key().into_item_key()));
+        assert!(cursor.token().is_some());
+    }
+
+    #[test]
+    fn commit_finalize_clears_git_scan_checkpoint_keys() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new_with_start_set(
+            backend.clone(),
+            78,
+            [0x78; 32],
+            start_set_id(0x44),
+        );
+        let sink = GitRepoCheckpointSink::new(&adapter, repo_key());
+        let plan = Vec::<scanner_git::PlannedCommit>::new();
+
+        sink.notify_stage_complete(&StageCheckpoint::PostCommitPlan {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &scanner_git::RepoArtifactFingerprint {
+                packs_hash: [0x31; 32],
+                idx_hash: [0x32; 32],
+            },
+            plan: &plan,
+        })
+        .expect("checkpoint should persist");
+
+        let base_key = adapter.checkpoint_base_key();
+        let prefix_key = adapter.checkpoint_prefix_key();
+        assert!(backend.contains_key(&base_key));
+
+        adapter
+            .commit_finalize(&finalize_output(FinalizeOutcome::Complete))
+            .expect("finalize should clear checkpoints");
+
+        assert!(!backend.contains_key(&base_key));
+        assert!(!backend.contains_key(&prefix_key));
+    }
+
+    #[test]
+    fn partial_finalize_preserves_checkpoint_keys() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new_with_start_set(
+            backend.clone(),
+            79,
+            [0x79; 32],
+            start_set_id(0x45),
+        );
+        let sink = GitRepoCheckpointSink::new(&adapter, repo_key());
+        let plan = Vec::<scanner_git::PlannedCommit>::new();
+
+        sink.notify_stage_complete(&StageCheckpoint::PostCommitPlan {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &scanner_git::RepoArtifactFingerprint {
+                packs_hash: [0x41; 32],
+                idx_hash: [0x42; 32],
+            },
+            plan: &plan,
+        })
+        .expect("checkpoint should persist");
+
+        let base_key = adapter.checkpoint_base_key();
+        assert!(backend.contains_key(&base_key));
+
+        adapter
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+                stats: Default::default(),
+            })
+            .expect("partial finalize should succeed");
+
+        assert!(
+            backend.contains_key(&base_key),
+            "partial finalize must preserve base checkpoint for resume"
         );
     }
 
@@ -2770,9 +3168,9 @@ mod tests {
             Some(&[0xBB][..]),
             "watermarks must land on complete finalize"
         );
-        // Non-atomic: exactly 4 batches (staging persist, first-phase
-        // data+seen, staging delete, second-phase watermarks).
-        assert_eq!(backend.batches().len(), 4);
+        // Non-atomic: exactly 5 batches (staging persist, first-phase
+        // data+seen, staging delete, watermarks, checkpoint deletes).
+        assert_eq!(backend.batches().len(), 5);
     }
 
     #[test]

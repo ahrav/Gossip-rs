@@ -50,6 +50,10 @@ use super::artifact_acquire::{
     ArtifactBuildLimits,
 };
 use super::byte_arena::ByteArena;
+use super::checkpoint::{
+    CheckpointAck, NoopCheckpointSink, ScanCheckpointError, ScanCheckpointSink, ScanResumeState,
+    StageCheckpoint,
+};
 use super::commit_graph::CommitGraphIndex;
 use super::commit_walk::introduced_by_plan;
 use super::commit_walk_limits::CommitWalkLimits;
@@ -92,6 +96,17 @@ pub(super) fn check_abort(abort: &AtomicBool) -> Result<(), GitScanError> {
         return Err(TreeDiffError::Aborted.into());
     }
     Ok(())
+}
+
+#[inline]
+pub(super) fn checkpoint_stage(
+    sink: &dyn ScanCheckpointSink,
+    checkpoint: &StageCheckpoint<'_>,
+) -> Result<(), GitScanError> {
+    match sink.notify_stage_complete(checkpoint)? {
+        CheckpointAck::Continue => Ok(()),
+        CheckpointAck::Abort => Err(GitScanError::CheckpointAbort),
+    }
 }
 
 /// Limits for pack file mmapping during scan execution.
@@ -254,6 +269,22 @@ impl Default for GitScanConfig {
     }
 }
 
+/// Caller-owned runtime context for one Git scan invocation.
+pub struct GitScanRunContext<'a> {
+    /// Seen-blob lookup store.
+    pub seen_store: &'a dyn SeenBlobStore,
+    /// Ref watermark lookup store.
+    pub watermark_store: &'a dyn RefWatermarkStore,
+    /// Optional finalize persistence store.
+    pub persist_store: Option<&'a dyn PersistenceStore>,
+    /// Stage checkpoint sink.
+    pub checkpoint_sink: &'a dyn ScanCheckpointSink,
+    /// Cooperative cancellation flag.
+    pub abort: &'a AtomicBool,
+    /// Structured event sink.
+    pub event_sink: std::sync::Arc<dyn crate::events::EventSink>,
+}
+
 /// Baseline pack-exec worker budget.
 ///
 /// Uses detected hardware parallelism (1× cores). CLI orchestration may
@@ -278,6 +309,18 @@ fn detected_parallelism() -> usize {
 /// On a 64-core machine with the 6x large-repo multiplier the uncapped
 /// count would be 384, consuming over 1.5 GiB in cache alone.
 pub(crate) const MAX_PACK_EXEC_WORKERS: usize = 128;
+
+/// Minimum number of pack plan completions between durable checkpoints.
+///
+/// Checkpointing serializes all accumulated scan results (scanned blobs,
+/// findings, skip records) into a prefix payload. For repos with many
+/// pack plans, checkpointing on every plan completion creates O(N^2) total
+/// serialized bytes across the scan because the payload grows
+/// monotonically. Throttling to every `N` plans reduces this to
+/// O(N/interval * N) = O(N^2/interval), a constant-factor improvement.
+/// The PreFinalize checkpoint emitted after all plans ensures no trailing
+/// work is lost.
+pub(crate) const CHECKPOINT_PLAN_INTERVAL: usize = 10;
 
 /// Repositories below this `in-pack` object count use the baseline 1× core
 /// multiplier for pack execution.
@@ -863,6 +906,9 @@ pub enum GitScanError {
     /// Persistence store write failed.
     #[error("{0}")]
     Persist(#[from] PersistError),
+    /// Stage checkpoint load or store failed.
+    #[error("{0}")]
+    Checkpoint(#[from] ScanCheckpointError),
     /// Underlying I/O error not covered by a more specific variant.
     #[error("{0}")]
     Io(#[from] io::Error),
@@ -879,6 +925,9 @@ pub enum GitScanError {
     /// or `git repack` invalidated the planned offsets. Callers should retry.
     #[error("concurrent git maintenance detected; artifacts changed during scan")]
     ConcurrentMaintenance,
+    /// Cooperative abort signalled by checkpoint sink.
+    #[error("scan aborted by checkpoint sink")]
+    CheckpointAbort,
 }
 
 /// Runs a full Git scan with the provided configuration and stores.
@@ -946,7 +995,6 @@ pub enum GitScanError {
 /// # Caveats
 /// - Loose object decode failures are recorded as skipped candidates and may
 ///   yield a `FinalizeOutcome::Partial`, suppressing watermark writes.
-#[allow(clippy::too_many_arguments)]
 pub fn run_git_scan(
     repo_root: &Path,
     engine: std::sync::Arc<Engine>,
@@ -958,7 +1006,32 @@ pub fn run_git_scan(
     abort: &AtomicBool,
     event_sink: std::sync::Arc<dyn crate::events::EventSink>,
 ) -> Result<GitScanResult, GitScanError> {
-    check_abort(abort)?;
+    let noop_checkpoint_sink = NoopCheckpointSink;
+    run_git_scan_with_context(
+        repo_root,
+        engine,
+        resolver,
+        config,
+        GitScanRunContext {
+            seen_store,
+            watermark_store,
+            persist_store,
+            checkpoint_sink: &noop_checkpoint_sink,
+            abort,
+            event_sink,
+        },
+    )
+}
+
+/// Runs a full Git scan with caller-provided persistence and checkpoint sinks.
+pub fn run_git_scan_with_context(
+    repo_root: &Path,
+    engine: std::sync::Arc<Engine>,
+    resolver: &dyn StartSetResolver,
+    config: &GitScanConfig,
+    context: GitScanRunContext<'_>,
+) -> Result<GitScanResult, GitScanError> {
+    check_abort(context.abort)?;
     scanner_engine::perf_counters::reset();
 
     let start_set_id = config.start_set.id();
@@ -968,7 +1041,7 @@ pub fn run_git_scan(
         config.policy_hash,
         start_set_id,
         resolver,
-        watermark_store,
+        context.watermark_store,
         config.repo_open,
     )?;
 
@@ -997,10 +1070,37 @@ pub fn run_git_scan(
         (cg, None)
     };
 
+    let artifact_fingerprint = repo
+        .artifact_fingerprint
+        .clone()
+        .ok_or_else(|| GitScanError::Io(io::Error::other("artifact fingerprint missing")))?;
+    let resume_state = ScanResumeState::from_loaded(
+        context.checkpoint_sink.load_resume_state()?,
+        config.scan_mode,
+        &artifact_fingerprint,
+    )?;
+
     // Commit plan (shared across both modes).
-    perf_let!(plan_start = Instant::now());
-    let plan = introduced_by_plan(&repo, &cg, config.commit_walk)?;
-    perf_let!(commit_plan_nanos = plan_start.elapsed().as_nanos() as u64);
+    perf_let!(mut commit_plan_nanos = 0u64);
+    let plan = if let Some(resume_state) = &resume_state {
+        resume_state.plan().to_vec()
+    } else {
+        perf_let!(plan_start = Instant::now());
+        let plan = introduced_by_plan(&repo, &cg, config.commit_walk)?;
+        #[cfg(feature = "git-perf")]
+        {
+            commit_plan_nanos = plan_start.elapsed().as_nanos() as u64;
+        }
+        checkpoint_stage(
+            context.checkpoint_sink,
+            &StageCheckpoint::PostCommitPlan {
+                scan_mode: config.scan_mode,
+                artifact_fingerprint: &artifact_fingerprint,
+                plan: &plan,
+            },
+        )?;
+        plan
+    };
 
     // Build commit-graph index and emit-once bitset (shared by both modes).
     let cg_index = std::sync::Arc::new(CommitGraphIndex::build_from_mem(&cg)?);
@@ -1009,19 +1109,19 @@ pub fn run_git_scan(
 
     // Emit identity dictionary before any CommitMeta events.
     if let Some(ref interner) = identity_interner {
-        emit_identity_dictionary(&*event_sink, interner);
+        emit_identity_dictionary(&*context.event_sink, interner);
     }
-    check_abort(abort)?;
+    check_abort(context.abort)?;
 
     // Dispatch to mode-specific pipeline.
     let mk_commit_meta = || CommitMetaContext {
-        event_sink: std::sync::Arc::clone(&event_sink),
+        event_sink: std::sync::Arc::clone(&context.event_sink),
         commit_graph_index: std::sync::Arc::clone(&cg_index),
         commit_meta_seen: std::sync::Arc::clone(&commit_meta_seen),
         identity_interner: identity_interner.clone(),
     };
     let null_seen_persister = NullSeenBitmapPersister;
-    let seen_persister: &dyn SeenBitmapPersister = match persist_store {
+    let seen_persister: &dyn SeenBitmapPersister = match context.persist_store {
         Some(store) => store,
         None => &null_seen_persister,
     };
@@ -1030,23 +1130,27 @@ pub fn run_git_scan(
         GitScanMode::OdbBlobFast => super::runner_odb_blob::run_odb_blob(
             &repo,
             std::sync::Arc::clone(&engine),
-            seen_store,
+            context.seen_store,
             seen_persister,
             &cg_index,
             &plan,
             config,
-            abort,
+            context.abort,
+            resume_state,
+            context.checkpoint_sink,
             mk_commit_meta(),
         )?,
         GitScanMode::DiffHistory => super::runner_diff_history::run_diff_history(
             &repo,
             std::sync::Arc::clone(&engine),
-            seen_store,
+            context.seen_store,
             seen_persister,
             &cg,
             &plan,
             config,
-            abort,
+            context.abort,
+            resume_state,
+            context.checkpoint_sink,
             mk_commit_meta(),
         )?,
     };
@@ -1056,7 +1160,7 @@ pub fn run_git_scan(
     if !repo.artifacts_unchanged()? {
         return Err(GitScanError::ConcurrentMaintenance);
     }
-    check_abort(abort)?;
+    check_abort(context.abort)?;
 
     // Finalize + persist.
     let refs = build_ref_entries(&repo, &cg)?;
@@ -1080,9 +1184,9 @@ pub fn run_git_scan(
 
     // Re-check after building FinalizeInput: for large repos the
     // collect + build can take non-trivial time.
-    check_abort(abort)?;
+    check_abort(context.abort)?;
 
-    if let Some(store) = persist_store {
+    if let Some(store) = context.persist_store {
         persist_finalize_output(store, &finalize)?;
     }
 
@@ -1305,5 +1409,46 @@ mod tests {
                 "expected stable key in metrics output: {key}"
             );
         }
+    }
+
+    /// A checkpoint sink that returns Abort must cause `checkpoint_stage` to
+    /// return `GitScanError::CheckpointAbort`.
+    #[test]
+    fn checkpoint_stage_abort_propagates_as_error() {
+        use crate::checkpoint::{
+            CheckpointAck, LoadedScanCheckpoint, ScanCheckpointError, ScanCheckpointSink,
+            StageCheckpoint,
+        };
+        use crate::RepoArtifactFingerprint;
+
+        struct AbortingSink;
+        impl ScanCheckpointSink for AbortingSink {
+            fn load_resume_state(&self) -> Result<LoadedScanCheckpoint, ScanCheckpointError> {
+                Ok(LoadedScanCheckpoint::Empty)
+            }
+            fn notify_stage_complete(
+                &self,
+                _checkpoint: &StageCheckpoint<'_>,
+            ) -> Result<CheckpointAck, ScanCheckpointError> {
+                Ok(CheckpointAck::Abort)
+            }
+        }
+
+        let fp = RepoArtifactFingerprint {
+            packs_hash: [0xAA; 32],
+            idx_hash: [0xBB; 32],
+        };
+        let checkpoint = StageCheckpoint::PostCommitPlan {
+            scan_mode: GitScanMode::DiffHistory,
+            artifact_fingerprint: &fp,
+            plan: &[],
+        };
+
+        let err = checkpoint_stage(&AbortingSink, &checkpoint)
+            .expect_err("Abort signal must produce an error");
+        assert!(
+            matches!(err, GitScanError::CheckpointAbort),
+            "expected CheckpointAbort, got: {err:?}"
+        );
     }
 }
