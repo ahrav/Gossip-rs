@@ -602,7 +602,7 @@ pub(crate) mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use gossip_stdx::git_test_support::{git_output_raw, git_stdout, init_git_repo, try_run_git};
+    use gossip_stdx::git_test_support::{git_stdout, init_git_repo, try_run_git};
     use rstest::rstest;
 
     use super::*;
