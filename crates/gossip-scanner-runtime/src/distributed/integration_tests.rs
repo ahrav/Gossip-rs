@@ -1730,6 +1730,62 @@ fn run_git_repo_worker_treats_cursor_covered_target_as_exhausted_empty() {
     );
 }
 
+#[test]
+fn run_git_repo_worker_completes_large_secret_history() {
+    let repo = create_git_repo_fixture_with_secret_history(16);
+    let mirror_root = tempdir().expect("mirror root");
+    let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+    let backend = TestGitBackend::default();
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let mut coordinator =
+        setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+    let report = run_git_repo_worker(
+        &mut coordinator,
+        &mut mirrors,
+        git_worker_identity(repo.path()),
+        backend,
+        DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
+        DistributedRuntimeConfig::default(),
+    )
+    .expect("large secret-bearing history should scan successfully");
+
+    assert_eq!(report.leases_seen, 1);
+    assert_eq!(report.shards_scanned, 1);
+    assert_eq!(run_progress(&coordinator).done(), 1);
+    assert_eq!(
+        shard_summaries(&coordinator)[0].status(),
+        ShardStatus::Done,
+        "history depth alone must not park or strand the shard"
+    );
+
+    let persisted = findings_sink
+        .findings_snapshot()
+        .expect("findings snapshot");
+    assert!(
+        !persisted.is_empty(),
+        "secret-bearing history should produce persisted findings"
+    );
+
+    let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+    assert_eq!(
+        rows.len(),
+        1,
+        "singleton repo shard produces one done-ledger row"
+    );
+    assert_eq!(
+        rows[0].status(),
+        DoneLedgerStatus::ScannedWithFindings,
+        "secret-bearing history should produce a findings-bearing done-ledger row"
+    );
+    assert_eq!(
+        rows[0].findings_count(),
+        persisted.len() as u32,
+        "done-ledger findings_count must match persisted findings"
+    );
+}
+
 /// Git repo-frontier shards require `CursorSemantics::Completed` so the
 /// checkpoint cursor represents fully-processed and durable progress.
 /// `Dispatched` semantics are rejected before any scan work begins.

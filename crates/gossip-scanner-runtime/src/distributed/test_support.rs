@@ -444,6 +444,33 @@ pub(super) fn create_git_repo_fixture_with_secrets() -> tempfile::TempDir {
     dir
 }
 
+/// Git repo fixture with repeated secret-bearing commits across one file.
+pub(super) fn create_git_repo_fixture_with_secret_history(
+    commit_count: usize,
+) -> tempfile::TempDir {
+    assert!(
+        commit_count > 0,
+        "secret-history fixture requires at least one commit"
+    );
+
+    let dir = tempdir().expect("tempdir");
+    init_git_repo(
+        dir.path(),
+        "distributed-runtime-tests@example.com",
+        "Distributed Runtime Tests",
+    );
+
+    for commit in 0..commit_count {
+        let contents = format!("{}\ncommit-{commit}\n", secret_fixture());
+        fs::write(dir.path().join("secret.txt"), contents).expect("write fixture");
+        run_git_in(dir.path(), &["add", "."]);
+        let message = format!("fixture-{commit}");
+        run_git_in(dir.path(), &["commit", "-q", "-m", message.as_str()]);
+    }
+
+    dir
+}
+
 /// Git repo fixture with benign content that produces zero findings.
 pub(super) fn create_clean_git_repo_fixture() -> tempfile::TempDir {
     let dir = tempdir().expect("tempdir");
