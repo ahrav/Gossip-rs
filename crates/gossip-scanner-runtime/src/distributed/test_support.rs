@@ -432,16 +432,7 @@ pub(super) fn successor_bytes(bytes: &[u8]) -> Vec<u8> {
 
 /// Git repo fixture seeded with a secret so scans produce at least one finding.
 pub(super) fn create_git_repo_fixture_with_secrets() -> tempfile::TempDir {
-    let dir = tempdir().expect("tempdir");
-    init_git_repo(
-        dir.path(),
-        "distributed-runtime-tests@example.com",
-        "Distributed Runtime Tests",
-    );
-    fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
-    run_git_in(dir.path(), &["add", "."]);
-    run_git_in(dir.path(), &["commit", "-q", "-m", "fixture"]);
-    dir
+    create_git_repo_fixture_with_secret_history(1)
 }
 
 /// Git repo fixture where each commit introduces a secret in a distinct file.
