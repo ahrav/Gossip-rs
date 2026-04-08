@@ -197,6 +197,17 @@ and `types.rs`.
 | `crates/gossip-scanner-runtime/src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregation |
 | `crates/gossip-scanner-runtime/src/coordination_sink.rs` | Coordination event recorder payloads for distributed scans |
 | `crates/gossip-scanner-runtime/src/distributed.rs` | Distributed worker-loop runtime and receipt-backed commit plumbing |
+| `crates/gossip-scanner-runtime/src/cli_tests.rs` | [Undocumented] |
+| `crates/gossip-scanner-runtime/src/distributed/commit_bridge.rs` | [Undocumented] |
+| `crates/gossip-scanner-runtime/src/distributed/execution.rs` | [Undocumented] |
+| `crates/gossip-scanner-runtime/src/distributed/integration_tests.rs` | [Undocumented] |
+| `crates/gossip-scanner-runtime/src/distributed/lease_ops.rs` | [Undocumented] |
+| `crates/gossip-scanner-runtime/src/distributed/test_support.rs` | [Undocumented] |
+| `crates/gossip-scanner-runtime/src/distributed/types.rs` | [Undocumented] |
+| `crates/gossip-scanner-runtime/src/distributed/unit_tests.rs` | [Undocumented] |
+| `crates/gossip-scanner-runtime/src/lib_tests.rs` | [Undocumented] |
+| `crates/gossip-scanner-runtime/src/runtime_durability_tests.rs` | [Undocumented] |
+| `crates/gossip-scanner-runtime/src/test_fixtures.rs` | [Undocumented] |
 
 ---
 
