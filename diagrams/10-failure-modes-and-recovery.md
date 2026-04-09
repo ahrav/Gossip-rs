@@ -229,8 +229,8 @@ sequenceDiagram
         W->>W: scan(content) → findings[]
         W->>W: Accumulate findings in memory
 
-        W--xCO: commit(token=5, cursor=page_4) → TIMEOUT
-        Note over W: Commit fails. Cannot advance cursor.
+        W--xCO: checkpoint(token=5, cursor=page_4) → TIMEOUT
+        Note over W: Checkpoint fails. Cannot advance cursor.
 
         W->>W: Park shard locally.<br/>Wait for network recovery.
     end
@@ -245,7 +245,7 @@ sequenceDiagram
     W->>CN: enumerate(page_3)
     CN-->>W: Page(items[], next_cursor)
     W->>W: Re-scan, accumulate findings
-    W->>CO: commit(token=6, cursor=page_4, findings)
+    W->>CO: checkpoint(token=6, cursor=page_4)
     CO-->>W: Ok(cursor advanced)
 
     rect rgb(220, 252, 231)
@@ -387,10 +387,10 @@ sequenceDiagram
     participant W2 as Worker 2 (current token=6)
 
     Note over W1,W2: After partition heals
-    W2->>CO: commit(token=6, cursor=page_3)
+    W2->>CO: checkpoint(token=6, cursor=page_3)
     CO-->>W2: Ok (6 == 6 ✓)
 
-    W1->>CO: commit(token=5, cursor=page_3)
+    W1->>CO: checkpoint(token=5, cursor=page_3)
     CO--xW1: Err(StaleFence: 5 != 6)
 
     Note over W1,W2: Single-writer invariant maintained (INV-S10)
@@ -401,8 +401,8 @@ sequenceDiagram
 > [Fencing Protocol -- Diagram 2: Zombie Worker Resolution](06-fencing-protocol.md).
 
 The diagram illustrates the fundamental asymmetry of the fencing protocol.
-Worker 2's commit succeeds because `6 == 6` is true -- it holds the current
-token and is the rightful owner. Worker 1's commit fails because `5 != 6` --
+Worker 2's checkpoint succeeds because `6 == 6` is true -- it holds the current
+token and is the rightful owner. Worker 1's checkpoint fails because `5 != 6` --
 its token is stale, and no amount of retrying will make it valid again. The
 only option for Worker 1 is to stop, discard its in-flight work, and
 re-acquire the shard if it wants to continue (which would give it token 7).
