@@ -674,7 +674,6 @@ mod tests {
 
     #[derive(Debug)]
     struct SmallModelPack {
-        pack_id: u16,
         pack_name: Vec<u8>,
         idx_bytes: Vec<u8>,
         objects: Vec<([u8; 20], u64)>,
@@ -812,7 +811,6 @@ mod tests {
                     builder.add_object(oid, offset);
                 }
                 SmallModelPack {
-                    pack_id: pack_idx as u16,
                     pack_name: format!("pack-{pack_idx}.pack").into_bytes(),
                     idx_bytes: builder.build(),
                     objects,
