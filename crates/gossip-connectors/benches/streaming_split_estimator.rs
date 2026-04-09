@@ -31,6 +31,10 @@ mod unix_bench {
     ///
     /// This benchmark varies only the estimator `sample_cap`; it does not model
     /// filesystem traversal or randomized key distributions.
+    ///
+    /// The sampled caps (`128`, `512`, `1024`) are intentionally spaced to
+    /// exercise low, mid, and higher bounded-memory operating points without
+    /// changing any other workload dimension.
     pub fn bench_observe(c: &mut Criterion) {
         let mut group = c.benchmark_group("streaming_split_estimator_observe");
         // Keep the benchmark's stream shape pinned to the allocation guard so
@@ -69,8 +73,6 @@ mod unix_bench {
 #[cfg(unix)]
 criterion::criterion_main!(unix_bench::benches);
 
-// On non-Unix platforms the estimator (and its benchmark hook) is unavailable,
-// so the bench binary compiles but does nothing.
 #[cfg(not(unix))]
 /// No-op entrypoint for non-Unix targets where the estimator benchmark hook is
 /// not exported.
