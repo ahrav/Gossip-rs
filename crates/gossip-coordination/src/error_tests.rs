@@ -1,3 +1,16 @@
+//! Error-surface regression tests for coordination error types.
+//!
+//! This module treats error behavior as a public contract. It verifies:
+//! - conversion boundaries from `CoordError` into operation-specific errors,
+//! - stable `Display`/`Debug` formatting expectations,
+//! - redaction guarantees for tenant identity, worker identity, and hash-like
+//!   values,
+//! - `source()` chain semantics for wrapped versus terminal errors,
+//! - edge behavior for fixed-size scratch/buffer utilities.
+//!
+//! The tests intentionally group `CoordError` variants to keep `From`
+//! conversion coverage explicit and maintainable as variants evolve.
+//!
 use std::error::Error;
 use std::fmt;
 
@@ -55,6 +68,8 @@ fn op_id_conflict_variant() -> CoordError {
     }
 }
 
+/// Cursor-related variants that are accepted by checkpoint/complete paths and
+/// rejected by operation paths that do not consume cursor state.
 fn cursor_variants() -> Vec<CoordError> {
     vec![
         CoordError::CursorRegression {
@@ -77,10 +92,13 @@ fn cursor_variants() -> Vec<CoordError> {
     ]
 }
 
+/// Split validation failure used to verify conversion rejection/acceptance
+/// boundaries across operation-specific error types.
 fn split_invalid_variant() -> CoordError {
     CoordError::SplitInvalid(SplitValidationError::NoChildren)
 }
 
+/// Variant specific to checkpoint/complete flows.
 fn checkpoint_missing_key_variant() -> CoordError {
     CoordError::CheckpointMissingKey
 }
@@ -465,6 +483,7 @@ fn oob_error() -> CoordError {
     })
 }
 
+/// Regression helper for cursor-regression variants carrying redacted lengths.
 fn regression_error() -> CoordError {
     CoordError::CursorRegression {
         old_key: Some(b"OLD_SECRET_KEY".len()),
@@ -544,9 +563,8 @@ fn acquire_scratch_write_cursor_panics_on_oversized_token() {
 #[test]
 fn acquire_scratch_cursor_view_with_token_but_no_last_key_returns_initial() {
     let mut scratch = AcquireScratch::new();
-    // Write a cursor with no last_key but with token.
-    // CursorUpdate::initial() should be returned because
-    // cursor_view derives presence from len > 0.
+    // Cursor presence is keyed off `last_key` length, so token-only updates
+    // must round-trip as the initial cursor.
     scratch.write_cursor(None, Some(b"some_token"));
     let view = scratch.view(ShardStatus::Active, CursorSemantics::Completed, None);
     let cursor = view.cursor();
