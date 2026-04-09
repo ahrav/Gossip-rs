@@ -13,8 +13,12 @@
 //! - Pack bytes (in-memory) and pack file paths (on disk in a tempdir).
 //! - A valid MIDX spanning all packs with correct OID-to-(pack_id, offset)
 //!   mappings.
-//! - Golden values: the expected resolved bytes for every object in the
-//!   fixture.
+//! - Golden values: the expected resolved bytes for every object with
+//!   known resolved content. Objects added via [`add_missing_ref_delta`]
+//!   have no resolved bytes and are excluded from [`golden_values`].
+//!
+//! [`add_missing_ref_delta`]: MultiPackFixtureBuilder::add_missing_ref_delta
+//! [`golden_values`]: MultiPackFixture::golden_values
 //!
 //! # Accessing the fixture
 //!
