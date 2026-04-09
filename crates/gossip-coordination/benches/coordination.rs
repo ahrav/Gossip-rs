@@ -47,29 +47,40 @@ use gossip_coordination::traits::CoordinationBackend;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// A deterministic tenant used throughout every benchmark.
+///
+/// Benchmarks share tenancy so shard runs and claims remain comparable without
+/// introducing variance from tenant isolation or extra cost from tenant lookup.
 fn tenant() -> TenantId {
     TenantId::from_bytes([1u8; 32])
 }
 
+/// The base worker ID used by benchmarks that do not vary the worker population.
+///
+/// Keeping this worker constant prevents benchmark noise from `WorkerId` creation
+/// while still allowing the coordinator to enforce lease semantics.
 fn worker() -> WorkerId {
     WorkerId::from_raw(1)
 }
 
-/// Leak bytes to produce `&'static [u8]` for benchmark shard specs.
+/// Leak bytes so every benchmark can reference `'static` shard specs.
 ///
-/// Criterion re-runs the benchmark closure many times. Using `'static`
-/// specs avoids re-allocating spec byte vectors on each iteration and
-/// keeps the allocation cost out of the measured path.
+/// Each benchmark runs its closure many times; by leaking the byte buffers we
+/// avoid per-iteration allocation and isolate the coordinator's hot path.
 fn leak_bytes(bytes: Vec<u8>) -> &'static [u8] {
     Box::leak(bytes.into_boxed_slice())
 }
 
 /// Build a coordinator with `n` shards registered under a single run.
 ///
-/// Each shard covers a unique 4-byte big-endian range `[i, i+1)`,
-/// supporting up to `u32::MAX` shards without key overlap. The slab
-/// is sized with headroom (`n + 1000`) to avoid exhaustion during
-/// benchmark iterations that allocate additional cursor/spec entries.
+/// Each shard covers a unique 4-byte big-endian range `[i, i+1)`, supporting
+/// up to `u32::MAX` shards without key overlap. The slab sizes include an extra
+/// `1_000` entries of headroom so benchmark iterations that build additional
+/// cursor/spec entries do not trigger reallocation or byte-slab exhaustion.
+///
+/// The helper always uses the same `RunId` and `CursorSemantics` so benchmarking
+/// code can focus on the desired operation while `register_shards` returns the
+/// created shard IDs for later access patterns.
 fn coordinator_with_shards(n: usize) -> (InMemoryCoordinator, RunId, Vec<ShardId>) {
     let mut coord = InMemoryCoordinator::with_limits(1000, n + 1000, n + 1000);
     let run = RunId::from_raw(1);
@@ -109,6 +120,10 @@ fn coordinator_with_shards(n: usize) -> (InMemoryCoordinator, RunId, Vec<ShardId
 /// Each iteration acquires the same shard (with advancing time to expire
 /// the previous lease). This measures the point-lookup cost through the
 /// two-level map at increasing scale.
+///
+/// The benchmark also reuses a single `ShardKey` plus an `AcquireScratch`
+/// across iterations so we measure the borrow path and lease lookup without
+/// including per-iteration scratch allocation.
 fn bench_acquire(c: &mut Criterion) {
     let mut group = c.benchmark_group("acquire");
 
@@ -152,6 +167,10 @@ fn bench_acquire(c: &mut Criterion) {
 /// Time is fixed (no lease expiry) so every iteration succeeds.
 /// Op-IDs increment monotonically so the op-log never triggers a
 /// conflict rejection.
+///
+/// Because the lease is obtained before `b.iter`, the benchmark churns
+/// only through `checkpoint`'s cursor update and op-log insert paths,
+/// providing a steady-state latency profile for the hottest production call.
 fn bench_checkpoint(c: &mut Criterion) {
     let mut group = c.benchmark_group("checkpoint");
 
@@ -197,6 +216,10 @@ fn bench_checkpoint(c: &mut Criterion) {
 ///
 /// Uses one long-lived coordinator and advances logical time by > lease
 /// duration each iteration so previously claimed shards are available again.
+///
+/// `WorkerId` values grow by one each iteration (with saturating addition)
+/// to ensure the benchmark cycles through new worker identities without
+/// overflowing, capturing the per-claim lookup and cooldown costs.
 fn bench_claim_next_available(c: &mut Criterion) {
     let mut group = c.benchmark_group("claim_next_available");
 
@@ -237,6 +260,10 @@ fn bench_claim_next_available(c: &mut Criterion) {
 /// models production behavior where a bounded worker population
 /// repeatedly claims shards, exercising cooldown map lookups and
 /// lease re-acquisition on previously held shards.
+///
+/// Cycling the same 8 workers keeps the coordinator's cooldown map in play
+/// so the benchmark captures both claim candidate filtering and lease
+/// refresh costs under a steady worker set.
 fn bench_claim_next_available_steady_state(c: &mut Criterion) {
     let mut group = c.benchmark_group("claim_next_available_steady_state");
 
@@ -275,6 +302,10 @@ fn bench_claim_next_available_steady_state(c: &mut Criterion) {
 /// The shard spec vectors are pre-allocated (leaked to `'static`) outside
 /// the benchmark loop so spec construction cost does not pollute the
 /// measurement.
+///
+/// A fresh `RunId` (driven by `run_counter`) and a corresponding `OpId`
+/// are created for each iteration so this benchmark measures the pure
+/// insertion cost independent of previous runs.
 fn bench_register_shards(c: &mut Criterion) {
     let mut group = c.benchmark_group("register_shards");
 
@@ -341,6 +372,9 @@ fn bench_register_shards(c: &mut Criterion) {
 ///   checks to skip summary construction effectively, this should be
 ///   faster than the `all` case. A similar runtime means most cost still
 ///   comes from scanning and sorting.
+///
+/// Each scenario pre-allocates a `summaries` buffer so allocator noise and
+/// capacity growth do not contaminate the filter/matching measurements.
 fn bench_list_shards(c: &mut Criterion) {
     let mut group = c.benchmark_group("list_shards");
 
@@ -403,6 +437,11 @@ fn bench_list_shards(c: &mut Criterion) {
 }
 
 /// Benchmark scan-only claim candidate collection at 10K shards.
+///
+/// Measures `collect_claim_candidates_into` without acquiring shards so the
+/// run exercises candidate extraction, ordering, and the returned earliest
+/// candidate cursor. The candidates vector is pre-sized to 10K to keep the
+/// benchmark focused on the coordinator's filtering cost.
 fn bench_collect_claim_candidates(c: &mut Criterion) {
     let mut group = c.benchmark_group("collect_claim_candidates");
     let (coord, run, _ids) = coordinator_with_shards(10_000);
