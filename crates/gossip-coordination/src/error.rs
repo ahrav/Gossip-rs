@@ -1528,6 +1528,13 @@ pub struct AcquireResultView<'a> {
 ///
 /// Used for inline storage of small variable-length fields (watermark keys,
 /// scratch buffers in `AcquireScratch`) without heap allocation.
+///
+/// ## Invariants
+///
+/// - `len <= N` always holds.
+/// - [`read`](Self::read) exposes only `bytes[..len]`.
+/// - Bytes beyond `len` are unspecified historical data and are never read
+///   through this API.
 pub struct FixedBuf<const N: usize> {
     bytes: [u8; N],
     len: usize,
@@ -1550,6 +1557,10 @@ impl<const N: usize> FixedBuf<N> {
     }
 
     /// Write `bytes` into the buffer, replacing any previous content.
+    ///
+    /// Trailing bytes from prior writes are intentionally left as-is when the
+    /// new payload is shorter; callers must use [`read`](Self::read), which
+    /// is length-bounded by `len`.
     ///
     /// # Panics
     ///
@@ -1575,6 +1586,7 @@ impl<const N: usize> FixedBuf<N> {
 
     /// Borrow the written portion of the buffer (`&bytes[..len]`).
     #[inline]
+    #[must_use]
     pub fn read(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
@@ -1590,6 +1602,7 @@ impl<const N: usize> FixedBuf<N> {
 
     /// Returns `true` if the buffer contains at least one written byte.
     #[inline]
+    #[must_use]
     pub fn has_data(&self) -> bool {
         self.len > 0
     }
@@ -1903,12 +1916,14 @@ impl<T> IdempotentOutcome<T> {
 
     /// Returns `true` if this was a replay (retry).
     #[inline]
+    #[must_use]
     pub fn is_replay(&self) -> bool {
         matches!(self, Self::Replayed(_))
     }
 
     /// Returns `true` if this was a first execution (not a replay).
     #[inline]
+    #[must_use]
     pub fn is_executed(&self) -> bool {
         matches!(self, Self::Executed(_))
     }
