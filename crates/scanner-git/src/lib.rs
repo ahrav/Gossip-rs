@@ -129,8 +129,11 @@ pub mod midx;
 pub mod midx_build;
 /// Defines error types for multi-pack index parsing and lookup.
 pub mod midx_error;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "bench")))]
 pub(crate) mod midx_test_builder;
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub mod midx_test_builder;
 /// Native git-reference resolution backed by `gix-ref`.
 pub mod native_ref_resolver;
 /// Defines fixed-size, zero-heap object ID types for SHA-1 and SHA-256.
@@ -139,6 +142,8 @@ pub mod object_id;
 pub mod object_store;
 /// Implements a fixed-capacity OID hash table for fast MIDX index lookups.
 pub mod oid_index;
+/// Dense seen-bitset indexed by MIDX ordinal positions.
+pub mod ordinal_seen;
 /// Implements a tiered set-associative cache for decoded pack objects.
 pub mod pack_cache;
 /// Defines pack and loose candidate output types for scan planning.
@@ -167,8 +172,6 @@ pub mod path_policy;
 /// Synthetic commit-ref materialization for explicit-commit lowering.
 mod synthetic_ref;
 use gossip_stdx::perf_stats;
-/// Dense seen-bitset indexed by MIDX ordinal positions.
-pub mod ordinal_seen;
 /// Defines the write-only persistence store contract and helpers.
 pub mod persist;
 /// Provides RocksDB-backed persistence adapters (feature-gated).
@@ -409,6 +412,8 @@ pub use scanner_engine::{
 pub use work_items::WorkItems;
 
 // ── Benchmark support ───────────────────────────────────────────────────
+#[cfg(feature = "bench")]
+pub use midx_test_builder::MidxBuilder;
 #[cfg(feature = "bench")]
 #[doc(hidden)]
 pub use pack_inflate_libdeflate::{LibdeflateDecompressor, LIBDEFLATE_THRESHOLD_BYTES};

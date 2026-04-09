@@ -1357,6 +1357,14 @@ mod tests {
         let err = RoaringSeenBitmap::deserialize(&bytes).expect_err("empty roaring payload");
         assert!(matches!(err, SeenBitmapError::InvalidBitmap(_)));
     }
+
+    #[test]
+    fn heap_bytes_returns_nonzero_for_nonempty_bitmap() {
+        let oids: Vec<OidBytes> = (0u8..100).map(sha1).collect();
+        let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        bitmap.insert_batch(&oids).expect("insert");
+        assert!(bitmap.heap_bytes() >= 100 * OidBytes::SHA1_LEN as usize);
+    }
 }
 
 #[cfg(all(test, feature = "stdx-proptest"))]

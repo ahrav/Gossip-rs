@@ -269,10 +269,9 @@ impl MidxOrdinalBitset {
     ) -> Result<(), MidxError> {
         self.validate_view(midx)?;
 
-        debug_assert!(
-            oids.windows(2).all(|pair| pair[0] <= pair[1]),
-            "batch_contains_sorted requires non-decreasing input"
-        );
+        if oids.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err(MidxError::InputNotSorted);
+        }
 
         out.clear();
         out.reserve(oids.len());
@@ -565,6 +564,110 @@ mod tests {
         bytes.extend_from_slice(&0u32.to_be_bytes());
         let err = MidxOrdinalBitset::deserialize(&bytes).expect_err("oversized");
         assert!(matches!(err, OrdinalSeenError::PayloadTooLarge { .. }));
+    }
+
+    // ── F4: Deserialization error variant coverage ──────────────────────
+
+    #[test]
+    fn deserialize_rejects_truncated_header() {
+        let err = MidxOrdinalBitset::deserialize(&[0u8; HEADER_LEN - 1]).expect_err("truncated");
+        assert_eq!(err, OrdinalSeenError::Truncated);
+    }
+
+    #[test]
+    fn deserialize_rejects_invalid_magic() {
+        let mut bytes = vec![0u8; HEADER_LEN + 8];
+        bytes[..4].copy_from_slice(b"XXXX");
+        bytes[4] = MOBS_VERSION;
+        bytes[5..9].copy_from_slice(&1u32.to_be_bytes());
+        let err = MidxOrdinalBitset::deserialize(&bytes).expect_err("bad magic");
+        assert_eq!(err, OrdinalSeenError::InvalidMagic);
+    }
+
+    #[test]
+    fn deserialize_rejects_unsupported_version() {
+        let mut bytes = vec![0u8; HEADER_LEN + 8];
+        bytes[..4].copy_from_slice(b"MOBS");
+        bytes[4] = 99;
+        bytes[5..9].copy_from_slice(&1u32.to_be_bytes());
+        let err = MidxOrdinalBitset::deserialize(&bytes).expect_err("bad version");
+        assert_eq!(err, OrdinalSeenError::UnsupportedVersion(99));
+    }
+
+    #[test]
+    fn deserialize_rejects_length_mismatch() {
+        let bitset = MidxOrdinalBitset::new(10, [0x00; 32]);
+        let mut bytes = bitset.serialize();
+        bytes.push(0xFF);
+        let err = MidxOrdinalBitset::deserialize(&bytes).expect_err("length mismatch");
+        assert_eq!(err, OrdinalSeenError::LengthMismatch);
+    }
+
+    #[test]
+    fn deserialize_rejects_cardinality_mismatch() {
+        let mut bitset = MidxOrdinalBitset::new(10, [0x00; 32]);
+        bitset.set(0);
+        let mut bytes = bitset.serialize();
+        // Corrupt cardinality from 1 to 2.
+        bytes[41..45].copy_from_slice(&2u32.to_be_bytes());
+        let err = MidxOrdinalBitset::deserialize(&bytes).expect_err("cardinality");
+        assert_eq!(
+            err,
+            OrdinalSeenError::CardinalityMismatch {
+                expected: 2,
+                actual: 1
+            }
+        );
+    }
+
+    // ── F5: Sorted-input and MIDX-mismatch error paths ─────────────────
+
+    #[test]
+    fn batch_contains_sorted_rejects_unsorted_input() {
+        let midx_bytes = build_test_midx(8);
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).expect("midx");
+        let bitset = MidxOrdinalBitset::new(midx.object_count(), [0x55; 32]);
+        let unsorted = vec![oid_from_u32(3), oid_from_u32(1)];
+        let err = bitset
+            .batch_contains_sorted(&midx, &unsorted)
+            .expect_err("unsorted");
+        assert!(matches!(err, MidxError::InputNotSorted));
+    }
+
+    #[test]
+    fn batch_contains_sorted_rejects_mismatched_midx() {
+        let midx_bytes = build_test_midx(8);
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).expect("midx");
+        let bitset = MidxOrdinalBitset::new(16, [0x66; 32]);
+        let err = bitset
+            .batch_contains_sorted(&midx, &[oid_from_u32(1)])
+            .expect_err("mismatched");
+        assert!(matches!(err, MidxError::MidxCorrupt { .. }));
+    }
+
+    // ── F6: validate_view error path in mark_seen_batch ─────────────────
+
+    #[test]
+    fn mark_seen_batch_rejects_mismatched_midx() {
+        let midx_bytes = build_test_midx(8);
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).expect("midx");
+        let mut bitset = MidxOrdinalBitset::new(16, [0x77; 32]);
+        let err = bitset
+            .mark_seen_batch(&midx, &[oid_from_u32(1)])
+            .expect_err("mismatched");
+        assert!(matches!(err, MidxError::MidxCorrupt { .. }));
+    }
+
+    // ── F12: Empty input edge case ──────────────────────────────────────
+
+    #[test]
+    fn mark_seen_batch_with_empty_input() {
+        let midx_bytes = build_test_midx(8);
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).expect("midx");
+        let mut bitset = MidxOrdinalBitset::new(midx.object_count(), [0x88; 32]);
+        let newly_marked = bitset.mark_seen_batch(&midx, &[]).expect("empty batch");
+        assert_eq!(newly_marked, 0);
+        assert_eq!(bitset.cardinality(), 0);
     }
 
     proptest! {

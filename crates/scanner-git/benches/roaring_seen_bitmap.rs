@@ -4,20 +4,14 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use scanner_git::{MidxOrdinalBitset, MidxView, ObjectFormat, OidBytes, RoaringSeenBitmap};
+use scanner_git::{
+    MidxBuilder, MidxOrdinalBitset, MidxView, ObjectFormat, OidBytes, RoaringSeenBitmap,
+};
 
 const BITMAP_SIZE: u32 = 1_000_000;
 const PROBE_BATCH: u32 = 10_000;
 const SCALE_POINTS: [u32; 3] = [100_000, 1_000_000, 10_000_000];
 const BENCH_FINGERPRINT: [u8; 32] = [0xA5; 32];
-const MIDX_MAGIC: [u8; 4] = *b"MIDX";
-const MIDX_VERSION: u8 = 1;
-const MIDX_HEADER_SIZE: usize = 12;
-const CHUNK_ENTRY_SIZE: usize = 12;
-const CHUNK_PNAM: [u8; 4] = *b"PNAM";
-const CHUNK_OIDF: [u8; 4] = *b"OIDF";
-const CHUNK_OIDL: [u8; 4] = *b"OIDL";
-const CHUNK_OOFF: [u8; 4] = *b"OOFF";
 
 fn oid_from_u32(value: u32) -> OidBytes {
     let mut bytes = [0u8; 20];
@@ -40,67 +34,15 @@ fn build_ordinal_bitset(size: u32) -> MidxOrdinalBitset {
     bitset
 }
 
-/// Builds a minimal valid MIDX (v1, SHA-1) for `size` sequential OIDs.
-///
-/// OIDs are produced by [`oid_from_u32`] which places the big-endian `u32`
-/// value in the first four bytes of a 20-byte SHA-1. Because sequential
-/// integers are lexicographically ordered under big-endian encoding, the
-/// resulting OIDL chunk is sorted by construction. Note that this produces
-/// a skewed fanout distribution (only buckets 0x00-0x09 are populated at
-/// 10M OIDs), which may not exercise all fanout-bucket cursor transitions.
 fn build_midx_bytes(size: u32) -> Vec<u8> {
-    let pnam = Vec::from(&b"pack-0.pack\0"[..]);
-    let mut oidf = vec![0u8; 256 * 4];
-    let mut counts = [0u32; 256];
-    let mut oidl = Vec::with_capacity(size as usize * 20);
-    let mut ooff = Vec::with_capacity(size as usize * 8);
-
+    let mut builder = MidxBuilder::new();
+    builder.add_pack(b"pack-0.pack");
     for value in 0..size {
         let oid = oid_from_u32(value);
-        counts[oid.as_slice()[0] as usize] += 1;
-        oidl.extend_from_slice(oid.as_slice());
-        ooff.extend_from_slice(&0u32.to_be_bytes());
-        ooff.extend_from_slice(&value.to_be_bytes());
+        let raw: [u8; 20] = oid.as_slice().try_into().expect("SHA-1 is 20 bytes");
+        builder.add_object(raw, 0, value as u64);
     }
-
-    let mut running = 0u32;
-    for (idx, count) in counts.iter().enumerate() {
-        running += count;
-        let off = idx * 4;
-        oidf[off..off + 4].copy_from_slice(&running.to_be_bytes());
-    }
-
-    let chunk_count = 4u8;
-    let chunk_table_size = (chunk_count as usize + 1) * CHUNK_ENTRY_SIZE;
-    let pnam_off = (MIDX_HEADER_SIZE + chunk_table_size) as u64;
-    let oidf_off = pnam_off + pnam.len() as u64;
-    let oidl_off = oidf_off + oidf.len() as u64;
-    let ooff_off = oidl_off + oidl.len() as u64;
-    let end_off = ooff_off + ooff.len() as u64;
-
-    let mut out = Vec::with_capacity(end_off as usize);
-    out.extend_from_slice(&MIDX_MAGIC);
-    out.push(MIDX_VERSION);
-    out.push(1);
-    out.push(chunk_count);
-    out.push(0);
-    out.extend_from_slice(&1u32.to_be_bytes());
-
-    let mut push_chunk = |id: [u8; 4], off: u64| {
-        out.extend_from_slice(&id);
-        out.extend_from_slice(&off.to_be_bytes());
-    };
-    push_chunk(CHUNK_PNAM, pnam_off);
-    push_chunk(CHUNK_OIDF, oidf_off);
-    push_chunk(CHUNK_OIDL, oidl_off);
-    push_chunk(CHUNK_OOFF, ooff_off);
-    push_chunk([0, 0, 0, 0], end_off);
-
-    out.extend_from_slice(&pnam);
-    out.extend_from_slice(&oidf);
-    out.extend_from_slice(&oidl);
-    out.extend_from_slice(&ooff);
-    out
+    builder.build()
 }
 
 fn build_probe_batch(size: u32) -> Vec<OidBytes> {
