@@ -465,20 +465,20 @@ pub(super) enum SpanStreamState {
 
 ```rust
 pub struct ScanScratch {
-    pub decode_ring: ByteRing,             // Circular buffer of decoded bytes
-    pub pending_windows: TimingWheel<...>, // Windows scheduled for processing
-    pub stream_hit_counts: Vec<u32>,       // Per-rule-variant window counter
-    pub stream_hit_touched: ScratchVec<u32>, // Touched indices for reset
-    pub vs_stream_matches: Vec<...>,       // Matches from Vectorscan callback
-    pub vs_stream_scratch: Option<...>,    // Vectorscan scratch reuse
-    pub pending_spans: Vec<...>,           // Child transform spans
-    pub span_streams: Vec<...>,            // Span detector instances
-    pub window_bytes: Vec<u8>,             // Temporary window materialization
-    pub total_decode_output_bytes: usize,  // Running total across transforms
-    pub slab: DecodeSlab,                  // Appended decoded output
-    pub seen: FixedSet128,                 // Dedupe hashes
-    pub tmp_findings: Vec<...>,            // Temporary findings buffer
-    pub findings_dropped: usize,           // Count of dropped findings
+    pub(super) decode_ring: ByteRing,             // Circular buffer of decoded bytes
+    pub(super) pending_windows: TimingWheel<...>, // Windows scheduled for processing
+    pub(super) stream_hit_counts: Vec<u32>,       // Per-rule-variant window counter
+    pub(super) stream_hit_touched: ScratchVec<u32>, // Touched indices for reset
+    pub(super) vs_stream_matches: Vec<...>,       // Matches from Vectorscan callback
+    pub(super) vs_stream_scratch: Option<...>,    // Vectorscan scratch reuse
+    pub(super) pending_spans: Vec<...>,           // Child transform spans
+    pub(super) span_streams: Vec<...>,            // Span detector instances
+    pub(super) window_bytes: Vec<u8>,             // Temporary window materialization
+    pub(super) total_decode_output_bytes: usize,  // Running total across transforms
+    pub(super) slab: DecodeSlab,                  // Appended decoded output
+    pub(super) seen: FixedSet128,                 // Dedupe hashes
+    pub(super) tmp_findings: Vec<...>,            // Temporary findings buffer
+    pub(super) findings_dropped: usize,           // Count of dropped findings
 }
 ```
 
