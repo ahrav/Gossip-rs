@@ -544,6 +544,14 @@ fn align_to_stride(value: u64, stride: u64) -> u64 {
 ///   O(log(stream_length / sample_cap)) times, each costing O(sample_cap).
 /// - **`estimate_split_key`**: O(log sample_cap) binary search.
 /// - **Memory**: O(sample_cap) samples, each carrying a heap-allocated key.
+///
+/// # Invariants
+///
+/// - `samples` is always sorted by non-decreasing key and strictly increasing
+///   `rank`.
+/// - `samples.len() <= sample_cap` after every public method returns.
+/// - `next_rank_sample` and `next_byte_mark` stay aligned to their respective
+///   stride grids.
 #[derive(Clone)]
 pub(crate) struct StreamingSplitEstimator {
     /// Maximum number of retained samples before compaction is triggered.
@@ -630,6 +638,8 @@ impl StreamingSplitEstimator {
     ///
     /// When `sample_cap` is at least the entry count, the result is exact
     /// because compaction never needs to discard a retained key.
+    ///
+    /// Complexity is O(entries) time and O(sample_cap) memory.
     pub(crate) fn from_sorted_entries<'a>(
         sample_cap: usize,
         entries: impl Iterator<Item = (&'a [u8], u64)>,
