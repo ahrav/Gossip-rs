@@ -20,6 +20,24 @@ use std::collections::HashSet;
 use super::midx_error::{ChunkId, MidxError};
 use super::object_id::{ObjectFormat, OidBytes};
 
+/// Cached chunk offsets for zero-parse reconstruction of a [`MidxView`].
+///
+/// Produced by [`MidxView::layout`] after a successful [`MidxView::parse`].
+/// Passed to [`MidxView::from_layout`] to reconstruct the view without
+/// re-validating the MIDX structure. The byte buffer must be identical to
+/// the one originally validated.
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedMidxLayout {
+    pub(crate) format: ObjectFormat,
+    pub(crate) pack_count: u32,
+    pub(crate) object_count: u32,
+    pnam_range: (usize, usize),
+    oidf_offset: usize,
+    oidl_range: (usize, usize),
+    ooff_range: (usize, usize),
+    loff_range: Option<(usize, usize)>,
+}
+
 /// MIDX magic bytes.
 const MIDX_MAGIC: [u8; 4] = *b"MIDX";
 /// MIDX version 1 (only supported version).
@@ -201,6 +219,80 @@ impl<'a> MidxView<'a> {
             ooff,
             loff,
         })
+    }
+
+    /// Extracts the validated layout for later zero-parse reconstruction.
+    ///
+    /// `data` must be the byte buffer that was passed to [`parse`](Self::parse).
+    pub(crate) fn layout(&self, data: &[u8]) -> ValidatedMidxLayout {
+        let base = data.as_ptr() as usize;
+        ValidatedMidxLayout {
+            format: self.format,
+            pack_count: self.pack_count,
+            object_count: self.object_count,
+            pnam_range: (self.pnam.as_ptr() as usize - base, self.pnam.len()),
+            oidf_offset: self.oidf.as_ptr() as usize - base,
+            oidl_range: (self.oidl.as_ptr() as usize - base, self.oidl.len()),
+            ooff_range: (self.ooff.as_ptr() as usize - base, self.ooff.len()),
+            loff_range: self.loff.map(|l| (l.as_ptr() as usize - base, l.len())),
+        }
+    }
+
+    /// Reconstructs a view from a previously validated layout.
+    ///
+    /// The byte buffer must be identical to the one validated by the
+    /// [`parse`](Self::parse) call that produced this layout. Assertions
+    /// verify that all layout offsets fall within `data`. If they do not,
+    /// the method panics with a diagnostic message.
+    #[inline]
+    pub(crate) fn from_layout(data: &'a [u8], layout: &ValidatedMidxLayout) -> Self {
+        assert!(
+            layout.pnam_range.0 + layout.pnam_range.1 <= data.len(),
+            "pnam out of bounds: offset {} + len {} > buf {}",
+            layout.pnam_range.0,
+            layout.pnam_range.1,
+            data.len(),
+        );
+        assert!(
+            layout.oidf_offset + FANOUT_SIZE <= data.len(),
+            "oidf out of bounds: offset {} + len {} > buf {}",
+            layout.oidf_offset,
+            FANOUT_SIZE,
+            data.len(),
+        );
+        assert!(
+            layout.oidl_range.0 + layout.oidl_range.1 <= data.len(),
+            "oidl out of bounds: offset {} + len {} > buf {}",
+            layout.oidl_range.0,
+            layout.oidl_range.1,
+            data.len(),
+        );
+        assert!(
+            layout.ooff_range.0 + layout.ooff_range.1 <= data.len(),
+            "ooff out of bounds: offset {} + len {} > buf {}",
+            layout.ooff_range.0,
+            layout.ooff_range.1,
+            data.len(),
+        );
+        if let Some((off, len)) = layout.loff_range {
+            assert!(
+                off + len <= data.len(),
+                "loff out of bounds: offset {} + len {} > buf {}",
+                off,
+                len,
+                data.len(),
+            );
+        }
+        Self {
+            format: layout.format,
+            pack_count: layout.pack_count,
+            object_count: layout.object_count,
+            pnam: &data[layout.pnam_range.0..layout.pnam_range.0 + layout.pnam_range.1],
+            oidf: &data[layout.oidf_offset..layout.oidf_offset + FANOUT_SIZE],
+            oidl: &data[layout.oidl_range.0..layout.oidl_range.0 + layout.oidl_range.1],
+            ooff: &data[layout.ooff_range.0..layout.ooff_range.0 + layout.ooff_range.1],
+            loff: layout.loff_range.map(|(off, len)| &data[off..off + len]),
+        }
     }
 
     /// Returns the number of packs referenced.
@@ -726,6 +818,88 @@ mod tests {
         let actual: Vec<&[u8]> = vec![b"pack-abc123", b"pack-xyz789"];
         let result = midx.verify_completeness(actual);
         assert!(matches!(result, Err(MidxError::MidxIncomplete { .. })));
+    }
+
+    #[test]
+    fn from_layout_round_trip_preserves_all_accessors() {
+        // Build a MIDX with 3 packs and 12 objects spread across them.
+        let mut builder = MidxBuilder::new();
+        builder.add_pack(b"pack-alpha");
+        builder.add_pack(b"pack-beta");
+        builder.add_pack(b"pack-gamma");
+
+        // 12 objects with distinct first bytes for fanout coverage.
+        let oids: [[u8; 20]; 12] = [
+            [0x01; 20], [0x0A; 20], [0x15; 20], [0x22; 20], [0x33; 20], [0x44; 20], [0x77; 20],
+            [0x88; 20], [0xAA; 20], [0xBB; 20], [0xDD; 20], [0xFF; 20],
+        ];
+        // Distribute objects across packs with varying offsets.
+        let pack_assignments: [(u16, u64); 12] = [
+            (0, 100),
+            (1, 200),
+            (2, 300),
+            (0, 400),
+            (1, 500),
+            (2, 600),
+            (0, 700),
+            (1, 800),
+            (2, 900),
+            (0, 1000),
+            (1, 1100),
+            (2, 1200),
+        ];
+        for (oid, (pack_id, offset)) in oids.iter().zip(pack_assignments.iter()) {
+            builder.add_object(*oid, *pack_id, *offset);
+        }
+
+        let data = builder.build();
+
+        // Parse, extract layout, reconstruct.
+        let original = MidxView::parse(&data, ObjectFormat::Sha1).unwrap();
+        let layout = original.layout(&data);
+        let reconstructed = MidxView::from_layout(&data, &layout);
+
+        // Scalar fields.
+        assert_eq!(original.object_count(), reconstructed.object_count());
+        assert_eq!(original.pack_count(), reconstructed.pack_count());
+        assert_eq!(layout.format, ObjectFormat::Sha1);
+        assert_eq!(original.oid_len(), reconstructed.oid_len());
+
+        // Per-object accessors: oid_at and offset_at.
+        let count = original.object_count();
+        assert!(count >= 12, "expected at least 12 objects");
+        for i in 0..count {
+            assert_eq!(
+                original.oid_at(i),
+                reconstructed.oid_at(i),
+                "oid_at mismatch at index {i}"
+            );
+            assert_eq!(
+                original.offset_at(i).unwrap(),
+                reconstructed.offset_at(i).unwrap(),
+                "offset_at mismatch at index {i}"
+            );
+        }
+
+        // find_oid for known OIDs.
+        for oid_raw in &oids {
+            let oid = OidBytes::sha1(*oid_raw);
+            let orig_idx = original.find_oid(&oid).unwrap();
+            let recon_idx = reconstructed.find_oid(&oid).unwrap();
+            assert_eq!(orig_idx, recon_idx, "find_oid mismatch for {oid}");
+            assert!(orig_idx.is_some(), "known OID should be found: {oid}");
+        }
+
+        // find_oid for a non-existent OID returns None on both.
+        let missing_oid = OidBytes::sha1([0x50; 20]);
+        assert_eq!(original.find_oid(&missing_oid).unwrap(), None);
+        assert_eq!(reconstructed.find_oid(&missing_oid).unwrap(), None);
+
+        // pack_names must match in order and content.
+        let orig_names: Vec<&[u8]> = original.pack_names().collect();
+        let recon_names: Vec<&[u8]> = reconstructed.pack_names().collect();
+        assert_eq!(orig_names, recon_names);
+        assert_eq!(orig_names.len(), 3);
     }
 
     #[test]
