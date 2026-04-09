@@ -37,8 +37,6 @@ const MAX_OBJ_SIZE: usize = 256;
 /// External base provider that always reports bases as missing.
 ///
 /// This keeps the harness focused on pack-local structure and decode logic.
-/// Cross-pack REF base lookup paths still need dedicated tests with `PackIo`
-/// or `SimPackIo`.
 struct NoExternalBases;
 
 impl ExternalBaseProvider for NoExternalBases {
@@ -65,9 +63,6 @@ impl PackObjectSink for NullSink {
 }
 
 /// OID resolver that never resolves (no MIDX available in fuzz context).
-///
-/// REF_DELTA planning paths that depend on real MIDX ordinal lookup are
-/// covered by unit tests that build synthetic MIDX fixtures.
 struct NoopResolver;
 
 impl scanner_git::OidResolver for NoopResolver {

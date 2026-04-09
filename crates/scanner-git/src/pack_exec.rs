@@ -3445,18 +3445,7 @@ mod tests {
         external: &mut B,
         sink: &mut S,
     ) -> PackExecReport {
-        let spill_dir = tempfile::tempdir().expect("spill dir");
-        execute_pack_plan(
-            plan,
-            pack,
-            arena,
-            limits,
-            cache,
-            external,
-            sink,
-            spill_dir.path(),
-        )
-        .unwrap()
+        exec_plan_result(plan, pack, arena, limits, cache, external, sink).unwrap()
     }
 
     fn exec_plan_result<S: PackObjectSink, B: ExternalBaseProvider>(

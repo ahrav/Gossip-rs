@@ -478,7 +478,7 @@ fn parse_decimal(bytes: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
     use super::super::delta_test_helpers::{
@@ -497,6 +497,15 @@ mod tests {
         out
     }
 
+    /// Build the on-disk path for a loose object and ensure the fan-out directory exists.
+    fn loose_object_path(objects_dir: &Path, oid: &OidBytes) -> PathBuf {
+        let hex = oid_to_hex(oid);
+        let (dir, file) = hex.split_at(2);
+        let dir_path = objects_dir.join(dir);
+        fs::create_dir_all(&dir_path).unwrap();
+        dir_path.join(file)
+    }
+
     fn write_loose_object(objects_dir: &Path, oid: OidBytes, kind: &str, payload: &[u8]) {
         let mut header = Vec::new();
         header.extend_from_slice(kind.as_bytes());
@@ -506,19 +515,11 @@ mod tests {
         header.extend_from_slice(payload);
 
         let compressed = zlib_compress(&header);
-        let hex = oid_to_hex(&oid);
-        let (dir, file) = hex.split_at(2);
-        let dir_path = objects_dir.join(dir);
-        fs::create_dir_all(&dir_path).unwrap();
-        fs::write(dir_path.join(file), &compressed).unwrap();
+        fs::write(loose_object_path(objects_dir, &oid), &compressed).unwrap();
     }
 
     fn write_loose_bytes(objects_dir: &Path, oid: OidBytes, payload: &[u8]) {
-        let hex = oid_to_hex(&oid);
-        let (dir, file) = hex.split_at(2);
-        let dir_path = objects_dir.join(dir);
-        fs::create_dir_all(&dir_path).unwrap();
-        fs::write(dir_path.join(file), payload).unwrap();
+        fs::write(loose_object_path(objects_dir, &oid), payload).unwrap();
     }
 
     fn build_pack_blob(data: &[u8]) -> Vec<u8> {
@@ -810,15 +811,11 @@ mod tests {
         let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 8);
         let mut io = PackIo::from_parts(midx, vec![pack_path], vec![objects_dir], limits).unwrap();
 
-        let loaded = ExternalBaseProvider::load_base(&mut io, &present_oid).unwrap();
-        assert!(matches!(
-            loaded,
-            Some(ExternalBase {
-                kind: ObjectKind::Blob,
-                ..
-            })
-        ));
-        assert_eq!(loaded.unwrap().bytes, b"loose-base");
+        let base = ExternalBaseProvider::load_base(&mut io, &present_oid)
+            .unwrap()
+            .expect("expected Some(ExternalBase)");
+        assert_eq!(base.kind, ObjectKind::Blob);
+        assert_eq!(base.bytes, b"loose-base");
 
         let missing = ExternalBaseProvider::load_base(&mut io, &missing_oid).unwrap();
         assert!(missing.is_none());
