@@ -3445,6 +3445,18 @@ mod tests {
         external: &mut B,
         sink: &mut S,
     ) -> PackExecReport {
+        exec_plan_result(plan, pack, arena, limits, cache, external, sink).unwrap()
+    }
+
+    fn exec_plan_result<S: PackObjectSink, B: ExternalBaseProvider>(
+        plan: &PackPlan,
+        pack: &[u8],
+        arena: &ByteArena,
+        limits: &PackDecodeLimits,
+        cache: &mut PackCache,
+        external: &mut B,
+        sink: &mut S,
+    ) -> Result<PackExecReport, PackExecError> {
         let spill_dir = tempfile::tempdir().expect("spill dir");
         execute_pack_plan(
             plan,
@@ -3456,7 +3468,6 @@ mod tests {
             sink,
             spill_dir.path(),
         )
-        .unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3808,6 +3819,122 @@ mod tests {
 
         assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_eq!(sink.emitted.len(), 1);
+    }
+
+    #[test]
+    fn merge_fast_path_propagates_sink_error() {
+        #[derive(Default)]
+        struct ErrorSink;
+
+        impl PackObjectSink for ErrorSink {
+            fn emit(
+                &mut self,
+                _candidate: &PackCandidate,
+                _path: &[u8],
+                _bytes: &[u8],
+            ) -> Result<(), PackExecError> {
+                Err(PackExecError::Sink("emit failed".to_owned()))
+            }
+        }
+
+        let (pack, offsets) = build_pack(&[(ObjectKind::Blob, b"hello")]);
+        let offset = offsets[0];
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x21; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset,
+        };
+
+        let plan = build_plan(
+            vec![offset],
+            vec![candidate],
+            vec![CandidateAtOffset {
+                offset,
+                cand_idx: 0,
+            }],
+            None,
+        );
+
+        let mut cache = PackCache::new(0);
+        let mut external = NoExternal;
+        let mut sink = ErrorSink;
+
+        let err = exec_plan_result(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, PackExecError::Sink(detail) if detail == "emit failed"));
+    }
+
+    #[test]
+    fn finish_error_propagates_from_sink() {
+        #[derive(Default)]
+        struct ErrorOnFinishSink;
+
+        impl PackObjectSink for ErrorOnFinishSink {
+            fn emit(
+                &mut self,
+                _candidate: &PackCandidate,
+                _path: &[u8],
+                _bytes: &[u8],
+            ) -> Result<(), PackExecError> {
+                Ok(())
+            }
+
+            fn finish(&mut self) -> Result<(), PackExecError> {
+                Err(PackExecError::Sink("finish failed".to_owned()))
+            }
+        }
+
+        let (pack, offsets) = build_pack(&[(ObjectKind::Blob, b"hello")]);
+        let offset = offsets[0];
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x22; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset,
+        };
+
+        let plan = build_plan(
+            vec![offset],
+            vec![candidate],
+            vec![CandidateAtOffset {
+                offset,
+                cand_idx: 0,
+            }],
+            None,
+        );
+
+        let mut cache = PackCache::new(0);
+        let mut external = NoExternal;
+        let mut sink = ErrorOnFinishSink;
+
+        let err = exec_plan_result(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, PackExecError::Sink(detail) if detail == "finish failed"));
     }
 
     #[test]
@@ -5287,6 +5414,136 @@ mod tests {
             skip.reason,
             SkipReason::ExternalBaseMissing { oid } if oid == missing_base_oid
         ));
+    }
+
+    #[test]
+    fn external_base_error_records_skip_reason() {
+        let base_oid = OidBytes::sha1([0xAA; 20]);
+        let delta_payload = build_insert_delta(b"irrelevant", 0);
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+
+        let delta_offset = pack.len() as u64;
+        let mut delta_entry = encode_entry_header(7, delta_payload.len());
+        delta_entry.extend_from_slice(base_oid.as_slice());
+        delta_entry.extend_from_slice(&zlib_compress(&delta_payload));
+        pack.extend_from_slice(&delta_entry);
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate_oid = OidBytes::sha1([0xBB; 20]);
+        let plan = build_single_external_ref_plan(
+            &pack,
+            0,
+            delta_offset,
+            candidate_oid,
+            base_oid,
+            ctx(path_ref),
+        );
+
+        /// Returns `Err(PackExecError::ExternalBase(...))` for every OID lookup.
+        struct FailingExternalBase;
+
+        impl ExternalBaseProvider for FailingExternalBase {
+            fn load_base(
+                &mut self,
+                _oid: &OidBytes,
+            ) -> Result<Option<ExternalBase>, PackExecError> {
+                Err(PackExecError::ExternalBase("injected error".into()))
+            }
+        }
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = FailingExternalBase;
+        let mut sink = TestSink::default();
+
+        let report = exec_plan_result(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .expect("execution continues despite provider error");
+
+        assert_perf_u32(report.stats.emitted_candidates, 0);
+        assert!(sink.emitted.is_empty());
+        assert_eq!(report.skips.len(), 1);
+        let skip = &report.skips[0];
+        assert_eq!(skip.offset, delta_offset);
+        assert!(
+            matches!(&skip.reason, SkipReason::ExternalBaseError { detail } if detail.contains("injected error"))
+        );
+    }
+
+    #[test]
+    fn external_base_missing_records_skip_reason() {
+        let base_oid = OidBytes::sha1([0xCC; 20]);
+        let delta_payload = build_insert_delta(b"irrelevant", 0);
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+
+        let delta_offset = pack.len() as u64;
+        let mut delta_entry = encode_entry_header(7, delta_payload.len());
+        delta_entry.extend_from_slice(base_oid.as_slice());
+        delta_entry.extend_from_slice(&zlib_compress(&delta_payload));
+        pack.extend_from_slice(&delta_entry);
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate_oid = OidBytes::sha1([0xDD; 20]);
+        let plan = build_single_external_ref_plan(
+            &pack,
+            0,
+            delta_offset,
+            candidate_oid,
+            base_oid,
+            ctx(path_ref),
+        );
+
+        /// Returns `Ok(None)` for every OID lookup, simulating a missing base.
+        struct MissingExternalBase;
+
+        impl ExternalBaseProvider for MissingExternalBase {
+            fn load_base(
+                &mut self,
+                _oid: &OidBytes,
+            ) -> Result<Option<ExternalBase>, PackExecError> {
+                Ok(None)
+            }
+        }
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = MissingExternalBase;
+        let mut sink = TestSink::default();
+
+        let report = exec_plan_result(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .expect("execution continues when base is missing");
+
+        assert_perf_u32(report.stats.emitted_candidates, 0);
+        assert!(sink.emitted.is_empty());
+        assert_eq!(report.skips.len(), 1);
+        let skip = &report.skips[0];
+        assert_eq!(skip.offset, delta_offset);
+        assert!(matches!(skip.reason, SkipReason::ExternalBaseMissing { oid } if oid == base_oid));
     }
 
     #[test]
