@@ -14,20 +14,31 @@
 //! the run exists in etcd but is invisible to `list_active_runs_into`
 //! and `collect_claim_candidates_into`.
 //!
-//! # Shard claiming
+//! ## Transactions and idempotency
+//!
+//! Run mutations and indexes are serialized in CAS transactions that either
+//! compare revisions (run/shard) or compare absence (shard creation). Each
+//! mutating call records an op-log entry so `check_op_idempotency` can detect
+//! retries and replay the original result instead of re-running the same
+//! transaction. The active-run index defines the set of runs that list and
+//! claim paths observe, while `register_shards` is the only transition that
+//! promotes a run from `Initializing` to `Active`.
+//!
+//! ## Shard claiming
 //!
 //! The [`ShardClaiming`] impl delegates to [`default_claim_next_available`],
-//! which iterates the candidate list produced by
-//! `collect_claim_candidates_into` and calls `acquire_and_restore_into` on
-//! each until one succeeds. The candidate buffer is reused across calls
-//! to avoid per-claim allocation.
+//! which iterates the candidate list produced by `collect_claim_candidates_into`
+//! and invokes `acquire_and_restore_into` until a claim succeeds or the list
+//! is exhausted. The candidate buffer is cleared before each call and stored
+//! afterward so that a worker can reuse the allocation across multiple claims.
 //!
-//! # Unpark
+//! ## Unpark
 //!
-//! `unpark_shard` transitions a `Parked` shard back to `Active` and
-//! publishes a new active-shard index entry. The CAS transaction guards
-//! both the shard and the run (run must still be `Active`) to prevent
-//! unparking into a terminated run.
+//! `unpark_shard` transitions a `Parked` shard back to `Active`, bumps the fence
+//! epoch, clears the park reason, and publishes a new active-shard index entry.
+//! The CAS transaction guards the shard record, the run record and index, and
+//! the absence of an owner key so the shard cannot be reactivated into a
+//! terminal run or while still owned.
 
 use std::collections::HashSet;
 
@@ -826,6 +837,11 @@ impl_sync_run_management!(EtcdCoordinator);
 impl_sync_run_management!(SimEtcdCoordinator);
 
 impl AsyncRunManagement for AsyncEtcdCoordinator {
+    /// Async counterpart to `RunManagement::create_run` for the etcd backend.
+    ///
+    /// Guards run creation with a compare-absent CAS, records the new
+    /// `RunRecord` in the run prefix, and reports `RunAlreadyExists` if the
+    /// key is already present.
     async fn create_run(
         &mut self,
         now: LogicalTime,
@@ -859,6 +875,13 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
         Err(CreateRunError::RunAlreadyExists { run })
     }
 
+    /// Async register that promotes a run to `Active` and publishes root shards.
+    ///
+    /// Runs the same validation and CAS sequence as the sync implementation but
+    /// wraps it in an optimistic retry loop controlled by
+    /// `optimistic_txn_retries` and `cas_retry_delay`.
+    /// Idempotency is detected via the op-log so repeated `op_id`/payload
+    /// combinations return the original result.
     async fn register_shards(
         &mut self,
         now: LogicalTime,
@@ -1050,6 +1073,10 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
         )))
     }
 
+    /// Reads a single run record and validates tenant consistency.
+    ///
+    /// Mirrors the sync lookup, returning `RunNotFound` or
+    /// `TenantMismatch` when the stored tenant differs from the caller.
     async fn get_run(&self, tenant: TenantId, run: RunId) -> Result<RunRecord, GetRunError> {
         match self.load_run_record(tenant, run).await {
             Ok(Some(p)) => {
@@ -1067,6 +1094,10 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
         }
     }
 
+    /// Scans the run's shard prefix to compute aggregate progress.
+    ///
+    /// Applies the same observations as the sync variant: status, lease
+    /// liveness at `now`, and the cursor position encoded in each record.
     async fn get_run_progress(
         &self,
         now: LogicalTime,
@@ -1088,6 +1119,8 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
         Ok(progress)
     }
 
+    /// Lists shard summaries that satisfy `filter`, sorted deterministic by
+    /// key range then shard id.
     async fn list_shards_into(
         &self,
         now: LogicalTime,
@@ -1116,6 +1149,11 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
         Ok(())
     }
 
+    /// Builds the candidate shard list by scanning the active index and owner
+    /// bindings asynchronously.
+    ///
+    /// Operates on keys-only prefixes, then loads owned records to check lease
+    /// deadlines so the caller can sleep until the earliest deadline expires.
     async fn collect_claim_candidates_into(
         &self,
         now: LogicalTime,
@@ -1202,6 +1240,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
         Ok(earliest_deadline)
     }
 
+    /// Finalizes an `Active` run by forwarding to `transition_run_terminal`.
     async fn complete_run(
         &mut self,
         now: LogicalTime,
@@ -1213,6 +1252,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             .await
     }
 
+    /// Marks an `Active` run as `Failed` through `transition_run_terminal`.
     async fn fail_run(
         &mut self,
         now: LogicalTime,
@@ -1224,6 +1264,11 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             .await
     }
 
+    /// Transitions `Initializing` or `Active` runs to `Cancelled`.
+    ///
+    /// The async path mirrors the sync implementation by choosing the right CAS
+    /// guard depending on the run status before calling
+    /// `transition_run_terminal`.
     async fn cancel_run(
         &mut self,
         now: LogicalTime,
@@ -1235,6 +1280,11 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             .await
     }
 
+    /// Re-activates a parked shard through an async CAS retry loop.
+    ///
+    /// The logic parallels the sync version: guard run/shard revisions, ensure
+    /// the run is `Active`, clear the park reason, advance the fence, and
+    /// publish the active shard index without creating an owner binding.
     async fn unpark_shard(
         &mut self,
         now: LogicalTime,
