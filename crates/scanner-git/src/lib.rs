@@ -131,6 +131,8 @@ pub mod midx_build;
 pub mod midx_error;
 #[cfg(test)]
 pub(crate) mod midx_test_builder;
+#[cfg(test)]
+pub(crate) mod multi_pack_test_helpers;
 /// Native git-reference resolution backed by `gix-ref`.
 pub mod native_ref_resolver;
 /// Defines fixed-size, zero-heap object ID types for SHA-1 and SHA-256.
