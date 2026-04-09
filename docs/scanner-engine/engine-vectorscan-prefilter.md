@@ -144,7 +144,7 @@ Each match generates one or more window seeds (per target) pushed to `ScanScratc
 
 ```rust
 let pair = rid * 3 + vidx;  // (rule_id, variant_idx) packed coordinate
-scratch.hit_acc_pool.push_span(pair, window);
+scratch.hit_acc_pool.push_span_unchecked_hot(pair, window);
 ```
 
 ### UTF-16 Stream Callback: `vs_utf16_stream_on_match`
