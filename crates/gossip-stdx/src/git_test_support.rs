@@ -122,14 +122,15 @@ pub fn try_run_git(dir: &Path, args: &[&str]) -> Output {
 
 /// Initialize a git repository with a deterministic local author identity.
 ///
-/// The initial branch is always `main`, regardless of the host's
-/// `init.defaultBranch` configuration.
+/// The initial branch is always `main` and the object format is always SHA-1,
+/// regardless of the host's `init.defaultBranch` or `init.defaultObjectFormat`
+/// configuration.
 ///
 /// # Panics
 ///
 /// Panics if any git command fails.
 pub fn init_git_repo(dir: &Path, email: &str, name: &str) {
-    run_git(dir, &["init", "-q", "-b", "main"]);
+    run_git(dir, &["init", "-q", "-b", "main", "--object-format=sha1"]);
     run_git(dir, &["config", "user.email", email]);
     run_git(dir, &["config", "user.name", name]);
 }
