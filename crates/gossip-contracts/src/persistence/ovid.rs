@@ -7,6 +7,16 @@
 //!
 //! The hashes ensure that weak and strong claims for the same stable item produce
 //! distinct keys, avoiding cross-contamination of findings records.
+//!
+//! ## Canonical encoding invariants
+//!
+//! The hash preimage is encoded as:
+//! 1. canonical bytes for [`StableItemId`]
+//! 2. one-byte version-strength discriminator (`0` for strong, `1` for weak)
+//! 3. canonical bytes for the underlying object version id
+//!
+//! This framing guarantees that a strong claim and weak claim for the same
+//! version bytes cannot collide at the canonical-byte layer.
 
 use std::sync::LazyLock;
 
@@ -60,12 +70,23 @@ impl CanonicalBytes for OvidHashInputs {
 }
 
 /// Derive an [`OvidHash`] from stable item identity and version claim.
+///
+/// This function is pure and deterministic for identical inputs. It performs no
+/// allocation beyond hasher state and no I/O.
 #[inline]
 #[must_use]
 pub fn derive_ovid_hash(inputs: &OvidHashInputs) -> OvidHash {
     OvidHash::from_bytes(derive_from_cached(&OVID_HASHER, inputs))
 }
 
+/// Encode [`VersionId`] canonically with an explicit strength discriminator.
+///
+/// The single-byte prefix is part of the hash domain:
+/// - `0` => [`VersionId::Strong`]
+/// - `1` => [`VersionId::Weak`]
+///
+/// This prevents canonical-byte ambiguity when the wrapped version id bytes are
+/// identical across strengths.
 #[inline]
 fn write_version_id_canonical(version: VersionId, h: &mut Hasher) {
     match version {
