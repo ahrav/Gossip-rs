@@ -595,6 +595,9 @@ mod tests {
     use tempfile::tempdir;
 
     const SMALL_MODEL_BUCKETS: [u8; 4] = [0x00, 0x40, 0x80, 0xC0];
+    /// Duplicate OIDs use second-byte values starting here (0xe0..); unique OIDs
+    /// must stay below this to avoid accidental collisions.
+    const DUPLICATE_BYTE_BASE: u8 = 0xe0;
 
     /// Helper to build minimal pack index v2 bytes for MIDX merge tests.
     struct TestIdxBuilder {
@@ -712,6 +715,9 @@ mod tests {
         subsets
     }
 
+    /// Generates all length-`duplicate_count` sequences drawn from `subsets`
+    /// (Cartesian product with replacement). Returns |subsets|^duplicate_count
+    /// results — keep `duplicate_count` small to avoid combinatorial blowup.
     fn duplicate_mask_sequences(subsets: &[u8], duplicate_count: usize) -> Vec<Vec<u8>> {
         if duplicate_count == 0 {
             return vec![Vec::new()];
@@ -763,7 +769,7 @@ mod tests {
         for (duplicate_idx, &mask) in duplicate_masks.iter().enumerate() {
             let oid = test_oid(
                 SMALL_MODEL_BUCKETS[(bucket_rotation + duplicate_idx) % SMALL_MODEL_BUCKETS.len()],
-                0xe0 + duplicate_idx as u8,
+                DUPLICATE_BYTE_BASE + duplicate_idx as u8,
             );
             for (pack_idx, objects) in objects_by_pack.iter_mut().enumerate() {
                 if mask & (1u8 << pack_idx) == 0 {
@@ -781,8 +787,8 @@ mod tests {
             for slot in 0..unique_needed {
                 let second_byte = (slot * pack_count + pack_idx) as u8;
                 debug_assert!(
-                    second_byte < 0xe0,
-                    "unique OID second byte {second_byte:#x} collides with duplicate namespace [0xe0..)"
+                    second_byte < DUPLICATE_BYTE_BASE,
+                    "unique OID second byte {second_byte:#x} collides with duplicate namespace [{DUPLICATE_BYTE_BASE:#x}..)"
                 );
                 let oid = test_oid(
                     SMALL_MODEL_BUCKETS[(bucket_rotation
