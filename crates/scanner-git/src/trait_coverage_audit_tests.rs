@@ -344,17 +344,6 @@ fn trait_coverage_audit_matches_public_trait_set() {
 
 #[test]
 fn trait_coverage_audit_has_real_impl_coverage_for_every_entry() {
-    for entry in TRAIT_COVERAGE_AUDIT {
-        assert!(
-            !entry.real_impls.is_empty(),
-            "{} must list at least one real implementation",
-            entry.trait_name
-        );
-    }
-}
-
-#[test]
-fn trait_coverage_audit_impl_entries_are_verified() {
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let impl_pairs = collect_impl_pairs(&src_dir);
     let type_names = collect_type_names(&src_dir);

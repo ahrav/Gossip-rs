@@ -5357,6 +5357,136 @@ mod tests {
     }
 
     #[test]
+    fn external_base_error_records_skip_reason() {
+        let base_oid = OidBytes::sha1([0xAA; 20]);
+        let delta_payload = build_insert_delta(b"irrelevant", 0);
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+
+        let delta_offset = pack.len() as u64;
+        let mut delta_entry = encode_entry_header(7, delta_payload.len());
+        delta_entry.extend_from_slice(base_oid.as_slice());
+        delta_entry.extend_from_slice(&zlib_compress(&delta_payload));
+        pack.extend_from_slice(&delta_entry);
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate_oid = OidBytes::sha1([0xBB; 20]);
+        let plan = build_single_external_ref_plan(
+            &pack,
+            0,
+            delta_offset,
+            candidate_oid,
+            base_oid,
+            ctx(path_ref),
+        );
+
+        /// Returns `Err(PackExecError::ExternalBase(...))` for every OID lookup.
+        struct FailingExternalBase;
+
+        impl ExternalBaseProvider for FailingExternalBase {
+            fn load_base(
+                &mut self,
+                _oid: &OidBytes,
+            ) -> Result<Option<ExternalBase>, PackExecError> {
+                Err(PackExecError::ExternalBase("injected error".into()))
+            }
+        }
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = FailingExternalBase;
+        let mut sink = TestSink::default();
+
+        let report = exec_plan_result(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .expect("execution continues despite provider error");
+
+        assert_perf_u32(report.stats.emitted_candidates, 0);
+        assert!(sink.emitted.is_empty());
+        assert_eq!(report.skips.len(), 1);
+        let skip = &report.skips[0];
+        assert_eq!(skip.offset, delta_offset);
+        assert!(
+            matches!(&skip.reason, SkipReason::ExternalBaseError { detail } if detail.contains("injected error"))
+        );
+    }
+
+    #[test]
+    fn external_base_missing_records_skip_reason() {
+        let base_oid = OidBytes::sha1([0xCC; 20]);
+        let delta_payload = build_insert_delta(b"irrelevant", 0);
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+
+        let delta_offset = pack.len() as u64;
+        let mut delta_entry = encode_entry_header(7, delta_payload.len());
+        delta_entry.extend_from_slice(base_oid.as_slice());
+        delta_entry.extend_from_slice(&zlib_compress(&delta_payload));
+        pack.extend_from_slice(&delta_entry);
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate_oid = OidBytes::sha1([0xDD; 20]);
+        let plan = build_single_external_ref_plan(
+            &pack,
+            0,
+            delta_offset,
+            candidate_oid,
+            base_oid,
+            ctx(path_ref),
+        );
+
+        /// Returns `Ok(None)` for every OID lookup, simulating a missing base.
+        struct MissingExternalBase;
+
+        impl ExternalBaseProvider for MissingExternalBase {
+            fn load_base(
+                &mut self,
+                _oid: &OidBytes,
+            ) -> Result<Option<ExternalBase>, PackExecError> {
+                Ok(None)
+            }
+        }
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = MissingExternalBase;
+        let mut sink = TestSink::default();
+
+        let report = exec_plan_result(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .expect("execution continues when base is missing");
+
+        assert_perf_u32(report.stats.emitted_candidates, 0);
+        assert!(sink.emitted.is_empty());
+        assert_eq!(report.skips.len(), 1);
+        let skip = &report.skips[0];
+        assert_eq!(skip.offset, delta_offset);
+        assert!(matches!(skip.reason, SkipReason::ExternalBaseMissing { oid } if oid == base_oid));
+    }
+
+    #[test]
     fn truncated_non_delta_stream_is_skipped() {
         let mut pack = Vec::new();
         pack.extend_from_slice(b"PACK");
