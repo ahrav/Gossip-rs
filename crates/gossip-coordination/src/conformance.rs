@@ -50,11 +50,11 @@ use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use gossip_contracts::identity::{OpId, RunId, ShardId, ShardKey};
 
-/// Assert that `complete_run`, `fail_run`, and `cancel_run` all reject
-/// with `RunTerminal` on a run that has already reached `expected_status`.
+/// Ensures that once a run reaches `expected_status`, every transition API
+/// rejects with `RunTerminal`.
 ///
-/// Uses timestamps 13–15 and OpIds 101–103 to avoid collisions with the
-/// setup operations in each calling block.
+/// This mirrors the Group C invariant while keeping the timestamps and OpIds
+/// (13–15 / 101–103) separate from other test inputs.
 fn assert_all_run_transitions_rejected<B: SimulationBackend>(
     coord: &mut B,
     expected_status: RunStatus,
@@ -117,6 +117,15 @@ fn assert_all_run_transitions_rejected<B: SimulationBackend>(
 /// already satisfy the full super-trait (`CoordinationFacade +
 /// SimIntrospection`), so a tighter bound would add complexity without
 /// excluding any real caller.
+///
+/// # Execution flow
+///
+/// Each test block logs its name via `eprintln!` and runs with a freshly
+/// seeded backend from `factory`, ensuring test isolation. The harness covers
+/// the module-level **Groups A/B/C**: it drives the cross-cutting invariants,
+/// boundary variants, and run-level behavior described above, switching
+/// between `CursorSemantics::Completed` and `CursorSemantics::Dispatched` as
+/// needed to exercise each scenario.
 pub fn run_coordination_conformance<B, F>(mut factory: F)
 where
     B: SimulationBackend,
