@@ -633,10 +633,10 @@ impl PackCache {
 
     /// Grows the cache to at least `capacity_bytes` if currently smaller.
     ///
-    /// If the current capacity is already >= `capacity_bytes`, this is a
-    /// no-op (no allocation). If growth is needed, the cache is
-    /// reconstructed with the new capacity. Follows the
-    /// `PackExecScratch::prepare()` pattern: only grows, never shrinks.
+    /// If the current capacity is already >= `capacity_bytes`, all cached
+    /// entries are invalidated but no reallocation occurs. If growth is
+    /// needed, the cache is reconstructed with the new capacity. Follows
+    /// the `PackExecScratch::prepare()` pattern: only grows, never shrinks.
     pub fn ensure_capacity(&mut self, capacity_bytes: u32) {
         if self.capacity_bytes() >= capacity_bytes {
             // Already large enough — just reset entries for the new scan.
@@ -1045,5 +1045,825 @@ mod tests {
             stats.dependency_marks > 0,
             "second hit's base should be protected"
         );
+    }
+}
+
+#[cfg(all(test, feature = "stdx-proptest"))]
+mod proptests {
+    use super::super::pack_inflate::ObjectKind;
+    use super::*;
+    use crate::test_utils::proptest_cases;
+    use proptest::prelude::*;
+    use std::collections::HashMap;
+
+    const STANDARD_PROPTEST_CASES: u32 = 32;
+    const SAME_SET_PROPTEST_CASES: u32 = 16;
+    const STANDARD_SMALL_ENTRY_COUNT: usize = 6;
+    const STANDARD_LARGE_ENTRY_COUNT: usize = 6;
+    const STANDARD_ENTRY_COUNT: usize = STANDARD_SMALL_ENTRY_COUNT + STANDARD_LARGE_ENTRY_COUNT;
+    const SAME_SET_ENTRY_COUNT: usize = 6;
+    const SAME_SET_LARGE_ENTRY_COUNT: usize = 6;
+
+    /// Sized so the small tier gets exactly 1 set (4 slots). With 6 small
+    /// entries, the pigeonhole principle guarantees eviction exercises the
+    /// CLOCK hand.
+    const STANDARD_CACHE_BYTES: u32 = MIN_LARGE_TIER_BYTES + WAYS as u32 * DEFAULT_SMALL_SLOT_SIZE;
+    const SAME_SET_CACHE_BYTES: u32 = 1024 * 1024;
+
+    /// Exceeds MIN_LARGE_TIER_BYTES so both tiers are active; the large tier
+    /// gets 32 MiB = 4 sets × 4 ways for 2 MiB slots. With
+    /// `SAME_SET_LARGE_ENTRY_COUNT` entries forced into one set, this
+    /// guarantees eviction in the large tier.
+    const SAME_SET_LARGE_CACHE_BYTES: u32 = MIN_LARGE_TIER_BYTES + 4 * 1024 * 1024;
+
+    /// Upper bound for target-set strategies. The actual set index is
+    /// computed as `target_set % cache.{small,large}.sets` at the test
+    /// site, so values beyond the real set count wrap correctly. Using a
+    /// generous bound avoids coupling the strategy range to the cache
+    /// budget-split arithmetic.
+    const TARGET_SET_RANGE: usize = 8;
+
+    #[derive(Clone, Copy, Debug)]
+    struct PayloadSpec {
+        len: usize,
+        seed: u64,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct CatalogEntrySpec {
+        offset: u64,
+        kind: ObjectKind,
+        payload: PayloadSpec,
+    }
+
+    #[derive(Clone, Debug)]
+    struct CatalogEntry {
+        offset: u64,
+        kind: ObjectKind,
+        bytes: Vec<u8>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CacheOp {
+        Get(usize),
+        Insert(usize),
+        /// Clears all entries mid-workload, exercising metadata and clock
+        /// hand reset between scans.
+        Reset,
+        /// Query an offset that was never inserted. The cache must return
+        /// `None`; any hit is phantom data indicating cross-slot corruption
+        /// or a hash-collision bug.
+        GetPhantom(u64),
+    }
+
+    fn arb_object_kind() -> impl Strategy<Value = ObjectKind> {
+        prop_oneof![
+            Just(ObjectKind::Blob),
+            Just(ObjectKind::Tree),
+            Just(ObjectKind::Commit),
+            Just(ObjectKind::Tag),
+        ]
+    }
+
+    fn arb_small_payload_spec() -> impl Strategy<Value = PayloadSpec> {
+        prop_oneof![
+            (Just(0usize), any::<u64>()),
+            (Just(1usize), any::<u64>()),
+            (Just(DEFAULT_SMALL_SLOT_SIZE as usize), any::<u64>()),
+            (1usize..=DEFAULT_SMALL_SLOT_SIZE as usize, any::<u64>()),
+        ]
+        .prop_map(|(len, seed)| PayloadSpec { len, seed })
+    }
+
+    fn arb_large_payload_spec() -> impl Strategy<Value = PayloadSpec> {
+        prop_oneof![
+            (Just(DEFAULT_SMALL_SLOT_SIZE as usize + 1), any::<u64>()),
+            (Just(DEFAULT_LARGE_SLOT_SIZE as usize), any::<u64>()),
+            (
+                (DEFAULT_SMALL_SLOT_SIZE as usize + 1)..=DEFAULT_LARGE_SLOT_SIZE as usize,
+                any::<u64>(),
+            ),
+        ]
+        .prop_map(|(len, seed)| PayloadSpec { len, seed })
+    }
+
+    fn arb_standard_catalog_specs() -> impl Strategy<Value = Vec<CatalogEntrySpec>> {
+        (
+            prop::collection::btree_set(0u64..50_000, STANDARD_SMALL_ENTRY_COUNT),
+            prop::collection::vec(arb_object_kind(), STANDARD_SMALL_ENTRY_COUNT),
+            prop::collection::vec(arb_small_payload_spec(), STANDARD_SMALL_ENTRY_COUNT),
+            prop::collection::btree_set(100_000u64..150_000, STANDARD_LARGE_ENTRY_COUNT),
+            prop::collection::vec(arb_object_kind(), STANDARD_LARGE_ENTRY_COUNT),
+            prop::collection::vec(arb_large_payload_spec(), STANDARD_LARGE_ENTRY_COUNT),
+        )
+            .prop_map(
+                |(
+                    small_offsets,
+                    small_kinds,
+                    small_payloads,
+                    large_offsets,
+                    large_kinds,
+                    large_payloads,
+                )| {
+                    let mut entries = Vec::with_capacity(STANDARD_ENTRY_COUNT);
+                    for ((offset, kind), payload) in small_offsets
+                        .into_iter()
+                        .zip(small_kinds)
+                        .zip(small_payloads)
+                    {
+                        entries.push(CatalogEntrySpec {
+                            offset,
+                            kind,
+                            payload,
+                        });
+                    }
+                    for ((offset, kind), payload) in large_offsets
+                        .into_iter()
+                        .zip(large_kinds)
+                        .zip(large_payloads)
+                    {
+                        entries.push(CatalogEntrySpec {
+                            offset,
+                            kind,
+                            payload,
+                        });
+                    }
+                    entries
+                },
+            )
+    }
+
+    /// Fisher-Yates shuffle driven by a deterministic LCG so proptest
+    /// can reproduce the exact permutation from a failing seed.
+    fn shuffle_ops(ops: &mut [CacheOp], mut rng: u64) {
+        for i in (1..ops.len()).rev() {
+            rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let j = (rng >> 33) as usize % (i + 1);
+            ops.swap(i, j);
+        }
+    }
+
+    fn arb_standard_ops() -> impl Strategy<Value = Vec<CacheOp>> {
+        (
+            prop::collection::vec(
+                prop_oneof![
+                    6 => (0usize..STANDARD_ENTRY_COUNT).prop_map(CacheOp::Get),
+                    6 => (0usize..STANDARD_ENTRY_COUNT).prop_map(CacheOp::Insert),
+                    2 => (200_000u64..300_000).prop_map(CacheOp::GetPhantom),
+                    1 => Just(CacheOp::Reset),
+                ],
+                48..96usize,
+            ),
+            any::<u64>(),
+        )
+            .prop_map(|(mut ops, shuffle_seed)| {
+                // Seed every catalog entry so early Get ops can hit. Without
+                // this, random Gets on un-inserted indices always miss,
+                // starving DependencyClock hint coverage. The shuffle varies
+                // initial CLOCK hand state across test cases.
+                let mut seeded: Vec<CacheOp> =
+                    (0..STANDARD_ENTRY_COUNT).map(CacheOp::Insert).collect();
+                shuffle_ops(&mut seeded, shuffle_seed);
+                seeded.append(&mut ops);
+                seeded
+            })
+    }
+
+    fn arb_standard_workload() -> impl Strategy<Value = (Vec<CatalogEntrySpec>, Vec<CacheOp>)> {
+        (arb_standard_catalog_specs(), arb_standard_ops())
+    }
+
+    fn arb_same_set_entry_specs() -> impl Strategy<Value = Vec<(ObjectKind, PayloadSpec)>> {
+        (
+            prop::collection::vec(arb_object_kind(), SAME_SET_ENTRY_COUNT),
+            prop::collection::vec(arb_small_payload_spec(), SAME_SET_ENTRY_COUNT),
+        )
+            .prop_map(|(kinds, payloads)| kinds.into_iter().zip(payloads).collect())
+    }
+
+    fn arb_same_set_ops() -> impl Strategy<Value = Vec<CacheOp>> {
+        (
+            prop::collection::vec(
+                prop_oneof![
+                    6 => (0usize..SAME_SET_ENTRY_COUNT).prop_map(CacheOp::Get),
+                    6 => (0usize..SAME_SET_ENTRY_COUNT).prop_map(CacheOp::Insert),
+                    2 => (200_000u64..300_000).prop_map(CacheOp::GetPhantom),
+                    1 => Just(CacheOp::Reset),
+                ],
+                24..72usize,
+            ),
+            any::<u64>(),
+        )
+            .prop_map(|(mut ops, shuffle_seed)| {
+                let mut seeded = (0..SAME_SET_ENTRY_COUNT)
+                    .map(CacheOp::Insert)
+                    .collect::<Vec<_>>();
+                shuffle_ops(&mut seeded, shuffle_seed);
+                seeded.append(&mut ops);
+                seeded
+            })
+    }
+
+    fn arb_same_set_workload(
+    ) -> impl Strategy<Value = (usize, Vec<(ObjectKind, PayloadSpec)>, Vec<CacheOp>)> {
+        // Vary the target set so boundary sets (e.g., last index) get
+        // exercised, not just set 0. The modulo at the test site wraps
+        // values beyond the actual set count.
+        (
+            0usize..TARGET_SET_RANGE,
+            arb_same_set_entry_specs(),
+            arb_same_set_ops(),
+        )
+    }
+
+    fn arb_same_set_large_entry_specs() -> impl Strategy<Value = Vec<(ObjectKind, PayloadSpec)>> {
+        (
+            prop::collection::vec(arb_object_kind(), SAME_SET_LARGE_ENTRY_COUNT),
+            prop::collection::vec(arb_large_payload_spec(), SAME_SET_LARGE_ENTRY_COUNT),
+        )
+            .prop_map(|(kinds, payloads)| kinds.into_iter().zip(payloads).collect())
+    }
+
+    fn arb_same_set_large_ops() -> impl Strategy<Value = Vec<CacheOp>> {
+        (
+            prop::collection::vec(
+                prop_oneof![
+                    6 => (0usize..SAME_SET_LARGE_ENTRY_COUNT).prop_map(CacheOp::Get),
+                    6 => (0usize..SAME_SET_LARGE_ENTRY_COUNT).prop_map(CacheOp::Insert),
+                    2 => (200_000u64..300_000).prop_map(CacheOp::GetPhantom),
+                    1 => Just(CacheOp::Reset),
+                ],
+                24..72usize,
+            ),
+            any::<u64>(),
+        )
+            .prop_map(|(mut ops, shuffle_seed)| {
+                let mut seeded = (0..SAME_SET_LARGE_ENTRY_COUNT)
+                    .map(CacheOp::Insert)
+                    .collect::<Vec<_>>();
+                shuffle_ops(&mut seeded, shuffle_seed);
+                seeded.append(&mut ops);
+                seeded
+            })
+    }
+
+    fn arb_same_set_large_workload(
+    ) -> impl Strategy<Value = (usize, Vec<(ObjectKind, PayloadSpec)>, Vec<CacheOp>)> {
+        (
+            0usize..TARGET_SET_RANGE,
+            arb_same_set_large_entry_specs(),
+            arb_same_set_large_ops(),
+        )
+    }
+
+    fn object_kind_tag(kind: ObjectKind) -> u64 {
+        match kind {
+            ObjectKind::Commit => 0x11,
+            ObjectKind::Tree => 0x22,
+            ObjectKind::Blob => 0x33,
+            ObjectKind::Tag => 0x44,
+        }
+    }
+
+    fn materialize_payload(offset: u64, kind: ObjectKind, spec: PayloadSpec) -> Vec<u8> {
+        let mut state = spec.seed ^ offset.rotate_left(17) ^ object_kind_tag(kind);
+        if state == 0 {
+            state = 0x9e37_79b9_7f4a_7c15;
+        }
+
+        let mut bytes = Vec::with_capacity(spec.len);
+        while bytes.len() < spec.len {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let word = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.truncate(spec.len);
+        bytes
+    }
+
+    fn build_catalog(specs: &[CatalogEntrySpec]) -> Vec<CatalogEntry> {
+        specs
+            .iter()
+            .map(|spec| CatalogEntry {
+                offset: spec.offset,
+                kind: spec.kind,
+                bytes: materialize_payload(spec.offset, spec.kind, spec.payload),
+            })
+            .collect()
+    }
+
+    fn find_colliding_offsets(target_set: usize, sets: usize, count: usize) -> Vec<u64> {
+        assert!(
+            sets.is_power_of_two(),
+            "same-set oracle requires power-of-two sets"
+        );
+        let mask = sets - 1;
+        let offsets: Vec<u64> = (0u64..)
+            .filter(|&offset| (hash_offset(offset) as usize & mask) == target_set)
+            .take(count)
+            .collect();
+        assert_eq!(offsets.len(), count, "expected enough colliding offsets");
+        offsets
+    }
+
+    fn build_same_set_catalog(
+        target_set: usize,
+        sets: usize,
+        entry_specs: &[(ObjectKind, PayloadSpec)],
+    ) -> Vec<CatalogEntry> {
+        let offsets = find_colliding_offsets(target_set, sets, entry_specs.len());
+        entry_specs
+            .iter()
+            .copied()
+            .zip(offsets)
+            .map(|((kind, payload), offset)| CatalogEntry {
+                offset,
+                kind,
+                bytes: materialize_payload(offset, kind, payload),
+            })
+            .collect()
+    }
+
+    fn new_standard_oracle_cache(policy: EvictionPolicy) -> PackCache {
+        let cache = PackCache::new_with_policy_for_test(STANDARD_CACHE_BYTES, policy);
+        assert!(
+            !cache.small.is_disabled(),
+            "standard oracle should enable small tier"
+        );
+        assert_eq!(
+            cache.small.sets, 1,
+            "standard oracle expects exactly 1 small set for pigeonhole eviction"
+        );
+        assert!(
+            !cache.large.is_disabled(),
+            "standard oracle should enable large tier"
+        );
+        cache
+    }
+
+    fn new_same_set_oracle_cache(policy: EvictionPolicy) -> PackCache {
+        let cache = PackCache::new_with_policy_for_test(SAME_SET_CACHE_BYTES, policy);
+        assert!(
+            !cache.small.is_disabled(),
+            "same-set oracle should keep the small tier enabled"
+        );
+        assert!(
+            cache.large.is_disabled(),
+            "same-set oracle should isolate the small tier"
+        );
+        assert!(cache.small.sets > 1, "same-set oracle needs multiple sets");
+        cache
+    }
+
+    fn new_same_set_large_oracle_cache(policy: EvictionPolicy) -> PackCache {
+        let cache = PackCache::new_with_policy_for_test(SAME_SET_LARGE_CACHE_BYTES, policy);
+        assert!(
+            !cache.large.is_disabled(),
+            "same-set large oracle should enable the large tier"
+        );
+        assert!(
+            cache.large.sets > 1,
+            "same-set large oracle needs multiple large sets"
+        );
+        cache
+    }
+
+    fn assert_hit_matches_reference(
+        hit: Option<CachedObject<'_>>,
+        offset: u64,
+        reference: &HashMap<u64, (ObjectKind, Vec<u8>)>,
+    ) -> Result<(), TestCaseError> {
+        if let Some(hit) = hit {
+            prop_assert!(
+                reference.contains_key(&offset),
+                "cache returned offset {offset} before any successful insert"
+            );
+            let (expected_kind, expected_bytes) = reference.get(&offset).expect("checked above");
+            prop_assert_eq!(
+                hit.kind,
+                *expected_kind,
+                "kind mismatch for offset {}",
+                offset
+            );
+            prop_assert_eq!(
+                hit.bytes,
+                expected_bytes.as_slice(),
+                "byte mismatch for offset {}",
+                offset
+            );
+        }
+        Ok(())
+    }
+
+    fn run_oracle_workload(
+        cache: &mut PackCache,
+        catalog: &[CatalogEntry],
+        ops: &[CacheOp],
+    ) -> Result<(), TestCaseError> {
+        let mut reference = HashMap::<u64, (ObjectKind, Vec<u8>)>::new();
+
+        for op in ops {
+            match *op {
+                CacheOp::Get(index) => {
+                    let entry = &catalog[index];
+                    assert_hit_matches_reference(
+                        cache.get(entry.offset),
+                        entry.offset,
+                        &reference,
+                    )?;
+                }
+                CacheOp::GetPhantom(offset) => {
+                    // Offset was never inserted; any hit is phantom data.
+                    prop_assert!(
+                        cache.get(offset).is_none(),
+                        "phantom get({offset}) should miss — offset was never inserted"
+                    );
+                }
+                CacheOp::Insert(index) => {
+                    let entry = &catalog[index];
+                    prop_assert!(
+                        cache.insert(entry.offset, entry.kind, &entry.bytes),
+                        "insert should succeed for offset {} with {} bytes",
+                        entry.offset,
+                        entry.bytes.len()
+                    );
+                    reference.insert(entry.offset, (entry.kind, entry.bytes.clone()));
+
+                    let hit = cache.get(entry.offset);
+                    prop_assert!(
+                        hit.is_some(),
+                        "immediate get after insert should hit for offset {}",
+                        entry.offset
+                    );
+                    let hit = hit.expect("checked above");
+                    prop_assert_eq!(
+                        hit.kind,
+                        entry.kind,
+                        "immediate get kind mismatch for offset {}",
+                        entry.offset
+                    );
+                    prop_assert_eq!(
+                        hit.bytes,
+                        entry.bytes.as_slice(),
+                        "immediate get bytes mismatch for offset {}",
+                        entry.offset
+                    );
+
+                    // The verification get arms a dependency hint. Clear it
+                    // so the next operation's eviction behavior is not
+                    // systematically biased toward DependencyClock protection.
+                    cache.pending_dependency_hint = None;
+                }
+                CacheOp::Reset => {
+                    cache.reset();
+                    // The real cache forgets everything; the oracle must too.
+                    reference.clear();
+                }
+            }
+        }
+
+        // Post-workload hit-integrity sweep: query every catalog entry and
+        // verify that any data the cache still holds is correct. Misses are
+        // expected (eviction is allowed) and silently pass — this sweep
+        // catches corrupt-on-hit, not missing-after-eviction.
+        for entry in catalog {
+            assert_hit_matches_reference(cache.get(entry.offset), entry.offset, &reference)?;
+        }
+
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            proptest_cases(STANDARD_PROPTEST_CASES)
+        ))]
+
+        #[test]
+        fn oracle_transparency_mixed_tiers_clock(
+            (catalog_specs, ops) in arb_standard_workload(),
+        ) {
+            let mut cache = new_standard_oracle_cache(EvictionPolicy::Clock);
+            let catalog = build_catalog(&catalog_specs);
+            run_oracle_workload(&mut cache, &catalog, &ops)?;
+            // Confirm both tiers saw traffic; a regression in the
+            // capacity-splitting logic could silently route everything
+            // to one tier.
+            prop_assert!(
+                cache.small.eviction_stats.insert_attempts > 0,
+                "mixed-tier workload should route inserts to the small tier"
+            );
+            prop_assert!(
+                cache.large.eviction_stats.insert_attempts > 0,
+                "mixed-tier workload should route inserts to the large tier"
+            );
+        }
+
+        #[test]
+        fn oracle_transparency_mixed_tiers_dependency_clock(
+            (catalog_specs, ops) in arb_standard_workload(),
+        ) {
+            let mut cache = new_standard_oracle_cache(EvictionPolicy::DependencyClock);
+            let catalog = build_catalog(&catalog_specs);
+            run_oracle_workload(&mut cache, &catalog, &ops)?;
+            prop_assert!(
+                cache.small.eviction_stats.insert_attempts > 0,
+                "mixed-tier workload should route inserts to the small tier"
+            );
+            prop_assert!(
+                cache.large.eviction_stats.insert_attempts > 0,
+                "mixed-tier workload should route inserts to the large tier"
+            );
+        }
+
+        /// All entries must miss after reset; new inserts must succeed.
+        #[test]
+        fn reset_invalidates_all_entries(
+            (catalog_specs, ops) in arb_standard_workload(),
+        ) {
+            let mut cache = new_standard_oracle_cache(EvictionPolicy::Clock);
+            let catalog = build_catalog(&catalog_specs);
+            run_oracle_workload(&mut cache, &catalog, &ops)?;
+
+            cache.reset();
+
+            for entry in &catalog {
+                prop_assert!(
+                    cache.get(entry.offset).is_none(),
+                    "get({}) should miss after reset",
+                    entry.offset
+                );
+            }
+            // Re-insert one entry to confirm the cache is still functional.
+            let first = &catalog[0];
+            prop_assert!(cache.insert(first.offset, first.kind, &first.bytes));
+            prop_assert!(cache.get(first.offset).is_some());
+        }
+
+        /// ensure_capacity with a larger value resets entries and grows.
+        #[test]
+        fn ensure_capacity_grow_clears_entries_clock(
+            (catalog_specs, ops) in arb_standard_workload(),
+        ) {
+            let mut cache = new_standard_oracle_cache(EvictionPolicy::Clock);
+            let catalog = build_catalog(&catalog_specs);
+            run_oracle_workload(&mut cache, &catalog, &ops)?;
+
+            let old_capacity = cache.capacity_bytes();
+            // Request enough growth that `new_with_policy` rounding still
+            // produces a larger cache than the original.
+            let new_capacity = old_capacity + 16 * 1024 * 1024;
+            cache.ensure_capacity(new_capacity);
+
+            prop_assert!(
+                cache.capacity_bytes() > old_capacity,
+                "capacity should grow beyond the original"
+            );
+            prop_assert_eq!(
+                cache.eviction_policy_name(),
+                "clock",
+                "eviction policy should survive reconstruction"
+            );
+            for entry in &catalog {
+                prop_assert!(
+                    cache.get(entry.offset).is_none(),
+                    "get({}) should miss after ensure_capacity grow",
+                    entry.offset
+                );
+            }
+        }
+
+        /// ensure_capacity grow must preserve DependencyClock across
+        /// reconstruction.
+        #[test]
+        fn ensure_capacity_grow_clears_entries_dependency_clock(
+            (catalog_specs, ops) in arb_standard_workload(),
+        ) {
+            let mut cache = new_standard_oracle_cache(EvictionPolicy::DependencyClock);
+            let catalog = build_catalog(&catalog_specs);
+            run_oracle_workload(&mut cache, &catalog, &ops)?;
+
+            let old_capacity = cache.capacity_bytes();
+            let new_capacity = old_capacity + 16 * 1024 * 1024;
+            cache.ensure_capacity(new_capacity);
+
+            prop_assert!(
+                cache.capacity_bytes() > old_capacity,
+                "capacity should grow beyond the original"
+            );
+            prop_assert_eq!(
+                cache.eviction_policy_name(),
+                "dependency_clock",
+                "eviction policy should survive reconstruction"
+            );
+            for entry in &catalog {
+                prop_assert!(
+                    cache.get(entry.offset).is_none(),
+                    "get({}) should miss after ensure_capacity grow",
+                    entry.offset
+                );
+            }
+        }
+
+        /// ensure_capacity with an equal-or-smaller value invalidates entries
+        /// without reallocation.
+        #[test]
+        fn ensure_capacity_no_grow_resets_entries_clock(
+            (catalog_specs, ops) in arb_standard_workload(),
+        ) {
+            let mut cache = new_standard_oracle_cache(EvictionPolicy::Clock);
+            let catalog = build_catalog(&catalog_specs);
+            run_oracle_workload(&mut cache, &catalog, &ops)?;
+
+            let cap = cache.capacity_bytes();
+            cache.ensure_capacity(cap);
+
+            prop_assert_eq!(cache.capacity_bytes(), cap, "capacity should not change");
+            prop_assert_eq!(
+                cache.eviction_policy_name(),
+                "clock",
+                "eviction policy should survive no-grow reset"
+            );
+            for entry in &catalog {
+                prop_assert!(
+                    cache.get(entry.offset).is_none(),
+                    "get({}) should miss after ensure_capacity reset",
+                    entry.offset
+                );
+            }
+        }
+
+        /// ensure_capacity no-grow must preserve DependencyClock.
+        #[test]
+        fn ensure_capacity_no_grow_resets_entries_dependency_clock(
+            (catalog_specs, ops) in arb_standard_workload(),
+        ) {
+            let mut cache = new_standard_oracle_cache(EvictionPolicy::DependencyClock);
+            let catalog = build_catalog(&catalog_specs);
+            run_oracle_workload(&mut cache, &catalog, &ops)?;
+
+            let cap = cache.capacity_bytes();
+            cache.ensure_capacity(cap);
+
+            prop_assert_eq!(cache.capacity_bytes(), cap, "capacity should not change");
+            prop_assert_eq!(
+                cache.eviction_policy_name(),
+                "dependency_clock",
+                "eviction policy should survive no-grow reset"
+            );
+            for entry in &catalog {
+                prop_assert!(
+                    cache.get(entry.offset).is_none(),
+                    "get({}) should miss after ensure_capacity reset",
+                    entry.offset
+                );
+            }
+        }
+
+        /// Re-inserting the same offset with different data overwrites the
+        /// entry within the small tier. Independent lengths catch stale
+        /// `slot.len` bugs where the stored length is not updated on
+        /// overwrite.
+        #[test]
+        fn duplicate_insert_overwrites_small(
+            offset in 0u64..100_000,
+            kind_a in arb_object_kind(),
+            kind_b in arb_object_kind(),
+            seed_a in any::<u64>(),
+            seed_b in any::<u64>(),
+            len_a in 1usize..=1024,
+            len_b in 1usize..=1024,
+        ) {
+            let mut cache = new_standard_oracle_cache(EvictionPolicy::Clock);
+            let payload_a = materialize_payload(offset, kind_a, PayloadSpec { len: len_a, seed: seed_a });
+            let payload_b = materialize_payload(offset, kind_b, PayloadSpec { len: len_b, seed: seed_b });
+
+            prop_assert!(cache.insert(offset, kind_a, &payload_a));
+            prop_assert!(cache.insert(offset, kind_b, &payload_b));
+
+            let hit = cache.get(offset);
+            prop_assert!(hit.is_some(), "re-inserted entry should be retrievable");
+            let hit = hit.expect("checked above");
+            prop_assert_eq!(hit.kind, kind_b, "kind should reflect the second insert");
+            prop_assert_eq!(
+                hit.bytes,
+                payload_b.as_slice(),
+                "bytes should reflect the second insert"
+            );
+        }
+
+        /// Re-inserting the same offset with different data overwrites the
+        /// entry within the large tier, exercising the large-tier dedup path.
+        /// Independent lengths catch stale `slot.len` bugs.
+        #[test]
+        fn duplicate_insert_overwrites_large(
+            offset in 0u64..100_000,
+            kind_a in arb_object_kind(),
+            kind_b in arb_object_kind(),
+            seed_a in any::<u64>(),
+            seed_b in any::<u64>(),
+            len_a in (DEFAULT_SMALL_SLOT_SIZE as usize + 1)..=(DEFAULT_SMALL_SLOT_SIZE as usize + 4096),
+            len_b in (DEFAULT_SMALL_SLOT_SIZE as usize + 1)..=(DEFAULT_SMALL_SLOT_SIZE as usize + 4096),
+        ) {
+            let mut cache = new_standard_oracle_cache(EvictionPolicy::Clock);
+            let payload_a = materialize_payload(offset, kind_a, PayloadSpec { len: len_a, seed: seed_a });
+            let payload_b = materialize_payload(offset, kind_b, PayloadSpec { len: len_b, seed: seed_b });
+
+            prop_assert!(cache.insert(offset, kind_a, &payload_a));
+            prop_assert!(cache.insert(offset, kind_b, &payload_b));
+
+            let hit = cache.get(offset);
+            prop_assert!(hit.is_some(), "re-inserted large entry should be retrievable");
+            let hit = hit.expect("checked above");
+            prop_assert_eq!(hit.kind, kind_b, "kind should reflect the second large insert");
+            prop_assert_eq!(
+                hit.bytes,
+                payload_b.as_slice(),
+                "bytes should reflect the second large insert"
+            );
+        }
+
+        /// Entries larger than the large-tier slot size must be rejected.
+        #[test]
+        fn oversize_entry_rejected(
+            offset in 0u64..100_000,
+            kind in arb_object_kind(),
+            len in (DEFAULT_LARGE_SLOT_SIZE as usize + 1)..=(DEFAULT_LARGE_SLOT_SIZE as usize + 4096),
+        ) {
+            let mut cache = new_standard_oracle_cache(EvictionPolicy::Clock);
+            let payload = vec![0xFFu8; len];
+            prop_assert!(
+                !cache.insert(offset, kind, &payload),
+                "oversize entry ({len} bytes) should be rejected"
+            );
+            prop_assert!(
+                cache.get(offset).is_none(),
+                "oversize entry should not be retrievable"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            proptest_cases(SAME_SET_PROPTEST_CASES)
+        ))]
+
+        #[test]
+        fn oracle_transparency_same_set_clock(
+            (target_set, entry_specs, ops) in arb_same_set_workload(),
+        ) {
+            let mut cache = new_same_set_oracle_cache(EvictionPolicy::Clock);
+            let target = target_set % cache.small.sets;
+            let catalog = build_same_set_catalog(target, cache.small.sets, &entry_specs);
+            run_oracle_workload(&mut cache, &catalog, &ops)?;
+            // 6 entries into 4-way set: at least 2 evictions from seeded inserts.
+            prop_assert!(
+                cache.eviction_stats().victim_selections > 0,
+                "same-set workload should trigger eviction"
+            );
+        }
+
+        #[test]
+        fn oracle_transparency_same_set_dependency_clock(
+            (target_set, entry_specs, ops) in arb_same_set_workload(),
+        ) {
+            let mut cache = new_same_set_oracle_cache(EvictionPolicy::DependencyClock);
+            let target = target_set % cache.small.sets;
+            let catalog = build_same_set_catalog(target, cache.small.sets, &entry_specs);
+            run_oracle_workload(&mut cache, &catalog, &ops)?;
+            prop_assert!(
+                cache.eviction_stats().victim_selections > 0,
+                "same-set workload should trigger eviction under DependencyClock"
+            );
+        }
+
+        #[test]
+        fn oracle_transparency_same_set_large_clock(
+            (target_set, entry_specs, ops) in arb_same_set_large_workload(),
+        ) {
+            let mut cache = new_same_set_large_oracle_cache(EvictionPolicy::Clock);
+            let target = target_set % cache.large.sets;
+            let catalog = build_same_set_catalog(target, cache.large.sets, &entry_specs);
+            run_oracle_workload(&mut cache, &catalog, &ops)?;
+            prop_assert!(
+                cache.eviction_stats().victim_selections > 0,
+                "same-set large workload should trigger eviction in the large tier"
+            );
+        }
+
+        #[test]
+        fn oracle_transparency_same_set_large_dependency_clock(
+            (target_set, entry_specs, ops) in arb_same_set_large_workload(),
+        ) {
+            let mut cache = new_same_set_large_oracle_cache(EvictionPolicy::DependencyClock);
+            let target = target_set % cache.large.sets;
+            let catalog = build_same_set_catalog(target, cache.large.sets, &entry_specs);
+            run_oracle_workload(&mut cache, &catalog, &ops)?;
+            prop_assert!(
+                cache.eviction_stats().victim_selections > 0,
+                "same-set large workload should trigger eviction under DependencyClock"
+            );
+        }
     }
 }
