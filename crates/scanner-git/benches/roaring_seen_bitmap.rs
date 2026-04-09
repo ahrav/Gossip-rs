@@ -5,7 +5,8 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use scanner_git::{
-    MidxBuilder, MidxOrdinalBitset, MidxView, ObjectFormat, OidBytes, RoaringSeenBitmap,
+    BytesView, HybridSeenStore, MidxBuilder, MidxOrdinalBitset, MidxView, ObjectFormat, OidBytes,
+    RepoArtifactFingerprint, RoaringSeenBitmap, RoaringSeenStore, SeenBlobStore,
 };
 
 const BITMAP_SIZE: u32 = 1_000_000;
@@ -35,6 +36,13 @@ fn build_bitmap(size: u32) -> RoaringSeenBitmap {
     let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
     bitmap.insert_batch(&oids).expect("bitmap");
     bitmap
+}
+
+fn bench_fingerprint(tag: u8) -> RepoArtifactFingerprint {
+    RepoArtifactFingerprint {
+        packs_hash: [tag; 32],
+        idx_hash: [tag.wrapping_add(1); 32],
+    }
 }
 
 fn build_ordinal_bitset(size: u32) -> MidxOrdinalBitset {
@@ -72,6 +80,30 @@ fn build_probe_batch(probe_count: u32, dataset_size: u32) -> Vec<OidBytes> {
 
 fn build_update_batch(start: u32, size: u32) -> Vec<OidBytes> {
     (start..start + size).map(oid_from_u32).collect()
+}
+
+fn build_hybrid_store(size: u32, loose_seen: u32) -> HybridSeenStore {
+    let mut bitmap = build_bitmap(size);
+    let loose = build_update_batch(size + PROBE_BATCH, loose_seen);
+    bitmap.insert_batch(&loose).expect("loose bitmap");
+    HybridSeenStore::with_midx(
+        RoaringSeenStore::new(bitmap),
+        BytesView::from_vec(build_midx_bytes(size)),
+        ObjectFormat::Sha1,
+        bench_fingerprint(0x31),
+    )
+    .expect("hybrid store")
+}
+
+fn build_hybrid_probe_batch(probe_count: u32, dataset_size: u32) -> Vec<OidBytes> {
+    let loose_base = dataset_size + PROBE_BATCH;
+    (0..probe_count)
+        .map(|idx| match idx % 4 {
+            0 | 1 => oid_from_u32(idx % dataset_size),
+            2 => oid_from_u32(loose_base + idx),
+            _ => oid_from_u32(loose_base + probe_count + idx),
+        })
+        .collect()
 }
 
 fn report_memory_profiles() {
@@ -148,6 +180,30 @@ fn bench_batch_contains_sorted_compare(c: &mut Criterion) {
     }
 }
 
+fn bench_hybrid_batch_check_seen_compare(c: &mut Criterion) {
+    for size in SCALE_POINTS {
+        let hybrid = build_hybrid_store(size, PROBE_BATCH);
+        hybrid.rebuild_from_fallback().expect("warm ordinal cache");
+        let bitmap = hybrid.fallback().bitmap().clone();
+        let mut probes = build_hybrid_probe_batch(PROBE_BATCH, size);
+        probes.sort_unstable();
+
+        assert_eq!(
+            hybrid.batch_check_seen(&probes).expect("hybrid query"),
+            bitmap.batch_contains_sorted(&probes),
+        );
+
+        c.bench_function(
+            &format!("roaring_seen/batch_contains_sorted_mixed_10k_against_{size}"),
+            |b| b.iter(|| black_box(bitmap.batch_contains_sorted(black_box(&probes)))),
+        );
+        c.bench_function(
+            &format!("hybrid_seen/batch_check_seen_mixed_10k_against_{size}"),
+            |b| b.iter(|| black_box(hybrid.batch_check_seen(black_box(&probes)).expect("hybrid"))),
+        );
+    }
+}
+
 fn bench_serialize(c: &mut Criterion) {
     let bitmap = build_bitmap(BITMAP_SIZE);
 
@@ -210,13 +266,33 @@ fn bench_merge(c: &mut Criterion) {
     });
 }
 
+fn bench_hybrid_rebuild(c: &mut Criterion) {
+    let base = build_hybrid_store(BITMAP_SIZE, 100_000);
+
+    c.bench_function("hybrid_seen/rebuild_from_fallback_1m", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let working = base.clone();
+                let start = Instant::now();
+                working.rebuild_from_fallback().expect("rebuild");
+                total += start.elapsed();
+                black_box(working);
+            }
+            total
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_batch_contains,
     bench_batch_contains_sorted_compare,
+    bench_hybrid_batch_check_seen_compare,
     bench_serialize,
     bench_deserialize,
     bench_insert_batch,
-    bench_merge
+    bench_merge,
+    bench_hybrid_rebuild
 );
 criterion_main!(benches);

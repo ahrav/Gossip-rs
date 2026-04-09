@@ -6,15 +6,23 @@
 //! corresponds to one entry in the MIDX OIDL chunk, eliminating the 20-byte
 //! per-OID index copy on the hot path.
 
+use std::cell::RefCell;
+use std::io;
 use std::mem::size_of;
 
+use blake3::Hasher;
 use bytemuck::{cast_slice, try_cast_slice};
 use gossip_stdx::bitset::DynamicBitSet;
 use gossip_stdx::words_for_bits;
 
+use super::bytes::BytesView;
+use super::errors::SpillError;
 use super::midx::{MidxCursor, MidxView};
 use super::midx_error::MidxError;
-use super::object_id::OidBytes;
+use super::object_id::{ObjectFormat, OidBytes};
+use super::repo_open::RepoArtifactFingerprint;
+use super::roaring_seen::{RoaringSeenBitmap, RoaringSeenStore};
+use super::seen_store::SeenBlobStore;
 
 const MOBS_MAGIC: [u8; 4] = *b"MOBS";
 const MOBS_VERSION: u8 = 1;
@@ -394,6 +402,283 @@ impl MidxOrdinalBitset {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ConfiguredMidxSnapshot {
+    bytes: BytesView,
+    object_format: ObjectFormat,
+    artifact_fingerprint: RepoArtifactFingerprint,
+}
+
+#[derive(Clone, Debug)]
+struct OrdinalCache {
+    bitset: MidxOrdinalBitset,
+    artifact_fingerprint: RepoArtifactFingerprint,
+}
+
+/// Seen-store wrapper that serves MIDX-resident OIDs from an ordinal bitset
+/// and falls back to the persisted roaring bitmap for loose objects.
+///
+/// The roaring bitmap remains the authoritative store. The ordinal cache is a
+/// derived acceleration structure tied to one MIDX snapshot and is rebuilt
+/// lazily after the configured snapshot changes.
+#[derive(Clone, Debug)]
+pub struct HybridSeenStore {
+    fallback: RoaringSeenStore,
+    midx_snapshot: Option<ConfiguredMidxSnapshot>,
+    ordinal: RefCell<Option<OrdinalCache>>,
+}
+
+impl HybridSeenStore {
+    /// Builds a hybrid store without a MIDX snapshot.
+    #[must_use]
+    pub fn new(fallback: RoaringSeenStore) -> Self {
+        Self {
+            fallback,
+            midx_snapshot: None,
+            ordinal: RefCell::new(None),
+        }
+    }
+
+    /// Builds a hybrid store with an initial MIDX snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpillError`] when the MIDX bytes do not parse for the given
+    /// object format or when the snapshot format disagrees with the roaring
+    /// bitmap's object length.
+    pub fn with_midx(
+        fallback: RoaringSeenStore,
+        midx_bytes: BytesView,
+        object_format: ObjectFormat,
+        artifact_fingerprint: RepoArtifactFingerprint,
+    ) -> Result<Self, SpillError> {
+        let mut store = Self::new(fallback);
+        store.set_midx_snapshot(midx_bytes, object_format, artifact_fingerprint)?;
+        Ok(store)
+    }
+
+    /// Returns the authoritative roaring fallback store.
+    #[must_use]
+    pub fn fallback(&self) -> &RoaringSeenStore {
+        &self.fallback
+    }
+
+    /// Returns the authoritative roaring fallback store, clearing any cached
+    /// ordinal bits before the caller mutates the bitmap.
+    pub fn fallback_mut(&mut self) -> &mut RoaringSeenStore {
+        self.ordinal.get_mut().take();
+        &mut self.fallback
+    }
+
+    /// Replaces the current MIDX snapshot and invalidates the ordinal cache
+    /// when the fingerprint changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpillError`] when the snapshot object format disagrees with
+    /// the roaring bitmap's object length or when the MIDX bytes do not parse.
+    pub fn set_midx_snapshot(
+        &mut self,
+        midx_bytes: BytesView,
+        object_format: ObjectFormat,
+        artifact_fingerprint: RepoArtifactFingerprint,
+    ) -> Result<(), SpillError> {
+        validate_snapshot(&self.fallback, midx_bytes.as_slice(), object_format)?;
+        let changed = self
+            .midx_snapshot
+            .as_ref()
+            .is_none_or(|current| current.artifact_fingerprint != artifact_fingerprint);
+        self.midx_snapshot = Some(ConfiguredMidxSnapshot {
+            bytes: midx_bytes,
+            object_format,
+            artifact_fingerprint,
+        });
+        if changed {
+            self.ordinal.get_mut().take();
+        }
+        Ok(())
+    }
+
+    /// Discards the configured MIDX snapshot and any cached ordinal bits.
+    pub fn clear_midx_snapshot(&mut self) {
+        self.midx_snapshot = None;
+        self.ordinal.get_mut().take();
+    }
+
+    /// Returns whether the cached ordinal bitset targets `fingerprint`.
+    #[must_use]
+    pub fn is_valid_for_fingerprint(&self, fingerprint: &RepoArtifactFingerprint) -> bool {
+        self.ordinal
+            .borrow()
+            .as_ref()
+            .is_some_and(|cache| &cache.artifact_fingerprint == fingerprint)
+    }
+
+    /// Rebuilds the ordinal cache from the authoritative roaring bitmap.
+    ///
+    /// OIDs missing from the configured MIDX remain available through the
+    /// roaring fallback and are not added to the ordinal bitset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpillError`] when the configured MIDX snapshot is invalid.
+    pub fn rebuild_from_fallback(&self) -> Result<(), SpillError> {
+        let Some(snapshot) = self.midx_snapshot.as_ref() else {
+            self.ordinal.borrow_mut().take();
+            return Ok(());
+        };
+
+        let midx = MidxView::parse(snapshot.bytes.as_slice(), snapshot.object_format)?;
+        let mut bitset = MidxOrdinalBitset::new(
+            midx.object_count(),
+            fold_artifact_fingerprint(&snapshot.artifact_fingerprint),
+        );
+        let mut cursor = MidxCursor::default();
+        for oid in self.fallback.bitmap().seen_oids() {
+            match midx.find_oid_sorted(&mut cursor, &oid) {
+                Ok(Some(ordinal)) => bitset.set(ordinal),
+                Ok(None) | Err(MidxError::InputOidLengthMismatch { .. }) => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        *self.ordinal.borrow_mut() = Some(OrdinalCache {
+            bitset,
+            artifact_fingerprint: snapshot.artifact_fingerprint.clone(),
+        });
+        Ok(())
+    }
+
+    fn ensure_ordinal_cache(&self) -> Result<(), SpillError> {
+        let Some(snapshot) = self.midx_snapshot.as_ref() else {
+            self.ordinal.borrow_mut().take();
+            return Ok(());
+        };
+        if self.is_valid_for_fingerprint(&snapshot.artifact_fingerprint) {
+            return Ok(());
+        }
+        self.ordinal.borrow_mut().take();
+        self.rebuild_from_fallback()
+    }
+}
+
+impl SeenBlobStore for HybridSeenStore {
+    fn batch_check_seen(&self, oids: &[OidBytes]) -> Result<Vec<bool>, SpillError> {
+        if oids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let Some(snapshot) = self.midx_snapshot.as_ref() else {
+            return self.fallback.batch_check_seen(oids);
+        };
+        self.ensure_ordinal_cache()?;
+
+        let cache_guard = self.ordinal.borrow();
+        let Some(cache) = cache_guard.as_ref() else {
+            return self.fallback.batch_check_seen(oids);
+        };
+        let midx = MidxView::parse(snapshot.bytes.as_slice(), snapshot.object_format)?;
+
+        let mut result = Vec::with_capacity(oids.len());
+        let mut fallback_oids = Vec::new();
+        let mut fallback_positions = Vec::new();
+        let mut cursor = MidxCursor::default();
+        let mut previous_oid: Option<&OidBytes> = None;
+        let mut previous_result = PreviousLookup::Ordinal(false);
+
+        for (idx, oid) in oids.iter().enumerate() {
+            if let Some(prev) = previous_oid {
+                if prev > oid {
+                    return self.fallback.batch_check_seen(oids);
+                }
+                if prev == oid {
+                    match previous_result {
+                        PreviousLookup::Ordinal(seen) => result.push(seen),
+                        PreviousLookup::Fallback => {
+                            result.push(false);
+                            fallback_oids.push(*oid);
+                            fallback_positions.push(idx);
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            if oid.len() != snapshot.object_format.oid_len() {
+                result.push(false);
+                fallback_oids.push(*oid);
+                fallback_positions.push(idx);
+                previous_oid = Some(oid);
+                previous_result = PreviousLookup::Fallback;
+                continue;
+            }
+
+            match midx.find_oid_sorted(&mut cursor, oid) {
+                Ok(Some(ordinal)) => {
+                    let seen = cache.bitset.test(ordinal);
+                    result.push(seen);
+                    previous_result = PreviousLookup::Ordinal(seen);
+                }
+                Ok(None) | Err(MidxError::InputOidLengthMismatch { .. }) => {
+                    result.push(false);
+                    fallback_oids.push(*oid);
+                    fallback_positions.push(idx);
+                    previous_result = PreviousLookup::Fallback;
+                }
+                Err(err) => return Err(err.into()),
+            }
+            previous_oid = Some(oid);
+        }
+
+        if fallback_oids.is_empty() {
+            return Ok(result);
+        }
+
+        let fallback_flags = self.fallback.batch_check_seen(&fallback_oids)?;
+        if fallback_flags.len() != fallback_positions.len() {
+            return Err(SpillError::SeenResponseMismatch {
+                got: fallback_flags.len(),
+                expected: fallback_positions.len(),
+            });
+        }
+        for (pos, seen) in fallback_positions
+            .into_iter()
+            .zip(fallback_flags.into_iter())
+        {
+            result[pos] = seen;
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PreviousLookup {
+    Ordinal(bool),
+    Fallback,
+}
+
+fn validate_snapshot(
+    fallback: &RoaringSeenStore,
+    midx_bytes: &[u8],
+    object_format: ObjectFormat,
+) -> Result<(), SpillError> {
+    let expected = fallback.bitmap().oid_len();
+    let got = object_format.oid_len();
+    if got != expected {
+        return Err(SpillError::OidLengthMismatch { got, expected });
+    }
+    MidxView::parse(midx_bytes, object_format)?;
+    Ok(())
+}
+
+fn fold_artifact_fingerprint(fingerprint: &RepoArtifactFingerprint) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(b"scanner-git::hybrid-seen-store");
+    hasher.update(&fingerprint.packs_hash);
+    hasher.update(&fingerprint.idx_hash);
+    *hasher.finalize().as_bytes()
+}
+
 #[inline]
 fn decode_words_le(payload: &[u8]) -> Vec<u64> {
     payload
@@ -446,12 +731,44 @@ mod tests {
     }
 
     fn build_test_midx(object_count: u32) -> Vec<u8> {
+        build_test_midx_from_values(&(0..object_count).collect::<Vec<_>>())
+    }
+
+    fn build_test_midx_from_values(values: &[u32]) -> Vec<u8> {
         let mut builder = MidxBuilder::new();
         builder.add_pack(b"pack-0.pack");
-        for value in 0..object_count {
+        for &value in values {
             builder.add_object(oid_raw_from_u32(value), 0, value as u64);
         }
         builder.build()
+    }
+
+    fn test_fingerprint(tag: u8) -> RepoArtifactFingerprint {
+        RepoArtifactFingerprint {
+            packs_hash: [tag; 32],
+            idx_hash: [tag.wrapping_add(1); 32],
+        }
+    }
+
+    fn build_seen_bitmap(values: &[u32]) -> RoaringSeenBitmap {
+        let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        let oids: Vec<OidBytes> = values.iter().copied().map(oid_from_u32).collect();
+        bitmap.insert_batch(&oids).expect("bitmap");
+        bitmap
+    }
+
+    fn build_hybrid_store(
+        seen_values: &[u32],
+        midx_values: &[u32],
+        fingerprint: RepoArtifactFingerprint,
+    ) -> HybridSeenStore {
+        HybridSeenStore::with_midx(
+            RoaringSeenStore::new(build_seen_bitmap(seen_values)),
+            BytesView::from_vec(build_test_midx_from_values(midx_values)),
+            ObjectFormat::Sha1,
+            fingerprint,
+        )
+        .expect("hybrid store")
     }
 
     #[test]
@@ -776,6 +1093,171 @@ mod tests {
         assert_eq!(out, vec![true, false]);
     }
 
+    #[test]
+    fn hybrid_seen_store_matches_roaring_for_midx_and_loose_queries() {
+        let fingerprint = test_fingerprint(0x10);
+        let store = build_hybrid_store(
+            &[1, 3, 5, 9, 10],
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            fingerprint.clone(),
+        );
+        let probes = vec![
+            oid_from_u32(1),
+            oid_from_u32(2),
+            oid_from_u32(3),
+            oid_from_u32(5),
+            oid_from_u32(9),
+            oid_from_u32(10),
+            oid_from_u32(11),
+        ];
+
+        assert!(store.ordinal.borrow().is_none());
+        let actual = store.batch_check_seen(&probes).expect("hybrid query");
+        let expected = store
+            .fallback()
+            .batch_check_seen(&probes)
+            .expect("roaring query");
+
+        assert_eq!(actual, expected);
+        assert!(store.is_valid_for_fingerprint(&fingerprint));
+        assert_eq!(
+            store
+                .ordinal
+                .borrow()
+                .as_ref()
+                .expect("cache")
+                .bitset
+                .cardinality(),
+            3
+        );
+    }
+
+    #[test]
+    fn hybrid_seen_store_degrades_to_roaring_without_midx_snapshot() {
+        let store = HybridSeenStore::new(RoaringSeenStore::new(build_seen_bitmap(&[1, 9, 10])));
+        let probes = vec![oid_from_u32(1), oid_from_u32(5), oid_from_u32(9)];
+
+        let actual = store.batch_check_seen(&probes).expect("hybrid query");
+        let expected = store
+            .fallback()
+            .batch_check_seen(&probes)
+            .expect("roaring query");
+
+        assert_eq!(actual, expected);
+        assert!(store.ordinal.borrow().is_none());
+    }
+
+    #[test]
+    fn hybrid_seen_store_rebuilds_after_snapshot_change() {
+        let fingerprint_a = test_fingerprint(0x20);
+        let fingerprint_b = test_fingerprint(0x21);
+        let mut store =
+            build_hybrid_store(&[1, 3, 9], &[0, 1, 2, 3, 4, 5, 6, 7], fingerprint_a.clone());
+        let probes = vec![oid_from_u32(1), oid_from_u32(3), oid_from_u32(9)];
+
+        assert_eq!(
+            store.batch_check_seen(&probes).expect("initial query"),
+            vec![true, true, true]
+        );
+        assert!(store.is_valid_for_fingerprint(&fingerprint_a));
+        assert_eq!(
+            store
+                .ordinal
+                .borrow()
+                .as_ref()
+                .expect("cache")
+                .bitset
+                .cardinality(),
+            2
+        );
+
+        store
+            .set_midx_snapshot(
+                BytesView::from_vec(build_test_midx_from_values(&[0, 2, 3, 4, 5, 6, 7, 8])),
+                ObjectFormat::Sha1,
+                fingerprint_b.clone(),
+            )
+            .expect("replace midx");
+
+        assert!(store.ordinal.borrow().is_none());
+        assert!(!store.is_valid_for_fingerprint(&fingerprint_a));
+
+        let actual = store.batch_check_seen(&probes).expect("rebuild query");
+        let expected = store
+            .fallback()
+            .batch_check_seen(&probes)
+            .expect("roaring query");
+
+        assert_eq!(actual, expected);
+        assert!(store.is_valid_for_fingerprint(&fingerprint_b));
+        assert_eq!(
+            store
+                .ordinal
+                .borrow()
+                .as_ref()
+                .expect("cache")
+                .bitset
+                .cardinality(),
+            1
+        );
+    }
+
+    #[test]
+    fn hybrid_seen_store_invalidates_cache_before_fallback_mutation() {
+        let fingerprint = test_fingerprint(0x30);
+        let mut store = build_hybrid_store(&[1], &[0, 1, 2, 3, 4, 5, 6, 7], fingerprint.clone());
+        let initial = vec![oid_from_u32(1), oid_from_u32(2)];
+
+        assert_eq!(
+            store.batch_check_seen(&initial).expect("initial query"),
+            vec![true, false]
+        );
+        assert!(store.is_valid_for_fingerprint(&fingerprint));
+
+        store
+            .fallback_mut()
+            .bitmap_mut()
+            .insert_batch(&[oid_from_u32(2), oid_from_u32(9)])
+            .expect("insert");
+        assert!(store.ordinal.borrow().is_none());
+
+        let probes = vec![oid_from_u32(1), oid_from_u32(2), oid_from_u32(9)];
+        let actual = store.batch_check_seen(&probes).expect("updated query");
+        let expected = store
+            .fallback()
+            .batch_check_seen(&probes)
+            .expect("roaring query");
+
+        assert_eq!(actual, expected);
+        assert!(store.is_valid_for_fingerprint(&fingerprint));
+        assert_eq!(
+            store
+                .ordinal
+                .borrow()
+                .as_ref()
+                .expect("cache")
+                .bitset
+                .cardinality(),
+            2
+        );
+    }
+
+    #[derive(Debug, Clone)]
+    enum HybridOp {
+        Insert(u16),
+        Query(Vec<u16>),
+    }
+
+    fn hybrid_ops() -> impl Strategy<Value = Vec<HybridOp>> {
+        vec(
+            prop_oneof![
+                (0u16..96).prop_map(HybridOp::Insert),
+                vec(0u16..96, 0..16).prop_map(HybridOp::Query),
+            ],
+            0..96,
+        )
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(
             crate::test_utils::proptest_cases(PROPTEST_CASES)
@@ -869,6 +1351,38 @@ mod tests {
 
             prop_assert_eq!(newly_marked, expected_new);
             prop_assert_eq!(bitset.cardinality(), card_before + expected_new);
+        }
+
+        #[test]
+        fn hybrid_seen_store_matches_hashset_oracle_for_insert_query_sequences(
+            ops in hybrid_ops(),
+        ) {
+            let mut oracle = std::collections::HashSet::new();
+            let midx_values: Vec<u32> = (0..64).collect();
+            let mut store = build_hybrid_store(&[], &midx_values, test_fingerprint(0x40));
+
+            for op in ops {
+                match op {
+                    HybridOp::Insert(value) => {
+                        let oid = oid_from_u32(value as u32);
+                        store
+                            .fallback_mut()
+                            .bitmap_mut()
+                            .insert_batch(&[oid])
+                            .expect("insert");
+                        oracle.insert(oid);
+                    }
+                    HybridOp::Query(values) => {
+                        let mut probes: Vec<OidBytes> =
+                            values.into_iter().map(|value| oid_from_u32(value as u32)).collect();
+                        probes.sort_unstable();
+                        let expected: Vec<bool> =
+                            probes.iter().map(|oid| oracle.contains(oid)).collect();
+                        let actual = store.batch_check_seen(&probes).expect("query");
+                        prop_assert_eq!(actual, expected);
+                    }
+                }
+            }
         }
     }
 }

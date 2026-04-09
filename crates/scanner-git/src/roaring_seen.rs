@@ -516,6 +516,13 @@ impl RoaringSeenBitmap {
         self.oids.iter()
     }
 
+    /// Returns the OIDs currently marked as seen, in sorted order.
+    pub fn seen_oids(&self) -> impl Iterator<Item = OidBytes> + '_ {
+        self.seen
+            .iter()
+            .map(|pos| OidBytes::from_slice(self.oids.oid_at(pos as usize)))
+    }
+
     /// Returns the serialized byte length for the persisted bitmap payload.
     #[must_use]
     pub fn serialized_size(&self) -> usize {
