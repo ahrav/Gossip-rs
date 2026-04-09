@@ -3,7 +3,9 @@
 //! The oracle compares two simulation backends at the coordination boundary:
 //! emitted events, full shard/run state, and invariant-check results. Backend-
 //! specific storage details such as slab addresses or etcd lease identifiers
-//! are normalized away before comparison.
+//! are normalized away before comparison. Collection fields with unstable
+//! iteration order are sorted so the comparison surface stays focused on
+//! semantic drift instead of backend-specific layout details.
 
 use std::collections::BTreeMap;
 
@@ -18,7 +20,12 @@ use gossip_coordination_etcd::EtcdCoordinatorConfig;
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config as ProptestConfig, RngAlgorithm, TestRng, TestRunner};
 
-/// Pairs two simulation harnesses and panics on any behavioral drift.
+/// Drives two simulation harnesses in lockstep and panics on behavioral drift.
+///
+/// The oracle treats matching event streams and matching normalized backend
+/// state as the contract. `seed` and `reproduce` are carried through every
+/// panic message so a failing sequence can be replayed directly from test
+/// output.
 pub(crate) struct DifferentialOracle<L: SimulationBackend, R: SimulationBackend> {
     left: CoordinationSim<L>,
     right: CoordinationSim<R>,
@@ -128,7 +135,12 @@ const _: () = {
 };
 
 impl<L: SimulationBackend, R: SimulationBackend> DifferentialOracle<L, R> {
-    /// Construct an oracle and verify both harnesses start from the same state.
+    /// Constructs an oracle and verifies both harnesses start from the same state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either backend cannot be normalized for comparison or if the
+    /// initial normalized states already differ.
     pub(crate) fn new(
         left: CoordinationSim<L>,
         left_label: &'static str,
@@ -183,7 +195,16 @@ impl<L: SimulationBackend, R: SimulationBackend> DifferentialOracle<L, R> {
         oracle
     }
 
-    /// Drive both harnesses with the same operation sequence and compare every step.
+    /// Replays the same operation sequence through both harnesses and compares every step.
+    ///
+    /// Each step must agree on emitted events, invariant-check output, and the
+    /// normalized run/shard snapshots gathered from backend introspection.
+    ///
+    /// # Panics
+    ///
+    /// Panics on the first invariant violation, event mismatch, normalization
+    /// failure, or state drift. The panic payload includes the full sequence and
+    /// reproduction metadata so the failure can be rerun deterministically.
     pub(crate) fn run_sequence(&mut self, ops: &[SimOp]) {
         for (step, op) in ops.iter().enumerate() {
             let (left_event, left_violations) = self.left.step(op.clone());
@@ -271,6 +292,8 @@ impl<L: SimulationBackend, R: SimulationBackend> DifferentialOracle<L, R> {
     }
 }
 
+/// Panics with a reproducible drift report that includes the failing step,
+/// operation, backend labels, and the full operation sequence.
 fn panic_drift<L: SimulationBackend, R: SimulationBackend>(
     oracle: &DifferentialOracle<L, R>,
     step: usize,
@@ -304,6 +327,15 @@ fn panic_drift<L: SimulationBackend, R: SimulationBackend>(
     );
 }
 
+/// Projects backend introspection into a backend-agnostic state snapshot.
+///
+/// Record fields that encode semantic state are copied into comparable
+/// structs, while backend-specific storage details are intentionally omitted.
+/// Collections whose iteration order is not part of the contract are sorted
+/// before comparison.
+///
+/// Returns an error when shard invariants fail or when `shard_count()` does
+/// not match the number of iterated shard records.
 fn comparable_state<B: SimIntrospection>(backend: &B) -> Result<ComparableBackendState, String> {
     let mut runs = BTreeMap::new();
     let mut shards = BTreeMap::new();
@@ -389,18 +421,32 @@ fn comparable_state<B: SimIntrospection>(backend: &B) -> Result<ComparableBacken
     Ok(ComparableBackendState { runs, shards })
 }
 
+/// Worker count used by the default randomized differential-oracle scenarios.
 pub(crate) const N_WORKERS: u64 = 4;
+/// Shard count used by the default randomized differential-oracle scenarios.
 pub(crate) const N_SHARDS: u64 = 8;
+/// Lease TTL passed to the etcd-backed simulator so acquire deadlines are stable.
 pub(crate) const OWNER_LEASE_TTL_SECS: i64 = 300;
+/// Number of optimistic etcd transaction retries used in oracle-backed tests.
 pub(crate) const OPTIMISTIC_TXN_RETRIES: usize = 8;
+/// Upper bound for child shards spawned by a single operation in test configs.
 pub(crate) const MAX_CHILDREN_PER_OP: usize = 8;
 
+/// Expands a `u64` seed into the 32-byte proptest RNG seed format.
 pub(crate) fn proptest_seed(seed: u64) -> [u8; 32] {
     let mut bytes = [0_u8; 32];
     bytes[..8].copy_from_slice(&seed.to_le_bytes());
     bytes
 }
 
+/// Generates a deterministic random operation sequence for a given seed.
+///
+/// The sequence length and operation distribution are fixed by the strategy so
+/// drift reports can be reproduced exactly from the recorded seed.
+///
+/// # Panics
+///
+/// Panics if the simulation operation strategy fails to produce a sequence.
 pub(crate) fn generated_ops(seed: u64) -> Vec<SimOp> {
     let strategy = proptest::collection::vec(arb_sim_op(N_WORKERS, N_SHARDS), 15..50);
     let mut runner = TestRunner::new_with_rng(
@@ -417,6 +463,15 @@ pub(crate) fn generated_ops(seed: u64) -> Vec<SimOp> {
         .current()
 }
 
+/// Builds the etcd-backed simulator configuration used by differential tests.
+///
+/// The tuning values mirror the shared oracle defaults so etcd-backed runs and
+/// in-memory runs exercise the same coordination limits.
+///
+/// # Panics
+///
+/// Panics if the selected namespace and tuning values do not form a valid
+/// `EtcdCoordinatorConfig`.
 pub(crate) fn etcd_sim_config(namespace: &str) -> EtcdCoordinatorConfig {
     EtcdCoordinatorConfig::new_with_tuning(
         ["http://127.0.0.1:2379"],
