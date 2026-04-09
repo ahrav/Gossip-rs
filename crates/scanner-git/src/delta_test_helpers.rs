@@ -179,6 +179,16 @@ pub fn kind_code(kind: ObjectKind) -> u8 {
     }
 }
 
+/// Returns the canonical Git object type name for an [`ObjectKind`].
+pub fn kind_name(kind: ObjectKind) -> &'static [u8] {
+    match kind {
+        ObjectKind::Commit => b"commit",
+        ObjectKind::Tree => b"tree",
+        ObjectKind::Blob => b"blob",
+        ObjectKind::Tag => b"tag",
+    }
+}
+
 /// Encode a pack entry header using an [`ObjectKind`] enum instead of a raw
 /// type byte.
 pub fn encode_entry_header_kind(kind: ObjectKind, size: usize) -> Vec<u8> {

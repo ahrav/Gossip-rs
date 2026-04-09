@@ -618,8 +618,7 @@ mod tests {
         let delta = builder.add_ref_delta(pack_delta, base, b"base!");
 
         let fixture = builder.build().unwrap();
-        let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 8);
-        let mut io = fixture.pack_io(limits).unwrap();
+        let mut io = fixture.pack_io(test_limits()).unwrap();
 
         let base_loaded = io.load_object(&fixture.oid(base)).unwrap().unwrap();
         let delta_loaded = io.load_object(&fixture.oid(delta)).unwrap().unwrap();
@@ -642,8 +641,7 @@ mod tests {
         let top = builder.add_ref_delta(pack_a, mid, b"leaf");
 
         let fixture = builder.build().unwrap();
-        let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 8);
-        let mut io = fixture.pack_io(limits).unwrap();
+        let mut io = fixture.pack_io(test_limits()).unwrap();
 
         let top_loaded = io.load_object(&fixture.oid(top)).unwrap().unwrap();
         assert_eq!(top_loaded.0, ObjectKind::Blob);
@@ -665,8 +663,7 @@ mod tests {
         let leaf = builder.add_ref_delta(pack_delta, local, b"leaf");
 
         let fixture = builder.build().unwrap();
-        let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 8);
-        let mut io = fixture.pack_io(limits).unwrap();
+        let mut io = fixture.pack_io(test_limits()).unwrap();
 
         let local_loaded = io.load_object(&fixture.oid(local)).unwrap().unwrap();
         assert_eq!(local_loaded.0, ObjectKind::Blob);
@@ -690,8 +687,7 @@ mod tests {
         );
 
         let fixture = builder.build().unwrap();
-        let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 8);
-        let mut io = fixture.pack_io(limits).unwrap();
+        let mut io = fixture.pack_io(test_limits()).unwrap();
 
         let loaded = io.load_object(&fixture.oid(missing)).unwrap();
         assert!(loaded.is_none());
@@ -710,8 +706,7 @@ mod tests {
         let top = builder.add_ref_delta(pack_a, mid, b"leaf");
 
         let fixture = builder.build().unwrap();
-        let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 8);
-        let mut io = fixture.pack_io(limits).unwrap();
+        let mut io = fixture.pack_io(test_limits()).unwrap();
 
         for (handle, oid, kind, expected) in fixture.golden_values() {
             let loaded = io.load_object(&oid).unwrap().unwrap();
@@ -721,6 +716,30 @@ mod tests {
         }
 
         assert_eq!(fixture.expected(top).unwrap().1, b"leaf");
+    }
+
+    #[test]
+    fn cross_pack_delta_depth_exceeded_from_fixture() {
+        let mut builder = MultiPackFixture::builder();
+        let pack_c = builder.add_pack(b"pack-c");
+        let pack_b = builder.add_pack(b"pack-b");
+        let pack_a = builder.add_pack(b"pack-a");
+
+        let base = builder.add_blob(pack_c, b"base");
+        let mid = builder.add_ref_delta(pack_b, base, b"middle");
+        let top = builder.add_ref_delta(pack_a, mid, b"leaf");
+
+        let fixture = builder.build().unwrap();
+
+        // Depth limit of 1 is too tight for a 2-deep delta chain.
+        let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 1);
+        let mut io = fixture.pack_io(limits).unwrap();
+
+        let err = io.load_object(&fixture.oid(top)).unwrap_err();
+        assert!(matches!(
+            err,
+            PackIoError::DeltaDepthExceeded { max_depth: 1 }
+        ));
     }
 
     #[test]

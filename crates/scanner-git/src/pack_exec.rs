@@ -3301,8 +3301,7 @@ mod tests {
     };
     use super::*;
     use crate::byte_arena::{ByteArena, ByteRef};
-    use crate::multi_pack_test_helpers::{stable_oid, MultiPackFixture};
-    use crate::pack_io::PackIoLimits;
+    use crate::multi_pack_test_helpers::{stable_oid, test_limits, MultiPackFixture};
     use crate::pack_plan_model::{CandidateAtOffset, DeltaKind, PackPlanStats};
     use crate::tree_candidate::{CandidateContext, ChangeKind};
     use std::collections::HashMap;
@@ -3358,6 +3357,55 @@ mod tests {
             ctx_flags: 0,
             cand_flags: 0,
             path_ref,
+        }
+    }
+
+    /// Builds a single-candidate `PackPlan` for a REF_DELTA with an external base.
+    fn build_single_external_ref_plan(
+        pack: &[u8],
+        pack_id: u16,
+        delta_offset: u64,
+        candidate_oid: OidBytes,
+        base_oid: OidBytes,
+        candidate_ctx: CandidateContext,
+    ) -> PackPlan {
+        let candidate = PackCandidate {
+            oid: candidate_oid,
+            ctx: candidate_ctx,
+            pack_id,
+            offset: delta_offset,
+        };
+        let (data_start, delta_size) = delta_header_meta(pack, delta_offset);
+        let need_offsets = vec![delta_offset];
+        let delta_deps = vec![DeltaDep {
+            offset: delta_offset,
+            kind: DeltaKind::Ref,
+            base: BaseLoc::External { oid: base_oid },
+            data_start,
+            delta_size,
+        }];
+        let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
+        PackPlan {
+            pack_id,
+            oid_len: 20,
+            max_delta_depth: 16,
+            candidates: vec![candidate],
+            candidate_offsets: vec![CandidateAtOffset {
+                offset: delta_offset,
+                cand_idx: 0,
+            }],
+            need_offsets,
+            delta_deps,
+            delta_dep_index,
+            exec_order: None,
+            stats: PackPlanStats {
+                candidate_count: 1,
+                need_count: 1,
+                external_bases: 1,
+                forward_deps: 0,
+                candidate_span: 0,
+                ..PackPlanStats::empty()
+            },
         }
     }
 
@@ -5149,8 +5197,7 @@ mod tests {
         let top = builder.add_ref_delta(pack_a, mid, b"base-a");
 
         let fixture = builder.build().unwrap();
-        let io_limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 8);
-        let mut external = fixture.sim_pack_io(io_limits).unwrap();
+        let mut external = fixture.sim_pack_io(test_limits()).unwrap();
 
         let pack_idx = fixture.pack_index(top);
         let pack = fixture.pack_bytes(pack_idx);
@@ -5229,8 +5276,7 @@ mod tests {
             builder.add_missing_ref_delta(pack, ObjectKind::Blob, missing_base_oid, 4, b"unused");
 
         let fixture = builder.build().unwrap();
-        let io_limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 8);
-        let mut external = fixture.sim_pack_io(io_limits).unwrap();
+        let mut external = fixture.sim_pack_io(test_limits()).unwrap();
 
         let pack_idx = fixture.pack_index(target);
         let pack_bytes = fixture.pack_bytes(pack_idx);
@@ -5238,47 +5284,14 @@ mod tests {
 
         let mut arena = ByteArena::with_capacity(64);
         let path_ref = arena.intern(b"missing.txt").unwrap();
-        let candidate = PackCandidate {
-            oid: fixture.oid(target),
-            ctx: ctx(path_ref),
-            pack_id: pack_idx as u16,
-            offset: delta_offset,
-        };
-
-        let (data_start, delta_size) = delta_header_meta(pack_bytes, delta_offset);
-        let need_offsets = vec![delta_offset];
-        let delta_deps = vec![DeltaDep {
-            offset: delta_offset,
-            kind: DeltaKind::Ref,
-            base: BaseLoc::External {
-                oid: missing_base_oid,
-            },
-            data_start,
-            delta_size,
-        }];
-        let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
-        let plan = PackPlan {
-            pack_id: pack_idx as u16,
-            oid_len: 20,
-            max_delta_depth: 16,
-            candidates: vec![candidate],
-            candidate_offsets: vec![CandidateAtOffset {
-                offset: delta_offset,
-                cand_idx: 0,
-            }],
-            need_offsets,
-            delta_deps,
-            delta_dep_index,
-            exec_order: None,
-            stats: PackPlanStats {
-                candidate_count: 1,
-                need_count: 1,
-                external_bases: 1,
-                forward_deps: 0,
-                candidate_span: 0,
-                ..PackPlanStats::empty()
-            },
-        };
+        let plan = build_single_external_ref_plan(
+            pack_bytes,
+            pack_idx as u16,
+            delta_offset,
+            fixture.oid(target),
+            missing_base_oid,
+            ctx(path_ref),
+        );
 
         let mut cache = PackCache::new(64 * 1024);
         let mut sink = TestSink::default();

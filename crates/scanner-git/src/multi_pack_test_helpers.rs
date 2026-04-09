@@ -43,16 +43,16 @@ use std::path::PathBuf;
 use sha1::{Digest, Sha1};
 use tempfile::TempDir;
 
-use crate::delta_test_helpers::{kind_code, make_add_delta, SyntheticPackBuilder};
+use crate::delta_test_helpers::{kind_code, kind_name, make_add_delta, SyntheticPackBuilder};
 use crate::midx_test_builder::MidxBuilder;
 use crate::pack_decode::PackDecodeLimits;
 use crate::pack_inflate::ObjectKind;
 use crate::pack_io::{PackIo, PackIoError, PackIoLimits};
 #[cfg(feature = "sim-harness")]
 use crate::sim_git_scan::SimPackIo;
-use crate::{BytesView, MidxView, ObjectFormat, OidBytes};
 #[cfg(not(feature = "sim-harness"))]
 use crate::sim_pack_io::SimPackIo;
+use crate::{BytesView, MidxView, ObjectFormat, OidBytes};
 
 /// Handle for a pack slot in a [`MultiPackFixtureBuilder`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -453,15 +453,6 @@ fn git_oid(kind: ObjectKind, bytes: &[u8]) -> OidBytes {
     hasher.update([0]);
     hasher.update(bytes);
     OidBytes::sha1(hasher.finalize().into())
-}
-
-fn kind_name(kind: ObjectKind) -> &'static [u8] {
-    match kind {
-        ObjectKind::Commit => b"commit",
-        ObjectKind::Tree => b"tree",
-        ObjectKind::Blob => b"blob",
-        ObjectKind::Tag => b"tag",
-    }
 }
 
 fn oid_to_sha1(oid: OidBytes) -> [u8; 20] {
