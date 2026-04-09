@@ -544,3 +544,4 @@ Source: `crates/gossip-frontier/src/hint.rs`
 | `crates/gossip-contracts/src/connector/api.rs`           | `ConnectorCapabilities`                                                                                                |
 | `crates/gossip-connectors/src/filesystem.rs`             | `FilesystemConnector` split point selection (`choose_split_point`)                                                     |
 | `crates/gossip-connectors/src/in_memory.rs`              | `InMemoryDeterministicConnector` split point selection (`choose_split_point`)                                          |
+| `crates/gossip-connectors/src/split_estimator.rs`        | `StreamingSplitEstimator` for byte-weighted split selection                                                            |
