@@ -3459,6 +3459,28 @@ mod tests {
         .unwrap()
     }
 
+    fn exec_plan_result<S: PackObjectSink, B: ExternalBaseProvider>(
+        plan: &PackPlan,
+        pack: &[u8],
+        arena: &ByteArena,
+        limits: &PackDecodeLimits,
+        cache: &mut PackCache,
+        external: &mut B,
+        sink: &mut S,
+    ) -> Result<PackExecReport, PackExecError> {
+        let spill_dir = tempfile::tempdir().expect("spill dir");
+        execute_pack_plan(
+            plan,
+            pack,
+            arena,
+            limits,
+            cache,
+            external,
+            sink,
+            spill_dir.path(),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn exec_plan_indices<S: PackObjectSink, B: ExternalBaseProvider>(
         plan: &PackPlan,
@@ -3808,6 +3830,62 @@ mod tests {
 
         assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_eq!(sink.emitted.len(), 1);
+    }
+
+    #[test]
+    fn merge_fast_path_propagates_sink_error() {
+        #[derive(Default)]
+        struct ErrorSink;
+
+        impl PackObjectSink for ErrorSink {
+            fn emit(
+                &mut self,
+                _candidate: &PackCandidate,
+                _path: &[u8],
+                _bytes: &[u8],
+            ) -> Result<(), PackExecError> {
+                Err(PackExecError::Sink("emit failed".to_owned()))
+            }
+        }
+
+        let (pack, offsets) = build_pack(&[(ObjectKind::Blob, b"hello")]);
+        let offset = offsets[0];
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x21; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset,
+        };
+
+        let plan = build_plan(
+            vec![offset],
+            vec![candidate],
+            vec![CandidateAtOffset {
+                offset,
+                cand_idx: 0,
+            }],
+            None,
+        );
+
+        let mut cache = PackCache::new(0);
+        let mut external = NoExternal;
+        let mut sink = ErrorSink;
+
+        let err = exec_plan_result(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, PackExecError::Sink(detail) if detail == "emit failed"));
     }
 
     #[test]

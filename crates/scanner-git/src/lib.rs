@@ -181,6 +181,8 @@ pub mod path_policy;
 pub(crate) mod sim_pack_io;
 /// Synthetic commit-ref materialization for explicit-commit lowering.
 mod synthetic_ref;
+#[cfg(test)]
+mod trait_coverage_audit_tests;
 use gossip_stdx::perf_stats;
 /// Defines the write-only persistence store contract and helpers.
 pub mod persist;
