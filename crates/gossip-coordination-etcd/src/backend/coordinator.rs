@@ -1083,9 +1083,15 @@ pub(crate) trait SyncEtcdLike: Sized {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    /// Hook used by simulation/test backends to inject split-replace faults.
+    ///
+    /// Real etcd backends leave this as a no-op.
     fn inject_split_replace_fault_if_armed(&mut self, _tenant: TenantId, _key: ShardKey) {}
 
     #[cfg(any(test, feature = "test-support"))]
+    /// Hook used by simulation/test backends to inject split-residual faults.
+    ///
+    /// Real etcd backends leave this as a no-op.
     fn inject_split_residual_fault_if_armed(&mut self, _tenant: TenantId, _key: ShardKey) {}
 }
 
@@ -1997,8 +2003,11 @@ impl AsyncEtcdCoordinator {
             .count())
     }
 
-    /// Load current persisted shard counts for one tenant and globally (async).
-    /// Lightweight capacity hint using count-only and keys-only RPCs (async).
+    /// Estimate claimable shard capacity for a run using cheap async RPCs.
+    ///
+    /// Mirrors the sync [`SyncEtcdLike::count_available_lightweight`]:
+    /// a `count_only` read of the active index minus a `keys_only` owner-key
+    /// count over the shard subtree.
     ///
     /// See [`EtcdCoordinator::count_available_lightweight`].
     pub(super) async fn count_available_lightweight(
