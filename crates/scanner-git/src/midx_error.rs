@@ -110,6 +110,13 @@ pub enum MidxError {
     /// Used when validating de-duplication requirements for input streams.
     #[error("duplicate input OID")]
     DuplicateInputOid,
+    /// Ordinal seen bitset payload could not be decoded.
+    #[error("ordinal seen bitset error: {source}")]
+    OrdinalSeenDecode {
+        /// The underlying deserialization error.
+        #[from]
+        source: super::ordinal_seen::OrdinalSeenError,
+    },
 }
 
 impl MidxError {
