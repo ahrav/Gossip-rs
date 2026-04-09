@@ -199,7 +199,14 @@ impl MultiPackFixtureBuilder {
     }
 
     /// Adds a named pack to the fixture and returns its handle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` contains NUL bytes (`\0`). MIDX PNAM entries are
+    /// NUL-delimited, so embedded NULs would split the name and corrupt
+    /// the pack-name-to-index mapping.
     pub(crate) fn add_pack(&mut self, name: &[u8]) -> PackHandle {
+        assert!(!name.contains(&0), "pack name must not contain NUL bytes");
         let handle = PackHandle(self.packs.len());
         self.packs.push(PackSpec {
             name: name.to_vec(),
