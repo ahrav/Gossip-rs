@@ -1,19 +1,17 @@
-//! Purpose: Provides regression coverage for the filesystem connector's ordered-content contract.
+//! Regression coverage for the filesystem connector's ordered-content contract.
 //!
-//! Invariants:
-//! - Enumeration must remain lexicographically ordered.
-//! - Resume must honor `last_key` even when persisted tokens are stale.
-//! - Stable IDs must be rooted in the canonical connector instance.
-//! - Path handling must not allow callers to escape the configured root.
+//! These tests verify the guarantees that matter to downstream scanners:
+//! lexicographic enumeration, resume behavior keyed by `last_key`, stable IDs derived
+//! from the canonical connector root, and path resolution that cannot escape the
+//! configured root.
 //!
-//! Algorithm Overview:
-//! Tests exercise the `FilesystemConnector` directly and via the `OrderedContentSource`
-//! conformance harness. Fixtures mix directory roots and single-file roots to validate
-//! path and identity checks under both operating modes.
+//! The suite exercises `FilesystemConnector` both directly and through the
+//! `OrderedContentSource` conformance harness. Fixtures intentionally mix directory
+//! roots and single-file roots because identity, path handling, and resume semantics
+//! differ subtly between those operating modes.
 //!
-//! Design Trade-offs:
-//! Test helpers require explicit budget parameters instead of using defaults to ensure
-//! pagination, byte limits, and deadline handling remain visible at the call site.
+//! Test helpers keep pagination, byte limits, and deadlines explicit at the call site
+//! so the contract under test stays visible in each scenario.
 
 use std::{
     io::{self, Read as _},
@@ -36,10 +34,10 @@ use rstest::rstest;
 use super::*;
 use crate::common::test_util::make_key;
 
-/// Intent: Provide a temporary directory with a known file layout.
+/// Builds a temporary directory fixture from relative paths and file contents.
 ///
-/// Invariants:
-/// - Parent directories for nested files are implicitly created.
+/// Nested parent directories are created automatically so call sites can focus on the
+/// layout they need to exercise.
 fn create_test_dir(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("create tempdir");
     for (rel, content) in files {
@@ -52,15 +50,15 @@ fn create_test_dir(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     dir
 }
 
-/// Intent: Provide a full-range shard for tests not exercising bounds.
+/// Returns an unbounded shard for tests that are not exercising key bounds.
 fn unbounded_shard() -> ShardSpec {
     ShardSpec::unbounded()
 }
 
-/// Intent: Execute `fill_page` with explicit limits, unwrapping the page.
+/// Calls `fill_page` with explicit limits and unwraps the expected page result.
 ///
-/// Invariants:
-/// - Requires all budget parameters to be specified explicitly so limits remain visible at the test call site.
+/// Tests use this helper instead of default budgets so pagination and byte-limit
+/// assumptions remain visible at the call site.
 fn fill_page_with_limits(
     connector: &mut FilesystemConnector,
     shard: &ShardSpec,
@@ -78,10 +76,10 @@ fn fill_page_with_limits(
         .expect("page should be present")
 }
 
-/// Intent: Recompute the stable ID a filesystem item should advertise.
+/// Recomputes the stable ID a filesystem item should advertise for assertions.
 ///
-/// Invariants:
-/// - The instance hash is derived from the canonicalized root path, guaranteeing equivalent roots resolve to the same identity.
+/// The connector instance hash is derived from the canonicalized root path so
+/// equivalent roots resolve to the same stable identity.
 fn expected_stable_item_id(
     root: &Path,
     rel_path: &[u8],
@@ -92,7 +90,7 @@ fn expected_stable_item_id(
     ItemIdentityKey::new(FILESYSTEM_CONNECTOR_TAG, connector_instance, rel_path).stable_id()
 }
 
-/// Intent: Extract ordered item keys from a conformance run for direct assertions.
+/// Collects ordered item keys from a conformance run for direct assertions.
 fn drain_keys(run: &gossip_contracts::connector::conformance::OrderedContentDrain) -> Vec<Vec<u8>> {
     run.items()
         .iter()
@@ -878,14 +876,12 @@ fn single_file_open_detects_replacement_after_init() {
     assert_eq!(buf, b"original");
     drop(reader);
 
-    // Create the replacement while the original still exists so the
-    // filesystem must allocate a distinct inode (two live files cannot share
-    // one).  A plain remove+create can recycle the inode on ext4.
+    // Rename over a separately created file so the replacement must carry a
+    // different inode; remove+create can recycle the inode on ext4.
     let staging = dir.path().join("data.txt.new");
     fs::write(&staging, b"impostor").expect("write replacement");
     fs::remove_file(&file_path).expect("remove original");
     fs::rename(&staging, &file_path).expect("swap replacement into place");
-    // A distinct inode at the same path must be rejected.
     let result = connector.open(&item_ref, crate::common::test_util::default_budgets());
     assert!(
         result.is_err(),
