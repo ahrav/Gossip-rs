@@ -55,10 +55,18 @@ pub struct SimEtcdCoordinator {
 }
 
 impl SimEtcdCoordinator {
+    /// Create a deterministic coordinator that drives a fresh `SimulatedEtcdKV` seeded with `seed`.
+    ///
+    /// The provided config is validated before the coordinator is constructed so callers
+    /// can rely on the same preconditions as the actual etcd-backed coordinator.
     pub fn new(config: EtcdCoordinatorConfig, seed: u64) -> Result<Self, EtcdCoordinatorError> {
         Self::with_kv(config, SimulatedEtcdKV::new(seed))
     }
 
+    /// Create a coordinator using a user-specified fault injection profile.
+    ///
+    /// The supplied `fault_config` customizes injected failures while the rest of the
+    /// coordinator state stays deterministic based on `seed`.
     pub fn with_fault_config(
         config: EtcdCoordinatorConfig,
         seed: u64,
@@ -81,6 +89,11 @@ impl SimEtcdCoordinator {
         Self::with_fault_config(config, seed, fault_config)
     }
 
+    /// Pair the coordinator with an existing `SimulatedEtcdKV`, useful for test harnesses that
+    /// need to control the underlying key-value state/seed directly.
+    ///
+    /// The config is validated before binding to `kv`, and the resulting coordinator owns fresh
+    /// caches plus the internal deferred-lease buffer.
     pub fn with_kv(
         config: EtcdCoordinatorConfig,
         kv: SimulatedEtcdKV,
@@ -110,6 +123,10 @@ impl SimEtcdCoordinator {
         &self.keyspace
     }
 
+    /// Switch the fault profile of the simulated KV at runtime.
+    ///
+    /// Updating the config feeds directly into the wrapped `SimulatedEtcdKV`, so faults may
+    /// trigger immediately between operations without reconstructing the coordinator.
     pub fn set_fault_config(&self, config: SimEtcdFaultConfig) {
         self.kv.borrow_mut().set_fault_config(config);
     }
@@ -140,6 +157,10 @@ impl SimEtcdCoordinator {
         self.kv.borrow().fault_stats()
     }
 
+    /// Populate `out` with runs whose active-status keys are present in the simulated KV.
+    ///
+    /// Before scanning runs, this method expires due leases and buffers the resulting IDs so
+    /// cache invalidation can happen on the next `&mut self` mutation path.
     pub fn list_active_runs_into(
         &self,
         tenant: TenantId,
@@ -155,6 +176,11 @@ impl SimEtcdCoordinator {
         <Self as SyncEtcdLike>::list_active_runs_into(self, tenant, out)
     }
 
+    /// Remove runs that never registered shards and whose TTL has expired.
+    ///
+    /// This method advances the cached logical clock, flushes buffered lease expirations, then
+    /// calls into the trait implementation so the etcd state transitions match the production
+    /// coordinator.
     pub fn gc_stale_initializing_runs_into(
         &mut self,
         tenant: TenantId,
@@ -166,6 +192,10 @@ impl SimEtcdCoordinator {
         <Self as SyncEtcdLike>::gc_stale_initializing_runs_into(self, tenant, cutoff, out)
     }
 
+    /// Schedule the next `register_shards` CAS to rerun by bumping the run-record revision.
+    ///
+    /// The recorded key is rewritten in `maybe_rewrite_key_before_txn` before the next transaction
+    /// so the next attempt hits a higher revision and exercises retry handling.
     pub fn test_arm_run_revision_bump(&self, tenant: TenantId, run: RunId) {
         self.test_faults.borrow_mut().rewrite_before_next_txn =
             Some(self.keyspace.run_record_key(tenant, run).into_bytes());
@@ -211,6 +241,9 @@ impl SimEtcdCoordinator {
         expired.clear();
     }
 
+    /// Refresh caches for `run` based on the latest persisted run and shard entries.
+    ///
+    /// Both reads execute before any cache mutation so failures leave the previous cache state intact.
     fn refresh_cached_run_state_inner(
         &mut self,
         tenant: TenantId,
@@ -247,6 +280,7 @@ impl SimEtcdCoordinator {
         Ok(())
     }
 
+    /// Remove the cached run and shard records without touching etcd.
     fn drop_cached_run_state_inner(&mut self, tenant: TenantId, run: RunId) {
         self.run_cache.remove(&(tenant, run));
         if let Some(keys) = self.shard_run_index.remove(&(tenant, run)) {
@@ -256,11 +290,17 @@ impl SimEtcdCoordinator {
         }
     }
 
+    /// Look up the cached persisted shard that corresponds to `record`.
+    ///
+    /// Many introspection helpers read slab data from the cached entry rather than the record itself.
     fn cached_shard_for_record(&self, record: &ShardRecord) -> Option<&PersistedShard> {
         self.shard_cache
             .get(&(record.tenant, ShardKey::new(record.run, record.shard)))
     }
 
+    /// Rewrite a single key before the next transaction when a test fault armed a revision bump.
+    ///
+    /// The rewrite asserts the original mod revision to keep the simulated CAS path deterministic.
     fn maybe_rewrite_key_before_txn(&self) -> Result<(), EtcdCoordinatorError> {
         let Some(key) = self.test_faults.borrow_mut().rewrite_before_next_txn.take() else {
             return Ok(());
@@ -393,6 +433,8 @@ impl SyncEtcdLike for SimEtcdCoordinator {
     }
 }
 
+/// Iterator over cached shard records, providing the same `(tenant, shard)` pairs exposed by
+/// production introspection.
 pub struct SimEtcdShardIter<'a> {
     inner: std::collections::hash_map::Iter<'a, (TenantId, ShardKey), PersistedShard>,
 }
@@ -407,6 +449,7 @@ impl<'a> Iterator for SimEtcdShardIter<'a> {
     }
 }
 
+/// Iterator over cached run records, mirroring `RunId` entries in the simulated cache.
 pub struct SimEtcdRunIter<'a> {
     inner: std::collections::hash_map::Iter<'a, (TenantId, RunId), PersistedRun>,
 }
@@ -421,6 +464,7 @@ impl<'a> Iterator for SimEtcdRunIter<'a> {
     }
 }
 
+/// Wrapper around `PooledSpawnedIter` that exposes spawned-child IDs for cached shards.
 pub struct SimEtcdSpawnedIter<'a> {
     inner: PooledSpawnedIter<'a>,
 }
