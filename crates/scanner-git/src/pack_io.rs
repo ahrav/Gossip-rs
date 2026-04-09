@@ -615,7 +615,9 @@ mod tests {
         let pack_delta = builder.add_pack(b"pack-delta");
 
         let base = builder.add_blob(pack_base, b"base");
-        let delta = builder.add_ref_delta(pack_delta, base, b"base!");
+        // Mixed delta: copies 4 bytes from base ("base") then appends "!".
+        // Resolved content = "base!" — depends on actual base bytes.
+        let delta = builder.add_ref_delta_mixed(pack_delta, base, 4, b"!");
 
         let fixture = builder.build().unwrap();
         let mut io = fixture.pack_io(test_limits()).unwrap();
@@ -626,6 +628,7 @@ mod tests {
         assert_eq!(base_loaded.0, ObjectKind::Blob);
         assert_eq!(base_loaded.1, fixture.expected(base).unwrap().1);
         assert_eq!(delta_loaded.0, ObjectKind::Blob);
+        assert_eq!(delta_loaded.1, b"base!");
         assert_eq!(delta_loaded.1, fixture.expected(delta).unwrap().1);
     }
 
@@ -637,18 +640,24 @@ mod tests {
         let pack_a = builder.add_pack(b"pack-a");
 
         let base = builder.add_blob(pack_c, b"root");
-        let mid = builder.add_ref_delta(pack_b, base, b"middle");
-        let top = builder.add_ref_delta(pack_a, mid, b"leaf");
+        // Mixed delta: copies "root" from base, appends "-mid".
+        // Resolved = "root-mid" — verifies base content was fetched correctly.
+        let mid = builder.add_ref_delta_mixed(pack_b, base, 4, b"-mid");
+        // Mixed delta: copies "root-mid" from mid, appends "-leaf".
+        // Resolved = "root-mid-leaf" — verifies two-hop base chain.
+        let top = builder.add_ref_delta_mixed(pack_a, mid, 8, b"-leaf");
 
         let fixture = builder.build().unwrap();
         let mut io = fixture.pack_io(test_limits()).unwrap();
 
         let top_loaded = io.load_object(&fixture.oid(top)).unwrap().unwrap();
         assert_eq!(top_loaded.0, ObjectKind::Blob);
+        assert_eq!(top_loaded.1, b"root-mid-leaf");
         assert_eq!(top_loaded.1, fixture.expected(top).unwrap().1);
 
         let mid_loaded = io.load_object(&fixture.oid(mid)).unwrap().unwrap();
         assert_eq!(mid_loaded.0, ObjectKind::Blob);
+        assert_eq!(mid_loaded.1, b"root-mid");
         assert_eq!(mid_loaded.1, fixture.expected(mid).unwrap().1);
     }
 
@@ -708,12 +717,15 @@ mod tests {
         let fixture = builder.build().unwrap();
         let mut io = fixture.pack_io(test_limits()).unwrap();
 
+        let mut count = 0;
         for (handle, oid, kind, expected) in fixture.golden_values() {
             let loaded = io.load_object(&oid).unwrap().unwrap();
             assert_eq!(loaded.0, kind);
             assert_eq!(loaded.1, expected);
             assert_eq!(fixture.oid(handle), oid);
+            count += 1;
         }
+        assert_eq!(count, 3);
 
         assert_eq!(fixture.expected(top).unwrap().1, b"leaf");
     }

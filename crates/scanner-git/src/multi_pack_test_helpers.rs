@@ -43,7 +43,9 @@ use std::path::PathBuf;
 use sha1::{Digest, Sha1};
 use tempfile::TempDir;
 
-use crate::delta_test_helpers::{kind_code, kind_name, make_add_delta, SyntheticPackBuilder};
+use crate::delta_test_helpers::{
+    kind_code, kind_name, make_add_delta, make_mixed_delta, SyntheticPackBuilder,
+};
 use crate::midx_test_builder::MidxBuilder;
 use crate::pack_decode::PackDecodeLimits;
 use crate::pack_inflate::ObjectKind;
@@ -232,6 +234,13 @@ impl MultiPackFixtureBuilder {
     }
 
     /// Adds a REF_DELTA object whose resolved bytes are `result_bytes`.
+    ///
+    /// Uses a literal-only delta instruction. The resolved output does not
+    /// depend on base content, only on `base.len()`. Prefer
+    /// [`add_ref_delta_mixed`] when the test must verify that cross-pack
+    /// base resolution returns the correct bytes.
+    ///
+    /// `result_bytes` must be <= 127 bytes (single add-literal opcode limit).
     pub(crate) fn add_ref_delta(
         &mut self,
         pack: PackHandle,
@@ -258,7 +267,56 @@ impl MultiPackFixtureBuilder {
         )
     }
 
+    /// Adds a REF_DELTA object that copies `copy_len` bytes from the base
+    /// then appends `suffix`.
+    ///
+    /// The resolved content is `base_bytes[..copy_len] || suffix`, which
+    /// depends on the actual base content. This makes incorrect base
+    /// resolution observable: if the decoder fetches wrong bytes, the
+    /// resolved output will differ from the golden value.
+    ///
+    /// `copy_len` must be > 0 and <= `base.resolved_bytes.len()`.
+    /// `suffix` must be <= 127 bytes (single add-literal opcode limit).
+    pub(crate) fn add_ref_delta_mixed(
+        &mut self,
+        pack: PackHandle,
+        base: ObjectHandle,
+        copy_len: usize,
+        suffix: &[u8],
+    ) -> ObjectHandle {
+        let base_object = self.object(base);
+        let base_bytes = base_object
+            .resolved_bytes
+            .as_ref()
+            .expect("REF_DELTA base must have resolved bytes");
+        assert!(
+            copy_len > 0 && copy_len <= base_bytes.len(),
+            "copy_len must be in 1..=base.len()"
+        );
+        let kind = base_object.kind;
+        let base_len = base_bytes.len();
+        let base_oid = base_object.oid;
+
+        let mut resolved = base_bytes[..copy_len].to_vec();
+        resolved.extend_from_slice(suffix);
+        let oid = git_oid(kind, &resolved);
+
+        self.push_object(
+            pack.0,
+            EntrySpec::RefDelta {
+                base_oid,
+                delta: make_mixed_delta(base_len, 0, copy_len, suffix),
+            },
+            kind,
+            oid,
+            Some(resolved),
+        )
+    }
+
     /// Adds an OFS_DELTA object whose resolved bytes are `result_bytes`.
+    ///
+    /// Uses a literal-only delta instruction. `result_bytes` must be
+    /// <= 127 bytes (single add-literal opcode limit).
     pub(crate) fn add_ofs_delta(
         &mut self,
         pack: PackHandle,
@@ -294,6 +352,8 @@ impl MultiPackFixtureBuilder {
     /// The entry's own OID is a synthetic [`stable_oid`] (not a real Git
     /// content hash) since the resolved content is unknown. `resolved_bytes`
     /// is set to `None`, so [`MultiPackFixture::expected`] returns `None`.
+    ///
+    /// `result_bytes` must be <= 127 bytes (single add-literal opcode limit).
     pub(crate) fn add_missing_ref_delta(
         &mut self,
         pack: PackHandle,
@@ -368,7 +428,11 @@ impl MultiPackFixtureBuilder {
             for &obj_idx in &objects_by_pack[pack_idx] {
                 let object = &mut objects[obj_idx];
                 object.offset = offsets[object.entry_idx];
-                midx.add_object(oid_to_sha1(object.oid), pack_idx as u16, object.offset);
+                midx.add_object(
+                    oid_to_sha1(object.oid),
+                    u16::try_from(pack_idx).expect("too many packs for MIDX test builder"),
+                    object.offset,
+                );
             }
 
             let path = tempdir
@@ -435,11 +499,11 @@ pub(crate) fn stable_oid(label: &[u8]) -> OidBytes {
     OidBytes::sha1(hasher.finalize().into())
 }
 
-/// Default `PackIoLimits` suitable for multi-pack fixture tests.
+/// Default [`PackIoLimits`] for multi-pack fixture tests.
 ///
-/// Centralizes the magic numbers (max depth 64, max inflated 1024,
-/// max delta chain 1024, max packs 8) that appear across all fixture
-/// tests.
+/// Returns decode limits of `max_header_bytes = 64`,
+/// `max_object_bytes = 1024`, `max_delta_bytes = 1024`,
+/// and `max_delta_depth = 8`.
 #[must_use]
 pub(crate) fn test_limits() -> PackIoLimits {
     PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 8)
@@ -490,21 +554,28 @@ mod tests {
         let pack_a = builder.add_pack(b"pack-a");
 
         let base = builder.add_blob(pack_c, b"blob-c");
-        let mid = builder.add_ref_delta(pack_b, base, b"blob-b");
-        let top = builder.add_ref_delta(pack_a, mid, b"blob-a");
+        // Mixed delta: copies "blob-c" (6 bytes) then appends "-b".
+        // Resolved = "blob-c-b" — depends on actual base content.
+        let mid = builder.add_ref_delta_mixed(pack_b, base, 6, b"-b");
+        // Mixed delta: copies "blob-c-b" (8 bytes) then appends "-a".
+        // Resolved = "blob-c-b-a" — depends on two-hop base chain.
+        let top = builder.add_ref_delta_mixed(pack_a, mid, 8, b"-a");
 
         let fixture = builder.build().unwrap();
         let mut sim = fixture.sim_pack_io(test_limits()).unwrap();
 
+        let mut count = 0;
         for (handle, oid, kind, expected) in fixture.golden_values() {
             let loaded = sim.load_object(&oid).unwrap().unwrap();
             assert_eq!(loaded.0, kind);
             assert_eq!(loaded.1, expected);
             assert_eq!(fixture.oid(handle), oid);
+            count += 1;
         }
+        assert_eq!(count, 3);
 
         let top_loaded = sim.load_object(&fixture.oid(top)).unwrap().unwrap();
-        assert_eq!(top_loaded.1, b"blob-a");
+        assert_eq!(top_loaded.1, b"blob-c-b-a");
     }
 
     #[test]
@@ -545,6 +616,32 @@ mod tests {
         let loaded = sim.load_object(&fixture.oid(missing)).unwrap();
         assert!(loaded.is_none());
         assert!(fixture.expected(missing).is_none());
+    }
+
+    #[test]
+    fn empty_pack_alongside_populated_pack_resolves() {
+        let mut builder = MultiPackFixture::builder();
+        let _empty = builder.add_pack(b"pack-empty");
+        let populated = builder.add_pack(b"pack-populated");
+
+        let base = builder.add_blob(populated, b"content");
+
+        let fixture = builder.build().unwrap();
+        let mut sim = fixture.sim_pack_io(test_limits()).unwrap();
+
+        let loaded = sim.load_object(&fixture.oid(base)).unwrap().unwrap();
+        assert_eq!(loaded.0, ObjectKind::Blob);
+        assert_eq!(loaded.1, b"content");
+    }
+
+    #[test]
+    #[should_panic(expected = "fixture requires unique OIDs")]
+    fn duplicate_oid_panics_on_build() {
+        let mut builder = MultiPackFixture::builder();
+        let pack = builder.add_pack(b"pack");
+        let _ = builder.add_blob(pack, b"same");
+        let _ = builder.add_blob(pack, b"same");
+        let _ = builder.build();
     }
 
     #[test]

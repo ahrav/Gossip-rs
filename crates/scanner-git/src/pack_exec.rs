@@ -5193,8 +5193,12 @@ mod tests {
         let pack_a = builder.add_pack(b"pack-a");
 
         let base = builder.add_blob(pack_c, b"base-c");
-        let mid = builder.add_ref_delta(pack_b, base, b"base-b");
-        let top = builder.add_ref_delta(pack_a, mid, b"base-a");
+        // Mixed delta: copies "base-c" from base, appends "-b" suffix.
+        // Resolved = "base-c-b" — verifies external base content.
+        let mid = builder.add_ref_delta_mixed(pack_b, base, 6, b"-b");
+        // Mixed delta: copies "base-c-b" from mid, appends "-a" suffix.
+        // Resolved = "base-c-b-a" — verifies two-hop external chain.
+        let top = builder.add_ref_delta_mixed(pack_a, mid, 8, b"-a");
 
         let fixture = builder.build().unwrap();
         let mut external = fixture.sim_pack_io(test_limits()).unwrap();
@@ -5276,12 +5280,13 @@ mod tests {
 
         assert_perf_u32(report.stats.emitted_candidates, 0);
         assert!(sink.emitted.is_empty());
-        assert!(report.skips.iter().any(|skip| {
-            matches!(
-                skip.reason,
-                SkipReason::ExternalBaseMissing { oid } if oid == missing_base_oid
-            )
-        }));
+        assert_eq!(report.skips.len(), 1);
+        let skip = &report.skips[0];
+        assert_eq!(skip.offset, delta_offset);
+        assert!(matches!(
+            skip.reason,
+            SkipReason::ExternalBaseMissing { oid } if oid == missing_base_oid
+        ));
     }
 
     #[test]
