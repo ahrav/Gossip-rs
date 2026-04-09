@@ -79,12 +79,12 @@ The module provides seven core capabilities:
 | File                 | Role                                                                                             |
 | -------------------- | ------------------------------------------------------------------------------------------------ |
 | `traits.rs`          | `CoordinationBackend` and `AsyncCoordinationBackend` traits -- the semantic contract for all backends (sync and async variants) |
-| `record.rs`          | `ShardRecord`, `ShardStatus`, `ParkReason`, `ShardSnapshotView`                                  |
+| `record.rs`          | `ShardRecord`, `ShardStatus`, `ParkReason`                                  |
 | `run.rs`             | `RunRecord`, `RunStatus`, `RunConfig`, `RunManagement` and `AsyncRunManagement` traits            |
 | `split_execution.rs` | Coordination-owned split execution helpers: derived shard IDs, payload hashing, result types     |
 | `in_memory.rs`       | In-memory reference implementation (executable spec)                                             |
 | `lease.rs`           | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`, `OpResult`                                       |
-| `error.rs`           | Shared `CoordError`, `InfraError` (typed infrastructure errors), and `IdempotentOutcome`          |
+| `error.rs`           | Shared `CoordError`, `InfraError` (typed infrastructure errors), `IdempotentOutcome`, and `ShardSnapshotView`          |
 | `run_errors.rs`      | Run-management error types                                                                       |
 | `validation.rs`      | `validate_lease`, `validate_cursor_update_pooled`, `check_op_idempotency`                        |
 | `shard_limits.rs`    | Shared shard-count limit validation helpers and `ShardLimitViolation` snapshots used by both backends |
