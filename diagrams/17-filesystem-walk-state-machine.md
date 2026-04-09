@@ -81,13 +81,13 @@ key-derived floor.
 stateDiagram-v2
     direction TB
 
-    [*] --> init: DirectoryWalker::new(root, floor, end, deadline)
+    [*] --> init: DirectoryWalker::new(root, start, resume_after, end, deadline)
     init --> poll: root WalkFrame seeded with sorted entries
 
     poll --> pop: frame.next_index >= frame.entries.len()
     poll --> descend: next entry is directory and subtree may overlap range
     poll --> skip: entry empty / non-file / pruned
-    poll --> emit: next entry is regular file in (floor, end)
+    poll --> emit: next entry is regular file in [start, end) and > resume_after
     poll --> done: next entry sorts at-or-above end
 
     skip --> poll
@@ -124,10 +124,10 @@ skipped before opening it.
 ```mermaid
 %% Diagram: subtree-pruning-logic
 flowchart TD
-    START(["should_skip_subtree(dir_prefix, floor, end)"])
+    START(["should_skip_subtree(dir_prefix, start, resume_after, end)"])
     EMPTY{"dir_prefix empty?"}
     SUBTREE["subtree_start = dir_prefix + '/'"]
-    BELOW{"prefix_successor(subtree_start) <= floor?"}
+    BELOW{"prefix_successor(subtree_start) <= start or resume_after?"}
     ABOVE{"end <= subtree_start?"}
     KEEP["descend into subtree"]
     SKIP["skip subtree"]
