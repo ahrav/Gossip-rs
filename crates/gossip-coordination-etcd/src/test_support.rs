@@ -14,7 +14,12 @@
 //! All helpers are backed by either:
 //!
 //! - An auto-provisioned Docker container (default), or
-//! - A pre-existing etcd at the address in `ETCD_ENDPOINTS`.
+//! - A pre-existing etcd from `ETCD_ENDPOINTS`.
+//!
+//! `ETCD_ENDPOINTS` is passed through to config parsing unchanged (after
+//! trimming surrounding whitespace), so it may contain one endpoint or a
+//! comma-separated endpoint list accepted by
+//! `EtcdCoordinatorConfig::from_endpoints_csv*`.
 //!
 //! A single etcd container is shared across all tests in a binary via
 //! [`OnceLock`]; each test gets its own namespace prefix for complete
@@ -100,6 +105,10 @@ fn etcd_image() -> ContainerRequest<GenericImage> {
 /// Resolution order:
 /// 1. If `ETCD_ENDPOINTS` is set and non-empty, use it directly.
 /// 2. Otherwise, start an etcd container via testcontainers.
+///
+/// The returned reference is process-global and initialized exactly once.
+/// When container-backed, the held container handle keeps etcd alive for
+/// the remainder of the test process.
 fn shared_endpoint() -> &'static EtcdEndpoint {
     SHARED_ETCD.get_or_init(|| {
         if let Some(endpoint) = external_endpoint() {
@@ -130,7 +139,10 @@ fn shared_endpoint() -> &'static EtcdEndpoint {
     })
 }
 
-/// Read `ETCD_ENDPOINTS` and return the first non-empty value, or `None`.
+/// Read `ETCD_ENDPOINTS` and return a trimmed non-empty value, or `None`.
+///
+/// This helper does not parse CSV itself; it returns the raw env value
+/// (after trimming), and downstream config constructors perform parsing.
 fn external_endpoint() -> Option<String> {
     std::env::var("ETCD_ENDPOINTS")
         .ok()
@@ -175,6 +187,9 @@ pub fn test_async_coordinator_config() -> EtcdCoordinatorConfig {
 }
 
 /// Create an [`EtcdCoordinator`] with explicit shard count limits.
+///
+/// Panics if the provided limits are rejected by
+/// [`EtcdCoordinatorConfig::with_shard_limits`], or if etcd is unreachable.
 pub fn test_coordinator_with_limits(
     max_shards_per_tenant: usize,
     max_total_shards: usize,
@@ -256,6 +271,9 @@ pub fn test_coordinator_in_namespace(namespace: &str) -> EtcdCoordinator {
 
 /// Create an [`EtcdCoordinator`] in a shared namespace with explicit
 /// shard count limits for limit enforcement contention tests.
+///
+/// Panics if the provided limits are rejected by
+/// [`EtcdCoordinatorConfig::with_shard_limits`], or if etcd is unreachable.
 pub fn test_coordinator_in_namespace_with_limits(
     namespace: &str,
     max_shards_per_tenant: usize,
@@ -272,6 +290,13 @@ pub fn test_coordinator_in_namespace_with_limits(
 /// Poll until the owner binding for `key` disappears, or panic if
 /// `ttl_secs + 10s` elapses without cleanup.  The generous fixed margin
 /// absorbs CI-host scheduling jitter.
+///
+/// # Panics
+///
+/// Panics if:
+/// - `ttl_secs` is negative (cannot convert to `Duration`),
+/// - owner-binding lookup fails while polling, or
+/// - cleanup is not observed before the deadline.
 pub fn wait_for_owner_binding_expiry(
     backend: &EtcdCoordinator,
     tenant: TenantId,
