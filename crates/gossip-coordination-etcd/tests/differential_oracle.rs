@@ -4,6 +4,13 @@
 //! This is the CI-friendly mock-drift check for the coordination subsystem.
 //! Both backends run entirely in memory, so the test can compare 100+ random
 //! `SimOp` sequences without Docker or a live etcd server.
+//!
+//! Environment knobs used by this test:
+//! - `GOSSIP_COORD_DIFF_SEED`: run one deterministic seed (handy for repro).
+//! - `GOSSIP_COORD_DIFF_CASES`: override how many generated seeds to execute.
+//!
+//! On any mismatch, failures include a copy/paste repro command produced by
+//! [`repro_command`], so a CI-only failure can be replayed locally verbatim.
 
 #[path = "support/oracle.rs"]
 mod oracle;
@@ -21,6 +28,10 @@ const CASES: usize = if cfg!(miri) { 4 } else { 128 };
 /// stays in sync with the harness's `DEFAULT_LEASE_DURATION`.
 const COORDINATOR_LEASE_DURATION: u64 = LEASE_DUR;
 
+/// Builds the exact `cargo test` command needed to replay a single failing seed.
+///
+/// The command pins the seed and uses `--exact`/`--nocapture` so local output
+/// matches CI diagnostics closely.
 fn repro_command(seed: u64) -> String {
     format!(
         "GOSSIP_COORD_DIFF_SEED={seed} cargo test -p gossip-coordination-etcd \
@@ -29,6 +40,15 @@ fn repro_command(seed: u64) -> String {
     )
 }
 
+/// Constructs the differential harness with aligned simulation settings.
+///
+/// Both coordinators use:
+/// - identical seed,
+/// - `FaultLevel::SunnyDay`,
+/// - the same worker/shard topology from `tests/support/oracle.rs`.
+///
+/// This keeps comparisons focused on backend behavior rather than on test setup
+/// differences.
 fn build_oracle(seed: u64) -> DifferentialOracle<InMemoryCoordinator, SimEtcdCoordinator> {
     let memory_backend = InMemoryCoordinator::new(COORDINATOR_LEASE_DURATION);
     let sim_etcd_backend = SimEtcdCoordinator::new(
@@ -52,6 +72,11 @@ fn build_oracle(seed: u64) -> DifferentialOracle<InMemoryCoordinator, SimEtcdCoo
     )
 }
 
+/// Validates that in-memory and simulated-etcd coordinators remain behaviorally
+/// equivalent across many generated operation sequences.
+///
+/// Seed selection is delegated to `selected_seeds_from_env`, so callers can run
+/// either one targeted seed or a wider fuzz-like batch.
 #[test]
 fn in_memory_matches_sim_etcd_differential_oracle() {
     for seed in selected_seeds_from_env("GOSSIP_COORD_DIFF_SEED", "GOSSIP_COORD_DIFF_CASES", CASES)
