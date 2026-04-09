@@ -484,7 +484,7 @@ mod tests {
     use super::super::delta_test_helpers::{
         encode_entry_header, encode_ofs_distance, encode_varint, zlib_compress,
     };
-    use super::super::multi_pack_test_helpers::{stable_oid, MultiPackFixture};
+    use super::super::multi_pack_test_helpers::{stable_oid, test_limits, MultiPackFixture};
     use super::super::object_id::{ObjectFormat, OidBytes};
 
     use super::super::midx_test_builder::MidxBuilder;
@@ -681,8 +681,13 @@ mod tests {
     fn missing_external_base_returns_none_from_fixture() {
         let mut builder = MultiPackFixture::builder();
         let pack = builder.add_pack(b"pack-missing");
-        let missing =
-            builder.add_missing_ref_delta(pack, stable_oid(b"missing-base"), 4, b"unused");
+        let missing = builder.add_missing_ref_delta(
+            pack,
+            ObjectKind::Blob,
+            stable_oid(b"missing-base"),
+            4,
+            b"unused",
+        );
 
         let fixture = builder.build().unwrap();
         let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 8);

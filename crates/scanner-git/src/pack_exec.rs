@@ -5225,7 +5225,8 @@ mod tests {
         let mut builder = MultiPackFixture::builder();
         let pack = builder.add_pack(b"pack-missing");
         let missing_base_oid = stable_oid(b"missing-base");
-        let target = builder.add_missing_ref_delta(pack, missing_base_oid, 4, b"unused");
+        let target =
+            builder.add_missing_ref_delta(pack, ObjectKind::Blob, missing_base_oid, 4, b"unused");
 
         let fixture = builder.build().unwrap();
         let io_limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 8);
