@@ -9,7 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::git_test_support::{CollectingSink, ctx, decode_hex, init_git_repo, run_git};
+use crate::git_test_support::{
+    CollectingSink, ctx, decode_hex, git_available, init_git_repo, run_git,
+};
 use scanner_git::{
     ByteArena, OidBytes, PackCache, PackCandidate, PackDecodeLimits, PackPlanConfig, PackView,
     build_pack_plans, execute_pack_plan,
@@ -92,6 +94,11 @@ fn load_verify_pack(idx_path: &Path, oid_len: usize) -> Vec<(OidBytes, u64)> {
 
 #[test]
 fn pack_exec_matches_git_cat_file() {
+    if !git_available() {
+        eprintln!("git not available; skipping pack exec test");
+        return;
+    }
+
     let tmp = tempfile::TempDir::new().unwrap();
     let repo = tmp.path();
 

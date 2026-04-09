@@ -6,7 +6,9 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use crate::git_test_support::{
     CollectingSink, ctx, git_available, git_output_raw, git_stdout, init_git_repo, oid_from_hex,
@@ -15,9 +17,9 @@ use crate::git_test_support::{
 use scanner_git::pack_inflate::ObjectKind;
 use scanner_git::{
     ByteArena, GitRepoPaths, MidxBuildLimits, MidxView, ObjectFormat, OidBytes, PackCache,
-    PackCandidate, PackDecodeLimits, PackIo, PackIoError, PackIoLimits, PackPlanConfig, PackView,
-    RepoOpenError, RepoOpenLimits, build_midx_bytes, build_pack_plans, collect_loose_dirs,
-    collect_pack_dirs, execute_pack_plan, resolve_pack_paths_from_midx,
+    PackCandidate, PackDecodeLimits, PackIo, PackIoError, PackIoLimits, PackObjectSink,
+    PackPlanConfig, PackView, RepoOpenError, RepoOpenLimits, build_midx_bytes, build_pack_plans,
+    collect_loose_dirs, collect_pack_dirs, execute_pack_plan, resolve_pack_paths_from_midx,
 };
 use tempfile::TempDir;
 
@@ -71,15 +73,6 @@ fn deterministic_blob(seed: u64, len: usize) -> Vec<u8> {
         state = next;
     }
     out
-}
-
-fn object_kind_name(kind: ObjectKind) -> &'static str {
-    match kind {
-        ObjectKind::Commit => "commit",
-        ObjectKind::Tree => "tree",
-        ObjectKind::Blob => "blob",
-        ObjectKind::Tag => "tag",
-    }
 }
 
 fn parse_object_kind(name: &str) -> ObjectKind {
@@ -174,34 +167,111 @@ fn create_multi_pack_repo() -> TempDir {
     tmp
 }
 
+/// Packs a base repo via GC, then adds a commit with a new blob so that
+/// the latest commit, tree, and blob remain as loose objects outside any pack.
+fn create_mixed_loose_packed_repo() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path();
+    init_git_repo(repo, "test@example.com", "Test User");
+
+    write_bytes(&repo.join("base.txt"), b"packed content\n");
+    run_git(repo, &["add", "."]);
+    run_git(repo, &["commit", "-q", "-m", "packed-base"]);
+    run_git(repo, &["gc", "--aggressive", "--prune=now"]);
+
+    // Post-GC commit leaves its objects loose.
+    write_bytes(&repo.join("loose.txt"), b"loose content\n");
+    run_git(repo, &["add", "."]);
+    run_git(repo, &["commit", "-q", "-m", "loose-tip"]);
+    tmp
+}
+
 /// Enumerates objects reachable from all refs via `git rev-list --objects --all`.
 ///
 /// Objects present in pack files but unreachable from any ref are not included.
 /// For post-GC/repack repos this covers full pack contents; repos with orphaned
 /// objects would have incomplete coverage.
+///
+/// Uses a single `git cat-file --batch` process to resolve type and content for
+/// all OIDs, avoiding per-object subprocess overhead.
 fn reachable_objects(repo: &Path) -> Vec<ReachableObject> {
     let mut seen = BTreeSet::new();
-    let mut objects = Vec::new();
+    let mut hex_oids = Vec::new();
     for line in git_stdout(repo, &["rev-list", "--objects", "--all"]).lines() {
         let Some(hex) = line.split_whitespace().next() else {
             continue;
         };
-        if !seen.insert(hex.to_owned()) {
-            continue;
+        if seen.insert(hex.to_owned()) {
+            hex_oids.push(hex.to_owned());
         }
-        let oid = oid_from_hex(hex);
-        let kind = parse_object_kind(&git_stdout(repo, &["cat-file", "-t", &oid.to_string()]));
-        let expected = git_output_raw(
-            repo,
-            &["cat-file", object_kind_name(kind), &oid.to_string()],
-        )
-        .stdout;
+    }
+
+    // Feed all OIDs to a single `git cat-file --batch` process.
+    // Output per object: "<oid> <type> <size>\n<content>\n"
+    let mut child = Command::new("git")
+        .args(["cat-file", "--batch"])
+        .current_dir(repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn git cat-file --batch");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for hex in &hex_oids {
+            writeln!(stdin, "{hex}").expect("failed to write OID to cat-file stdin");
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .expect("git cat-file --batch failed");
+    assert!(
+        output.status.success(),
+        "git cat-file --batch exited with {:?}:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = &output.stdout;
+    let mut pos = 0;
+    let mut objects = Vec::with_capacity(hex_oids.len());
+    while pos < stdout.len() {
+        let header_end = stdout[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or_else(|| panic!("missing header newline at offset {pos}"));
+        let header = std::str::from_utf8(&stdout[pos..pos + header_end])
+            .expect("non-UTF8 header from cat-file --batch");
+        pos += header_end + 1;
+
+        let parts: Vec<&str> = header.split_whitespace().collect();
+        assert!(
+            parts.len() >= 3,
+            "unexpected cat-file --batch header: {header:?}"
+        );
+        let hex = parts[0];
+        let kind = parse_object_kind(parts[1]);
+        let size: usize = parts[2]
+            .parse()
+            .unwrap_or_else(|err| panic!("failed to parse size from {header:?}: {err}"));
+
+        let expected = stdout[pos..pos + size].to_vec();
+        pos += size;
+        // Skip trailing newline delimiter.
+        assert_eq!(
+            stdout.get(pos).copied(),
+            Some(b'\n'),
+            "expected trailing newline after {size}-byte object at offset {pos}"
+        );
+        pos += 1;
+
         objects.push(ReachableObject {
-            oid,
+            oid: oid_from_hex(hex),
             kind,
             expected,
         });
     }
+
     objects.sort_by(|a, b| a.oid.cmp(&b.oid));
     objects
 }
@@ -271,10 +341,9 @@ fn build_blob_candidates(
         if obj.kind != ObjectKind::Blob {
             continue;
         }
-        let idx = midx
-            .find_oid(&obj.oid)
-            .unwrap()
-            .unwrap_or_else(|| panic!("blob {} missing from MIDX", obj.oid));
+        let Some(idx) = midx.find_oid(&obj.oid).unwrap() else {
+            continue; // loose object, not in any pack
+        };
         let (pack_id, offset) = midx.offset_at(idx).unwrap();
         let path_ref = arena
             .intern(format!("blob-{}", obj.oid).as_bytes())
@@ -317,9 +386,10 @@ fn verify_pack_io_against_git(objects: &[ReachableObject], artifacts: &PackRepoA
 fn verify_pack_exec_against_git(objects: &[ReachableObject], artifacts: &PackRepoArtifacts) {
     let midx = MidxView::parse(artifacts.midx_bytes.as_slice(), ObjectFormat::Sha1).unwrap();
     let (arena, candidates) = build_blob_candidates(objects, &midx);
+    let packed_blob_count = candidates.len();
     assert!(
-        !candidates.is_empty(),
-        "expected at least one reachable blob"
+        packed_blob_count > 0,
+        "expected at least one reachable packed blob"
     );
 
     let pack_views: Vec<Option<PackView<'_>>> = artifacts
@@ -370,19 +440,18 @@ fn verify_pack_exec_against_git(objects: &[ReachableObject], artifacts: &PackRep
         );
     }
 
-    let expected_blob_count = objects
-        .iter()
-        .filter(|obj| obj.kind == ObjectKind::Blob)
-        .count();
-    assert_eq!(sink.blobs.len(), expected_blob_count);
+    assert_eq!(
+        sink.blobs.len(),
+        packed_blob_count,
+        "decoded blob count should match packed candidate count"
+    );
     for obj in objects {
         if obj.kind != ObjectKind::Blob {
             continue;
         }
-        let actual = sink
-            .blobs
-            .get(&obj.oid)
-            .unwrap_or_else(|| panic!("missing decoded blob {}", obj.oid));
+        let Some(actual) = sink.blobs.get(&obj.oid) else {
+            continue; // loose blob not in any pack plan
+        };
         assert_eq!(
             actual.as_slice(),
             obj.expected.as_slice(),
@@ -457,11 +526,11 @@ fn differential_simple_gc() {
     verify_repo_against_git(
         repo.path(),
         LayoutExpectations {
-            min_objects: 13,
+            min_objects: 20,
             min_packs: 1,
             require_tag: true,
-            require_delta_objects: false,
-            min_delta_depth: 0,
+            require_delta_objects: true,
+            min_delta_depth: 1,
         },
     );
 }
@@ -507,6 +576,26 @@ fn differential_multi_pack() {
 }
 
 #[test]
+fn differential_mixed_loose_packed() {
+    if !git_available() {
+        eprintln!("git not available; skipping git pack differential tests");
+        return;
+    }
+
+    let repo = create_mixed_loose_packed_repo();
+    verify_repo_against_git(
+        repo.path(),
+        LayoutExpectations {
+            min_objects: 5,
+            min_packs: 1,
+            require_tag: false,
+            require_delta_objects: false,
+            min_delta_depth: 0,
+        },
+    );
+}
+
+#[test]
 fn differential_missing_oid_returns_none() {
     if !git_available() {
         eprintln!("git not available; skipping git pack differential tests");
@@ -514,6 +603,7 @@ fn differential_missing_oid_returns_none() {
     }
 
     let repo = create_simple_gc_repo();
+    let objects = reachable_objects(repo.path());
     let artifacts = pack_repo_artifacts(repo.path());
     let midx = MidxView::parse(artifacts.midx_bytes.as_slice(), ObjectFormat::Sha1).unwrap();
     let mut pack_io = PackIo::from_parts(
@@ -524,11 +614,15 @@ fn differential_missing_oid_returns_none() {
     )
     .unwrap();
 
-    let fabricated = OidBytes::sha1([0x00; 20]);
-    let result = pack_io.load_object(&fabricated);
+    // Flip one bit in a known-existing OID to produce a near-miss that
+    // exercises the MIDX binary search rather than trivially mismatching.
+    let mut near_miss_bytes = objects[0].oid.as_slice().to_vec();
+    near_miss_bytes[0] ^= 0x01;
+    let near_miss = OidBytes::from_slice(&near_miss_bytes);
+    let result = pack_io.load_object(&near_miss);
     assert!(
         matches!(result, Ok(None)),
-        "expected Ok(None) for fabricated OID, got {result:?}"
+        "expected Ok(None) for near-miss OID, got {result:?}"
     );
 }
 
@@ -568,4 +662,21 @@ fn differential_delta_depth_exceeded() {
         saw_depth_exceeded,
         "expected at least one DeltaDepthExceeded error with max_delta_depth=1"
     );
+}
+
+#[test]
+#[should_panic(expected = "duplicate emit for OID")]
+fn collecting_sink_rejects_duplicate_oid() {
+    let oid = OidBytes::sha1([0xAA; 20]);
+    let mut arena = ByteArena::with_capacity(64.try_into().unwrap());
+    let path_ref = arena.intern(b"test-path").unwrap();
+    let candidate = PackCandidate {
+        oid,
+        ctx: ctx(path_ref),
+        pack_id: 0,
+        offset: 0,
+    };
+    let mut sink = CollectingSink::default();
+    sink.emit(&candidate, b"test-path", b"first").unwrap();
+    sink.emit(&candidate, b"test-path", b"second").unwrap();
 }

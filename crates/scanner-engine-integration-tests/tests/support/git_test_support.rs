@@ -6,10 +6,12 @@ use scanner_git::{
     ByteRef, CandidateContext, ChangeKind, OidBytes, PackCandidate, PackExecError, PackObjectSink,
 };
 
-#[allow(unused_imports)]
 pub(crate) use gossip_stdx::git_test_support::{
-    decode_hex, git_available, git_output_raw, git_stdout, init_git_repo, run_git,
+    decode_hex, git_available, git_stdout, init_git_repo, run_git,
 };
+// Used by the integration target but not the simulation target.
+#[allow(unused_imports)]
+pub(crate) use gossip_stdx::git_test_support::git_output_raw;
 
 pub(crate) fn oid_from_hex(hex: &str) -> OidBytes {
     OidBytes::from_slice(&decode_hex(hex.trim()))
@@ -19,6 +21,8 @@ pub(crate) fn oid_from_hex(hex: &str) -> OidBytes {
 ///
 /// Panics on duplicate OID emission — a duplicate indicates a bug in the
 /// plan builder or executor since each candidate maps to exactly one pack.
+// Integration test support compiles per-target; rustc cannot see cross-module
+// usage within the test harness, producing false dead_code warnings.
 #[derive(Default)]
 #[allow(dead_code)]
 pub(crate) struct CollectingSink {
@@ -38,8 +42,8 @@ impl PackObjectSink for CollectingSink {
     }
 }
 
-/// Builds a canonical candidate context for tests.
-#[allow(dead_code)]
+/// Returns a fixed-value `CandidateContext` suitable for test fixtures.
+#[allow(dead_code)] // see comment on CollectingSink above
 pub(crate) fn ctx(path_ref: ByteRef) -> CandidateContext {
     CandidateContext {
         commit_id: 1,
