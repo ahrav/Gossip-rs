@@ -25,19 +25,19 @@
 //!
 //! # Resume semantics
 //!
-//! When tokens are enabled, the cursor token carries the next-index as a
-//! big-endian `u64`. On resume, the token is used as an O(1) fast path:
-//! the item just before the token index is validated against `last_key`. If
-//! the token is missing, malformed, or stale, the connector falls back to
-//! O(log n) `upper_bound` binary search. This validation runs in all build
-//! profiles (not just debug). When tokens are disabled, resume is always
-//! key-based via binary search.
+//! When a cursor token carries a big-endian `u64` next-index, split-point
+//! resume can treat it as an O(1) fast path: the item just before the token
+//! index is validated against `last_key`. If the token is missing, malformed,
+//! or stale, the connector falls back to O(log n) `upper_bound` binary search.
+//! This validation runs in all build profiles (not just debug).
 //!
-//! # Budget expiry
+//! # Budget handling
 //!
-//! An expired deadline returns `Err(EnumerateError::retryable(...))` rather
-//! than an empty page. This avoids ambiguity with the empty-page-means-EOF
-//! signal and lets callers distinguish budget exhaustion from scan completion.
+//! Read operations treat byte budgets as advisory upper bounds rather than
+//! readiness checks: [`open`](InMemoryDeterministicConnector::open) ignores
+//! them, and [`read_range`](InMemoryDeterministicConnector::read_range) clamps
+//! the copy length to the requested maximum. Split-point selection accepts
+//! budgets for API symmetry but does not consume them.
 //!
 //! # Scope and limitations
 //!
@@ -126,11 +126,10 @@ impl common::KeyedEntry for PreparedItem {
 ///
 /// # Resume semantics
 ///
-/// When tokens are enabled (the default), the cursor token carries the
-/// next-index as a big-endian `u64`. On resume, the token is used as an
-/// O(1) fast path with validation against `last_key`; on mismatch the
-/// connector falls back to O(log n) binary search. See module docs for full
-/// detail.
+/// When a cursor token carries the expected big-endian next-index, split-point
+/// resume uses it as an O(1) fast path with validation against `last_key`; on
+/// mismatch the connector falls back to O(log n) binary search. See module
+/// docs for full detail.
 ///
 /// # Capabilities
 ///
@@ -141,9 +140,10 @@ pub struct InMemoryDeterministicConnector {
     /// Sorted, precomputed item storage shared via [`Arc`] for cheap cloning.
     /// Built once at construction; never mutated afterward.
     items: Arc<[PreparedItem]>,
-    /// When `true`, enumeration pages emit big-endian index tokens and the
-    /// resume path uses them as an O(1) fast path with key-based fallback.
-    /// When `false`, tokens are neither emitted nor consumed.
+    /// Controls whether [`Self::caps`] advertises `token_resume`.
+    ///
+    /// Split-point helpers still operate on whatever cursor the caller passes
+    /// in; this flag only changes capability negotiation.
     emit_tokens: bool,
 }
 
@@ -152,11 +152,11 @@ impl InMemoryDeterministicConnector {
     ///
     /// Items are sorted lexicographically by key (O(n log n)), verified to
     /// contain no duplicate keys, and then all per-item metadata is
-    /// precomputed into internal records. Subsequent page emission pays
-    /// only clone/copy costs.
+    /// precomputed into internal records. Subsequent reads and split-point
+    /// queries pay only clone/copy costs plus bound checks.
     ///
-    /// Token emission is enabled by default. Use [`with_tokens(false)`] to
-    /// disable it.
+    /// `token_resume` capability advertisement is enabled by default. Use
+    /// [`with_tokens(false)`] to suppress that capability in [`Self::caps`].
     ///
     /// # Panics
     ///
@@ -199,10 +199,10 @@ impl InMemoryDeterministicConnector {
         }
     }
 
-    /// Enable or disable pagination token emission/consumption.
+    /// Enable or disable `token_resume` capability advertisement.
     ///
-    /// Disabling tokens is useful when callers want to validate key-only resume
-    /// behavior or simulate connectors that cannot persist opaque token state.
+    /// Disabling the flag is useful when callers need capability negotiation to
+    /// mirror a connector that cannot round-trip opaque token state.
     #[must_use]
     pub fn with_tokens(mut self, enabled: bool) -> Self {
         self.emit_tokens = enabled;
@@ -238,6 +238,11 @@ impl InMemoryDeterministicConnector {
     /// interpreted in the surrounding helper, so this method can focus on
     /// resuming from the cursor and feeding the estimator with ordered bytes
     /// and size hints for the remaining range.
+    ///
+    /// # Errors
+    ///
+    /// Propagates permanent errors from invalid bound ordering and any
+    /// estimator error returned while validating the cursor against the range.
     fn choose_split_point_bounds(
         &self,
         start: Option<&[u8]>,
