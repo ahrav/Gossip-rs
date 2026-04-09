@@ -240,6 +240,10 @@ fn parse_impl_for(trimmed: &str) -> Option<(String, String)> {
 ///
 /// Returns a set of `(trait_name, type_name)` pairs with path prefixes
 /// and generics stripped. Line and block comments are skipped.
+///
+/// Assumes each `impl ... for ...` appears on a single line — multi-line
+/// declarations where `for` lands on a continuation line are not detected.
+/// `cargo fmt` keeps these single-line in practice.
 fn collect_impl_pairs(dir: &Path) -> HashSet<(String, String)> {
     let mut files = Vec::new();
     collect_rs_files(dir, &mut files);
@@ -276,68 +280,6 @@ fn collect_impl_pairs(dir: &Path) -> HashSet<(String, String)> {
     pairs
 }
 
-/// Scans all `.rs` files under `dir` for `struct` and `enum` declarations.
-///
-/// Used as a fallback for blanket impl verification: if a type exists and the
-/// trait has a blanket impl, the type is considered to implement the trait.
-fn collect_type_names(dir: &Path) -> HashSet<String> {
-    let mut files = Vec::new();
-    collect_rs_files(dir, &mut files);
-
-    let mut names = HashSet::new();
-    for path in &files {
-        let source = fs::read_to_string(path).unwrap();
-        let mut in_block_comment = false;
-        for line in source.lines() {
-            let trimmed = line.trim_start();
-            if in_block_comment {
-                if trimmed.contains("*/") {
-                    in_block_comment = false;
-                }
-                continue;
-            }
-            if trimmed.starts_with("/*") {
-                if !trimmed.contains("*/") {
-                    in_block_comment = true;
-                }
-                continue;
-            }
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            let keyword = if trimmed.starts_with("struct ") || trimmed.starts_with("pub struct ") {
-                "struct"
-            } else if trimmed.starts_with("enum ") || trimmed.starts_with("pub enum ") {
-                "enum"
-            } else if trimmed.starts_with("pub(crate) struct ") {
-                "struct"
-            } else if trimmed.starts_with("pub(crate) enum ") {
-                "enum"
-            } else {
-                continue;
-            };
-            let after_kw = trimmed
-                .split_once(keyword)
-                .map(|x| x.1)
-                .unwrap_or("")
-                .trim_start();
-            let raw_name = after_kw
-                .split(|c: char| c.is_whitespace() || c == '<' || c == '{' || c == '(' || c == ';')
-                .next()
-                .unwrap_or("");
-            if !raw_name.is_empty()
-                && raw_name
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_uppercase())
-            {
-                names.insert(raw_name.to_owned());
-            }
-        }
-    }
-    names
-}
-
 fn collect_public_trait_names(dir: &Path) -> Vec<String> {
     let mut files = Vec::new();
     collect_rs_files(dir, &mut files);
@@ -366,7 +308,10 @@ fn collect_public_trait_names(dir: &Path) -> Vec<String> {
             }
             let is_pub_trait = trimmed.starts_with("pub trait ")
                 || trimmed.starts_with("pub(crate) trait ")
-                || trimmed.starts_with("pub(super) trait ");
+                || trimmed.starts_with("pub(super) trait ")
+                || trimmed.starts_with("pub unsafe trait ")
+                || trimmed.starts_with("pub(crate) unsafe trait ")
+                || trimmed.starts_with("pub(super) unsafe trait ");
             if !is_pub_trait {
                 continue;
             }
@@ -378,8 +323,8 @@ fn collect_public_trait_names(dir: &Path) -> Vec<String> {
             let Some(raw_name) = after_trait.split_whitespace().next() else {
                 continue;
             };
-            let name = raw_name.trim_end_matches([':', '{', '<']);
-            names.push(name.to_owned());
+            let name = extract_bare_name(raw_name.trim_end_matches([':']));
+            names.push(name);
         }
     }
 
@@ -408,13 +353,12 @@ fn trait_coverage_audit_matches_public_trait_set() {
 fn trait_coverage_audit_has_real_impl_coverage_for_every_entry() {
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let impl_pairs = collect_impl_pairs(&src_dir);
-    let type_names = collect_type_names(&src_dir);
 
     // Traits with blanket impls where the implementing type is a generic
     // parameter (e.g., `impl<T> EventSink for T where T: GitEventOutput`).
     // These cannot be matched by explicit `impl Trait for Type` lines, so
-    // we fall back to checking that the named type exists.
-    let blanket_impl_traits: HashSet<&str> = HashSet::from(["EventSink"]);
+    // we fall back to checking that the type implements the prerequisite trait.
+    let blanket_impl_requirements: &[(&str, &str)] = &[("EventSink", "GitEventOutput")];
 
     let mut errors = Vec::new();
 
@@ -424,10 +368,16 @@ fn trait_coverage_audit_has_real_impl_coverage_for_every_entry() {
             if impl_pairs.contains(&pair) {
                 continue;
             }
-            // Blanket impl fallback: if the trait has a blanket impl and the
-            // type exists as a struct/enum, treat it as verified.
-            if blanket_impl_traits.contains(entry.trait_name) && type_names.contains(*impl_name) {
-                continue;
+            // Blanket impl fallback: verify the type implements the
+            // prerequisite trait that the blanket impl requires.
+            if let Some(&(_, required_trait)) = blanket_impl_requirements
+                .iter()
+                .find(|&&(trait_name, _)| trait_name == entry.trait_name)
+            {
+                let required_pair = (required_trait.to_owned(), (*impl_name).to_owned());
+                if impl_pairs.contains(&required_pair) {
+                    continue;
+                }
             }
             errors.push(format!(
                 "  {} for {} — not found in src/",
@@ -449,9 +399,8 @@ fn trait_coverage_audit_has_real_impl_coverage_for_every_entry() {
 fn trait_coverage_audit_catches_unlisted_impls() {
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let impl_pairs = collect_impl_pairs(&src_dir);
-    let type_names = collect_type_names(&src_dir);
 
-    let blanket_impl_traits: HashSet<&str> = HashSet::from(["EventSink"]);
+    let blanket_impl_requirements: &[(&str, &str)] = &[("EventSink", "GitEventOutput")];
 
     // Build lookup: trait_name -> set of (real_impls ∪ test_stubs).
     let mut listed: HashMap<&str, HashSet<&str>> = HashMap::new();
@@ -474,9 +423,16 @@ fn trait_coverage_audit_catches_unlisted_impls() {
             continue;
         }
         // Blanket impl fallback: the type satisfies the trait through a blanket
-        // impl, so it would not appear as an explicit entry in the table.
-        if blanket_impl_traits.contains(trait_name.as_str()) && type_names.contains(type_name) {
-            continue;
+        // impl via the prerequisite trait, so it would not appear as an explicit
+        // entry in the table.
+        if let Some(&(_, required_trait)) = blanket_impl_requirements
+            .iter()
+            .find(|&&(t, _)| t == trait_name.as_str())
+        {
+            let required_pair = (required_trait.to_owned(), type_name.clone());
+            if impl_pairs.contains(&required_pair) {
+                continue;
+            }
         }
         errors.push(format!(
             "  {} for {} — found in source but not in TRAIT_COVERAGE_AUDIT",
