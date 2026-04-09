@@ -284,6 +284,29 @@ fn bench_hybrid_rebuild(c: &mut Criterion) {
     });
 }
 
+/// Cold-start benchmark: measures `batch_check_seen` on a freshly constructed
+/// hybrid store whose ordinal cache has NOT been pre-warmed. This captures the
+/// cost of the lazy rebuild that happens on the first query.
+fn bench_hybrid_cold_start(c: &mut Criterion) {
+    let base = build_hybrid_store(BITMAP_SIZE, PROBE_BATCH);
+    let mut probes = build_hybrid_probe_batch(PROBE_BATCH, BITMAP_SIZE);
+    probes.sort_unstable();
+
+    c.bench_function("hybrid_seen/batch_check_seen_cold_start_1m", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let working = base.clone();
+                let start = Instant::now();
+                let _result = working.batch_check_seen(black_box(&probes)).expect("cold");
+                total += start.elapsed();
+                black_box(_result);
+            }
+            total
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_batch_contains,
@@ -293,6 +316,7 @@ criterion_group!(
     bench_deserialize,
     bench_insert_batch,
     bench_merge,
-    bench_hybrid_rebuild
+    bench_hybrid_rebuild,
+    bench_hybrid_cold_start
 );
 criterion_main!(benches);

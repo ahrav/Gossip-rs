@@ -20,6 +20,24 @@ use std::collections::HashSet;
 use super::midx_error::{ChunkId, MidxError};
 use super::object_id::{ObjectFormat, OidBytes};
 
+/// Cached chunk offsets for zero-parse reconstruction of a [`MidxView`].
+///
+/// Produced by [`MidxView::layout`] after a successful [`MidxView::parse`].
+/// Passed to [`MidxView::from_layout`] to reconstruct the view without
+/// re-validating the MIDX structure. The byte buffer must be identical to
+/// the one originally validated.
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedMidxLayout {
+    pub(crate) format: ObjectFormat,
+    pub(crate) pack_count: u32,
+    pub(crate) object_count: u32,
+    pnam_range: (usize, usize),
+    oidf_offset: usize,
+    oidl_range: (usize, usize),
+    ooff_range: (usize, usize),
+    loff_range: Option<(usize, usize)>,
+}
+
 /// MIDX magic bytes.
 const MIDX_MAGIC: [u8; 4] = *b"MIDX";
 /// MIDX version 1 (only supported version).
@@ -201,6 +219,46 @@ impl<'a> MidxView<'a> {
             ooff,
             loff,
         })
+    }
+
+    /// Extracts the validated layout for later zero-parse reconstruction.
+    ///
+    /// `data` must be the byte buffer that was passed to [`parse`](Self::parse).
+    pub(crate) fn layout(&self, data: &[u8]) -> ValidatedMidxLayout {
+        let base = data.as_ptr() as usize;
+        ValidatedMidxLayout {
+            format: self.format,
+            pack_count: self.pack_count,
+            object_count: self.object_count,
+            pnam_range: (self.pnam.as_ptr() as usize - base, self.pnam.len()),
+            oidf_offset: self.oidf.as_ptr() as usize - base,
+            oidl_range: (self.oidl.as_ptr() as usize - base, self.oidl.len()),
+            ooff_range: (self.ooff.as_ptr() as usize - base, self.ooff.len()),
+            loff_range: self.loff.map(|l| (l.as_ptr() as usize - base, l.len())),
+        }
+    }
+
+    /// Reconstructs a view from a previously validated layout.
+    ///
+    /// The byte buffer must be identical to the one validated by the
+    /// [`parse`](Self::parse) call that produced this layout. No validation
+    /// is performed; invalid layouts cause undefined slice bounds.
+    #[inline]
+    pub(crate) fn from_layout(data: &'a [u8], layout: &ValidatedMidxLayout) -> Self {
+        debug_assert!(layout.pnam_range.0 + layout.pnam_range.1 <= data.len());
+        debug_assert!(layout.oidf_offset + FANOUT_SIZE <= data.len());
+        debug_assert!(layout.oidl_range.0 + layout.oidl_range.1 <= data.len());
+        debug_assert!(layout.ooff_range.0 + layout.ooff_range.1 <= data.len());
+        Self {
+            format: layout.format,
+            pack_count: layout.pack_count,
+            object_count: layout.object_count,
+            pnam: &data[layout.pnam_range.0..layout.pnam_range.0 + layout.pnam_range.1],
+            oidf: &data[layout.oidf_offset..layout.oidf_offset + FANOUT_SIZE],
+            oidl: &data[layout.oidl_range.0..layout.oidl_range.0 + layout.oidl_range.1],
+            ooff: &data[layout.ooff_range.0..layout.ooff_range.0 + layout.ooff_range.1],
+            loff: layout.loff_range.map(|(off, len)| &data[off..off + len]),
+        }
     }
 
     /// Returns the number of packs referenced.
