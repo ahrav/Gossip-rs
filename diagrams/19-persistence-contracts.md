@@ -123,7 +123,7 @@ The trait hierarchy summarized:
 
 ### Conformance harness
 
-`run_conformance()` executes 11 checks across three suites:
+`run_conformance()` executes 12 checks across three suites:
 
 | Suite | Checks | Validates |
 |:---|:---|:---|
@@ -159,7 +159,7 @@ graph TB
     end
 
     subgraph layer2 ["Layer 2: Version-Specific Occurrence"]
-        OR["OccurrenceRecord<br/>tenant_id: TenantId<br/>finding_id: FindingId<br/>occurrence_id: OccurrenceId<br/>object_version_id: ObjectVersionId<br/>byte_offset: u64<br/>byte_length: NonZeroU64"]
+        OR["OccurrenceRecord<br/>tenant_id: TenantId<br/>occurrence_id: OccurrenceId<br/>finding_id: FindingId<br/>object_version_id: ObjectVersionId<br/>byte_offset: u64<br/>byte_length: NonZeroU64"]
         OID["OccurrenceId = BLAKE3(<br/>  finding_id,<br/>  object_version_id,<br/>  byte_offset,<br/>  byte_length<br/>)"]
     end
 
