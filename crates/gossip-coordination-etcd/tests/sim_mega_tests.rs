@@ -1,4 +1,9 @@
 #![cfg(feature = "test-support")]
+//! Large-scale simulation tests that exercise the etcd-backed coordination
+//! harness behind `gossip-coordination-etcd`.
+//! Each test runs multiple pseudo-random seeds (configurable via
+//! `GOSSIP_SIM_SEEDS` / `GOSSIP_SIM_SEED`) to ensure the invariant checker and
+//! backend fault-handling logic behave across diverse failure interleavings.
 
 use std::collections::BTreeMap;
 
@@ -14,15 +19,26 @@ use gossip_coordination_etcd::sim_etcd_kv::{SimEtcdFaultConfig, SimEtcdFaultStat
 use gossip_coordination_etcd::{EtcdCoordinatorConfig, SimEtcdCoordinator};
 
 #[derive(Clone)]
+/// Configuration for each mega-sim sweep.
+///
+/// Adjusting these parameters lets the tests exercise different harness fault
+/// levels, backend fault injections, cluster sizes, and work volumes.
 struct SimCase {
+    /// Fault level attributed to the simulation harness.
     harness_level: FaultLevel,
+    /// Backend fault profile injected directly into the etcd simulator.
     etcd_faults: SimEtcdFaultConfig,
+    /// Number of workers the harness should launch.
     workers: u64,
+    /// Number of shards managed by the harness.
     shards: u64,
+    /// Number of operations targeted at safety invariants.
     safety_ops: usize,
+    /// Number of operations targeted at liveness completion.
     liveness_ops: usize,
 }
 
+/// Interpret `GOSSIP_SIM_SEEDS`, fallback to `default` when unset or invalid.
 fn parse_seed_count(default: usize) -> usize {
     match std::env::var("GOSSIP_SIM_SEEDS") {
         Ok(value) => match value.parse() {
@@ -39,6 +55,7 @@ fn parse_seed_count(default: usize) -> usize {
     }
 }
 
+/// Interpret `GOSSIP_SIM_SEED` so a single deterministic seed can be replayed.
 fn parse_single_seed() -> Option<u64> {
     match std::env::var("GOSSIP_SIM_SEED") {
         Ok(value) => match value.parse() {
@@ -54,6 +71,7 @@ fn parse_single_seed() -> Option<u64> {
     }
 }
 
+/// Build the seed list for a sweep, honoring a single-seed override if present.
 fn selected_seeds(default_count: usize) -> Vec<u64> {
     if let Some(seed) = parse_single_seed() {
         vec![seed]
@@ -62,6 +80,7 @@ fn selected_seeds(default_count: usize) -> Vec<u64> {
     }
 }
 
+/// Construct the deterministic etcd coordinator config shared across tests.
 fn test_config() -> EtcdCoordinatorConfig {
     EtcdCoordinatorConfig::new_with_tuning(
         ["http://127.0.0.1:2379"],
@@ -73,6 +92,10 @@ fn test_config() -> EtcdCoordinatorConfig {
     .expect("hard-coded mega-sim etcd config must be valid")
 }
 
+/// Create a coordination simulation configured for the provided `case`.
+///
+/// Backend faults take effect immediately so the harness must be prepared to
+/// handle transient failures from op zero.
 fn build_sim(seed: u64, case: &SimCase) -> CoordinationSim<SimEtcdCoordinator> {
     let config = test_config();
     let retry_budget = config.optimistic_txn_retries();
@@ -92,12 +115,14 @@ fn build_sim(seed: u64, case: &SimCase) -> CoordinationSim<SimEtcdCoordinator> {
     sim
 }
 
+/// Execute a single seed run and return the report plus backend fault statistics.
 fn run_case(seed: u64, case: &SimCase) -> (SimReport, SimEtcdFaultStats) {
     let (report, backend) =
         build_sim(seed, case).run_and_return_backend(case.safety_ops, case.liveness_ops);
     (report, backend.fault_stats())
 }
 
+/// Merge per-seed event counts into the aggregate map.
 fn merge_event_counts(
     aggregate: &mut BTreeMap<SimEventKind, usize>,
     counts: &BTreeMap<SimEventKind, usize>,
@@ -107,6 +132,7 @@ fn merge_event_counts(
     }
 }
 
+/// Format a `cargo test` invocation that reproduces the failure seed.
 fn repro_command(test_name: &str, seed: u64) -> String {
     format!(
         "GOSSIP_SIM_SEED={seed} cargo test -p gossip-coordination-etcd --features test-support \
@@ -114,6 +140,7 @@ fn repro_command(test_name: &str, seed: u64) -> String {
     )
 }
 
+/// Assert that each required event kind surfaced somewhere in the sweep.
 fn assert_required_events(
     counts: &BTreeMap<SimEventKind, usize>,
     required: &[SimEventKind],
@@ -127,6 +154,10 @@ fn assert_required_events(
     }
 }
 
+/// Execute the seed sweep in parallel and return failures, counts, and stats.
+///
+/// Threads are joined after collecting their diagnostics so panics bubble up
+/// without discarding invariant violation details.
 fn run_parallel_seed_sweep(
     test_name: &str,
     seeds: &[u64],
@@ -198,6 +229,7 @@ fn run_parallel_seed_sweep(
     (all_failures, aggregate_counts, aggregate_faults)
 }
 
+/// Fail early if any seed reported invariant violations, emitting repro info.
 fn assert_seed_sweep_clean(test_name: &str, seed_count: usize, failures: &[(u64, String)]) {
     assert!(
         failures.is_empty(),
@@ -215,6 +247,7 @@ fn assert_seed_sweep_clean(test_name: &str, seed_count: usize, failures: &[(u64,
     );
 }
 
+/// Fault profile targeting CAS contention without other fault noise.
 fn stormy_cas_faults() -> SimEtcdFaultConfig {
     SimEtcdFaultConfig::for_level(FaultLevel::Stormy)
         .with_uncertain_commit_ppm(0)
@@ -222,14 +255,17 @@ fn stormy_cas_faults() -> SimEtcdFaultConfig {
         .with_retry_exhaustion_ppm(0)
 }
 
+/// Augment `stormy_cas_faults` with aggressive CAS compare failures.
 fn elevated_cas_faults() -> SimEtcdFaultConfig {
     stormy_cas_faults().with_cas_compare_failure_ppm(300_000)
 }
 
+/// Stable tenant identifier used by deterministic test flows.
 fn tenant() -> TenantId {
     TenantId::from_bytes([0x01; 32])
 }
 
+/// Convert the raw integer into a logical timeline expected by the coordinator.
 fn now(raw: u64) -> LogicalTime {
     LogicalTime::from_raw(raw)
 }
