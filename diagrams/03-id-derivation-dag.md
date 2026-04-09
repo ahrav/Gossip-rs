@@ -30,7 +30,7 @@ graph TD
     end
 
     subgraph ItemIdentity ["Item Identity"]
-        locator["locator<br/><i>Vec&lt;u8&gt;</i>"]
+        locator["locator<br/><i>Box&lt;[u8]&gt;</i>"]
         ConnectorInstanceIdHash["ConnectorInstanceIdHash<br/><i>32B</i>"]
         ItemIdentityKey["ItemIdentityKey<br/><i>variable</i>"]
         StableItemId["StableItemId<br/><i>32B</i>"]
@@ -61,7 +61,7 @@ graph TD
 
     subgraph PolicyIdentity ["Policy Identity"]
         policy_hash_version["policy_hash_version<br/><i>u32</i>"]
-        id_hash_mode["id_hash_mode<br/><i>u8</i>"]
+        id_hash_mode["id_hash_mode<br/><i>IdHashMode</i>"]
         evidence_hash_version["evidence_hash_version<br/><i>u32</i>"]
         rules_digest["rules_digest<br/><i>[u8; 32]</i>"]
         PolicyHashInputs["PolicyHashInputs<br/><i>41B struct</i>"]
@@ -163,7 +163,7 @@ The item identity chain answers "what was scanned?" independently of who scanned
 %% Diagram: item-identity-chain
 graph LR
     ConnectorTag["ConnectorTag<br/>(8B, fixed)"]
-    locator["locator<br/>(Vec&lt;u8&gt;, variable)"]
+    locator["locator<br/>(Box&lt;[u8]&gt;, variable)"]
     instance_bytes["instance_bytes<br/>(variable)"]
     ConnectorInstanceIdHash["ConnectorInstanceIdHash<br/>(32B)"]
     ItemIdentityKey["ItemIdentityKey<br/>(8B tag + 32B instance + len-prefixed locator)"]
