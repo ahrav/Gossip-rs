@@ -389,7 +389,7 @@ ensuring the item is re-scanned on the next shard claim.
 | `OrderedContentRuntime` (execute_source, execute_scan_misses) | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | `OrderedContentPage::prefilter_done_ledger` | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | `scan_local_filesystem` | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
-| `ReceiptCommitSink` (translate_ordered_item, submit_ordered_item) | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| `ReceiptCommitSink` (translate_ordered_item, submit_ordered_item) | `crates/gossip-scanner-runtime/src/distributed/commit_bridge.rs` |
 | `translate_item_result` | `crates/gossip-scanner-runtime/src/result_translation.rs` |
 | `PrefixCheckpointAggregator` | `crates/gossip-scanner-runtime/src/checkpoint_aggregator.rs` |
 | `CommitPipeline` | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` |
@@ -399,4 +399,4 @@ ensuring the item is re-scanned on the next shard claim.
 | `DoneLedger::batch_get` | `crates/gossip-contracts/src/persistence/done_ledger.rs` |
 | `validate_page_sequence` | `crates/gossip-contracts/src/connector/common.rs` |
 | `validate_page_contract` (wraps `validate_page_sequence`) | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
-| Page loop (`scan_ordered_source_with_engine`) | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| Page loop (`scan_ordered_source_with_engine`) | `crates/gossip-scanner-runtime/src/distributed/execution.rs` |
