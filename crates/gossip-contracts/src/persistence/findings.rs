@@ -447,6 +447,12 @@ impl ObservationRecord {
     /// Reconstruct an observation record from persisted storage and verify
     /// that the stored `observation_id` still matches the canonical
     /// derivation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceInputError::ObservationIdMismatch`] when the stored
+    /// identifier differs from the canonical derivation, which usually points
+    /// to corruption or delayed replay scenarios.
     #[expect(
         clippy::too_many_arguments,
         reason = "ObservationRecord intentionally mirrors a flat durable row schema"
@@ -524,6 +530,12 @@ impl ObservationRecord {
 
     /// Verify that the stored `observation_id` still matches the canonical
     /// derivation from `(tenant, policy_hash, occurrence_id)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceInputError::ObservationIdMismatch`] when the stored
+    /// identifier disagrees with the derivation, which indicates referential
+    /// corruption or stale persistence artifacts.
     pub fn validate_identity(&self) -> Result<(), PersistenceInputError> {
         let expected = self.derived_observation_id();
 
@@ -854,8 +866,14 @@ impl<'a> FindingsUpsertBatch<'a> {
 ///    [`CommitHandle::wait`] yields a [`FindingsCommitReceipt`].
 pub trait FindingsSink: Send + Sync {
     /// Backend-specific immediate submit or wait error type.
+    ///
+    /// Implementations should describe the failure conditions that map to
+    /// this error so callers know when retry or fallback logic is required.
     type Error: Error + Send + Sync + 'static;
     /// Handle returned for eventual durable acknowledgement of submitted rows.
+    ///
+    /// The handle must expose `CommitHandle::wait` so callers can observe
+    /// when the batch has been durably committed.
     type CommitHandle: CommitHandle<Receipt = FindingsCommitReceipt, Error = Self::Error>;
 
     /// Submit all rows in `batch`, inserting new records and ignoring
