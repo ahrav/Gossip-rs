@@ -341,7 +341,7 @@ shard coordination:
 ## Source Code References
 
 - **Deep dive document**: `04-boundary-2-coordination/03-fencing-protocol-deep-dive.md`
-- **Coordination data types**: `crates/gossip-contracts/src/coordination/` (shard_spec, cursor, pooled, manifest, limits)
+- **Coordination data types**: `crates/gossip-contracts/src/coordination/` (cursor, limits, manifest, pooled, restored_state, shard_spec, split)
 - **Coordination protocol**: `crates/gossip-coordination/src/`
 - **Fencing validation logic**: `crates/gossip-coordination/src/validation.rs`
 - **Shard operations**: `crates/gossip-coordination/src/in_memory.rs` and `crates/gossip-coordination/src/traits.rs`
