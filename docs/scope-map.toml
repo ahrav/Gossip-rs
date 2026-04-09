@@ -379,6 +379,14 @@ dir = "crates/scanner-git/src/seen_store.rs"
 
 [[scopes]]
 doc = "docs/scanner-git/spill-and-memory.md"
+dir = "crates/scanner-git/src/ordinal_seen.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/spill-and-memory.md"
+dir = "crates/scanner-git/src/roaring_seen.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/spill-and-memory.md"
 dir = "crates/scanner-git/src/unique_blob.rs"
 
 [[scopes]]
