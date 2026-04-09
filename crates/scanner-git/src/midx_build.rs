@@ -588,9 +588,16 @@ impl Ord for MergeEntry<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::repo::RepoKind;
     use tempfile::tempdir;
+
+    const SMALL_MODEL_BUCKETS: [u8; 4] = [0x00, 0x40, 0x80, 0xC0];
+    /// Duplicate OIDs use second-byte values starting here (0xe0..); unique OIDs
+    /// must stay below this to avoid accidental collisions.
+    const DUPLICATE_BYTE_BASE: u8 = 0xe0;
 
     /// Helper to build minimal pack index v2 bytes for MIDX merge tests.
     struct TestIdxBuilder {
@@ -629,9 +636,16 @@ mod tests {
 
             let mut oid_table = Vec::with_capacity(objects.len() * 20);
             let mut offset_table = Vec::with_capacity(objects.len() * 4);
+            let mut large_offsets = Vec::new();
             for (oid, offset) in &objects {
                 oid_table.extend_from_slice(oid);
-                offset_table.extend_from_slice(&(*offset as u32).to_be_bytes());
+                if *offset >= LARGE_OFFSET_FLAG as u64 {
+                    let loff_idx = (large_offsets.len() / 8) as u32;
+                    offset_table.extend_from_slice(&(LARGE_OFFSET_FLAG | loff_idx).to_be_bytes());
+                    large_offsets.extend_from_slice(&offset.to_be_bytes());
+                } else {
+                    offset_table.extend_from_slice(&(*offset as u32).to_be_bytes());
+                }
             }
 
             let crc_table = vec![0u8; objects.len() * 4];
@@ -644,6 +658,7 @@ mod tests {
             out.extend_from_slice(&oid_table);
             out.extend_from_slice(&crc_table);
             out.extend_from_slice(&offset_table);
+            out.extend_from_slice(&large_offsets);
             out.extend_from_slice(&checksums);
             out
         }
@@ -655,6 +670,224 @@ mod tests {
         oid[1] = second;
         oid[19] = first ^ second;
         oid
+    }
+
+    #[derive(Debug)]
+    struct SmallModelPack {
+        pack_name: Vec<u8>,
+        idx_bytes: Vec<u8>,
+        objects: Vec<([u8; 20], u64)>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CanonicalMidx {
+        fanout: [u32; FANOUT_ENTRIES],
+        entries: Vec<([u8; 20], (u16, u64))>,
+    }
+
+    fn for_each_permutation(indices: &mut [usize], start: usize, visit: &mut impl FnMut(&[usize])) {
+        if start == indices.len() {
+            visit(indices);
+            return;
+        }
+
+        for index in start..indices.len() {
+            indices.swap(start, index);
+            for_each_permutation(indices, start + 1, visit);
+            indices.swap(start, index);
+        }
+    }
+
+    /// Enumerates all bitmasks of `pack_count` bits that have at least 2 bits set,
+    /// representing subsets of packs that share a duplicate OID.
+    fn duplicate_subsets(pack_count: usize) -> Vec<u8> {
+        assert!(
+            pack_count <= 7,
+            "pack_count={pack_count} would overflow the u8 bitmask (max 7)"
+        );
+        let mut subsets = Vec::new();
+        for mask in 0u8..(1u8 << pack_count) {
+            if mask.count_ones() >= 2 {
+                subsets.push(mask);
+            }
+        }
+        subsets
+    }
+
+    /// Generates all length-`duplicate_count` sequences drawn from `subsets`
+    /// (Cartesian product with replacement). Returns |subsets|^duplicate_count
+    /// results — keep `duplicate_count` small to avoid combinatorial blowup.
+    fn duplicate_mask_sequences(subsets: &[u8], duplicate_count: usize) -> Vec<Vec<u8>> {
+        if duplicate_count == 0 {
+            return vec![Vec::new()];
+        }
+
+        let mut sequences = Vec::new();
+        let mut current = Vec::with_capacity(duplicate_count);
+
+        fn build_sequences(
+            subsets: &[u8],
+            duplicate_count: usize,
+            current: &mut Vec<u8>,
+            sequences: &mut Vec<Vec<u8>>,
+        ) {
+            if current.len() == duplicate_count {
+                sequences.push(current.clone());
+                return;
+            }
+
+            for &subset in subsets {
+                current.push(subset);
+                build_sequences(subsets, duplicate_count, current, sequences);
+                current.pop();
+            }
+        }
+
+        build_sequences(subsets, duplicate_count, &mut current, &mut sequences);
+        sequences
+    }
+
+    /// Constructs `pack_count` packs each containing `objects_per_pack` objects, with
+    /// `duplicate_masks` controlling which packs share duplicate OIDs.
+    ///
+    /// OID collision-freedom relies on disjoint second-byte ranges:
+    /// - **Duplicate OIDs** use `second_byte = 0xe0 + duplicate_idx` (range `[0xe0, 0xe0+dc)`).
+    /// - **Unique OIDs** use `second_byte = slot * pack_count + pack_idx`, which is injective
+    ///   and bounded by `objects_per_pack * pack_count` (max 24 for the current bounds).
+    ///
+    /// These ranges never overlap for `objects_per_pack <= 6` and `pack_count <= 4`.
+    /// `byte[0]` is rotated across `SMALL_MODEL_BUCKETS` to exercise multiple fanout buckets.
+    fn build_small_model_packs(
+        pack_count: usize,
+        objects_per_pack: usize,
+        duplicate_masks: &[u8],
+        bucket_rotation: usize,
+    ) -> Vec<SmallModelPack> {
+        let mut objects_by_pack = vec![Vec::with_capacity(objects_per_pack); pack_count];
+
+        for (duplicate_idx, &mask) in duplicate_masks.iter().enumerate() {
+            let oid = test_oid(
+                SMALL_MODEL_BUCKETS[(bucket_rotation + duplicate_idx) % SMALL_MODEL_BUCKETS.len()],
+                DUPLICATE_BYTE_BASE + duplicate_idx as u8,
+            );
+            for (pack_idx, objects) in objects_by_pack.iter_mut().enumerate() {
+                if mask & (1u8 << pack_idx) == 0 {
+                    continue;
+                }
+                let offset = 1_000 + (pack_idx as u64 * 100) + objects.len() as u64;
+                objects.push((oid, offset));
+            }
+        }
+
+        for (pack_idx, objects) in objects_by_pack.iter_mut().enumerate() {
+            let unique_needed = objects_per_pack
+                .checked_sub(objects.len())
+                .expect("duplicate masks must not overfill a pack");
+            for slot in 0..unique_needed {
+                let second_byte = (slot * pack_count + pack_idx) as u8;
+                debug_assert!(
+                    second_byte < DUPLICATE_BYTE_BASE,
+                    "unique OID second byte {second_byte:#x} collides with duplicate namespace [{DUPLICATE_BYTE_BASE:#x}..)"
+                );
+                let oid = test_oid(
+                    SMALL_MODEL_BUCKETS[(bucket_rotation
+                        + duplicate_masks.len()
+                        + pack_idx
+                        + slot)
+                        % SMALL_MODEL_BUCKETS.len()],
+                    second_byte,
+                );
+                let offset = 1_000 + (pack_idx as u64 * 100) + objects.len() as u64;
+                objects.push((oid, offset));
+            }
+        }
+
+        objects_by_pack
+            .into_iter()
+            .enumerate()
+            .map(|(pack_idx, objects)| {
+                let mut builder = TestIdxBuilder::new();
+                for &(oid, offset) in &objects {
+                    builder.add_object(oid, offset);
+                }
+                SmallModelPack {
+                    pack_name: format!("pack-{pack_idx}.pack").into_bytes(),
+                    idx_bytes: builder.build(),
+                    objects,
+                }
+            })
+            .collect()
+    }
+
+    /// Computes the expected MIDX for `packs` presented in `order`.
+    ///
+    /// `order[perm_pos]` gives the canonical pack index; `perm_pos` becomes
+    /// the pack_id written to OOFF (matching the PNAM position that
+    /// `build_midx_in_memory` assigns from slice order).  For duplicate OIDs,
+    /// the lowest remapped pack_id wins.
+    fn expected_midx_for_order(packs: &[SmallModelPack], order: &[usize]) -> CanonicalMidx {
+        let mut winners = BTreeMap::new();
+        for (perm_pos, &pack_idx) in order.iter().enumerate() {
+            let remapped_id = perm_pos as u16;
+            for &(oid, offset) in &packs[pack_idx].objects {
+                winners
+                    .entry(oid)
+                    .and_modify(|winner: &mut (u16, u64)| {
+                        if remapped_id < winner.0 {
+                            *winner = (remapped_id, offset);
+                        }
+                    })
+                    .or_insert((remapped_id, offset));
+            }
+        }
+
+        let mut fanout = [0u32; FANOUT_ENTRIES];
+        let mut entries = Vec::with_capacity(winners.len());
+        for (oid, winner) in winners {
+            fanout[oid[0] as usize] += 1;
+            entries.push((oid, winner));
+        }
+
+        let mut running = 0u32;
+        for count in &mut fanout {
+            running += *count;
+            *count = running;
+        }
+
+        CanonicalMidx { fanout, entries }
+    }
+
+    fn canonicalize_midx(midx: &MidxView<'_>) -> CanonicalMidx {
+        let mut fanout = [0u32; FANOUT_ENTRIES];
+        let mut prev_fanout = 0u32;
+        for (bucket, slot) in fanout.iter_mut().enumerate() {
+            let value = midx.fanout(bucket as u8);
+            assert!(
+                value >= prev_fanout,
+                "fanout must be monotonic: bucket={bucket} value={value} prev={prev_fanout}"
+            );
+            *slot = value;
+            prev_fanout = value;
+        }
+        assert_eq!(
+            fanout[FANOUT_ENTRIES - 1],
+            midx.object_count(),
+            "fanout[255] must equal object_count"
+        );
+
+        let mut entries = Vec::with_capacity(midx.object_count() as usize);
+        let mut prev_oid: Option<[u8; 20]> = None;
+        for idx in 0..midx.object_count() {
+            let mut oid = [0u8; 20];
+            oid.copy_from_slice(midx.oid_at(idx));
+            if let Some(prev) = prev_oid {
+                assert!(prev < oid, "OIDL must be strictly ascending at index {idx}");
+            }
+            prev_oid = Some(oid);
+            entries.push((oid, midx.offset_at(idx).unwrap()));
+        }
+
+        CanonicalMidx { fanout, entries }
     }
 
     fn test_repo_with_pack_file(pack_basename: &str) -> (tempfile::TempDir, GitRepoPaths, PathBuf) {
@@ -689,13 +922,76 @@ mod tests {
 
     #[test]
     fn merge_entry_ordering() {
-        // Create mock entries to test ordering
-        let oid_a = [0x11u8; 20];
-        let oid_b = [0x22u8; 20];
+        // Two-OID ordering case: the lower OID must pop before the higher OID.
+        let oid_lo = test_oid(0x11, 0x01);
+        let oid_hi = test_oid(0x22, 0x02);
 
-        // BinaryHeap is max-heap, so we reverse comparison
-        // Lower OID should have higher priority (pop first)
-        assert!(oid_a < oid_b);
+        let mut builder = TestIdxBuilder::new();
+        builder.add_object(oid_lo, 100);
+        builder.add_object(oid_hi, 200);
+        let idx_bytes = builder.build();
+        let view = IdxView::parse(&idx_bytes, ObjectFormat::Sha1).unwrap();
+
+        // Lower OID pops first from the max-heap (reversed comparison).
+        let mut heap = BinaryHeap::new();
+        let mut iter_hi = view.iter_oids();
+        iter_hi.next(); // skip oid_lo
+        let (hi_oid, hi_idx) = iter_hi.next().unwrap();
+
+        let mut iter_lo = view.iter_oids();
+        let (lo_oid, lo_idx) = iter_lo.next().unwrap();
+        iter_lo.next(); // advance past oid_hi so iter is positioned
+
+        // Push higher OID first, then lower — heap should still pop lower first.
+        heap.push(MergeEntry {
+            oid: hi_oid,
+            pack_id: 0,
+            idx_in_pack: hi_idx,
+            view,
+            iter: view.iter_oids(), // dummy — not used in comparison
+        });
+        heap.push(MergeEntry {
+            oid: lo_oid,
+            pack_id: 1,
+            idx_in_pack: lo_idx,
+            view,
+            iter: view.iter_oids(),
+        });
+
+        let first = heap.pop().unwrap();
+        assert_eq!(first.oid, &oid_lo, "lower OID must pop first");
+
+        let second = heap.pop().unwrap();
+        assert_eq!(second.oid, &oid_hi, "higher OID must pop second");
+
+        // Same OID, different pack_ids — lower pack_id wins the tie-break.
+        let mut heap2 = BinaryHeap::new();
+        let mut iter_a = view.iter_oids();
+        let (oid_a, idx_a) = iter_a.next().unwrap();
+        let mut iter_b = view.iter_oids();
+        let (oid_b, idx_b) = iter_b.next().unwrap();
+        assert_eq!(oid_a, oid_b, "both entries must reference the same OID");
+
+        heap2.push(MergeEntry {
+            oid: oid_a,
+            pack_id: 5,
+            idx_in_pack: idx_a,
+            view,
+            iter: view.iter_oids(),
+        });
+        heap2.push(MergeEntry {
+            oid: oid_b,
+            pack_id: 2,
+            idx_in_pack: idx_b,
+            view,
+            iter: view.iter_oids(),
+        });
+
+        let winner = heap2.pop().unwrap();
+        assert_eq!(
+            winner.pack_id, 2,
+            "lower pack_id must win the tie-break for equal OIDs"
+        );
     }
 
     #[test]
@@ -803,6 +1099,236 @@ mod tests {
     }
 
     #[test]
+    fn exhaustive_small_model_merge_covers_all_pack_orderings() {
+        let mut builds_tested = 0usize;
+        let mut expected_builds = 0usize;
+
+        // Growth is super-exponential in pack_count (subsets^dc * N! * rotations).
+        // pack_count=4 => ~68K builds (<10s). pack_count=5 => ~1.7M. Do not increase
+        // without profiling.
+        for pack_count in 1..=4usize {
+            let duplicate_subsets = duplicate_subsets(pack_count);
+
+            for objects_per_pack in 1..=6usize {
+                for duplicate_count in 0..=objects_per_pack.min(2) {
+                    for duplicate_masks in
+                        duplicate_mask_sequences(&duplicate_subsets, duplicate_count)
+                    {
+                        for bucket_rotation in 0..SMALL_MODEL_BUCKETS.len() {
+                            let permutation_count = (1..=pack_count).product::<usize>();
+                            expected_builds += permutation_count;
+
+                            let packs = build_small_model_packs(
+                                pack_count,
+                                objects_per_pack,
+                                &duplicate_masks,
+                                bucket_rotation,
+                            );
+                            let idx_views: Vec<_> = packs
+                                .iter()
+                                .map(|pack| {
+                                    IdxView::parse(&pack.idx_bytes, ObjectFormat::Sha1)
+                                        .expect("small-model idx bytes should parse")
+                                })
+                                .collect();
+                            // Unique OID count is invariant across permutations;
+                            // compute from the identity order for the count check.
+                            let identity: Vec<usize> = (0..pack_count).collect();
+                            let identity_expected = expected_midx_for_order(&packs, &identity);
+                            let unique_count = identity_expected.entries.len();
+                            let total_objects = pack_count * objects_per_pack;
+                            let expected_permutations = (1..=pack_count).product::<usize>();
+                            let mut observed_permutations = 0usize;
+                            let mut order: Vec<_> = (0..pack_count).collect();
+
+                            for_each_permutation(&mut order, 0, &mut |permutation| {
+                                // Use permutation position as pack_id so that OOFF
+                                // entries correctly index into the PNAM table, which
+                                // build_midx_in_memory writes from slice order.
+                                let views: Vec<_> = permutation
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(perm_pos, &pack_idx)| {
+                                        (
+                                            perm_pos as u16,
+                                            packs[pack_idx].pack_name.clone(),
+                                            idx_views[pack_idx],
+                                        )
+                                    })
+                                    .collect();
+                                let expected = expected_midx_for_order(&packs, permutation);
+                                let midx_bytes =
+                                    build_midx_in_memory(&views, ObjectFormat::Sha1, total_objects)
+                                        .expect("small-model MIDX build should succeed");
+                                let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1)
+                                    .expect("small-model MIDX should parse");
+                                let actual = canonicalize_midx(&midx);
+
+                                assert_eq!(
+                                    midx.pack_count(),
+                                    pack_count as u32,
+                                    "pack_count changed for order {:?}, duplicate_masks={:?}, rotation={bucket_rotation}",
+                                    permutation,
+                                    duplicate_masks,
+                                );
+                                assert_eq!(
+                                    actual.entries.len(),
+                                    unique_count,
+                                    "unique OID count must be invariant across permutations: order {:?}, duplicate_masks={:?}, rotation={bucket_rotation}",
+                                    permutation,
+                                    duplicate_masks,
+                                );
+                                assert_eq!(
+                                    actual,
+                                    expected,
+                                    "small-model merge mismatch for pack_count={pack_count}, objects_per_pack={objects_per_pack}, duplicate_masks={duplicate_masks:?}, rotation={bucket_rotation}, order={permutation:?}",
+                                );
+
+                                let expected_pnam: Vec<&[u8]> = permutation
+                                    .iter()
+                                    .map(|&pack_idx| packs[pack_idx].pack_name.as_slice())
+                                    .collect();
+                                let actual_pnam: Vec<&[u8]> = midx.pack_names().collect();
+                                assert_eq!(
+                                    actual_pnam, expected_pnam,
+                                    "PNAM order mismatch for pack_count={pack_count}, order={permutation:?}",
+                                );
+
+                                builds_tested += 1;
+                                observed_permutations += 1;
+                            });
+
+                            assert_eq!(
+                                observed_permutations, expected_permutations,
+                                "permutation enumeration mismatch for pack_count={pack_count}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            builds_tested, expected_builds,
+            "iteration count mismatch — verify test coverage is not accidentally reduced"
+        );
+    }
+
+    /// Offsets on both sides of the 2^31 LOFF threshold: the serialized MIDX
+    /// contains both direct OOFF entries and LOFF-indirected 8-byte entries.
+    #[test]
+    fn build_midx_in_memory_handles_large_offsets_via_loff() {
+        let large_offset: u64 = 0x1_0000_0000; // 4 GiB — well above the 2^31 LOFF threshold
+        let small_offset: u64 = 42;
+
+        let mut pack0 = TestIdxBuilder::new();
+        pack0.add_object(test_oid(0x10, 0x01), large_offset);
+        pack0.add_object(test_oid(0x80, 0x02), small_offset);
+
+        let mut pack1 = TestIdxBuilder::new();
+        pack1.add_object(test_oid(0xfe, 0x03), large_offset + 8192);
+
+        let pack0_bytes = pack0.build();
+        let pack1_bytes = pack1.build();
+        let pack0_view = IdxView::parse(&pack0_bytes, ObjectFormat::Sha1).unwrap();
+        let pack1_view = IdxView::parse(&pack1_bytes, ObjectFormat::Sha1).unwrap();
+        let total_objects = (pack0_view.object_count() + pack1_view.object_count()) as usize;
+
+        let views = vec![
+            (0u16, b"pack-0.pack".to_vec(), pack0_view),
+            (1u16, b"pack-1.pack".to_vec(), pack1_view),
+        ];
+        let midx_bytes = build_midx_in_memory(&views, ObjectFormat::Sha1, total_objects).unwrap();
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).unwrap();
+
+        assert_eq!(midx.object_count(), 3);
+
+        // OIDs are sorted: 0x10 < 0x80 < 0xfe
+        let (pack_id_0, offset_0) = midx.offset_at(0).unwrap();
+        assert_eq!(pack_id_0, 0);
+        assert_eq!(
+            offset_0, large_offset,
+            "large offset must round-trip through LOFF"
+        );
+
+        let (pack_id_1, offset_1) = midx.offset_at(1).unwrap();
+        assert_eq!(pack_id_1, 0);
+        assert_eq!(offset_1, small_offset);
+
+        let (pack_id_2, offset_2) = midx.offset_at(2).unwrap();
+        assert_eq!(pack_id_2, 1);
+        assert_eq!(
+            offset_2,
+            large_offset + 8192,
+            "second large offset must round-trip through LOFF"
+        );
+    }
+
+    /// LOFF threshold boundary: 0x7FFF_FFFF stays inline in OOFF, while
+    /// 0x8000_0000 is encoded through LOFF indirection.
+    #[test]
+    fn build_midx_loff_boundary_values() {
+        let just_below: u64 = 0x7FFF_FFFF; // max value that fits in 31 bits
+        let exactly_at: u64 = 0x8000_0000; // LARGE_OFFSET_FLAG — triggers LOFF
+
+        // Pack with only the sub-threshold offset — should produce no LOFF chunk.
+        let mut pack_small = TestIdxBuilder::new();
+        pack_small.add_object(test_oid(0x10, 0x01), just_below);
+        let small_bytes = pack_small.build();
+        let small_view = IdxView::parse(&small_bytes, ObjectFormat::Sha1).unwrap();
+
+        let views_no_loff = vec![(0u16, b"pack-0.pack".to_vec(), small_view)];
+        let midx_no_loff = build_midx_in_memory(&views_no_loff, ObjectFormat::Sha1, 1).unwrap();
+        let parsed_no_loff = MidxView::parse(&midx_no_loff, ObjectFormat::Sha1).unwrap();
+
+        assert_eq!(parsed_no_loff.object_count(), 1);
+        let (pid, off) = parsed_no_loff.offset_at(0).unwrap();
+        assert_eq!(pid, 0);
+        assert_eq!(off, just_below, "0x7FFF_FFFF must round-trip without LOFF");
+        // Verify no LOFF chunk: header byte 6 is chunk_count (4 without LOFF, 5 with).
+        assert_eq!(
+            midx_no_loff[6], 4,
+            "sub-threshold offset must not produce LOFF chunk"
+        );
+
+        // Pack with the at-threshold offset — must produce a LOFF chunk.
+        let mut pack_at = TestIdxBuilder::new();
+        pack_at.add_object(test_oid(0x20, 0x02), exactly_at);
+        let at_bytes = pack_at.build();
+        let at_view = IdxView::parse(&at_bytes, ObjectFormat::Sha1).unwrap();
+
+        let views_loff = vec![(0u16, b"pack-0.pack".to_vec(), at_view)];
+        let midx_loff = build_midx_in_memory(&views_loff, ObjectFormat::Sha1, 1).unwrap();
+        let parsed_loff = MidxView::parse(&midx_loff, ObjectFormat::Sha1).unwrap();
+
+        assert_eq!(parsed_loff.object_count(), 1);
+        let (pid, off) = parsed_loff.offset_at(0).unwrap();
+        assert_eq!(pid, 0);
+        assert_eq!(off, exactly_at, "0x8000_0000 must round-trip through LOFF");
+        assert_eq!(
+            midx_loff[6], 5,
+            "at-threshold offset must produce LOFF chunk"
+        );
+
+        // Both offsets in the same MIDX — verifies coexistence.
+        let small_view2 = IdxView::parse(&small_bytes, ObjectFormat::Sha1).unwrap();
+        let at_view2 = IdxView::parse(&at_bytes, ObjectFormat::Sha1).unwrap();
+        let views_both = vec![
+            (0u16, b"pack-0.pack".to_vec(), small_view2),
+            (1u16, b"pack-1.pack".to_vec(), at_view2),
+        ];
+        let midx_both = build_midx_in_memory(&views_both, ObjectFormat::Sha1, 2).unwrap();
+        let parsed_both = MidxView::parse(&midx_both, ObjectFormat::Sha1).unwrap();
+
+        assert_eq!(parsed_both.object_count(), 2);
+        // OIDs sorted: 0x10 < 0x20
+        let (pid0, off0) = parsed_both.offset_at(0).unwrap();
+        assert_eq!((pid0, off0), (0, just_below));
+        let (pid1, off1) = parsed_both.offset_at(1).unwrap();
+        assert_eq!((pid1, off1), (1, exactly_at));
+    }
+
+    #[test]
     fn build_midx_bytes_checks_actual_serialized_size_cap() {
         let long_name = format!("pack-{}", "a".repeat(180));
         let (_temp, repo, idx_path) = test_repo_with_pack_file(&long_name);
@@ -895,6 +1421,123 @@ mod tests {
         assert!(
             matches!(err, MidxBuildError::TooManyPacks { count: 3, max: 2 }),
             "expected TooManyPacks {{ count: 3, max: 2 }}, got {err:?}"
+        );
+    }
+
+    /// Maximum-deduplication case: every pack contains the same OIDs.
+    /// The merged MIDX contains exactly `objects_per_pack` entries, and each
+    /// winner resolves to PNAM position 0 for the current input permutation.
+    #[test]
+    fn all_duplicate_merge_deduplicates_to_lowest_pack_id() {
+        let objects_per_pack = 4;
+        let pack_count = 3;
+
+        // All packs share the exact same set of OIDs.
+        let shared_objects: Vec<_> = (0..objects_per_pack)
+            .map(|i| {
+                test_oid(
+                    SMALL_MODEL_BUCKETS[i % SMALL_MODEL_BUCKETS.len()],
+                    0x10 + i as u8,
+                )
+            })
+            .collect();
+
+        let packs: Vec<SmallModelPack> = (0..pack_count)
+            .map(|pack_idx| {
+                let mut builder = TestIdxBuilder::new();
+                let mut objects = Vec::with_capacity(objects_per_pack);
+                for (slot, &oid) in shared_objects.iter().enumerate() {
+                    let offset = 1_000 + (pack_idx as u64 * 100) + slot as u64;
+                    builder.add_object(oid, offset);
+                    objects.push((oid, offset));
+                }
+                SmallModelPack {
+                    pack_name: format!("pack-{pack_idx}.pack").into_bytes(),
+                    idx_bytes: builder.build(),
+                    objects,
+                }
+            })
+            .collect();
+
+        let idx_views: Vec<_> = packs
+            .iter()
+            .map(|p| IdxView::parse(&p.idx_bytes, ObjectFormat::Sha1).unwrap())
+            .collect();
+
+        // Verify all permutations produce correct output with position-based
+        // pack_ids that match PNAM order.
+        let mut order: Vec<_> = (0..pack_count).collect();
+        for_each_permutation(&mut order, 0, &mut |permutation| {
+            let views: Vec<_> = permutation
+                .iter()
+                .enumerate()
+                .map(|(perm_pos, &i)| (perm_pos as u16, packs[i].pack_name.clone(), idx_views[i]))
+                .collect();
+            let expected = expected_midx_for_order(&packs, permutation);
+            let total = pack_count * objects_per_pack;
+            let midx_bytes = build_midx_in_memory(&views, ObjectFormat::Sha1, total).unwrap();
+            let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).unwrap();
+            let actual = canonicalize_midx(&midx);
+
+            assert_eq!(
+                actual.entries.len(),
+                objects_per_pack,
+                "all-duplicate merge must produce exactly {objects_per_pack} entries, order={permutation:?}",
+            );
+
+            // Whichever pack lands at PNAM position 0 should win all duplicates.
+            for (_, (winner_pack, _)) in &actual.entries {
+                assert_eq!(
+                    *winner_pack, 0,
+                    "all-duplicate merge must resolve to PNAM position 0, order={permutation:?}"
+                );
+            }
+
+            assert_eq!(
+                actual, expected,
+                "all-duplicate merge mismatch for order={permutation:?}",
+            );
+        });
+    }
+
+    #[test]
+    fn build_midx_bytes_returns_too_many_objects_when_limit_exceeded() {
+        let temp = tempdir().unwrap();
+        let git_dir = temp.path().join(".git");
+        let objects_dir = git_dir.join("objects");
+        let pack_dir = objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+
+        let repo = GitRepoPaths {
+            kind: RepoKind::Worktree,
+            worktree_root: Some(temp.path().to_path_buf()),
+            git_dir: git_dir.clone(),
+            common_dir: git_dir,
+            objects_dir,
+            pack_dir: pack_dir.clone(),
+            alternate_object_dirs: Vec::new(),
+        };
+
+        // Two packs with 3 objects each = 6 total.
+        for i in 0u8..2 {
+            let mut builder = TestIdxBuilder::new();
+            for j in 0u8..3 {
+                let oid_byte = i * 16 + j;
+                builder.add_object(test_oid(oid_byte, 0x01), (oid_byte as u64) * 100);
+            }
+            let idx_path = pack_dir.join(format!("pack-{i:040x}.idx"));
+            fs::write(&idx_path, builder.build()).unwrap();
+        }
+
+        let limits = MidxBuildLimits {
+            max_total_objects: 5,
+            ..MidxBuildLimits::default()
+        };
+        let err = build_midx_bytes(&repo, ObjectFormat::Sha1, &limits)
+            .expect_err("6 objects with max_total_objects=5 must return TooManyObjects");
+        assert!(
+            matches!(err, MidxBuildError::TooManyObjects { count: 6, max: 5 }),
+            "expected TooManyObjects {{ count: 6, max: 5 }}, got {err:?}"
         );
     }
 }
