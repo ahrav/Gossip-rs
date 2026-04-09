@@ -163,7 +163,7 @@ graph TD
 
     subgraph Compaction ["grow_strides_and_compact()"]
         TARGET["target = sample_cap / 2<br/>(e.g. 512)"]
-        AXIS{"compaction_axis:<br/>first.byte_pos != last.byte_pos?"}
+        AXIS{"compaction_axis:<br/>first.recorded_byte_position != last.recorded_byte_position?"}
         BYTE_AXIS["Use byte-position axis"]
         RANK_AXIS["Use rank axis<br/>(degenerate: all-zero-size)"]
         SELECT["selected_sample_indices():<br/>nearest-neighbor interpolation<br/>on chosen axis"]
@@ -305,7 +305,7 @@ graph TD
     end
 
     subgraph MEM ["InMemoryDeterministicConnector — batch"]
-        MEM_ITEMS["items: Vec&lt;InMemoryItem&gt;<br/>(all items in memory)"]
+        MEM_ITEMS["items: Arc&lt;[PreparedItem]&gt;<br/>(all items in memory)"]
         MEM_SPLIT["choose_split_point_bounds():<br/>common::estimate_split_from_sorted(<br/>  items.iter().map(key, size),<br/>  range.len(), cursor, end<br/>)"]
     end
 
