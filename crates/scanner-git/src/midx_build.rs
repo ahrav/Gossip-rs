@@ -633,9 +633,16 @@ mod tests {
 
             let mut oid_table = Vec::with_capacity(objects.len() * 20);
             let mut offset_table = Vec::with_capacity(objects.len() * 4);
+            let mut large_offsets = Vec::new();
             for (oid, offset) in &objects {
                 oid_table.extend_from_slice(oid);
-                offset_table.extend_from_slice(&(*offset as u32).to_be_bytes());
+                if *offset >= LARGE_OFFSET_FLAG as u64 {
+                    let loff_idx = (large_offsets.len() / 8) as u32;
+                    offset_table.extend_from_slice(&(LARGE_OFFSET_FLAG | loff_idx).to_be_bytes());
+                    large_offsets.extend_from_slice(&offset.to_be_bytes());
+                } else {
+                    offset_table.extend_from_slice(&(*offset as u32).to_be_bytes());
+                }
             }
 
             let crc_table = vec![0u8; objects.len() * 4];
@@ -648,6 +655,7 @@ mod tests {
             out.extend_from_slice(&oid_table);
             out.extend_from_slice(&crc_table);
             out.extend_from_slice(&offset_table);
+            out.extend_from_slice(&large_offsets);
             out.extend_from_slice(&checksums);
             out
         }
@@ -688,7 +696,13 @@ mod tests {
         }
     }
 
+    /// Enumerates all bitmasks of `pack_count` bits that have at least 2 bits set,
+    /// representing subsets of packs that share a duplicate OID.
     fn duplicate_subsets(pack_count: usize) -> Vec<u8> {
+        assert!(
+            pack_count <= 7,
+            "pack_count={pack_count} would overflow the u8 bitmask (max 7)"
+        );
         let mut subsets = Vec::new();
         for mask in 0u8..(1u8 << pack_count) {
             if mask.count_ones() >= 2 {
@@ -728,6 +742,16 @@ mod tests {
         sequences
     }
 
+    /// Constructs `pack_count` packs each containing `objects_per_pack` objects, with
+    /// `duplicate_masks` controlling which packs share duplicate OIDs.
+    ///
+    /// OID collision-freedom relies on disjoint second-byte ranges:
+    /// - **Duplicate OIDs** use `second_byte = 0xe0 + duplicate_idx` (range `[0xe0, 0xe0+dc)`).
+    /// - **Unique OIDs** use `second_byte = slot * pack_count + pack_idx`, which is injective
+    ///   and bounded by `objects_per_pack * pack_count` (max 24 for the current bounds).
+    ///
+    /// These ranges never overlap for `objects_per_pack <= 6` and `pack_count <= 7`.
+    /// `byte[0]` is rotated across `SMALL_MODEL_BUCKETS` to exercise multiple fanout buckets.
     fn build_small_model_packs(
         pack_count: usize,
         objects_per_pack: usize,
@@ -738,8 +762,7 @@ mod tests {
 
         for (duplicate_idx, &mask) in duplicate_masks.iter().enumerate() {
             let oid = test_oid(
-                SMALL_MODEL_BUCKETS
-                    [(bucket_rotation + duplicate_idx * 2) % SMALL_MODEL_BUCKETS.len()],
+                SMALL_MODEL_BUCKETS[(bucket_rotation + duplicate_idx) % SMALL_MODEL_BUCKETS.len()],
                 0xe0 + duplicate_idx as u8,
             );
             for (pack_idx, objects) in objects_by_pack.iter_mut().enumerate() {
@@ -756,13 +779,18 @@ mod tests {
                 .checked_sub(objects.len())
                 .expect("duplicate masks must not overfill a pack");
             for slot in 0..unique_needed {
+                let second_byte = (slot * pack_count + pack_idx) as u8;
+                debug_assert!(
+                    second_byte < 0xe0,
+                    "unique OID second byte {second_byte:#x} collides with duplicate namespace [0xe0..)"
+                );
                 let oid = test_oid(
                     SMALL_MODEL_BUCKETS[(bucket_rotation
                         + duplicate_masks.len()
                         + pack_idx
                         + slot)
                         % SMALL_MODEL_BUCKETS.len()],
-                    (slot * pack_count + pack_idx) as u8,
+                    second_byte,
                 );
                 let offset = 1_000 + (pack_idx as u64 * 100) + objects.len() as u64;
                 objects.push((oid, offset));
@@ -999,7 +1027,11 @@ mod tests {
     #[test]
     fn exhaustive_small_model_merge_covers_all_pack_orderings() {
         let mut builds_tested = 0usize;
+        let mut expected_builds = 0usize;
 
+        // Growth is super-exponential in pack_count (subsets^dc * N! * rotations).
+        // pack_count=4 => ~68K builds (<10s). pack_count=5 => ~1.5M. Do not increase
+        // without profiling.
         for pack_count in 2..=4usize {
             let duplicate_subsets = duplicate_subsets(pack_count);
 
@@ -1009,6 +1041,9 @@ mod tests {
                         duplicate_mask_sequences(&duplicate_subsets, duplicate_count)
                     {
                         for bucket_rotation in 0..SMALL_MODEL_BUCKETS.len() {
+                            let permutation_count = (1..=pack_count).product::<usize>();
+                            expected_builds += permutation_count;
+
                             let packs = build_small_model_packs(
                                 pack_count,
                                 objects_per_pack,
@@ -1032,6 +1067,9 @@ mod tests {
                                 // Keep canonical pack_ids stable while permuting the view slice so
                                 // duplicate resolution remains tied to pack identity rather than
                                 // slice position.
+                                //
+                                // The pack_name clone is required because build_midx_in_memory
+                                // takes &[(u16, Vec<u8>, IdxView)] with owned name bytes.
                                 let views: Vec<_> = permutation
                                     .iter()
                                     .map(|&pack_idx| {
@@ -1069,6 +1107,16 @@ mod tests {
                                     "small-model merge mismatch for pack_count={pack_count}, objects_per_pack={objects_per_pack}, duplicate_masks={duplicate_masks:?}, rotation={bucket_rotation}, order={permutation:?}",
                                 );
 
+                                let expected_pnam: Vec<&[u8]> = permutation
+                                    .iter()
+                                    .map(|&pack_idx| packs[pack_idx].pack_name.as_slice())
+                                    .collect();
+                                let actual_pnam: Vec<&[u8]> = midx.pack_names().collect();
+                                assert_eq!(
+                                    actual_pnam, expected_pnam,
+                                    "PNAM order mismatch for pack_count={pack_count}, order={permutation:?}",
+                                );
+
                                 builds_tested += 1;
                                 observed_permutations += 1;
                             });
@@ -1083,9 +1131,59 @@ mod tests {
             }
         }
 
-        assert!(
-            builds_tested >= 1_000,
-            "exhaustive small-model test should exercise many builds: {builds_tested}"
+        assert_eq!(
+            builds_tested, expected_builds,
+            "iteration count mismatch — verify test coverage is not accidentally reduced"
+        );
+    }
+
+    /// Verifies the MIDX large-offset (LOFF) indirection path by using offsets >= 2^31.
+    /// The small-model exhaustive test uses small offsets (~1000) and never triggers LOFF.
+    #[test]
+    fn build_midx_in_memory_handles_large_offsets_via_loff() {
+        let large_offset: u64 = 0x1_0000_0000; // 4 GiB — well above the 2^31 LOFF threshold
+        let small_offset: u64 = 42;
+
+        let mut pack0 = TestIdxBuilder::new();
+        pack0.add_object(test_oid(0x10, 0x01), large_offset);
+        pack0.add_object(test_oid(0x80, 0x02), small_offset);
+
+        let mut pack1 = TestIdxBuilder::new();
+        pack1.add_object(test_oid(0xfe, 0x03), large_offset + 8192);
+
+        let pack0_bytes = pack0.build();
+        let pack1_bytes = pack1.build();
+        let pack0_view = IdxView::parse(&pack0_bytes, ObjectFormat::Sha1).unwrap();
+        let pack1_view = IdxView::parse(&pack1_bytes, ObjectFormat::Sha1).unwrap();
+        let total_objects = (pack0_view.object_count() + pack1_view.object_count()) as usize;
+
+        let views = vec![
+            (0u16, b"pack-0.pack".to_vec(), pack0_view),
+            (1u16, b"pack-1.pack".to_vec(), pack1_view),
+        ];
+        let midx_bytes = build_midx_in_memory(&views, ObjectFormat::Sha1, total_objects).unwrap();
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).unwrap();
+
+        assert_eq!(midx.object_count(), 3);
+
+        // OIDs are sorted: 0x10 < 0x80 < 0xfe
+        let (pack_id_0, offset_0) = midx.offset_at(0).unwrap();
+        assert_eq!(pack_id_0, 0);
+        assert_eq!(
+            offset_0, large_offset,
+            "large offset must round-trip through LOFF"
+        );
+
+        let (pack_id_1, offset_1) = midx.offset_at(1).unwrap();
+        assert_eq!(pack_id_1, 0);
+        assert_eq!(offset_1, small_offset);
+
+        let (pack_id_2, offset_2) = midx.offset_at(2).unwrap();
+        assert_eq!(pack_id_2, 1);
+        assert_eq!(
+            offset_2,
+            large_offset + 8192,
+            "second large offset must round-trip through LOFF"
         );
     }
 
