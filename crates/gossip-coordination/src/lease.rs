@@ -82,10 +82,6 @@ use gossip_contracts::identity::{
     FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId,
 };
 
-// ============================================================================
-// LeaseHolder
-// ============================================================================
-
 /// Identity and deadline of the worker currently holding a shard lease.
 ///
 /// Bundles `owner` and `deadline` into a single value so that the
@@ -141,10 +137,6 @@ impl LeaseHolder {
     }
 }
 
-// ============================================================================
-// Lease
-// ============================================================================
-
 /// A capability token granting exclusive, temporary rights to mutate a shard.
 ///
 /// Returned by `acquire_and_restore_into` and required by every lease-gated
@@ -161,10 +153,10 @@ impl LeaseHolder {
 ///
 /// ## Construction and visibility
 ///
-/// The constructor is `pub` — only the coordinator produces leases.
-/// Workers receive them as opaque tokens and present them back via public
-/// accessors. This prevents workers from forging or extending their own
-/// leases.
+/// The constructor is `pub`, but production systems should treat lease
+/// creation as coordinator-owned behavior and issue leases only via
+/// acquisition flows. Workers should treat received leases as opaque tokens
+/// and present them back via accessors only.
 #[must_use = "discarding a Lease wastes the shard's availability window until expiry"]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lease {
@@ -179,7 +171,10 @@ pub struct Lease {
 impl Lease {
     /// Construct a new lease binding a worker to a shard for a bounded duration.
     ///
-    /// Only callable within the crate — the coordinator is the sole producer.
+    /// This constructor is `pub` primarily for type ergonomics (tests,
+    /// snapshots, and boundary code), but production call sites should route
+    /// lease issuance through coordinator acquisition flows so fencing and
+    /// deadline invariants are established from authoritative state.
     ///
     /// # Panics
     ///
@@ -272,8 +267,8 @@ impl Lease {
 
     /// Extend the lease deadline after a successful renewal.
     ///
-    /// Only callable within the crate — workers cannot extend their
-    /// own deadlines without going through the coordinator's `renew` path.
+    /// The method is crate-internal; workers cannot extend their own
+    /// deadlines without going through the coordinator's `renew` path.
     /// The fence epoch is **not** changed; renewal is a deadline extension,
     /// not an ownership transfer.
     ///
@@ -297,10 +292,6 @@ impl Lease {
         self.deadline = deadline;
     }
 }
-
-// ============================================================================
-// OpKind
-// ============================================================================
 
 /// Operation kinds that participate in per-shard idempotency.
 ///
@@ -468,7 +459,7 @@ impl fmt::Display for OpKind {
 }
 
 // Compile-time assertions: discriminant values must never drift from their
-// persisted encoding. If a variant is added, add a corresponding assertion.
+// persisted encoding.
 const _: () = assert!(OpKind::Checkpoint as u8 == 0);
 const _: () = assert!(OpKind::Complete as u8 == 1);
 const _: () = assert!(OpKind::Park as u8 == 2);
@@ -476,10 +467,6 @@ const _: () = assert!(OpKind::SplitReplace as u8 == 3);
 const _: () = assert!(OpKind::SplitResidual as u8 == 4);
 const _: () = assert!(OpKind::Unpark as u8 == 5);
 const _: () = assert!(core::mem::size_of::<OpKind>() == 1);
-
-// ============================================================================
-// OpResult
-// ============================================================================
 
 /// Stored result status for an executed operation.
 ///
@@ -553,10 +540,6 @@ const _: () = assert!(OpResult::Error as u8 == 1);
 const _: () = assert!(OpResult::Superseded as u8 == 2);
 const _: () = assert!(core::mem::size_of::<OpResult>() == 1);
 
-// ============================================================================
-// OpLogEntry
-// ============================================================================
-
 /// A single entry in the bounded per-shard operation log.
 ///
 /// The shard record caches the last 16 entries in a ring buffer (see
@@ -575,8 +558,8 @@ const _: () = assert!(core::mem::size_of::<OpResult>() == 1);
 ///
 /// ## Construction
 ///
-/// The constructor is `pub` — only the coordinator creates entries.
-/// Tests and snapshot consumers read via public accessors.
+/// The constructor is `pub` for test/snapshot ergonomics; production entries
+/// should be created by coordinator mutation paths only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpLogEntry {
     op_id: OpId,
@@ -589,9 +572,13 @@ pub struct OpLogEntry {
 impl OpLogEntry {
     /// Record a completed operation in the op-log.
     ///
-    /// Only callable within the crate — the coordinator is the sole producer.
+    /// This constructor is `pub` primarily for type ergonomics (tests and
+    /// snapshot decoding), but production entries should be created only by
+    /// coordinator mutation paths after idempotency validation.
+    ///
     /// The caller must ensure `op_id` uniqueness within the shard's op-log
-    /// (checked by [`ShardRecord::op_log_push`](super::record::ShardRecord::op_log_push)).
+    /// (enforced in normal coordinator flow by
+    /// [`ShardRecord::op_log_push`](super::record::ShardRecord::op_log_push)).
     ///
     /// # Panics
     ///
@@ -669,16 +656,10 @@ impl OpLogEntry {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
-
-    // -- OpKind roundtrip ------------------------------------------------
 
     #[test]
     fn op_kind_roundtrip_table() {
@@ -701,8 +682,6 @@ mod tests {
         }
     }
 
-    // -- OpResult roundtrip ----------------------------------------------
-
     #[test]
     fn op_result_roundtrip_table() {
         let cases: &[(u8, Option<OpResult>)] = &[
@@ -724,8 +703,6 @@ mod tests {
         }
     }
 
-    // -- OpKind Display ---------------------------------------------------
-
     #[test]
     fn op_kind_display_all_variants() {
         let cases: &[(OpKind, &str)] = &[
@@ -740,8 +717,6 @@ mod tests {
             assert_eq!(kind.to_string(), expected, "OpKind::Display for {kind:?}");
         }
     }
-
-    // -- OpResult Display -------------------------------------------------
 
     #[test]
     fn op_result_display_all_variants() {
@@ -758,8 +733,6 @@ mod tests {
             );
         }
     }
-
-    // -- Lease construction and accessors --------------------------------
 
     #[test]
     fn lease_construction_and_accessors() {
@@ -781,8 +754,6 @@ mod tests {
         assert_eq!(lease.shard_key(), ShardKey::new(run, shard));
     }
 
-    // -- OpLogEntry construction and accessors ---------------------------
-
     #[test]
     fn op_log_entry_construction_and_accessors() {
         let op_id = OpId::from_raw(12345);
@@ -800,8 +771,6 @@ mod tests {
         assert_eq!(entry.executed_at(), executed_at);
     }
 
-    // -- Property tests --------------------------------------------------
-
     proptest! {
         #![proptest_config(gossip_contracts::test_util::miri_proptest_config())]
 
@@ -810,7 +779,6 @@ mod tests {
             if let Some(kind) = OpKind::from_u8(v) {
                 prop_assert_eq!(kind.as_u8(), v);
             }
-            // Unrecognized values must return None — no crash, no panic.
         }
 
         #[test]
