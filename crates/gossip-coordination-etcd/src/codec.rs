@@ -69,6 +69,7 @@ use gossip_coordination::{
 };
 use gossip_stdx::{ByteSlab, RingBuffer, SlabFull};
 
+/// 2-byte tag that prefixes every v1 blob so decoders can gate on the format.
 const VERSION_PREFIX_V1: &[u8; 2] = b"v1";
 
 /// Minimum serialized size of a single `ShardId` entry (8 bytes for `u64`).
@@ -108,6 +109,7 @@ pub enum BlobKind {
 }
 
 impl BlobKind {
+    /// Map a wire discriminant byte to the corresponding blob kind, rejecting unknown values.
     fn from_u8(raw: u8) -> Option<Self> {
         match raw {
             1 => Some(Self::RunRecord),
@@ -117,6 +119,7 @@ impl BlobKind {
         }
     }
 
+    /// Return the wire-compatible discriminant so callers can write it into headers.
     fn as_u8(self) -> u8 {
         self as u8
     }
@@ -1549,22 +1552,27 @@ impl<'a> Decoder<'a> {
 // These mirror the corresponding `Decoder::read_*` methods.
 // ---------------------------------------------------------------------------
 
+/// Append the 32-byte tenant identifier that the decoder expects verbatim.
 fn put_tenant(out: &mut Vec<u8>, tenant: TenantId) {
     out.extend_from_slice(tenant.as_bytes());
 }
 
+/// Encode a boolean as a single 0/1 byte so it pairs with `Decoder::read_bool`.
 fn put_bool(out: &mut Vec<u8>, value: bool) {
     out.push(u8::from(value));
 }
 
+/// Push an 8-bit value without padding, matching the decoder's single-byte reads.
 fn put_u8(out: &mut Vec<u8>, value: u8) {
     out.push(value);
 }
 
+/// Append the little-endian `u32` representation so the decoder can read a matching `u32`.
 fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Append the little-endian `u64` representation of `value`.
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
@@ -1581,11 +1589,16 @@ fn put_len(out: &mut Vec<u8>, len: usize) {
     );
 }
 
+/// Encode a byte slice as `u32` length prefix followed by the raw bytes.
+///
+/// This is the shared representation for shard-spec fragments, cursor fields,
+/// and other variable-length payloads that [`Decoder::read_vec`] reconstructs.
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     put_len(out, bytes.len());
     out.extend_from_slice(bytes);
 }
 
+/// Encode an optional byte slice with a bool presence tag followed by `put_bytes` when present.
 fn put_opt_bytes(out: &mut Vec<u8>, bytes: Option<&[u8]>) {
     match bytes {
         Some(bytes) => {
@@ -1596,6 +1609,7 @@ fn put_opt_bytes(out: &mut Vec<u8>, bytes: Option<&[u8]>) {
     }
 }
 
+/// Encode an optional `u64` with a leading presence flag so decoding stays symmetric.
 fn put_opt_u64(out: &mut Vec<u8>, value: Option<u64>) {
     match value {
         Some(value) => {
@@ -1606,6 +1620,7 @@ fn put_opt_u64(out: &mut Vec<u8>, value: Option<u64>) {
     }
 }
 
+/// Encode an optional `u32` with a presence flag before the little-endian payload.
 fn put_opt_u32(out: &mut Vec<u8>, value: Option<u32>) {
     match value {
         Some(value) => {
@@ -1616,6 +1631,7 @@ fn put_opt_u32(out: &mut Vec<u8>, value: Option<u32>) {
     }
 }
 
+/// Encode an optional `u8` via the standard bool tag semantics.
 fn put_opt_u8(out: &mut Vec<u8>, value: Option<u8>) {
     match value {
         Some(value) => {
