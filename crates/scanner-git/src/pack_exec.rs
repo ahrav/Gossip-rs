@@ -5206,45 +5206,14 @@ mod tests {
 
         let mut arena = ByteArena::with_capacity(64);
         let path_ref = arena.intern(b"fixture.txt").unwrap();
-        let candidate = PackCandidate {
-            oid: fixture.oid(top),
-            ctx: ctx(path_ref),
-            pack_id: pack_idx as u16,
-            offset: delta_offset,
-        };
-
-        let (data_start, delta_size) = delta_header_meta(pack, delta_offset);
-        let need_offsets = vec![delta_offset];
-        let delta_deps = vec![DeltaDep {
-            offset: delta_offset,
-            kind: DeltaKind::Ref,
-            base: BaseLoc::External { oid: base_oid },
-            data_start,
-            delta_size,
-        }];
-        let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
-        let plan = PackPlan {
-            pack_id: pack_idx as u16,
-            oid_len: 20,
-            max_delta_depth: 16,
-            candidates: vec![candidate],
-            candidate_offsets: vec![CandidateAtOffset {
-                offset: delta_offset,
-                cand_idx: 0,
-            }],
-            need_offsets,
-            delta_deps,
-            delta_dep_index,
-            exec_order: None,
-            stats: PackPlanStats {
-                candidate_count: 1,
-                need_count: 1,
-                external_bases: 1,
-                forward_deps: 0,
-                candidate_span: 0,
-                ..PackPlanStats::empty()
-            },
-        };
+        let plan = build_single_external_ref_plan(
+            pack,
+            pack_idx as u16,
+            delta_offset,
+            fixture.oid(top),
+            base_oid,
+            ctx(path_ref),
+        );
 
         let mut cache = PackCache::new(64 * 1024);
         let mut sink = CollectingSink::default();
