@@ -117,6 +117,7 @@ const TRAIT_COVERAGE_AUDIT: &[TraitCoverageAudit] = &[
         trait_name: "SeenBlobStore",
         real_impls: &[
             "AlwaysSeenStore",
+            "HybridSeenStore",
             "InMemoryPersistenceStore",
             "InMemorySeenStore",
             "NeverSeenStore",
@@ -181,15 +182,15 @@ fn skip_angle_brackets(s: &str) -> Option<&str> {
 
 /// Strips path prefix and generics from a type or trait name.
 ///
+/// Generics are stripped first so that path separators inside type parameters
+/// (e.g., `Option<std::io::Error>`) do not confuse the path resolution.
+///
 /// `super::repo::RepoError` becomes `RepoError`.
 /// `MappingBridge<'_, S>` becomes `MappingBridge`.
+/// `Option<std::io::Error>` becomes `Option`.
 fn extract_bare_name(raw: &str) -> String {
-    let after_path = raw.rsplit("::").next().unwrap_or(raw);
-    after_path
-        .split(['<', '{', '('])
-        .next()
-        .unwrap_or(after_path)
-        .to_owned()
+    let base = raw.split(['<', '{', '(']).next().unwrap_or(raw);
+    base.rsplit("::").next().unwrap_or(base).to_owned()
 }
 
 /// Parses a trimmed line starting with `impl` into `(trait_name, type_name)`.
