@@ -584,6 +584,8 @@ Full invariant definitions and the checker implementation are in
 | `crates/gossip-coordination/src/sim/sim_behavioral_tests.rs`         | Tier 4a: fixed-seed behavioral regression + deterministic replay       |
 | `crates/gossip-coordination/src/sim/mega_sim_tests.rs`               | Tier 4b: thread-parallel seed sweep + proptest sweeper                 |
 | `crates/gossip-coordination/src/sim/proptest_state_machine_tests.rs` | Tier 4c: proptest state machine tests with per-op shrinking            |
+| `crates/gossip-coordination/src/sim/test_util.rs` | Tier 4: Shared test utilities and proptest strategies |
+| `crates/gossip-coordination/src/sim/worker.rs` | Tier 4: Simulated worker tracking and deterministic op generation |
 | `crates/gossip-coordination/src/sim/harness.rs`                      | Simulation driver (`run` + `run_overload`)                             |
 | `crates/gossip-coordination/src/sim/harness_tests.rs`                | Harness unit and property tests for bookkeeping and op generation      |
 | `crates/gossip-coordination/src/sim/invariants.rs`                   | External invariant checker (S1–S9)                                     |
