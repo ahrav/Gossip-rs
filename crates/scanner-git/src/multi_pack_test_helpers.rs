@@ -362,6 +362,11 @@ impl MultiPackFixtureBuilder {
         missing_base_size: usize,
         result_bytes: &[u8],
     ) -> ObjectHandle {
+        assert_eq!(
+            missing_base_oid.len(),
+            OidBytes::SHA1_LEN,
+            "multi-pack fixtures only support SHA-1 (20-byte) OIDs"
+        );
         let pack_idx = pack.0;
         let entry_idx = self.packs[pack_idx].entries.len();
         let oid = stable_oid(format!("missing-ref-{pack_idx}-{entry_idx}").as_bytes());
