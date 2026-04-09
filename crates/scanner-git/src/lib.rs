@@ -134,6 +134,8 @@ pub(crate) mod midx_test_builder;
 #[cfg(feature = "bench")]
 #[doc(hidden)]
 pub mod midx_test_builder;
+#[cfg(test)]
+pub(crate) mod multi_pack_test_helpers;
 /// Native git-reference resolution backed by `gix-ref`.
 pub mod native_ref_resolver;
 /// Defines fixed-size, zero-heap object ID types for SHA-1 and SHA-256.
@@ -169,6 +171,14 @@ pub mod pack_plan_model;
 pub mod pack_reader;
 /// Implements a path policy classifier for tree diff candidates.
 pub mod path_policy;
+/// In-memory pack I/O for tests when the full sim-harness feature is disabled.
+///
+/// Re-includes `sim_git_scan/pack_io.rs` under a separate module path. This
+/// file must only use `crate::` imports (never `super::`) for the `#[path]`
+/// re-inclusion to compile correctly.
+#[cfg(all(test, not(feature = "sim-harness")))]
+#[path = "sim_git_scan/pack_io.rs"]
+pub(crate) mod sim_pack_io;
 /// Synthetic commit-ref materialization for explicit-commit lowering.
 mod synthetic_ref;
 use gossip_stdx::perf_stats;

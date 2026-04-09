@@ -2,6 +2,11 @@
 //!
 //! Uses in-memory pack bytes and MIDX bytes to resolve external bases
 //! deterministically without filesystem access.
+//!
+//! **Import constraint:** This file is re-included via `#[path]` in `lib.rs`
+//! under `mod sim_pack_io` (when the `sim-harness` feature is disabled).
+//! All imports must use `crate::` paths, never `super::`, for the
+//! re-inclusion to compile correctly.
 
 use crate::pack_decode::{entry_header_at, inflate_entry_payload};
 use crate::pack_delta::apply_delta;

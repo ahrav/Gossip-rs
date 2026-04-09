@@ -169,16 +169,30 @@ pub fn encode_ofs_distance(dist: u64) -> Vec<u8> {
     encode_ofs_offset(dist)
 }
 
+/// Returns the pack-format type code for an [`ObjectKind`].
+pub fn kind_code(kind: ObjectKind) -> u8 {
+    match kind {
+        ObjectKind::Commit => 1,
+        ObjectKind::Tree => 2,
+        ObjectKind::Blob => 3,
+        ObjectKind::Tag => 4,
+    }
+}
+
+/// Returns the canonical Git object type name for an [`ObjectKind`].
+pub fn kind_name(kind: ObjectKind) -> &'static [u8] {
+    match kind {
+        ObjectKind::Commit => b"commit",
+        ObjectKind::Tree => b"tree",
+        ObjectKind::Blob => b"blob",
+        ObjectKind::Tag => b"tag",
+    }
+}
+
 /// Encode a pack entry header using an [`ObjectKind`] enum instead of a raw
 /// type byte.
 pub fn encode_entry_header_kind(kind: ObjectKind, size: usize) -> Vec<u8> {
-    let obj_type = match kind {
-        ObjectKind::Commit => 1u8,
-        ObjectKind::Tree => 2u8,
-        ObjectKind::Blob => 3u8,
-        ObjectKind::Tag => 4u8,
-    };
-    encode_entry_header(obj_type, size)
+    encode_entry_header(kind_code(kind), size)
 }
 
 /// Builder for synthetic pack files containing non-delta, OFS_DELTA, and

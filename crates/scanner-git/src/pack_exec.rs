@@ -3301,6 +3301,7 @@ mod tests {
     };
     use super::*;
     use crate::byte_arena::{ByteArena, ByteRef};
+    use crate::multi_pack_test_helpers::{stable_oid, test_limits, MultiPackFixture};
     use crate::pack_plan_model::{CandidateAtOffset, DeltaKind, PackPlanStats};
     use crate::tree_candidate::{CandidateContext, ChangeKind};
     use std::collections::HashMap;
@@ -3356,6 +3357,55 @@ mod tests {
             ctx_flags: 0,
             cand_flags: 0,
             path_ref,
+        }
+    }
+
+    /// Builds a single-candidate `PackPlan` for a REF_DELTA with an external base.
+    fn build_single_external_ref_plan(
+        pack: &[u8],
+        pack_id: u16,
+        delta_offset: u64,
+        candidate_oid: OidBytes,
+        base_oid: OidBytes,
+        candidate_ctx: CandidateContext,
+    ) -> PackPlan {
+        let candidate = PackCandidate {
+            oid: candidate_oid,
+            ctx: candidate_ctx,
+            pack_id,
+            offset: delta_offset,
+        };
+        let (data_start, delta_size) = delta_header_meta(pack, delta_offset);
+        let need_offsets = vec![delta_offset];
+        let delta_deps = vec![DeltaDep {
+            offset: delta_offset,
+            kind: DeltaKind::Ref,
+            base: BaseLoc::External { oid: base_oid },
+            data_start,
+            delta_size,
+        }];
+        let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
+        PackPlan {
+            pack_id,
+            oid_len: 20,
+            max_delta_depth: 16,
+            candidates: vec![candidate],
+            candidate_offsets: vec![CandidateAtOffset {
+                offset: delta_offset,
+                cand_idx: 0,
+            }],
+            need_offsets,
+            delta_deps,
+            delta_dep_index,
+            exec_order: None,
+            stats: PackPlanStats {
+                candidate_count: 1,
+                need_count: 1,
+                external_bases: 1,
+                forward_deps: 0,
+                candidate_span: 0,
+                ..PackPlanStats::empty()
+            },
         }
     }
 
@@ -5133,6 +5183,110 @@ mod tests {
             sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
             Some(result_bytes.as_slice())
         );
+    }
+
+    #[test]
+    fn ref_delta_external_base_decodes_via_sim_pack_io_fixture() {
+        let mut builder = MultiPackFixture::builder();
+        let pack_c = builder.add_pack(b"pack-c");
+        let pack_b = builder.add_pack(b"pack-b");
+        let pack_a = builder.add_pack(b"pack-a");
+
+        let base = builder.add_blob(pack_c, b"base-c");
+        // Mixed delta: copies "base-c" from base, appends "-b" suffix.
+        // Resolved = "base-c-b" — verifies external base content.
+        let mid = builder.add_ref_delta_mixed(pack_b, base, 6, b"-b");
+        // Mixed delta: copies "base-c-b" from mid, appends "-a" suffix.
+        // Resolved = "base-c-b-a" — verifies two-hop external chain.
+        let top = builder.add_ref_delta_mixed(pack_a, mid, 8, b"-a");
+
+        let fixture = builder.build().unwrap();
+        let mut external = fixture.sim_pack_io(test_limits()).unwrap();
+
+        let pack_idx = fixture.pack_index(top);
+        let pack = fixture.pack_bytes(pack_idx);
+        let delta_offset = fixture.offset(top);
+        let base_oid = fixture.oid(mid);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"fixture.txt").unwrap();
+        let plan = build_single_external_ref_plan(
+            pack,
+            pack_idx as u16,
+            delta_offset,
+            fixture.oid(top),
+            base_oid,
+            ctx(path_ref),
+        );
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut sink = CollectingSink::default();
+        let report = exec_plan(
+            &plan,
+            pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        );
+
+        assert_perf_u32(report.stats.emitted_candidates, 1);
+        assert_eq!(
+            sink.blobs
+                .get(&fixture.oid(top))
+                .map(|bytes| bytes.as_slice()),
+            Some(fixture.expected(top).unwrap().1)
+        );
+    }
+
+    #[test]
+    fn missing_external_base_from_sim_pack_io_fixture_is_skipped() {
+        let mut builder = MultiPackFixture::builder();
+        let pack = builder.add_pack(b"pack-missing");
+        let missing_base_oid = stable_oid(b"missing-base");
+        let target =
+            builder.add_missing_ref_delta(pack, ObjectKind::Blob, missing_base_oid, 4, b"unused");
+
+        let fixture = builder.build().unwrap();
+        let mut external = fixture.sim_pack_io(test_limits()).unwrap();
+
+        let pack_idx = fixture.pack_index(target);
+        let pack_bytes = fixture.pack_bytes(pack_idx);
+        let delta_offset = fixture.offset(target);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"missing.txt").unwrap();
+        let plan = build_single_external_ref_plan(
+            pack_bytes,
+            pack_idx as u16,
+            delta_offset,
+            fixture.oid(target),
+            missing_base_oid,
+            ctx(path_ref),
+        );
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut sink = TestSink::default();
+        let report = exec_plan(
+            &plan,
+            pack_bytes,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        );
+
+        assert_perf_u32(report.stats.emitted_candidates, 0);
+        assert!(sink.emitted.is_empty());
+        assert_eq!(report.skips.len(), 1);
+        let skip = &report.skips[0];
+        assert_eq!(skip.offset, delta_offset);
+        assert!(matches!(
+            skip.reason,
+            SkipReason::ExternalBaseMissing { oid } if oid == missing_base_oid
+        ));
     }
 
     #[test]
