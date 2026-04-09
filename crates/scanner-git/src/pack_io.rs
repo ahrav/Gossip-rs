@@ -484,6 +484,7 @@ mod tests {
     use super::super::delta_test_helpers::{
         encode_entry_header, encode_ofs_distance, encode_varint, zlib_compress,
     };
+    use super::super::multi_pack_test_helpers::{stable_oid, test_limits, MultiPackFixture};
     use super::super::object_id::{ObjectFormat, OidBytes};
 
     use super::super::midx_test_builder::MidxBuilder;
@@ -605,6 +606,152 @@ mod tests {
         let delta = io.load_object(&OidBytes::sha1(delta_oid)).unwrap().unwrap();
         assert_eq!(delta.0, ObjectKind::Blob);
         assert_eq!(delta.1, result_bytes);
+    }
+
+    #[test]
+    fn load_cross_pack_ref_delta_from_fixture() {
+        let mut builder = MultiPackFixture::builder();
+        let pack_base = builder.add_pack(b"pack-base");
+        let pack_delta = builder.add_pack(b"pack-delta");
+
+        let base = builder.add_blob(pack_base, b"base");
+        // Mixed delta: copies 4 bytes from base ("base") then appends "!".
+        // Resolved content = "base!" — depends on actual base bytes.
+        let delta = builder.add_ref_delta_mixed(pack_delta, base, 4, b"!");
+
+        let fixture = builder.build().unwrap();
+        let mut io = fixture.pack_io(test_limits()).unwrap();
+
+        let base_loaded = io.load_object(&fixture.oid(base)).unwrap().unwrap();
+        let delta_loaded = io.load_object(&fixture.oid(delta)).unwrap().unwrap();
+
+        assert_eq!(base_loaded.0, ObjectKind::Blob);
+        assert_eq!(base_loaded.1, fixture.expected(base).unwrap().1);
+        assert_eq!(delta_loaded.0, ObjectKind::Blob);
+        assert_eq!(delta_loaded.1, b"base!");
+        assert_eq!(delta_loaded.1, fixture.expected(delta).unwrap().1);
+    }
+
+    #[test]
+    fn load_three_pack_multi_hop_chain_from_fixture() {
+        let mut builder = MultiPackFixture::builder();
+        let pack_c = builder.add_pack(b"pack-c");
+        let pack_b = builder.add_pack(b"pack-b");
+        let pack_a = builder.add_pack(b"pack-a");
+
+        let base = builder.add_blob(pack_c, b"root");
+        // Mixed delta: copies "root" from base, appends "-mid".
+        // Resolved = "root-mid" — verifies base content was fetched correctly.
+        let mid = builder.add_ref_delta_mixed(pack_b, base, 4, b"-mid");
+        // Mixed delta: copies "root-mid" from mid, appends "-leaf".
+        // Resolved = "root-mid-leaf" — verifies two-hop base chain.
+        let top = builder.add_ref_delta_mixed(pack_a, mid, 8, b"-leaf");
+
+        let fixture = builder.build().unwrap();
+        let mut io = fixture.pack_io(test_limits()).unwrap();
+
+        let top_loaded = io.load_object(&fixture.oid(top)).unwrap().unwrap();
+        assert_eq!(top_loaded.0, ObjectKind::Blob);
+        assert_eq!(top_loaded.1, b"root-mid-leaf");
+        assert_eq!(top_loaded.1, fixture.expected(top).unwrap().1);
+
+        let mid_loaded = io.load_object(&fixture.oid(mid)).unwrap().unwrap();
+        assert_eq!(mid_loaded.0, ObjectKind::Blob);
+        assert_eq!(mid_loaded.1, b"root-mid");
+        assert_eq!(mid_loaded.1, fixture.expected(mid).unwrap().1);
+    }
+
+    #[test]
+    fn load_mixed_ofs_and_ref_delta_chain_from_fixture() {
+        let mut builder = MultiPackFixture::builder();
+        let pack_base = builder.add_pack(b"pack-base");
+        let pack_delta = builder.add_pack(b"pack-delta");
+
+        let base = builder.add_blob(pack_base, b"seed");
+        let local = builder.add_ofs_delta(pack_base, base, b"local");
+        let leaf = builder.add_ref_delta(pack_delta, local, b"leaf");
+
+        let fixture = builder.build().unwrap();
+        let mut io = fixture.pack_io(test_limits()).unwrap();
+
+        let local_loaded = io.load_object(&fixture.oid(local)).unwrap().unwrap();
+        assert_eq!(local_loaded.0, ObjectKind::Blob);
+        assert_eq!(local_loaded.1, fixture.expected(local).unwrap().1);
+
+        let leaf_loaded = io.load_object(&fixture.oid(leaf)).unwrap().unwrap();
+        assert_eq!(leaf_loaded.0, ObjectKind::Blob);
+        assert_eq!(leaf_loaded.1, fixture.expected(leaf).unwrap().1);
+    }
+
+    #[test]
+    fn missing_external_base_returns_none_from_fixture() {
+        let mut builder = MultiPackFixture::builder();
+        let pack = builder.add_pack(b"pack-missing");
+        let missing = builder.add_missing_ref_delta(
+            pack,
+            ObjectKind::Blob,
+            stable_oid(b"missing-base"),
+            4,
+            b"unused",
+        );
+
+        let fixture = builder.build().unwrap();
+        let mut io = fixture.pack_io(test_limits()).unwrap();
+
+        let loaded = io.load_object(&fixture.oid(missing)).unwrap();
+        assert!(loaded.is_none());
+        assert!(fixture.expected(missing).is_none());
+    }
+
+    #[test]
+    fn fixture_golden_values_match_pack_io() {
+        let mut builder = MultiPackFixture::builder();
+        let pack_c = builder.add_pack(b"pack-c");
+        let pack_b = builder.add_pack(b"pack-b");
+        let pack_a = builder.add_pack(b"pack-a");
+
+        let base = builder.add_blob(pack_c, b"base");
+        let mid = builder.add_ref_delta(pack_b, base, b"middle");
+        let top = builder.add_ref_delta(pack_a, mid, b"leaf");
+
+        let fixture = builder.build().unwrap();
+        let mut io = fixture.pack_io(test_limits()).unwrap();
+
+        let mut count = 0;
+        for (handle, oid, kind, expected) in fixture.golden_values() {
+            let loaded = io.load_object(&oid).unwrap().unwrap();
+            assert_eq!(loaded.0, kind);
+            assert_eq!(loaded.1, expected);
+            assert_eq!(fixture.oid(handle), oid);
+            count += 1;
+        }
+        assert_eq!(count, 3);
+
+        assert_eq!(fixture.expected(top).unwrap().1, b"leaf");
+    }
+
+    #[test]
+    fn cross_pack_delta_depth_exceeded_from_fixture() {
+        let mut builder = MultiPackFixture::builder();
+        let pack_c = builder.add_pack(b"pack-c");
+        let pack_b = builder.add_pack(b"pack-b");
+        let pack_a = builder.add_pack(b"pack-a");
+
+        let base = builder.add_blob(pack_c, b"base");
+        let mid = builder.add_ref_delta(pack_b, base, b"middle");
+        let top = builder.add_ref_delta(pack_a, mid, b"leaf");
+
+        let fixture = builder.build().unwrap();
+
+        // Depth limit of 1 is too tight for a 2-deep delta chain.
+        let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 1);
+        let mut io = fixture.pack_io(limits).unwrap();
+
+        let err = io.load_object(&fixture.oid(top)).unwrap_err();
+        assert!(matches!(
+            err,
+            PackIoError::DeltaDepthExceeded { max_depth: 1 }
+        ));
     }
 
     #[test]
