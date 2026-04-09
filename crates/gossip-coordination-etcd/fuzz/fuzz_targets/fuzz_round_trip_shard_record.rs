@@ -1,15 +1,23 @@
-//! Fuzzing target for shard record serialization round-trips.
+//! Fuzz target that monitors the serialization/deserialization stability of shard records.
 //!
-//! Ensures that any valid byte sequence parsed into a shard record
-//! can be reliably re-encoded and re-decoded to the exact same bytes.
+//! Drives `decode_shard_record`/`encode_shard_record` with arbitrary byte sequences so
+//! malformed inputs are filtered by an early return while valid records must stay stable.
+//! The goal is catching regressions where decoding and re-encoding would otherwise drift,
+//! exposing invariants such as deterministic byte output, consistent field layout, and
+//! repeatable use of `ByteSlab` storage for transient allocations.
 #![no_main]
 
 use gossip_coordination_etcd::{decode_shard_record, encode_shard_record};
 use gossip_stdx::ByteSlab;
 use libfuzzer_sys::fuzz_target;
 
-/// If `decode_shard_record` succeeds, re-encoding and re-decoding must
-/// produce identical bytes.
+/// Ensures that every successfully decoded shard record survives an encode/decode round trip.
+///
+/// Inputs are arbitrary `&[u8]`; invalid sequences are ignored so libFuzzer focuses on well-formed
+/// shard records. For bytes that decode, the test re-encodes and decodes twice, asserting each
+/// re-encoded buffer matches the previous one so the serialization schema remains deterministic.
+/// The slab capacity is fixed at 4KiB to provide enough workspace for record data without
+/// growing aggressively during fuzzing, which keeps memory usage and allocation paths stable.
 fuzz_target!(|data: &[u8]| {
     let mut slab1 = ByteSlab::with_capacity(4096);
     let Ok(record1) = decode_shard_record(data, &mut slab1) else {
