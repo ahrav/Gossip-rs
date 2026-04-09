@@ -263,10 +263,19 @@ impl MidxOrdinalBitset {
     /// Duplicate OIDs reuse the previous lookup result so the method preserves
     /// the non-decreasing input contract already used by `RoaringSeenBitmap`.
     ///
+    /// # Safety Contract
+    ///
+    /// The caller must ensure that `midx` refers to the same MIDX snapshot used
+    /// to construct this bitset. The method validates object-count parity but
+    /// cannot verify MIDX identity (the trailing checksum is not yet parsed).
+    /// Using a different MIDX with the same object count produces silently wrong
+    /// results.
+    ///
     /// # Errors
     ///
     /// Returns [`MidxError`] if the MIDX object count does not match the
-    /// bitset, or if an OID lookup encounters a corrupt MIDX.
+    /// bitset, if the input OIDs are not in non-decreasing order, or if an
+    /// OID lookup encounters a corrupt MIDX.
     pub fn batch_contains_sorted(
         &self,
         midx: &MidxView<'_>,
@@ -283,10 +292,19 @@ impl MidxOrdinalBitset {
     ///
     /// `out` is cleared before results are written.
     ///
+    /// # Safety Contract
+    ///
+    /// The caller must ensure that `midx` refers to the same MIDX snapshot used
+    /// to construct this bitset. The method validates object-count parity but
+    /// cannot verify MIDX identity (the trailing checksum is not yet parsed).
+    /// Using a different MIDX with the same object count produces silently wrong
+    /// results.
+    ///
     /// # Errors
     ///
     /// Returns [`MidxError`] if the MIDX object count does not match the
-    /// bitset, or if an OID lookup encounters a corrupt MIDX.
+    /// bitset, if the input OIDs are not in non-decreasing order, or if an
+    /// OID lookup encounters a corrupt MIDX.
     pub fn batch_contains_sorted_into(
         &self,
         midx: &MidxView<'_>,
@@ -329,8 +347,9 @@ impl MidxOrdinalBitset {
     ///
     /// Sort order is validated upfront so a rejection never leaves the bitset
     /// in a partially-modified state. OID length mismatches (e.g. SHA-256
-    /// probes against a SHA-1 MIDX) are treated as "not found," matching the
-    /// read-path behavior in [`batch_contains_sorted_into`](Self::batch_contains_sorted_into).
+    /// probes against a SHA-1 MIDX) are treated as "not found" rather than
+    /// an error, unlike [`batch_contains_sorted_into`](Self::batch_contains_sorted_into)
+    /// which propagates [`MidxError::InputOidLengthMismatch`].
     pub fn mark_seen_batch(
         &mut self,
         midx: &MidxView<'_>,
@@ -553,8 +572,10 @@ impl HybridSeenStore {
 
     /// Rebuilds the ordinal cache from the authoritative roaring bitmap.
     ///
-    /// OIDs missing from the configured MIDX remain available through the
-    /// roaring fallback and are not added to the ordinal bitset.
+    /// If no MIDX snapshot is configured, the ordinal cache is cleared and the
+    /// method returns `Ok(())`. OIDs missing from the configured MIDX remain
+    /// available through the roaring fallback and are not added to the ordinal
+    /// bitset.
     ///
     /// # Errors
     ///
