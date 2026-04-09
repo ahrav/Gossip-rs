@@ -20,7 +20,10 @@ use rstest::rstest;
 use super::*;
 use crate::common::test_util::{default_budgets, make_key};
 
-/// Build a `MemItem` by canonicalizing the byte key and cloning its payload.
+/// Builds a `MemItem` fixture from raw bytes.
+///
+/// Keys are normalized through `make_key` so test assertions match the same
+/// canonical key representation used by connector code paths.
 fn make_item(key: &[u8], data: &[u8]) -> MemItem {
     MemItem::new(make_key(key), Vec::from(data))
 }
@@ -41,6 +44,10 @@ fn split_point_returns_none(#[case] items: Vec<MemItem>, #[case] cursor: Cursor)
     assert!(split.is_none());
 }
 
+/// Well-formed `ItemRef` bytes that decode to an out-of-bounds item index.
+///
+/// This separates "shape is valid but index is invalid" from malformed-byte
+/// cases so error handling is exercised for both rejection paths.
 const BAD_INDEX_BYTES: [u8; 8] = 999u64.to_be_bytes();
 
 #[rstest]
@@ -288,6 +295,12 @@ fn split_point_degenerate_first_item_heavy() {
 }
 
 mod prop {
+    //! Property tests for split-point ordering guarantees.
+    //!
+    //! The strategy deliberately enforces unique keys because the connector
+    //! constructor rejects duplicates. That keeps generated cases focused on
+    //! split behavior instead of constructor precondition failures.
+
     use super::*;
     use proptest::collection::vec as pvec;
     use proptest::prelude::*;
