@@ -136,6 +136,34 @@ impl DynamicBitSet {
         self.words[word_idx] &= !(1u64 << bit_idx);
     }
 
+    /// Returns a shared reference to the underlying word storage.
+    #[inline]
+    pub fn as_words(&self) -> &[u64] {
+        &self.words
+    }
+
+    /// Constructs a bitset from a pre-existing word vector.
+    ///
+    /// The caller must ensure that `words.len() == words_for_bits(bit_length)` and
+    /// that padding bits in the last word are zero. Both invariants are
+    /// debug-asserted but not enforced in release builds.
+    pub fn from_words(words: Vec<u64>, bit_length: usize) -> Self {
+        debug_assert_eq!(
+            words.len(),
+            words_for_bits(bit_length),
+            "word count does not match bit_length"
+        );
+        let bs = Self { words, bit_length };
+        debug_assert!(
+            bs.words.is_empty() || {
+                let mask = !bs.last_word_mask();
+                (bs.words[bs.words.len() - 1] & mask) == 0
+            },
+            "padding bits in last word must be zero"
+        );
+        bs
+    }
+
     /// Clears all bits.
     #[inline]
     pub fn clear(&mut self) {

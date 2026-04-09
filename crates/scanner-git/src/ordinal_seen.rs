@@ -9,6 +9,7 @@
 use std::mem::size_of;
 
 use bytemuck::{cast_slice, try_cast_slice};
+use gossip_stdx::bitset::DynamicBitSet;
 use gossip_stdx::words_for_bits;
 
 use super::midx::{MidxCursor, MidxView};
@@ -65,15 +66,19 @@ pub enum OrdinalSeenError {
 /// Each bit position corresponds to an OID index in the MIDX OIDL chunk.
 /// Bit `i` is set iff the OID at `midx.oid_at(i)` has been seen.
 ///
+/// Delegates bit storage and manipulation to [`DynamicBitSet`] while adding
+/// MIDX-specific metadata (object count, fingerprint) and incremental
+/// cardinality tracking.
+///
 /// # Invariants
 /// - `midx_object_count` equals the MIDX object count at construction time.
 /// - `midx_fingerprint` identifies which MIDX version the ordinals belong to.
-/// - `words.len() == words_for_bits(midx_object_count as usize)`.
+/// - `bits.bit_length() == midx_object_count as usize`.
 /// - All set bits are in range `[0, midx_object_count)`.
-/// - `cardinality` equals the number of set bits in `words`.
+/// - `cardinality` equals the number of set bits in `bits`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MidxOrdinalBitset {
-    words: Vec<u64>,
+    bits: DynamicBitSet,
     midx_object_count: u32,
     midx_fingerprint: [u8; 32],
     cardinality: u32,
@@ -84,7 +89,7 @@ impl MidxOrdinalBitset {
     #[must_use]
     pub fn new(midx_object_count: u32, midx_fingerprint: [u8; 32]) -> Self {
         Self {
-            words: vec![0; words_for_bits(midx_object_count as usize)],
+            bits: DynamicBitSet::empty(midx_object_count as usize),
             midx_object_count,
             midx_fingerprint,
             cardinality: 0,
@@ -115,10 +120,7 @@ impl MidxOrdinalBitset {
             );
             return false;
         }
-        let i = ordinal as usize;
-        let word = i >> 6;
-        let bit = i & 63;
-        (self.words[word] & (1u64 << bit)) != 0
+        self.bits.is_set(ordinal as usize)
     }
 
     /// Returns the number of set bits.
@@ -127,10 +129,10 @@ impl MidxOrdinalBitset {
         self.cardinality
     }
 
-    /// Returns the heap memory used by the backing `Vec<u64>`.
+    /// Returns the heap memory used by the backing word storage.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
-        self.words.capacity() * size_of::<u64>()
+        std::mem::size_of_val(self.bits.as_words())
     }
 
     /// Returns the fingerprint for the MIDX snapshot this bitset targets.
@@ -142,25 +144,33 @@ impl MidxOrdinalBitset {
     /// Returns the serialized size of the MOBS payload.
     #[must_use]
     pub fn serialized_size(&self) -> usize {
-        HEADER_LEN + self.words.len() * size_of::<u64>()
+        HEADER_LEN + std::mem::size_of_val(self.bits.as_words())
     }
 
-    /// Serializes the bitset into a deterministic MOBS payload.
-    #[must_use]
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.serialized_size());
+    /// Serializes the bitset into `out`, clearing it first.
+    pub fn serialize_into(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.reserve(self.serialized_size());
         out.extend_from_slice(&MOBS_MAGIC);
         out.push(MOBS_VERSION);
         out.extend_from_slice(&self.midx_object_count.to_be_bytes());
         out.extend_from_slice(&self.midx_fingerprint);
         out.extend_from_slice(&self.cardinality.to_be_bytes());
+        let words = self.bits.as_words();
         if cfg!(target_endian = "little") {
-            out.extend_from_slice(cast_slice(self.words.as_slice()));
+            out.extend_from_slice(cast_slice(words));
         } else {
-            for word in &self.words {
+            for word in words {
                 out.extend_from_slice(&word.to_le_bytes());
             }
         }
+    }
+
+    /// Serializes the bitset into a deterministic MOBS payload.
+    #[must_use]
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.serialize_into(&mut out);
         out
     }
 
@@ -199,7 +209,7 @@ impl MidxOrdinalBitset {
         }
 
         let payload = &bytes[HEADER_LEN..];
-        let words = if cfg!(target_endian = "little") {
+        let words: Vec<u64> = if cfg!(target_endian = "little") {
             match try_cast_slice::<u8, u64>(payload) {
                 Ok(raw_words) => raw_words.to_vec(),
                 Err(_) => decode_words_le(payload),
@@ -208,8 +218,19 @@ impl MidxOrdinalBitset {
             decode_words_le(payload)
         };
 
+        // Verify padding bits are zero before constructing the DynamicBitSet,
+        // which requires this invariant.
         if let Some(&last_word) = words.last() {
-            let padding_mask = !last_word_mask(midx_object_count);
+            let remainder = midx_object_count % 64;
+            let padding_mask = if remainder == 0 {
+                if midx_object_count == 0 {
+                    u64::MAX
+                } else {
+                    0
+                }
+            } else {
+                !((1u64 << remainder) - 1)
+            };
             if last_word & padding_mask != 0 {
                 return Err(OrdinalSeenError::OutOfRangeBits);
             }
@@ -223,8 +244,9 @@ impl MidxOrdinalBitset {
             });
         }
 
+        let bits = DynamicBitSet::from_words(words, midx_object_count as usize);
         Ok(Self {
-            words,
+            bits,
             midx_object_count,
             midx_fingerprint,
             cardinality,
@@ -276,10 +298,10 @@ impl MidxOrdinalBitset {
         out.clear();
         out.reserve(oids.len());
         let mut cursor = MidxCursor::default();
-        let mut previous_oid = None;
+        let mut previous_oid: Option<&OidBytes> = None;
         let mut previous_seen = false;
         for oid in oids {
-            if previous_oid == Some(*oid) {
+            if previous_oid == Some(oid) {
                 out.push(previous_seen);
                 continue;
             }
@@ -292,7 +314,7 @@ impl MidxOrdinalBitset {
                 Err(e) => return Err(e),
             };
             out.push(seen);
-            previous_oid = Some(*oid);
+            previous_oid = Some(oid);
             previous_seen = seen;
         }
         Ok(())
@@ -311,14 +333,14 @@ impl MidxOrdinalBitset {
 
         let mut newly_marked = 0u32;
         let mut cursor = MidxCursor::default();
-        let mut previous_oid = None;
+        let mut previous_oid: Option<&OidBytes> = None;
 
         for oid in oids {
             if let Some(previous) = previous_oid {
-                if previous > *oid {
+                if previous > oid {
                     return Err(MidxError::InputNotSorted);
                 }
-                if previous == *oid {
+                if previous == oid {
                     continue;
                 }
             }
@@ -327,7 +349,7 @@ impl MidxOrdinalBitset {
             if let Some(ordinal) = lookup {
                 newly_marked += u32::from(self.test_and_set(ordinal));
             }
-            previous_oid = Some(*oid);
+            previous_oid = Some(oid);
         }
 
         Ok(newly_marked)
@@ -351,16 +373,14 @@ impl MidxOrdinalBitset {
             );
             return false;
         }
-        let i = ordinal as usize;
-        let word = i >> 6;
-        let bit = i & 63;
-        let mask = 1u64 << bit;
-        let was_unset = (self.words[word] & mask) == 0;
-        self.words[word] |= mask;
-        if was_unset {
+        let idx = ordinal as usize;
+        if !self.bits.is_set(idx) {
+            self.bits.set(idx);
             self.cardinality += 1;
+            true
+        } else {
+            false
         }
-        was_unset
     }
 }
 
@@ -372,7 +392,9 @@ fn decode_words_le(payload: &[u8]) -> Vec<u64> {
         .collect()
 }
 
-#[inline]
+/// Counts set bits in raw words, masking the last word to `bit_count` bits.
+/// Used during deserialization to validate the stored cardinality before
+/// constructing a `DynamicBitSet`.
 fn count_set_bits(words: &[u64], bit_count: u32) -> u32 {
     if words.is_empty() {
         return 0;
@@ -382,13 +404,8 @@ fn count_set_bits(words: &[u64], bit_count: u32) -> u32 {
     for &word in &words[..last] {
         total += word.count_ones();
     }
-    total + (words[last] & last_word_mask(bit_count)).count_ones()
-}
-
-#[inline]
-fn last_word_mask(bit_count: u32) -> u64 {
     let remainder = bit_count % 64;
-    if remainder == 0 {
+    let mask = if remainder == 0 {
         if bit_count == 0 {
             0
         } else {
@@ -396,7 +413,8 @@ fn last_word_mask(bit_count: u32) -> u64 {
         }
     } else {
         (1u64 << remainder) - 1
-    }
+    };
+    total + (words[last] & mask).count_ones()
 }
 
 #[cfg(test)]
@@ -566,8 +584,6 @@ mod tests {
         assert!(matches!(err, OrdinalSeenError::PayloadTooLarge { .. }));
     }
 
-    // ── F4: Deserialization error variant coverage ──────────────────────
-
     #[test]
     fn deserialize_rejects_truncated_header() {
         let err = MidxOrdinalBitset::deserialize(&[0u8; HEADER_LEN - 1]).expect_err("truncated");
@@ -620,8 +636,6 @@ mod tests {
         );
     }
 
-    // ── F5: Sorted-input and MIDX-mismatch error paths ─────────────────
-
     #[test]
     fn batch_contains_sorted_rejects_unsorted_input() {
         let midx_bytes = build_test_midx(8);
@@ -645,8 +659,6 @@ mod tests {
         assert!(matches!(err, MidxError::MidxCorrupt { .. }));
     }
 
-    // ── F6: validate_view error path in mark_seen_batch ─────────────────
-
     #[test]
     fn mark_seen_batch_rejects_mismatched_midx() {
         let midx_bytes = build_test_midx(8);
@@ -657,8 +669,6 @@ mod tests {
             .expect_err("mismatched");
         assert!(matches!(err, MidxError::MidxCorrupt { .. }));
     }
-
-    // ── F12: Empty input edge case ──────────────────────────────────────
 
     #[test]
     fn mark_seen_batch_with_empty_input() {
@@ -726,6 +736,43 @@ mod tests {
                 .collect();
 
             prop_assert_eq!(bitset.batch_contains_sorted(&midx, &probes).expect("batch lookup"), expected);
+        }
+
+        #[test]
+        fn mark_seen_batch_matches_oracle(
+            pre_seen in vec(0u16..256, 0..128),
+            batch in vec(0u16..320, 0..128),
+        ) {
+            let midx_bytes = build_test_midx(256);
+            let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).expect("midx");
+            let mut bitset = MidxOrdinalBitset::new(midx.object_count(), [0xBB; 32]);
+
+            let mut already_set = std::collections::HashSet::new();
+            for &ordinal in &pre_seen {
+                if (ordinal as u32) < 256 {
+                    bitset.set(ordinal as u32);
+                    already_set.insert(ordinal);
+                }
+            }
+            let card_before = bitset.cardinality();
+
+            let mut batch = batch;
+            batch.sort_unstable();
+            let oids: Vec<OidBytes> = batch.iter().map(|&v| oid_from_u32(v as u32)).collect();
+
+            let newly_marked = bitset.mark_seen_batch(&midx, &oids).expect("mark");
+
+            // Oracle: count unique OIDs that are in MIDX range AND not already set.
+            let mut expected_new = 0u32;
+            let mut counted = std::collections::HashSet::new();
+            for &v in &batch {
+                if (v as u32) < 256 && !already_set.contains(&v) && counted.insert(v) {
+                    expected_new += 1;
+                }
+            }
+
+            prop_assert_eq!(newly_marked, expected_new);
+            prop_assert_eq!(bitset.cardinality(), card_before + expected_new);
         }
     }
 }

@@ -13,9 +13,20 @@ const PROBE_BATCH: u32 = 10_000;
 const SCALE_POINTS: [u32; 3] = [100_000, 1_000_000, 10_000_000];
 const BENCH_FINGERPRINT: [u8; 32] = [0xA5; 32];
 
+/// Generates a deterministic OID that spreads across all 256 fanout buckets.
+///
+/// Hashing the counter distributes the first byte uniformly, so benchmark
+/// MIDX fanout tables mirror real-world distributions instead of cramming
+/// every entry into bucket 0.
 fn oid_from_u32(value: u32) -> OidBytes {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    let h = hasher.finish();
     let mut bytes = [0u8; 20];
-    bytes[..4].copy_from_slice(&value.to_be_bytes());
+    bytes[..8].copy_from_slice(&h.to_le_bytes());
+    // Embed the original counter so distinct inputs never collide on 20 bytes.
+    bytes[8..12].copy_from_slice(&value.to_be_bytes());
     OidBytes::sha1(bytes)
 }
 

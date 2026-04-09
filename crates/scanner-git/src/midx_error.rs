@@ -133,3 +133,18 @@ impl MidxError {
         MAX_MISSING_PACK_NAMES
     }
 }
+
+impl From<super::ordinal_seen::OrdinalSeenError> for MidxError {
+    fn from(e: super::ordinal_seen::OrdinalSeenError) -> Self {
+        use super::ordinal_seen::OrdinalSeenError;
+        MidxError::corrupt(match e {
+            OrdinalSeenError::Truncated => "truncated ordinal seen payload",
+            OrdinalSeenError::InvalidMagic => "invalid ordinal seen magic",
+            OrdinalSeenError::UnsupportedVersion(_) => "unsupported ordinal seen version",
+            OrdinalSeenError::LengthMismatch => "ordinal seen length mismatch",
+            OrdinalSeenError::CardinalityMismatch { .. } => "ordinal seen cardinality mismatch",
+            OrdinalSeenError::OutOfRangeBits => "ordinal seen out-of-range bits",
+            OrdinalSeenError::PayloadTooLarge { .. } => "ordinal seen payload too large",
+        })
+    }
+}
