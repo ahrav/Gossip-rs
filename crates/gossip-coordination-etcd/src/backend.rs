@@ -221,7 +221,9 @@ pub(crate) struct PersistedRun {
 /// so concurrent shard-creating operations serialize within a tenant.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PersistedTenantShardCount {
+    /// Materialized shard count observed for the tenant, used to guard tenant-specific limits.
     pub(crate) count: u64,
+    /// etcd `mod_revision` observed when the counter was read, used for CAS guards.
     pub(crate) mod_revision: i64,
 }
 
@@ -232,9 +234,13 @@ pub(crate) struct PersistedTenantShardCount {
 /// 2. add the same compare+put pair to the mutation transaction.
 #[derive(Debug)]
 pub(crate) struct TenantShardCountMutation {
+    /// Key that identifies the tenant shard counter being mutated.
     pub(crate) key: TenantShardCountKey,
+    /// Counter value observed in etcd before the current mutation attempt.
     pub(crate) current_count: usize,
+    /// Counter value that will be written if the CAS succeeds.
     pub(crate) next_count: u64,
+    /// CAS clause that locks the counter to the observed `mod_revision`.
     pub(crate) compare: Compare,
 }
 
@@ -452,9 +458,14 @@ fn build_slab_capacity_for_initial_shard(input: &InitialShardInput<'_>) -> usize
 /// Encode a shard record into a binary blob, then deallocate its pooled
 /// fields and clear the slab.
 ///
-/// Returns `InfraError::corruption` on encode failure — encoding a
-/// just-constructed record should never fail under normal operation;
-/// failure indicates a codec or invariant bug.
+/// The temporary `ByteSlab` is emptied before propagating errors so the
+/// pool invariants hold even on failure.
+///
+/// # Errors
+///
+/// - `gossip_coordination::InfraError::corruption` if the codec refuses to
+///   encode a well-formed record, indicating a codec bug or invariant
+///   violation in `record`.
 fn encode_ephemeral_shard_blob(
     context: &'static str,
     mut record: ShardRecord,
@@ -472,8 +483,12 @@ fn encode_ephemeral_shard_blob(
 /// Construct a root shard record from registration input, validate its
 /// invariants, and encode it into a binary blob ready for etcd storage.
 ///
-/// Returns [`RegisterShardsError::ResourceExhausted`] if the slab cannot
-/// accommodate the shard's pooled fields.
+/// # Errors
+///
+/// - `RegisterShardsError::ResourceExhausted` when allocating the encoding
+///   slab fails because the pooled fields are too large for the limit.
+/// - `RegisterShardsError::BackendError` when encoding fails due to codec
+///   invariants triggered by the freshly built record.
 fn build_root_shard_blob(
     tenant: TenantId,
     run: RunId,
@@ -501,8 +516,12 @@ fn build_root_shard_blob(
 /// Verify that a persisted owner binding is consistent with the shard
 /// record's lease holder and fence epoch.
 ///
-/// Returns an invariant-violation error if the owner key exists but the
-/// shard record has no lease, or if the worker/fence fields disagree.
+///
+/// # Errors
+///
+/// - `EtcdCoordinatorError::Codec` (with `EtcdOperation::Get`) when the
+///   owner key is present but the shard record lacks a lease or when the
+///   worker/fence binding disagrees with the persisted lease.
 pub(crate) fn validate_owner_consistency(
     owner: &PersistedOwner,
     record: &ShardRecord,
@@ -593,6 +612,12 @@ pub(crate) fn map_etcd_err(
 /// [`gossip_coordination::validate_lease`], then verifies that the shard's
 /// current owner binding matches the presented lease's worker + fence
 /// epoch. Returns `map_stale_fence(presented, current)` on mismatch.
+///
+/// # Errors
+///
+/// - Any error produced by `gossip_coordination::validate_lease`.
+/// - The value returned by `map_stale_fence` when the persisted owner
+///   binding disagrees with the presented lease's worker/fence combination.
 fn validate_loaded_shard_lease<E>(
     now: LogicalTime,
     tenant: TenantId,
@@ -694,6 +719,11 @@ fn compare_owner_present(
 
 /// Decode an owner-key blob, wrapping codec errors with the given
 /// operation context.
+///
+/// # Errors
+///
+/// - `EtcdCoordinatorError::Codec` when the owner blob fails to decode or
+///   violates codec invariants.
 fn decode_owner_binding(
     operation: EtcdOperation,
     bytes: &[u8],
@@ -707,6 +737,11 @@ pub(crate) fn encode_tenant_shard_count(count: u64) -> [u8; 8] {
 }
 
 /// Decode a tenant shard counter from 8-byte little-endian `u64`.
+///
+/// # Errors
+///
+/// - `EtcdCoordinatorError::Codec` when the supplied bytes are not exactly
+///   eight bytes, violating the counter encoding invariant.
 fn decode_tenant_shard_count(
     operation: EtcdOperation,
     bytes: &[u8],
@@ -724,6 +759,11 @@ fn decode_tenant_shard_count(
 }
 
 /// Decode a tenant shard counter KV with its revision metadata.
+///
+/// # Errors
+///
+/// - Forwards any `EtcdCoordinatorError::Codec` emitted while decoding the
+///   counter payload.
 pub(crate) fn decode_tenant_shard_count_kv(
     kv: &etcd_client::KeyValue,
 ) -> Result<PersistedTenantShardCount, EtcdCoordinatorError> {
@@ -747,6 +787,12 @@ pub(crate) fn u64_to_usize_saturating(value: u64) -> usize {
 ///
 /// Combines codec decoding with the structural check that every owner
 /// key must be attached to a real etcd lease (lease ID > 0).
+///
+/// # Errors
+///
+/// - `EtcdCoordinatorError::Codec` when the owner blob fails to decode.
+/// - `EtcdCoordinatorError::Codec` when the owner key is not attached to a
+///   non-zero etcd lease.
 pub(crate) fn decode_owner_kv(
     kv: &etcd_client::KeyValue,
 ) -> Result<PersistedOwner, EtcdCoordinatorError> {
