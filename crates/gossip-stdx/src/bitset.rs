@@ -136,6 +136,39 @@ impl DynamicBitSet {
         self.words[word_idx] &= !(1u64 << bit_idx);
     }
 
+    /// Returns a shared reference to the underlying word storage.
+    #[inline]
+    pub fn as_words(&self) -> &[u64] {
+        &self.words
+    }
+
+    /// Constructs a bitset from a pre-existing word vector.
+    ///
+    /// Prefer [`DynamicBitSet::empty`] when constructing from scratch. This
+    /// constructor exists for deserialization paths that have already validated
+    /// the word buffer externally.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `words.len() != words_for_bits(bit_length)` or if padding
+    /// bits in the last word are non-zero.
+    pub fn from_words(words: Vec<u64>, bit_length: usize) -> Self {
+        assert_eq!(
+            words.len(),
+            words_for_bits(bit_length),
+            "word count does not match bit_length"
+        );
+        let bs = Self { words, bit_length };
+        assert!(
+            bs.words.is_empty() || {
+                let mask = !bs.last_word_mask();
+                (bs.words[bs.words.len() - 1] & mask) == 0
+            },
+            "padding bits in last word must be zero"
+        );
+        bs
+    }
+
     /// Clears all bits.
     #[inline]
     pub fn clear(&mut self) {
