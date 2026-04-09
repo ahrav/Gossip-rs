@@ -9,12 +9,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::git_test_support::{decode_hex, init_git_repo, run_git};
+use crate::git_test_support::{CollectingSink, ctx, decode_hex, init_git_repo, run_git};
 use scanner_git::{
-    ByteArena, ByteRef, CandidateContext, ChangeKind, OidBytes, PackCache, PackCandidate,
-    PackDecodeLimits, PackPlanConfig, PackView, build_pack_plans, execute_pack_plan,
+    ByteArena, OidBytes, PackCache, PackCandidate, PackDecodeLimits, PackPlanConfig, PackView,
+    build_pack_plans, execute_pack_plan,
 };
-use scanner_git::{ExternalBase, ExternalBaseProvider, PackExecError, PackObjectSink};
+use scanner_git::{ExternalBase, ExternalBaseProvider, PackExecError};
 
 fn perf_stats_enabled() -> bool {
     cfg!(all(feature = "perf-stats", debug_assertions))
@@ -29,24 +29,6 @@ impl ExternalBaseProvider for NoExternalBases {
     fn load_base(&mut self, _oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError> {
         self.calls += 1;
         Ok(None)
-    }
-}
-
-/// Sink that collects decoded blob bytes by OID.
-#[derive(Default)]
-struct CollectingSink {
-    blobs: HashMap<OidBytes, Vec<u8>>,
-}
-
-impl PackObjectSink for CollectingSink {
-    fn emit(
-        &mut self,
-        candidate: &PackCandidate,
-        _path: &[u8],
-        bytes: &[u8],
-    ) -> Result<(), PackExecError> {
-        self.blobs.insert(candidate.oid, bytes.to_vec());
-        Ok(())
     }
 }
 
@@ -106,18 +88,6 @@ fn load_verify_pack(idx_path: &Path, oid_len: usize) -> Vec<(OidBytes, u64)> {
         }
     }
     out
-}
-
-/// Builds a canonical candidate context for tests.
-fn ctx(path_ref: ByteRef) -> CandidateContext {
-    CandidateContext {
-        commit_id: 1,
-        parent_idx: 0,
-        change_kind: ChangeKind::Add,
-        ctx_flags: 0,
-        cand_flags: 0,
-        path_ref,
-    }
 }
 
 #[test]
