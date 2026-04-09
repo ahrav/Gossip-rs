@@ -19,8 +19,8 @@ const CHUNK_OOFF: [u8; 4] = *b"OOFF";
 /// tests but not for checksum-validating tooling.
 #[derive(Default)]
 pub struct MidxBuilder {
-    pub pack_names: Vec<Vec<u8>>,
-    pub objects: Vec<([u8; 20], u16, u64)>,
+    pack_names: Vec<Vec<u8>>,
+    objects: Vec<([u8; 20], u16, u64)>,
 }
 
 impl MidxBuilder {

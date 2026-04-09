@@ -56,13 +56,15 @@ fn build_midx_bytes(size: u32) -> Vec<u8> {
     builder.build()
 }
 
-fn build_probe_batch(size: u32) -> Vec<OidBytes> {
-    (0..size)
+fn build_probe_batch(probe_count: u32, dataset_size: u32) -> Vec<OidBytes> {
+    (0..probe_count)
         .map(|idx| {
             if idx % 2 == 0 {
+                // Hit: OID exists in the dataset.
                 oid_from_u32(idx)
             } else {
-                oid_from_u32(size + idx)
+                // Miss: OID beyond the dataset range.
+                oid_from_u32(dataset_size + idx)
             }
         })
         .collect()
@@ -90,7 +92,7 @@ fn report_memory_profiles() {
 
 fn bench_batch_contains(c: &mut Criterion) {
     let bitmap = build_bitmap(BITMAP_SIZE);
-    let probes = build_probe_batch(PROBE_BATCH);
+    let probes = build_probe_batch(PROBE_BATCH, BITMAP_SIZE);
 
     c.bench_function("roaring_seen/batch_contains_10k_against_1m", |b| {
         b.iter(|| black_box(bitmap.batch_contains(black_box(&probes))))
@@ -102,7 +104,7 @@ fn bench_batch_contains_sorted_scale(c: &mut Criterion, size: u32) {
     let ordinal = build_ordinal_bitset(size);
     let midx_bytes = build_midx_bytes(size);
     let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).expect("midx");
-    let mut probes = build_probe_batch(PROBE_BATCH);
+    let mut probes = build_probe_batch(PROBE_BATCH, size);
     probes.sort_unstable();
 
     // Sorted probes with duplicates retained (exercises the dedup fast path).

@@ -110,6 +110,12 @@ pub enum MidxError {
     /// Used when validating de-duplication requirements for input streams.
     #[error("duplicate input OID")]
     DuplicateInputOid,
+    /// The ordinal-seen payload uses an unsupported format version.
+    #[error("unsupported ordinal seen version: {version}")]
+    UnsupportedOrdinalVersion {
+        /// The version byte found in the payload.
+        version: u8,
+    },
 }
 
 impl MidxError {
@@ -137,14 +143,19 @@ impl MidxError {
 impl From<super::ordinal_seen::OrdinalSeenError> for MidxError {
     fn from(e: super::ordinal_seen::OrdinalSeenError) -> Self {
         use super::ordinal_seen::OrdinalSeenError;
-        MidxError::corrupt(match e {
-            OrdinalSeenError::Truncated => "truncated ordinal seen payload",
-            OrdinalSeenError::InvalidMagic => "invalid ordinal seen magic",
-            OrdinalSeenError::UnsupportedVersion(_) => "unsupported ordinal seen version",
-            OrdinalSeenError::LengthMismatch => "ordinal seen length mismatch",
-            OrdinalSeenError::CardinalityMismatch { .. } => "ordinal seen cardinality mismatch",
-            OrdinalSeenError::OutOfRangeBits => "ordinal seen out-of-range bits",
-            OrdinalSeenError::PayloadTooLarge { .. } => "ordinal seen payload too large",
-        })
+        match e {
+            OrdinalSeenError::UnsupportedVersion(version) => {
+                MidxError::UnsupportedOrdinalVersion { version }
+            }
+            other => MidxError::corrupt(match other {
+                OrdinalSeenError::Truncated => "truncated ordinal seen payload",
+                OrdinalSeenError::InvalidMagic => "invalid ordinal seen magic",
+                OrdinalSeenError::UnsupportedVersion(_) => unreachable!(),
+                OrdinalSeenError::LengthMismatch => "ordinal seen length mismatch",
+                OrdinalSeenError::CardinalityMismatch { .. } => "ordinal seen cardinality mismatch",
+                OrdinalSeenError::OutOfRangeBits => "ordinal seen out-of-range bits",
+                OrdinalSeenError::PayloadTooLarge { .. } => "ordinal seen payload too large",
+            }),
+        }
     }
 }

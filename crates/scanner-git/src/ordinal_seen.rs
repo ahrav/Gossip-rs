@@ -222,12 +222,10 @@ impl MidxOrdinalBitset {
         // which requires this invariant.
         if let Some(&last_word) = words.last() {
             let remainder = midx_object_count % 64;
+            // When remainder == 0 and words is non-empty, all 64 bits are valid
+            // so there are no padding bits to check.
             let padding_mask = if remainder == 0 {
-                if midx_object_count == 0 {
-                    u64::MAX
-                } else {
-                    0
-                }
+                0
             } else {
                 !((1u64 << remainder) - 1)
             };
@@ -324,6 +322,11 @@ impl MidxOrdinalBitset {
     ///
     /// Returns the count of newly marked ordinals. Inputs must be sorted in
     /// non-decreasing order. Duplicate OIDs are allowed and counted once.
+    ///
+    /// Sort order is validated upfront so a rejection never leaves the bitset
+    /// in a partially-modified state. OID length mismatches (e.g. SHA-256
+    /// probes against a SHA-1 MIDX) are treated as "not found," matching the
+    /// read-path behavior in [`batch_contains_sorted_into`](Self::batch_contains_sorted_into).
     pub fn mark_seen_batch(
         &mut self,
         midx: &MidxView<'_>,
@@ -331,22 +334,28 @@ impl MidxOrdinalBitset {
     ) -> Result<u32, MidxError> {
         self.validate_view(midx)?;
 
+        if oids.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err(MidxError::InputNotSorted);
+        }
+
         let mut newly_marked = 0u32;
         let mut cursor = MidxCursor::default();
         let mut previous_oid: Option<&OidBytes> = None;
 
         for oid in oids {
-            if let Some(previous) = previous_oid {
-                if previous > oid {
-                    return Err(MidxError::InputNotSorted);
-                }
-                if previous == oid {
-                    continue;
-                }
+            if previous_oid == Some(oid) {
+                continue;
             }
 
-            let lookup = midx.find_oid_sorted(&mut cursor, oid)?;
-            if let Some(ordinal) = lookup {
+            let ordinal = match midx.find_oid_sorted(&mut cursor, oid) {
+                Ok(found) => found,
+                // OID length mismatch (e.g. SHA-256 probe against SHA-1 MIDX)
+                // is treated as "not found" rather than a corruption error,
+                // matching the read-path behavior.
+                Err(MidxError::InputOidLengthMismatch { .. }) => None,
+                Err(e) => return Err(e),
+            };
+            if let Some(ordinal) = ordinal {
                 newly_marked += u32::from(self.test_and_set(ordinal));
             }
             previous_oid = Some(oid);
@@ -355,6 +364,12 @@ impl MidxOrdinalBitset {
         Ok(newly_marked)
     }
 
+    /// Checks that the MIDX view is compatible with this bitset.
+    ///
+    /// Currently validates object count only. Fingerprint validation requires
+    /// `MidxView` to expose a checksum accessor, which is not yet available.
+    /// Until then, callers must ensure the `MidxView` matches the snapshot
+    /// used to construct this bitset (i.e. the same MIDX file on disk).
     #[inline]
     fn validate_view(&self, midx: &MidxView<'_>) -> Result<(), MidxError> {
         if midx.object_count() != self.midx_object_count {
@@ -405,12 +420,9 @@ fn count_set_bits(words: &[u64], bit_count: u32) -> u32 {
         total += word.count_ones();
     }
     let remainder = bit_count % 64;
+    // When remainder == 0 and words is non-empty, all 64 bits are valid.
     let mask = if remainder == 0 {
-        if bit_count == 0 {
-            0
-        } else {
-            u64::MAX
-        }
+        u64::MAX
     } else {
         (1u64 << remainder) - 1
     };
@@ -521,6 +533,34 @@ mod tests {
             .mark_seen_batch(&midx, &[oid_from_u32(2), oid_from_u32(1)])
             .expect_err("decreasing input must fail");
         assert!(matches!(err, MidxError::InputNotSorted));
+    }
+
+    #[test]
+    fn mark_seen_batch_does_not_mutate_on_sort_rejection() {
+        let midx_bytes = build_test_midx(8);
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).expect("midx");
+        let mut bitset = MidxOrdinalBitset::new(midx.object_count(), [0x33; 32]);
+        // First OID would be a hit, second is unsorted relative to first.
+        let err = bitset
+            .mark_seen_batch(&midx, &[oid_from_u32(5), oid_from_u32(1)])
+            .expect_err("unsorted");
+        assert!(matches!(err, MidxError::InputNotSorted));
+        // No bits should have been set — the sort check fires before mutation.
+        assert_eq!(bitset.cardinality(), 0);
+        assert!(!bitset.test(5));
+    }
+
+    #[test]
+    fn mark_seen_batch_swallows_oid_length_mismatch_as_miss() {
+        let midx_bytes = build_test_midx(8);
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).expect("midx");
+        let mut bitset = MidxOrdinalBitset::new(midx.object_count(), [0x33; 32]);
+        // SHA-256 OID against a SHA-1 MIDX: treated as "not found", not an error.
+        let newly_marked = bitset
+            .mark_seen_batch(&midx, &[oid_from_u32(1), OidBytes::sha256([0x55; 32])])
+            .expect("length mismatch should be swallowed");
+        assert_eq!(newly_marked, 1);
+        assert!(bitset.test(1));
     }
 
     #[test]
