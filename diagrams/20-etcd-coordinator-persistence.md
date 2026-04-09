@@ -390,9 +390,9 @@ graph TB
     CFGE_EE["EmptyEndpoint { index }"]
     CFGE_IS["InvalidEndpointScheme { index }"]
     CFGE_EP["EmptyNamespacePrefix"]
-    CFGE_SS["PrefixMustStartWithSlash"]
-    CFGE_ES["PrefixMustNotEndWithSlash"]
-    CFGE_DS["PrefixContainsDoubleSlash"]
+    CFGE_SS["NamespacePrefixMustStartWithSlash"]
+    CFGE_ES["NamespacePrefixMustNotEndWithSlash"]
+    CFGE_DS["NamespacePrefixContainsDoubleSlash"]
 
     CODEC["EtcdCodecError (12 variants)<br/>Truncated, InvalidVersionPrefix,<br/>InvalidBlobKind, UnexpectedBlobKind,<br/>InvalidBool, InvalidEnum,<br/>InvalidSpec, InvalidCursor,<br/>SlabFull, TrailingBytes,<br/>InvariantViolation, FieldTooLarge"]
 
@@ -594,5 +594,7 @@ transaction shapes across the sync and async entrypoints.
 | `crates/gossip-coordination-etcd/src/tests.rs` | Config, keyspace, property tests, integration test |
 | `crates/gossip-coordination-etcd/src/codec_tests.rs` | Codec round-trip and error-case tests |
 | `crates/gossip-coordination-etcd/fuzz/fuzz_targets/` | 4 libfuzzer targets for decode/round-trip |
-| `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend`, `AsyncCoordinationBackend`, `RunManagement`, `AsyncRunManagement`, `ShardClaiming` trait definitions |
+| `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend`, `AsyncCoordinationBackend` trait definitions |
+| `crates/gossip-coordination/src/run.rs` | `RunManagement`, `AsyncRunManagement` trait definitions |
+| `crates/gossip-coordination/src/facade.rs` | `ShardClaiming` trait definition |
 | `crates/gossip-coordination/src/in_memory.rs` | `InMemoryCoordinator` reference implementation |
