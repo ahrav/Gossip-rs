@@ -588,9 +588,13 @@ impl Ord for MergeEntry<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::repo::RepoKind;
     use tempfile::tempdir;
+
+    const SMALL_MODEL_BUCKETS: [u8; 4] = [0x00, 0x40, 0x80, 0xC0];
 
     /// Helper to build minimal pack index v2 bytes for MIDX merge tests.
     struct TestIdxBuilder {
@@ -655,6 +659,196 @@ mod tests {
         oid[1] = second;
         oid[19] = first ^ second;
         oid
+    }
+
+    #[derive(Debug)]
+    struct SmallModelPack {
+        pack_id: u16,
+        pack_name: Vec<u8>,
+        idx_bytes: Vec<u8>,
+        objects: Vec<([u8; 20], u64)>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CanonicalMidx {
+        fanout: [u32; FANOUT_ENTRIES],
+        entries: Vec<([u8; 20], (u16, u64))>,
+    }
+
+    fn for_each_permutation(indices: &mut [usize], start: usize, visit: &mut impl FnMut(&[usize])) {
+        if start == indices.len() {
+            visit(indices);
+            return;
+        }
+
+        for index in start..indices.len() {
+            indices.swap(start, index);
+            for_each_permutation(indices, start + 1, visit);
+            indices.swap(start, index);
+        }
+    }
+
+    fn duplicate_subsets(pack_count: usize) -> Vec<u8> {
+        let mut subsets = Vec::new();
+        for mask in 0u8..(1u8 << pack_count) {
+            if mask.count_ones() >= 2 {
+                subsets.push(mask);
+            }
+        }
+        subsets
+    }
+
+    fn duplicate_mask_sequences(subsets: &[u8], duplicate_count: usize) -> Vec<Vec<u8>> {
+        if duplicate_count == 0 {
+            return vec![Vec::new()];
+        }
+
+        let mut sequences = Vec::new();
+        let mut current = Vec::with_capacity(duplicate_count);
+
+        fn build_sequences(
+            subsets: &[u8],
+            duplicate_count: usize,
+            current: &mut Vec<u8>,
+            sequences: &mut Vec<Vec<u8>>,
+        ) {
+            if current.len() == duplicate_count {
+                sequences.push(current.clone());
+                return;
+            }
+
+            for &subset in subsets {
+                current.push(subset);
+                build_sequences(subsets, duplicate_count, current, sequences);
+                current.pop();
+            }
+        }
+
+        build_sequences(subsets, duplicate_count, &mut current, &mut sequences);
+        sequences
+    }
+
+    fn build_small_model_packs(
+        pack_count: usize,
+        objects_per_pack: usize,
+        duplicate_masks: &[u8],
+        bucket_rotation: usize,
+    ) -> Vec<SmallModelPack> {
+        let mut objects_by_pack = vec![Vec::with_capacity(objects_per_pack); pack_count];
+
+        for (duplicate_idx, &mask) in duplicate_masks.iter().enumerate() {
+            let oid = test_oid(
+                SMALL_MODEL_BUCKETS
+                    [(bucket_rotation + duplicate_idx * 2) % SMALL_MODEL_BUCKETS.len()],
+                0xe0 + duplicate_idx as u8,
+            );
+            for (pack_idx, objects) in objects_by_pack.iter_mut().enumerate() {
+                if mask & (1u8 << pack_idx) == 0 {
+                    continue;
+                }
+                let offset = 1_000 + (pack_idx as u64 * 100) + objects.len() as u64;
+                objects.push((oid, offset));
+            }
+        }
+
+        for (pack_idx, objects) in objects_by_pack.iter_mut().enumerate() {
+            let unique_needed = objects_per_pack
+                .checked_sub(objects.len())
+                .expect("duplicate masks must not overfill a pack");
+            for slot in 0..unique_needed {
+                let oid = test_oid(
+                    SMALL_MODEL_BUCKETS[(bucket_rotation
+                        + duplicate_masks.len()
+                        + pack_idx
+                        + slot)
+                        % SMALL_MODEL_BUCKETS.len()],
+                    (slot * pack_count + pack_idx) as u8,
+                );
+                let offset = 1_000 + (pack_idx as u64 * 100) + objects.len() as u64;
+                objects.push((oid, offset));
+            }
+        }
+
+        objects_by_pack
+            .into_iter()
+            .enumerate()
+            .map(|(pack_idx, objects)| {
+                let mut builder = TestIdxBuilder::new();
+                for &(oid, offset) in &objects {
+                    builder.add_object(oid, offset);
+                }
+                SmallModelPack {
+                    pack_id: pack_idx as u16,
+                    pack_name: format!("pack-{pack_idx}.pack").into_bytes(),
+                    idx_bytes: builder.build(),
+                    objects,
+                }
+            })
+            .collect()
+    }
+
+    fn expected_midx(packs: &[SmallModelPack]) -> CanonicalMidx {
+        let mut winners = BTreeMap::new();
+        for pack in packs {
+            for &(oid, offset) in &pack.objects {
+                winners
+                    .entry(oid)
+                    .and_modify(|winner: &mut (u16, u64)| {
+                        if pack.pack_id < winner.0 {
+                            *winner = (pack.pack_id, offset);
+                        }
+                    })
+                    .or_insert((pack.pack_id, offset));
+            }
+        }
+
+        let mut fanout = [0u32; FANOUT_ENTRIES];
+        let mut entries = Vec::with_capacity(winners.len());
+        for (oid, winner) in winners {
+            fanout[oid[0] as usize] += 1;
+            entries.push((oid, winner));
+        }
+
+        let mut running = 0u32;
+        for count in &mut fanout {
+            running += *count;
+            *count = running;
+        }
+
+        CanonicalMidx { fanout, entries }
+    }
+
+    fn canonicalize_midx(midx: &MidxView<'_>) -> CanonicalMidx {
+        let mut fanout = [0u32; FANOUT_ENTRIES];
+        let mut prev_fanout = 0u32;
+        for (bucket, slot) in fanout.iter_mut().enumerate() {
+            let value = midx.fanout(bucket as u8);
+            assert!(
+                value >= prev_fanout,
+                "fanout must be monotonic: bucket={bucket} value={value} prev={prev_fanout}"
+            );
+            *slot = value;
+            prev_fanout = value;
+        }
+        assert_eq!(
+            fanout[FANOUT_ENTRIES - 1],
+            midx.object_count(),
+            "fanout[255] must equal object_count"
+        );
+
+        let mut entries = Vec::with_capacity(midx.object_count() as usize);
+        let mut prev_oid: Option<[u8; 20]> = None;
+        for idx in 0..midx.object_count() {
+            let mut oid = [0u8; 20];
+            oid.copy_from_slice(midx.oid_at(idx));
+            if let Some(prev) = prev_oid {
+                assert!(prev < oid, "OIDL must be strictly ascending at index {idx}");
+            }
+            prev_oid = Some(oid);
+            entries.push((oid, midx.offset_at(idx).unwrap()));
+        }
+
+        CanonicalMidx { fanout, entries }
     }
 
     fn test_repo_with_pack_file(pack_basename: &str) -> (tempfile::TempDir, GitRepoPaths, PathBuf) {
@@ -800,6 +994,99 @@ mod tests {
 
         assert_eq!(midx.oid_at(0), &shared_oid);
         assert_eq!(midx.offset_at(0).unwrap(), (0, 111));
+    }
+
+    #[test]
+    fn exhaustive_small_model_merge_covers_all_pack_orderings() {
+        let mut builds_tested = 0usize;
+
+        for pack_count in 2..=4usize {
+            let duplicate_subsets = duplicate_subsets(pack_count);
+
+            for objects_per_pack in 1..=6usize {
+                for duplicate_count in 0..=objects_per_pack.min(2) {
+                    for duplicate_masks in
+                        duplicate_mask_sequences(&duplicate_subsets, duplicate_count)
+                    {
+                        for bucket_rotation in 0..SMALL_MODEL_BUCKETS.len() {
+                            let packs = build_small_model_packs(
+                                pack_count,
+                                objects_per_pack,
+                                &duplicate_masks,
+                                bucket_rotation,
+                            );
+                            let idx_views: Vec<_> = packs
+                                .iter()
+                                .map(|pack| {
+                                    IdxView::parse(&pack.idx_bytes, ObjectFormat::Sha1)
+                                        .expect("small-model idx bytes should parse")
+                                })
+                                .collect();
+                            let expected = expected_midx(&packs);
+                            let total_objects = pack_count * objects_per_pack;
+                            let expected_permutations = (1..=pack_count).product::<usize>();
+                            let mut observed_permutations = 0usize;
+                            let mut order: Vec<_> = (0..pack_count).collect();
+
+                            for_each_permutation(&mut order, 0, &mut |permutation| {
+                                // Keep canonical pack_ids stable while permuting the view slice so
+                                // duplicate resolution remains tied to pack identity rather than
+                                // slice position.
+                                let views: Vec<_> = permutation
+                                    .iter()
+                                    .map(|&pack_idx| {
+                                        (
+                                            packs[pack_idx].pack_id,
+                                            packs[pack_idx].pack_name.clone(),
+                                            idx_views[pack_idx],
+                                        )
+                                    })
+                                    .collect();
+                                let midx_bytes =
+                                    build_midx_in_memory(&views, ObjectFormat::Sha1, total_objects)
+                                        .expect("small-model MIDX build should succeed");
+                                let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1)
+                                    .expect("small-model MIDX should parse");
+                                let actual = canonicalize_midx(&midx);
+
+                                assert_eq!(
+                                    midx.pack_count(),
+                                    pack_count as u32,
+                                    "pack_count changed for order {:?}, duplicate_masks={:?}, rotation={bucket_rotation}",
+                                    permutation,
+                                    duplicate_masks,
+                                );
+                                assert_eq!(
+                                    actual.entries.len(),
+                                    expected.entries.len(),
+                                    "unique object count changed for order {:?}, duplicate_masks={:?}, rotation={bucket_rotation}",
+                                    permutation,
+                                    duplicate_masks,
+                                );
+                                assert_eq!(
+                                    actual,
+                                    expected,
+                                    "small-model merge mismatch for pack_count={pack_count}, objects_per_pack={objects_per_pack}, duplicate_masks={duplicate_masks:?}, rotation={bucket_rotation}, order={permutation:?}",
+                                );
+
+                                builds_tested += 1;
+                                observed_permutations += 1;
+                            });
+
+                            assert_eq!(
+                                observed_permutations, expected_permutations,
+                                "permutation enumeration mismatch for pack_count={pack_count}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            builds_tested >= 1_000,
+            "exhaustive small-model test should exercise many builds: {builds_tested}"
+        );
     }
 
     #[test]
