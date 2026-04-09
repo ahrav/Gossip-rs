@@ -12,6 +12,12 @@
 //! `KeyedEntry::key_bytes()` in ascending byte-lexicographic order. Bound
 //! resolution is key-byte authoritative and intentionally does not decode keys
 //! beyond size validation.
+//!
+//! # Design Notes
+//!
+//! I/O permanence classification is intentionally conservative: only error
+//! kinds known to be structurally permanent are marked permanent, while unknown
+//! or timing-sensitive failures remain retryable by default.
 
 use std::{
     io,
@@ -235,6 +241,9 @@ pub(crate) fn deadline_expired(deadline: Option<Instant>) -> bool {
 /// mismatches, read-only mounts, and symlink loops — will not resolve on
 /// retry. Everything else (interrupted, would-block, connection-reset, etc.)
 /// is assumed transient and therefore retryable.
+///
+/// This policy intentionally favors retryability for unrecognized cases so new
+/// `ErrorKind` variants are not accidentally treated as hard failures.
 pub fn is_permanent_io_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -282,6 +291,9 @@ pub(crate) fn classify_io_enumerate_error(
 /// When `path` is `Some`, a [`ToxicDigest`] of the path is included in
 /// the message for log-safe diagnostics; when `None`, only the operation
 /// and error are reported.
+///
+/// The returned retryability is derived solely from [`is_permanent_io_error`]
+/// to keep read and enumerate paths aligned.
 pub(crate) fn classify_io_read_error(op: &str, path: Option<&Path>, err: &io::Error) -> ReadError {
     let msg = match path {
         Some(p) => format!("{op} failed for ({digest}): {err}", digest = path_digest(p)),
@@ -324,6 +336,9 @@ pub(crate) fn enumerate_error_to_read(error: EnumerateError) -> ReadError {
 // ---------------------------------------------------------------------------
 
 /// Convert raw path bytes to a [`PathBuf`] losslessly on Unix.
+///
+/// Unix paths are opaque byte sequences, so this conversion preserves all
+/// bytes exactly with no UTF-8 validation.
 #[cfg(unix)]
 pub fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes.to_vec()))
