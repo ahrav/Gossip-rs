@@ -137,9 +137,9 @@ graph TD
     style SGIT fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
 ```
 
-**Generic hooks.** `OrderedContentRuntime::execute_source`,
-`GitRepoRuntime::execute_discovery`, and `GitRepoRuntime::execute_repo` are the
-family-shaped generic hooks exported by the runtime crate.
+**Generic hooks.** `OrderedContentRuntime::execute_source` (exported),
+`GitRepoRuntime::execute_discovery` (internal), and `GitRepoRuntime::execute_repo` (internal) are the
+family-shaped generic hooks used by the runtime crate.
 
 **Concrete implementations stay on the family contracts.**
 `FilesystemConnector` and `InMemoryDeterministicConnector`
@@ -181,7 +181,7 @@ sequenceDiagram
 
     LOOP->>CS: finish_item(item_key)
     CS->>CS: translate_in_flight(item_key, InFlightItem)
-    CS->>CS: translate_item_result(findings, rule_fingerprint_resolver)
+    CS->>CS: translate_item_result(findings, rule_fingerprint)
     note right of CS: Batch identity derivation (NormHash, FindingId, OccurrenceId)
     CS->>CS: submit QueuedCommit to commit pipeline
     CS->>REC: record_commit_progress(Finish { item_key })
@@ -268,6 +268,8 @@ helpers that assemble direct coordination and durability backends.
 | Ordered-content runtime module | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | Git runtime module | `crates/gossip-scanner-runtime/src/git_repo.rs` |
 | Distributed runtime module | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| Receipt-driven commit bridge and tracking | `crates/gossip-scanner-runtime/src/distributed/commit_bridge.rs` |
+| Commit pipeline and queued commit records | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` |
 | Commit sink trait and bridge record types | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
 | Deterministic identity derivation | `crates/gossip-scanner-runtime/src/result_translation.rs` |
 | Coordination event recorder types | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
