@@ -31,6 +31,10 @@ use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use gossip_contracts::identity::{FenceEpoch, LogicalTime, OpId, ShardId, ShardKey, WorkerId};
 
+/// Calls [`RunManagement::list_shards_into`] for the canonical test tenant/run.
+///
+/// This helper centralizes boilerplate used across filter tests and treats
+/// any lookup failure as a test failure.
 fn list_shards_with_filter(
     coord: &InMemoryCoordinator,
     at: LogicalTime,
@@ -252,22 +256,22 @@ use proptest::prelude::*;
 /// time (enabling lease expiry between operations).
 #[derive(Debug, Clone)]
 enum Op {
-    Acquire {
-        worker: u8,
-    },
-    Checkpoint {
-        cursor_key: u8,
-    },
-    Complete {
-        cursor_key: u8,
-    },
+    /// Attempts to acquire a shard for `worker`.
+    Acquire { worker: u8 },
+    /// Attempts a checkpoint with a single-byte cursor key.
+    Checkpoint { cursor_key: u8 },
+    /// Attempts completion with a single-byte cursor key.
+    Complete { cursor_key: u8 },
+    /// Attempts to park the most recently acquired lease.
     Park,
+    /// Attempts to renew the most recently acquired lease.
     Renew,
+    /// Attempts split-replace on the most recently acquired lease.
     SplitReplace,
+    /// Attempts split-residual on the most recently acquired lease.
     SplitResidual,
-    TimeAdvance {
-        ticks: u64,
-    },
+    /// Advances logical time without issuing coordinator mutations.
+    TimeAdvance { ticks: u64 },
     /// Run-level: complete the run (Active -> Done).
     CompleteRun,
     /// Run-level: fail the run (Active -> Failed).
@@ -627,7 +631,10 @@ proptest! {
 // - Terminal shards (Done, Parked) are excluded from the count.
 // - The half-open deadline boundary (`now < deadline`) is respected.
 
-/// Helper: create a coordinator with `n` shards in a single run.
+/// Creates a single-run coordinator preloaded with `n` contiguous shards.
+///
+/// The returned coordinator has one tenant/run in `Active` state with all
+/// shards registered, `Active`, and unleased.
 fn multi_shard_coordinator(n: usize) -> InMemoryCoordinator {
     use crate::test_fixtures::test_run_config as run_config;
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
@@ -1054,8 +1061,6 @@ fn memory_budget_constants_match_struct_sizes() {
     let shard_size = size_of::<ShardRecord>();
     let run_size = size_of::<RunRecord>();
 
-    // The planning formula uses constants from in_memory.rs; keep them in
-    // lockstep with the actual target layout.
     // Keep this test in lockstep with the implementation and docs.
     assert_eq!(
         shard_size,
