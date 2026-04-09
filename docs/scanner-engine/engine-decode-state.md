@@ -107,7 +107,7 @@ pub(super) fn materialize(&self, mut id: StepId, out: &mut ScratchVec<DecodeStep
         out.push(node.step.to_decode_step());
         id = node.parent;
     }
-    // Reverse to root-to-leaf order
+    // Reverse in place
     let len = out.len();
     for i in 0..len / 2 {
         out.as_mut_slice().swap(i, len - 1 - i);
