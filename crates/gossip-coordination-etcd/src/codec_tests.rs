@@ -1,9 +1,19 @@
 //! Tests for etcd coordination record encoding and decoding.
 //!
-//! Contains round-trip property tests and structural unit tests for the binary
-//! codec used to persist `RunRecord` and `ShardRecord` structures to etcd.
-//! Ensures that field validation, length constraints, and invariant checks
-//! are correctly applied during deserialization.
+//! Covers the v1 wire format used to persist `RunRecord`, `ShardRecord`, and
+//! shard-owner metadata into etcd.
+//!
+//! The suite mixes example-driven tests, crafted invalid blobs, and proptests
+//! so the codec is exercised from both directions:
+//! - encoding valid in-memory records to a stable byte representation,
+//! - decoding bytes while enforcing version, length, and semantic invariants,
+//! - rolling back staged `ByteSlab` allocations when decode fails partway
+//!   through a record.
+//!
+//! The helpers near the bottom of the file intentionally construct records that
+//! satisfy coordination invariants before round-tripping them. The invalid-blob
+//! helpers do the opposite: they build wire payloads that isolate one rejected
+//! condition at a time so each failure mode stays easy to diagnose.
 
 use super::*;
 
@@ -338,6 +348,7 @@ fn decode_shard_record_rolls_back_on_slab_exhaustion() {
 // Proptest: RunRecord round-trip with random fields
 // ---------------------------------------------------------------------------
 
+/// Generates either cursor semantic accepted by the v1 run/shard codecs.
 fn arb_cursor_semantics() -> impl Strategy<Value = CursorSemantics> {
     prop_oneof![
         Just(CursorSemantics::Completed),
@@ -345,6 +356,7 @@ fn arb_cursor_semantics() -> impl Strategy<Value = CursorSemantics> {
     ]
 }
 
+/// Generates the run states that can appear in persisted records.
 fn arb_run_status() -> impl Strategy<Value = RunStatus> {
     prop_oneof![
         Just(RunStatus::Initializing),
@@ -379,7 +391,6 @@ fn arb_run_record() -> impl Strategy<Value = RunRecord> {
                     1usize..=4usize
                 };
 
-                // Generate between 0 and 4 op-log entries.
                 let op_count = 0usize..=4usize;
 
                 (
@@ -506,6 +517,7 @@ proptest! {
 // Proptest: ShardRecord round-trip with random fields
 // ---------------------------------------------------------------------------
 
+/// Generates persisted shard states covered by the shard codec.
 fn arb_shard_status() -> impl Strategy<Value = ShardStatus> {
     prop_oneof![
         Just(ShardStatus::Active),
@@ -515,6 +527,7 @@ fn arb_shard_status() -> impl Strategy<Value = ShardStatus> {
     ]
 }
 
+/// Generates every park reason that may be serialized with a parked shard.
 fn arb_park_reason() -> impl Strategy<Value = ParkReason> {
     prop_oneof![
         Just(ParkReason::PermissionDenied),
@@ -525,6 +538,7 @@ fn arb_park_reason() -> impl Strategy<Value = ParkReason> {
     ]
 }
 
+/// Generates shard op kinds that can populate the shard op-log.
 fn arb_op_kind() -> impl Strategy<Value = OpKind> {
     prop_oneof![
         Just(OpKind::Checkpoint),
@@ -536,6 +550,7 @@ fn arb_op_kind() -> impl Strategy<Value = OpKind> {
     ]
 }
 
+/// Generates result variants accepted by `OpLogEntry`.
 fn arb_op_result() -> impl Strategy<Value = OpResult> {
     prop_oneof![
         Just(OpResult::Completed),
@@ -1402,6 +1417,8 @@ fn shard_record_with_u64_max_run_and_shard_ids_round_trips() {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Builds a small `RunRecord` fixture whose op-log and root-shard set stay
+/// consistent with the requested status.
 fn sample_run_record(status: RunStatus, cursor_semantics: CursorSemantics) -> RunRecord {
     let tenant = TenantId::from_bytes([0x11; 32]);
     let run = RunId::from_raw(0x0102_0304_0506_0708);
@@ -1471,6 +1488,8 @@ fn sample_run_record(status: RunStatus, cursor_semantics: CursorSemantics) -> Ru
     record
 }
 
+/// Builds an active split-child shard fixture with lease, spawned child, and
+/// op-log state populated so round-trip tests cover the dense shard shape.
 fn sample_active_child_shard_record(cursor_semantics: CursorSemantics) -> (ShardRecord, ByteSlab) {
     let tenant = TenantId::from_bytes([0x22; 32]);
     let run = RunId::from_raw(0x9999);
@@ -1526,6 +1545,7 @@ fn sample_active_child_shard_record(cursor_semantics: CursorSemantics) -> (Shard
     (record, slab)
 }
 
+/// Builds a terminal shard fixture with a cursor and completion op-log entry.
 fn sample_done_shard_record() -> (ShardRecord, ByteSlab) {
     let tenant = TenantId::from_bytes([0x33; 32]);
     let run = RunId::from_raw(0x1001);
@@ -1556,6 +1576,8 @@ fn sample_done_shard_record() -> (ShardRecord, ByteSlab) {
     (record, slab)
 }
 
+/// Builds a split shard fixture whose spawned children satisfy split-state
+/// invariants without introducing extra lease or cursor state.
 fn sample_split_shard_record() -> (ShardRecord, ByteSlab) {
     let tenant = TenantId::from_bytes([0x44; 32]);
     let run = RunId::from_raw(0x1002);
@@ -1586,6 +1608,7 @@ fn sample_split_shard_record() -> (ShardRecord, ByteSlab) {
     (record, slab)
 }
 
+/// Builds a parked shard fixture for park-reason round-trip coverage.
 fn sample_parked_shard_record(park_reason: ParkReason) -> (ShardRecord, ByteSlab) {
     let tenant = TenantId::from_bytes([0x55; 32]);
     let run = RunId::from_raw(0x1003);
@@ -1616,6 +1639,8 @@ fn sample_parked_shard_record(park_reason: ParkReason) -> (ShardRecord, ByteSlab
     (record, slab)
 }
 
+/// Compares two shard records including the slab-backed fields that do not
+/// participate directly in `PartialEq`.
 fn assert_shard_record_eq(
     expected: &ShardRecord,
     expected_slab: &ByteSlab,
@@ -1665,10 +1690,12 @@ fn assert_shard_record_eq(
     }
 }
 
+/// Releases slab-backed fields allocated for a test fixture or decoded record.
 fn release_shard_record(record: &mut ShardRecord, slab: &mut ByteSlab) {
     record.deallocate_fields(slab);
 }
 
+/// Copies spawned-child ids into pooled slab storage when a fixture needs them.
 fn pooled_spawned(spawned: &[ShardId], slab: &mut ByteSlab) -> PooledSpawned {
     let mut pooled = PooledSpawned::new();
     if !spawned.is_empty() {
@@ -1680,10 +1707,13 @@ fn pooled_spawned(spawned: &[ShardId], slab: &mut ByteSlab) -> PooledSpawned {
     pooled
 }
 
+/// Marks a raw shard id as derived by setting the parent-bit used in tests.
 fn derived_shard(base: u64) -> ShardId {
     ShardId::from_raw(base | (1u64 << 63))
 }
 
+/// Encodes an `Active` run with no roots so decode hits the run invariant
+/// instead of failing earlier on wire-shape validation.
 fn invalid_active_run_without_roots_blob() -> Vec<u8> {
     let mut blob = Vec::new();
     blob.extend_from_slice(b"v1");
@@ -1701,6 +1731,8 @@ fn invalid_active_run_without_roots_blob() -> Vec<u8> {
     blob
 }
 
+/// Encodes a shard cursor token without a last key so decode exercises the
+/// cursor-shape invariant directly.
 fn invalid_shard_token_without_last_key_blob() -> Vec<u8> {
     let mut blob = Vec::new();
     blob.extend_from_slice(b"v1");
@@ -1860,10 +1892,8 @@ fn decode_run_record_rejects_oversized_registered_shards() {
     );
 }
 
-/// Verify: shard op_log timestamps are not checked for monotonicity.
-///
-/// Encodes a shard record with out-of-order op_log timestamps. If this
-/// decodes successfully, the monotonicity check is missing.
+/// Encodes a shard record with out-of-order op-log timestamps and asserts that
+/// decode rejects the invariant violation explicitly.
 #[test]
 fn decode_shard_record_rejects_non_monotonic_op_log_timestamps() {
     let mut blob = Vec::new();
@@ -1922,9 +1952,9 @@ fn decode_shard_record_rejects_non_monotonic_op_log_timestamps() {
 // Large root-shard count round-trip (structural bound, no hard cap)
 // ---------------------------------------------------------------------------
 
-/// Records with >1024 root shards round-trip correctly now that the decoder
-/// derives its allocation guard from remaining wire bytes rather than a
-/// hard-coded constant.
+/// Records with a large root-shard set still round-trip because the decoder
+/// derives its allocation guard from the remaining wire bytes rather than an
+/// unrelated fixed threshold.
 #[test]
 fn run_record_large_root_shard_count_round_trips() {
     let tenant = TenantId::from_bytes([0xFD; 32]);
