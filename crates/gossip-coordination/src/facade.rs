@@ -151,12 +151,9 @@ impl fmt::Display for ClaimError {
     }
 }
 
-/// Maps run-lookup errors into claim errors.
-///
-/// `collect_claim_candidates_into` returns `GetRunError`, which we translate
-/// 1:1 since both `RunNotFound` and `TenantMismatch` apply identically at
-/// the claim level. The match is exhaustive (no wildcard) so adding a new
-/// `GetRunError` variant produces a compile error here.
+/// Maps `GetRunError` variants produced by `collect_claim_candidates_into`
+/// directly into `ClaimError`, keeping the mapping exhaustive so new
+/// `GetRunError` variants must be mapped explicitly.
 impl From<GetRunError> for ClaimError {
     fn from(e: GetRunError) -> Self {
         match e {
@@ -167,8 +164,8 @@ impl From<GetRunError> for ClaimError {
     }
 }
 
-// Compile-time size guard: keeps `ClaimError` small so the error path of
-// `Result<_, ClaimError>` is lightweight.
+/// Keeps `ClaimError` compact (<= 56 bytes) so the claim error path remains
+/// stack-friendly without inflating each call frame.
 const _: () = assert!(std::mem::size_of::<ClaimError>() <= 56);
 
 // ============================================================================
@@ -248,6 +245,21 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 56);
 /// - [`ClaimError::BackendError`] — the coordination backend
 ///   encountered an infrastructure-level error. See [`InfraError`]
 ///   for transient vs. corruption classification.
+///
+/// ## Candidate buffer lifecycle
+///
+/// `candidates` is a caller-owned buffer that `collect_claim_candidates_into`
+/// refills on every invocation, letting orchestrators reuse the same `Vec`
+/// without repeated allocations. `out` is the scratch space that backs the
+/// returned `AcquireResultView`; callers must keep it alive for the lifetime
+/// of that view because `snapshot` borrows from `out`.
+///
+/// ## Consistency guard
+///
+/// `ShardNotFound` counts toward `inconsistency_count`. If every candidate
+/// vanishes before acquisition, the backend index has diverged from the
+/// shard map and we panic to surface this corruption instead of silently
+/// returning `NoneAvailable`.
 pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
     backend: &mut B,
     now: LogicalTime,
@@ -269,10 +281,9 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
 
     let len = candidates.len();
     let offset = worker.as_raw() as usize % len;
-    let mut inconsistency_count = 0usize;
-    // Merge the scan-phase earliest deadline with any tighter deadlines
-    // discovered during per-shard acquire attempts (AlreadyLeased errors).
+    let mut inconsistency_count = 0usize; // Counts `ShardNotFound` hits for the consistency guard.
     let mut earliest_deadline: Option<LogicalTime> = scan_deadline;
+    // Track the tightest deadline observed both during the scan and in race results.
     let mut i = 0usize;
     let acquired = loop {
         if i == len {
@@ -313,11 +324,9 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
                 continue;
             }
             Err(AcquireError::ShardNotFound { .. }) => {
-                // collect_claim_candidates_into returned this shard but
-                // acquire_and_restore says it doesn't exist.  Isolated
-                // occurrences are tolerable (a concurrent split_replace
-                // could cause a transient gap); all-not-found is data
-                // corruption and is caught by the post-loop assert.
+                // Candidate disappeared between the scan and `acquire_and_restore_into`,
+                // e.g. a concurrent `split_replace`. The consistency guard below will panic
+                // if every candidate vanishes this way.
                 debug_assert!(
                     false,
                     "claim_next_available: candidate shard {key:?} \
@@ -349,9 +358,7 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
         });
     }
 
-    // Partial ShardNotFound is tolerable (concurrent mutations).
-    // All-not-found means the backend's shard index is fundamentally
-    // inconsistent with the shard map — unconditional panic (data corruption).
+    // Panic if every candidate disappeared to flag backend index corruption.
     assert!(
         inconsistency_count < candidates.len(),
         "all {} candidates returned ShardNotFound — backend index vs shard map inconsistency",
@@ -439,8 +446,6 @@ pub trait ShardClaiming: CoordinationBackend + RunManagement {
         out: &'a mut AcquireScratch,
     ) -> Result<AcquireResultView<'a>, ClaimError>;
 }
-
-// No blanket impl: backends must implement `ShardClaiming` explicitly.
 
 // ============================================================================
 // CoordinationFacade — combined super-trait
