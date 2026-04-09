@@ -8,7 +8,6 @@ Representative view of the current built-in detection rules used by scanner-rs.
 - [crates/scanner-engine/src/rules/yaml.rs](../../crates/scanner-engine/src/rules/yaml.rs)
 - [crates/scanner-engine/src/rules/mod.rs](../../crates/scanner-engine/src/rules/mod.rs)
 - [crates/scanner-engine/src/demo.rs](../../crates/scanner-engine/src/demo.rs)
-- [crates/scanner-scheduler/src/scheduler/parallel_scan.rs](../../crates/scanner-scheduler/src/scheduler/parallel_scan.rs)
 
 ## Current Snapshot
 
@@ -35,7 +34,7 @@ Rule loading order:
 3. Compiled-in fallback embedded from `crates/scanner-engine/default_rules.yaml` via `include_str!("../../default_rules.yaml")` in `crates/scanner-engine/src/rules/mod.rs`
 
 Startup logs include the resolved rule source and a stable fast non-cryptographic
-`rule_hash` fingerprint of the loaded rule bytes to make cache and rule-source
+`rules_content_hash64` fingerprint of the loaded rule bytes to make cache and rule-source
 behavior auditable.
 
 ## Suppression Controls
