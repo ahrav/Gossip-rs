@@ -416,4 +416,5 @@ overwhelm the coordinator's shard tracking.
 | `crates/gossip-coordination/src/record.rs`               | `ShardStatus::Split`, `ShardRecord`                                          |
 | `crates/gossip-frontier/src/hint.rs`                     | `propagate_hint_on_split()`                                                  |
 | `crates/gossip-frontier/src/builder.rs`                  | `PreallocShardBuilder::split_range_by_boundaries()`                          |
-| `crates/gossip-contracts/src/connector/api.rs`           | `ConnectorCapabilities`, `choose_split_point()` (inherent method on each connector)  |
+| `crates/gossip-contracts/src/connector/api.rs`           | `ConnectorCapabilities`                                                      |
+| `crates/gossip-contracts/src/connector/ordered.rs`       | `OrderedContentSource::choose_split_point()`                                 |
