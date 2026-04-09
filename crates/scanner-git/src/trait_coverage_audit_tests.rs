@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +10,11 @@ struct TraitCoverageAudit {
 }
 
 const TRAIT_COVERAGE_AUDIT: &[TraitCoverageAudit] = &[
+    TraitCoverageAudit {
+        trait_name: "CacheSlot",
+        real_impls: &["DeltaSlot", "TreeSlot"],
+        test_stubs: &["TestSlot"],
+    },
     TraitCoverageAudit {
         trait_name: "CandidateSink",
         real_impls: &[
@@ -32,7 +37,12 @@ const TRAIT_COVERAGE_AUDIT: &[TraitCoverageAudit] = &[
     TraitCoverageAudit {
         trait_name: "ExternalBaseProvider",
         real_impls: &["PackIo", "SimPackIo"],
-        test_stubs: &["ExternalBaseProviderImpl", "NoExternal"],
+        test_stubs: &[
+            "ExternalBaseProviderImpl",
+            "FailingExternalBase",
+            "MissingExternalBase",
+            "NoExternal",
+        ],
     },
     TraitCoverageAudit {
         trait_name: "GitEventOutput",
@@ -52,7 +62,12 @@ const TRAIT_COVERAGE_AUDIT: &[TraitCoverageAudit] = &[
     TraitCoverageAudit {
         trait_name: "PackObjectSink",
         real_impls: &["EngineAdapter"],
-        test_stubs: &["CollectingSink", "ErrorSink", "TestSink"],
+        test_stubs: &[
+            "CollectingSink",
+            "ErrorOnFinishSink",
+            "ErrorSink",
+            "TestSink",
+        ],
     },
     TraitCoverageAudit {
         trait_name: "PackReader",
@@ -224,7 +239,7 @@ fn parse_impl_for(trimmed: &str) -> Option<(String, String)> {
 /// Scans all `.rs` files under `dir` for `impl Trait for Type` lines.
 ///
 /// Returns a set of `(trait_name, type_name)` pairs with path prefixes
-/// and generics stripped. Comment lines (`//`) are skipped.
+/// and generics stripped. Line and block comments are skipped.
 fn collect_impl_pairs(dir: &Path) -> HashSet<(String, String)> {
     let mut files = Vec::new();
     collect_rs_files(dir, &mut files);
@@ -232,8 +247,21 @@ fn collect_impl_pairs(dir: &Path) -> HashSet<(String, String)> {
     let mut pairs = HashSet::new();
     for path in &files {
         let source = fs::read_to_string(path).unwrap();
+        let mut in_block_comment = false;
         for line in source.lines() {
             let trimmed = line.trim_start();
+            if in_block_comment {
+                if trimmed.contains("*/") {
+                    in_block_comment = false;
+                }
+                continue;
+            }
+            if trimmed.starts_with("/*") {
+                if !trimmed.contains("*/") {
+                    in_block_comment = true;
+                }
+                continue;
+            }
             if trimmed.starts_with("//") {
                 continue;
             }
@@ -259,8 +287,21 @@ fn collect_type_names(dir: &Path) -> HashSet<String> {
     let mut names = HashSet::new();
     for path in &files {
         let source = fs::read_to_string(path).unwrap();
+        let mut in_block_comment = false;
         for line in source.lines() {
             let trimmed = line.trim_start();
+            if in_block_comment {
+                if trimmed.contains("*/") {
+                    in_block_comment = false;
+                }
+                continue;
+            }
+            if trimmed.starts_with("/*") {
+                if !trimmed.contains("*/") {
+                    in_block_comment = true;
+                }
+                continue;
+            }
             if trimmed.starts_with("//") {
                 continue;
             }
@@ -305,15 +346,36 @@ fn collect_public_trait_names(dir: &Path) -> Vec<String> {
     let mut names = Vec::new();
     for path in files {
         let source = fs::read_to_string(path).unwrap();
+        let mut in_block_comment = false;
         for line in source.lines() {
             let trimmed = line.trim_start();
+            if in_block_comment {
+                if trimmed.contains("*/") {
+                    in_block_comment = false;
+                }
+                continue;
+            }
+            if trimmed.starts_with("/*") {
+                if !trimmed.contains("*/") {
+                    in_block_comment = true;
+                }
+                continue;
+            }
             if trimmed.starts_with("//") {
                 continue;
             }
-            if !trimmed.starts_with("pub trait ") {
+            let is_pub_trait = trimmed.starts_with("pub trait ")
+                || trimmed.starts_with("pub(crate) trait ")
+                || trimmed.starts_with("pub(super) trait ");
+            if !is_pub_trait {
                 continue;
             }
-            let Some(raw_name) = trimmed.split_whitespace().nth(2) else {
+            // For all visibility forms the trait name is the token after `trait`.
+            let Some(trait_pos) = trimmed.find("trait ") else {
+                continue;
+            };
+            let after_trait = trimmed[trait_pos + 6..].trim_start();
+            let Some(raw_name) = after_trait.split_whitespace().next() else {
                 continue;
             };
             let name = raw_name.trim_end_matches([':', '{', '<']);
@@ -377,6 +439,57 @@ fn trait_coverage_audit_has_real_impl_coverage_for_every_entry() {
     if !errors.is_empty() {
         panic!(
             "TRAIT_COVERAGE_AUDIT has {} impl(s) not found in source:\n{}",
+            errors.len(),
+            errors.join("\n")
+        );
+    }
+}
+
+#[test]
+fn trait_coverage_audit_catches_unlisted_impls() {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let impl_pairs = collect_impl_pairs(&src_dir);
+    let type_names = collect_type_names(&src_dir);
+
+    let blanket_impl_traits: HashSet<&str> = HashSet::from(["EventSink"]);
+
+    // Build lookup: trait_name -> set of (real_impls ∪ test_stubs).
+    let mut listed: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for entry in TRAIT_COVERAGE_AUDIT {
+        let set = listed.entry(entry.trait_name).or_default();
+        for name in entry.real_impls.iter().chain(entry.test_stubs.iter()) {
+            set.insert(name);
+        }
+    }
+
+    let mut errors = Vec::new();
+
+    for (trait_name, type_name) in &impl_pairs {
+        let Some(known) = listed.get(trait_name.as_str()) else {
+            // Trait not in audit table — the forward test
+            // (`trait_coverage_audit_matches_public_trait_set`) already catches this.
+            continue;
+        };
+        if known.contains(type_name.as_str()) {
+            continue;
+        }
+        // Blanket impl fallback: the type satisfies the trait through a blanket
+        // impl, so it would not appear as an explicit entry in the table.
+        if blanket_impl_traits.contains(trait_name.as_str()) && type_names.contains(type_name) {
+            continue;
+        }
+        errors.push(format!(
+            "  {} for {} — found in source but not in TRAIT_COVERAGE_AUDIT",
+            trait_name, type_name
+        ));
+    }
+
+    errors.sort();
+
+    if !errors.is_empty() {
+        panic!(
+            "Source contains {} impl(s) not listed in TRAIT_COVERAGE_AUDIT:\n{}\n\
+             Add missing types to the `real_impls` or `test_stubs` arrays.",
             errors.len(),
             errors.join("\n")
         );

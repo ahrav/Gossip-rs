@@ -3878,6 +3878,66 @@ mod tests {
     }
 
     #[test]
+    fn finish_error_propagates_from_sink() {
+        #[derive(Default)]
+        struct ErrorOnFinishSink;
+
+        impl PackObjectSink for ErrorOnFinishSink {
+            fn emit(
+                &mut self,
+                _candidate: &PackCandidate,
+                _path: &[u8],
+                _bytes: &[u8],
+            ) -> Result<(), PackExecError> {
+                Ok(())
+            }
+
+            fn finish(&mut self) -> Result<(), PackExecError> {
+                Err(PackExecError::Sink("finish failed".to_owned()))
+            }
+        }
+
+        let (pack, offsets) = build_pack(&[(ObjectKind::Blob, b"hello")]);
+        let offset = offsets[0];
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x22; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset,
+        };
+
+        let plan = build_plan(
+            vec![offset],
+            vec![candidate],
+            vec![CandidateAtOffset {
+                offset,
+                cand_idx: 0,
+            }],
+            None,
+        );
+
+        let mut cache = PackCache::new(0);
+        let mut external = NoExternal;
+        let mut sink = ErrorOnFinishSink;
+
+        let err = exec_plan_result(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, PackExecError::Sink(detail) if detail == "finish failed"));
+    }
+
+    #[test]
     fn merge_fast_path_cache_hit_probes_once() {
         let object_bytes = b"cached";
         let (pack, offsets) = build_pack(&[(ObjectKind::Blob, object_bytes)]);

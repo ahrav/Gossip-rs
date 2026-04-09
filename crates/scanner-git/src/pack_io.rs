@@ -821,7 +821,10 @@ mod tests {
         assert!(missing.is_none());
 
         let err = ExternalBaseProvider::load_base(&mut io, &corrupt_oid).unwrap_err();
-        assert!(matches!(err, PackExecError::ExternalBase(_)));
+        assert!(
+            matches!(err, PackExecError::ExternalBase(ref detail) if !detail.is_empty()),
+            "ExternalBase error should contain a non-empty detail describing the failure"
+        );
     }
 
     #[test]
