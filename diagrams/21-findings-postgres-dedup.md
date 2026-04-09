@@ -47,7 +47,7 @@ flowchart TB
 
     input -->|"step 1"| validate-obs
     validate-obs{{"validate_observation_identity()<br/>Stored observation IDs must match<br/>canonical BLAKE3 derivation"}}
-    validate-obs -->|"mismatch"| err-obs["InvalidObservationIdentity"]
+    validate-obs -->|"mismatch"| err-obs["ObservationIdMismatch"]
     validate-obs -->|"step 2"| validate-tenant
 
     validate-tenant{{"validate_tenant_consistency()<br/>All records across all three<br/>layers must share one TenantId"}}
@@ -323,7 +323,7 @@ The convergence guarantee holds because:
 
 | Scenario | How it would manifest | Prevention |
 |:---|:---|:---|
-| Rust uses `seen_at >=` but SQL uses `>` | Provenance flip-flops on equal timestamps depending on row encounter order | Test: `equal_seen_at_no_tiebreaker` asserts existing wins when neither has location |
+| Rust uses `seen_at >=` but SQL uses `>` | Provenance flip-flops on equal timestamps depending on row encounter order | Test: `merge_observation_equal_seen_at_no_tiebreaker` asserts existing wins when neither has location |
 | SQL `location_url` uses independent `COALESCE` | URL from run A paired with display from run B | Test: `observations_insert_sql_pairs_location_url_with_display_source` asserts no independent COALESCE |
 | SQL CASE arms use different predicates per column | run_id from winner, shard_id from loser | Test: all three provenance CASE arms share identical predicate text |
 | Rust mixes provenance fields | fence_epoch from incoming, run_id from existing | Single `winner` binding sources all three fields |
