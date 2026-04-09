@@ -47,14 +47,19 @@ use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardLimitScop
 use gossip_contracts::identity::{FenceEpoch, OpId, RunId, ShardId, ShardKey};
 use rstest::rstest;
 
+/// Populate `out` with the run's currently visible shards while keeping
+/// the vector's capacity deterministic for test assertions.
+///
+/// `ListShards` is only calling `list_shards_into` for the tenant/run pair
+/// inferred from the fixtures, so callers only need to pick a filter and
+/// logical time. The helper reserves capacity up front so the resulting
+/// allocations remain predictable when comparing `Vec` lengths across runs.
 fn list_shards_for_run(
     coord: &InMemoryCoordinator,
     at: LogicalTime,
     filter: ShardFilter,
     out: &mut Vec<ShardSummary>,
 ) {
-    // Optional pre-sizing for deterministic test allocations.
-    // `list_shards_into` itself can grow `out` if needed.
     let required = coord
         .run_shards
         .get(&(test_tenant(), test_run()))
@@ -747,8 +752,9 @@ fn active_run_coordinator() -> InMemoryCoordinator {
     coord
 }
 
-/// Discriminant for the three run-terminal operations so parameterized
-/// tests can dispatch without repeating the match logic.
+/// Discriminates between `complete_run`, `fail_run`, and `cancel_run` so
+/// shared test helpers remain oblivious to the underlying method
+/// signatures.
 #[derive(Debug, Clone, Copy)]
 enum TerminalOp {
     Complete,
