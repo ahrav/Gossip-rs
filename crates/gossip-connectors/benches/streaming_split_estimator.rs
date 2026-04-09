@@ -22,6 +22,12 @@ mod unix_bench {
     use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group};
     use gossip_connectors::benchmark_streaming_split_estimator_observe_fixed_size;
 
+    /// Unix-only Criterion group for the split estimator's fixed-size stream.
+    ///
+    /// The benchmark helper depends on the estimator's Unix filesystem-facing
+    /// implementation details, so this module is only built where that helper
+    /// exists.
+    ///
     /// Benchmarks the split estimator's steady-state `observe` loop across
     /// representative sample-cap settings.
     ///
@@ -31,6 +37,14 @@ mod unix_bench {
     ///
     /// This benchmark varies only the estimator `sample_cap`; it does not model
     /// filesystem traversal or randomized key distributions.
+    ///
+    /// The measured loop always observes:
+    /// - `count = 1_000_000` monotonically ordered keys.
+    /// - A fixed file-size shape supplied by the helper's final argument.
+    /// - One of three representative reservoir sizes: `128`, `512`, or `1024`.
+    ///
+    /// `black_box` is applied to both inputs and outputs so the optimizer cannot
+    /// fold away the helper call and accidentally benchmark dead code.
     pub fn bench_observe(c: &mut Criterion) {
         let mut group = c.benchmark_group("streaming_split_estimator_observe");
         // Keep the benchmark's stream shape pinned to the allocation guard so
@@ -69,9 +83,11 @@ mod unix_bench {
 #[cfg(unix)]
 criterion::criterion_main!(unix_bench::benches);
 
-// On non-Unix platforms the estimator (and its benchmark hook) is unavailable,
-// so the bench binary compiles but does nothing.
 #[cfg(not(unix))]
 /// No-op entrypoint for non-Unix targets where the estimator benchmark hook is
 /// not exported.
+///
+/// Keeping the bench target buildable on unsupported platforms avoids
+/// conditional manifest wiring while still making the lack of estimator support
+/// explicit.
 fn main() {}
