@@ -110,11 +110,12 @@ pub enum MidxError {
     /// Used when validating de-duplication requirements for input streams.
     #[error("duplicate input OID")]
     DuplicateInputOid,
-    /// The ordinal-seen payload uses an unsupported format version.
-    #[error("unsupported ordinal seen version: {version}")]
-    UnsupportedOrdinalVersion {
-        /// The version byte found in the payload.
-        version: u8,
+    /// Ordinal seen bitset payload could not be decoded.
+    #[error("ordinal seen bitset error: {source}")]
+    OrdinalSeenDecode {
+        /// The underlying deserialization error.
+        #[from]
+        source: super::ordinal_seen::OrdinalSeenError,
     },
 }
 
@@ -137,25 +138,5 @@ impl MidxError {
     /// Returns the maximum number of missing pack names recorded for diagnostics.
     pub fn missing_packs_limit() -> usize {
         MAX_MISSING_PACK_NAMES
-    }
-}
-
-impl From<super::ordinal_seen::OrdinalSeenError> for MidxError {
-    fn from(e: super::ordinal_seen::OrdinalSeenError) -> Self {
-        use super::ordinal_seen::OrdinalSeenError;
-        match e {
-            OrdinalSeenError::UnsupportedVersion(version) => {
-                MidxError::UnsupportedOrdinalVersion { version }
-            }
-            other => MidxError::corrupt(match other {
-                OrdinalSeenError::Truncated => "truncated ordinal seen payload",
-                OrdinalSeenError::InvalidMagic => "invalid ordinal seen magic",
-                OrdinalSeenError::UnsupportedVersion(_) => unreachable!(),
-                OrdinalSeenError::LengthMismatch => "ordinal seen length mismatch",
-                OrdinalSeenError::CardinalityMismatch { .. } => "ordinal seen cardinality mismatch",
-                OrdinalSeenError::OutOfRangeBits => "ordinal seen out-of-range bits",
-                OrdinalSeenError::PayloadTooLarge { .. } => "ordinal seen payload too large",
-            }),
-        }
     }
 }

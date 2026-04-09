@@ -112,14 +112,11 @@ impl MidxOrdinalBitset {
     #[inline]
     #[must_use]
     pub fn test(&self, ordinal: u32) -> bool {
-        if ordinal >= self.midx_object_count {
-            debug_assert!(
-                ordinal < self.midx_object_count,
-                "ordinal bitset access out of range: {ordinal} >= {}",
-                self.midx_object_count
-            );
-            return false;
-        }
+        assert!(
+            ordinal < self.midx_object_count,
+            "ordinal bitset access out of range: {ordinal} >= {}",
+            self.midx_object_count
+        );
         self.bits.is_set(ordinal as usize)
     }
 
@@ -289,26 +286,24 @@ impl MidxOrdinalBitset {
     ) -> Result<(), MidxError> {
         self.validate_view(midx)?;
 
-        if oids.windows(2).any(|pair| pair[0] > pair[1]) {
-            return Err(MidxError::InputNotSorted);
-        }
-
         out.clear();
         out.reserve(oids.len());
         let mut cursor = MidxCursor::default();
         let mut previous_oid: Option<&OidBytes> = None;
         let mut previous_seen = false;
         for oid in oids {
-            if previous_oid == Some(oid) {
-                out.push(previous_seen);
-                continue;
+            if let Some(prev) = previous_oid {
+                if prev > oid {
+                    return Err(MidxError::InputNotSorted);
+                }
+                if prev == oid {
+                    out.push(previous_seen);
+                    continue;
+                }
             }
             let seen = match midx.find_oid_sorted(&mut cursor, oid) {
                 Ok(Some(ordinal)) => self.test(ordinal),
                 Ok(None) => false,
-                // OID length mismatch (e.g. SHA-256 probe against SHA-1 MIDX)
-                // is treated as "not found" rather than a corruption error.
-                Err(MidxError::InputOidLengthMismatch { .. }) => false,
                 Err(e) => return Err(e),
             };
             out.push(seen);
@@ -375,19 +370,19 @@ impl MidxOrdinalBitset {
         if midx.object_count() != self.midx_object_count {
             return Err(MidxError::corrupt(OBJECT_COUNT_MISMATCH));
         }
+        // Fingerprint validation requires MidxView to expose the trailing MIDX
+        // checksum (currently not parsed). Until then, callers must ensure the
+        // bitset and view refer to the same MIDX snapshot.
         Ok(())
     }
 
     #[inline]
     fn test_and_set(&mut self, ordinal: u32) -> bool {
-        if ordinal >= self.midx_object_count {
-            debug_assert!(
-                ordinal < self.midx_object_count,
-                "ordinal bitset access out of range: {ordinal} >= {}",
-                self.midx_object_count
-            );
-            return false;
-        }
+        assert!(
+            ordinal < self.midx_object_count,
+            "ordinal bitset access out of range: {ordinal} >= {}",
+            self.midx_object_count
+        );
         let idx = ordinal as usize;
         if !self.bits.is_set(idx) {
             self.bits.set(idx);
@@ -475,7 +470,6 @@ mod tests {
             assert!(bitset.test(ordinal));
         }
         assert_eq!(bitset.cardinality(), 6);
-        assert!(!bitset.test(130));
     }
 
     #[test]
@@ -492,12 +486,11 @@ mod tests {
             oid_from_u32(3),
             oid_from_u32(4),
             oid_from_u32(9),
-            OidBytes::sha256([0x55; 32]),
         ];
         let flags = bitset
             .batch_contains_sorted(&midx, &probes)
             .expect("batch lookup");
-        assert_eq!(flags, vec![true, true, false, true, false, false]);
+        assert_eq!(flags, vec![true, true, false, true, false]);
     }
 
     #[test]
@@ -711,6 +704,32 @@ mod tests {
     }
 
     #[test]
+    fn batch_contains_sorted_rejects_oid_length_mismatch() {
+        let midx_bytes = build_test_midx(8);
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).expect("midx");
+        let bitset = MidxOrdinalBitset::new(midx.object_count(), [0xAA; 32]);
+        let probes = vec![OidBytes::sha256([0x55; 32])];
+        let err = bitset
+            .batch_contains_sorted(&midx, &probes)
+            .expect_err("length mismatch");
+        assert!(matches!(err, MidxError::InputOidLengthMismatch { .. }));
+    }
+
+    #[test]
+    fn serialize_deserialize_zero_objects() {
+        let bitset = MidxOrdinalBitset::new(0, [0xCC; 32]);
+        assert_eq!(bitset.cardinality(), 0);
+        assert_eq!(bitset.object_count(), 0);
+        assert_eq!(bitset.heap_bytes(), 0);
+
+        let bytes = bitset.serialize();
+        assert_eq!(bytes.len(), HEADER_LEN);
+
+        let decoded = MidxOrdinalBitset::deserialize(&bytes).expect("zero-object round-trip");
+        assert_eq!(decoded, bitset);
+    }
+
+    #[test]
     fn mark_seen_batch_with_empty_input() {
         let midx_bytes = build_test_midx(8);
         let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).expect("midx");
@@ -718,6 +737,43 @@ mod tests {
         let newly_marked = bitset.mark_seen_batch(&midx, &[]).expect("empty batch");
         assert_eq!(newly_marked, 0);
         assert_eq!(bitset.cardinality(), 0);
+    }
+
+    #[test]
+    fn serialize_into_clears_preexisting_buffer() {
+        let mut bitset = MidxOrdinalBitset::new(10, [0xDD; 32]);
+        bitset.set(3);
+        bitset.set(7);
+
+        let expected = bitset.serialize();
+        let mut buf = vec![0xFF; 1024];
+        bitset.serialize_into(&mut buf);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn batch_contains_sorted_into_reuses_buffer() {
+        let midx_bytes = build_test_midx(8);
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).expect("midx");
+        let mut bitset = MidxOrdinalBitset::new(midx.object_count(), [0xEE; 32]);
+        bitset.set(0);
+        bitset.set(3);
+
+        let mut out = Vec::new();
+
+        // First call.
+        let probes_a = vec![oid_from_u32(0), oid_from_u32(1)];
+        bitset
+            .batch_contains_sorted_into(&midx, &probes_a, &mut out)
+            .expect("first batch");
+        assert_eq!(out, vec![true, false]);
+
+        // Second call reuses the same buffer with different inputs.
+        let probes_b = vec![oid_from_u32(3), oid_from_u32(5)];
+        bitset
+            .batch_contains_sorted_into(&midx, &probes_b, &mut out)
+            .expect("second batch");
+        assert_eq!(out, vec![true, false]);
     }
 
     proptest! {

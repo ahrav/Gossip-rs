@@ -144,27 +144,22 @@ impl DynamicBitSet {
 
     /// Constructs a bitset from a pre-existing word vector.
     ///
-    /// # Preconditions
-    ///
-    /// The caller **must** ensure both invariants hold before calling:
-    /// 1. `words.len() == words_for_bits(bit_length)`
-    /// 2. Padding bits in the last word are zero.
-    ///
-    /// Both are debug-asserted but not enforced in release builds. Violating
-    /// either invariant causes logical incorrectness (`PartialEq`, `count`,
-    /// `iter_set` may return wrong results) but not memory unsafety.
-    ///
     /// Prefer [`DynamicBitSet::empty`] when constructing from scratch. This
     /// constructor exists for deserialization paths that have already validated
     /// the word buffer externally.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `words.len() != words_for_bits(bit_length)` or if padding
+    /// bits in the last word are non-zero.
     pub fn from_words(words: Vec<u64>, bit_length: usize) -> Self {
-        debug_assert_eq!(
+        assert_eq!(
             words.len(),
             words_for_bits(bit_length),
             "word count does not match bit_length"
         );
         let bs = Self { words, bit_length };
-        debug_assert!(
+        assert!(
             bs.words.is_empty() || {
                 let mask = !bs.last_word_mask();
                 (bs.words[bs.words.len() - 1] & mask) == 0

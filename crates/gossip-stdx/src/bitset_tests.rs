@@ -363,6 +363,21 @@ mod proptests {
             prop_assert_eq!(b.count(), 0);
             prop_assert!(b.padding_invariant_holds());
         }
+
+        #[test]
+        fn from_words_as_words_round_trip(bit_len in 0usize..512, indices in prop::collection::vec(0usize..512, 0..256)) {
+            let mut bs = DynamicBitSet::empty(bit_len);
+            for &idx in &indices {
+                if idx < bit_len {
+                    bs.set(idx);
+                }
+            }
+
+            let reconstructed = DynamicBitSet::from_words(bs.as_words().to_vec(), bit_len);
+            prop_assert_eq!(&reconstructed, &bs);
+            prop_assert_eq!(reconstructed.count(), bs.count());
+            prop_assert!(reconstructed.padding_invariant_holds());
+        }
     }
 }
 
@@ -409,6 +424,31 @@ mod unit_tests {
         b65.set(64);
         assert_eq!(b65.count(), 1);
         assert!(b65.padding_invariant_holds());
+    }
+
+    #[test]
+    fn from_words_round_trip_boundaries() {
+        for bit_len in [0, 1, 63, 64, 65, 129] {
+            let mut bs = DynamicBitSet::empty(bit_len);
+            // Set some bits at interesting positions.
+            for idx in [0, bit_len.saturating_sub(1)] {
+                if idx < bit_len {
+                    bs.set(idx);
+                }
+            }
+            let reconstructed = DynamicBitSet::from_words(bs.as_words().to_vec(), bit_len);
+            assert_eq!(reconstructed, bs, "round-trip failed for bit_len={bit_len}");
+            assert_eq!(reconstructed.count(), bs.count());
+            assert!(reconstructed.padding_invariant_holds());
+        }
+    }
+
+    #[test]
+    fn from_words_empty() {
+        let bs = DynamicBitSet::from_words(vec![], 0);
+        assert_eq!(bs.count(), 0);
+        assert!(bs.padding_invariant_holds());
+        assert!(bs.as_words().is_empty());
     }
 
     #[test]
