@@ -76,10 +76,6 @@ use crate::common::{
 };
 use crate::split_estimator::StreamingSplitEstimator;
 
-// ---------------------------------------------------------------------------
-// CachedFile
-// ---------------------------------------------------------------------------
-
 /// Single-entry read cache keyed by `item_ref` bytes.
 ///
 /// # Purpose
@@ -143,10 +139,6 @@ impl<R: io::Read> io::Read for BudgetedReader<R> {
         Ok(read)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Enumeration walk state
-// ---------------------------------------------------------------------------
 
 /// Minimal per-entry state retained while sorting a single directory.
 ///
@@ -315,18 +307,17 @@ impl<'a> DirectoryWalker<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// FilesystemConnector
-// ---------------------------------------------------------------------------
-
 /// Mode of operation for the configured filesystem root.
 ///
 /// # Purpose
 /// Distinguishes between directory traversal and single-file roots, holding
 /// the necessary pre-verified state for secure confined reads.
 enum RootMode {
+    /// Canonical root is a directory tree and keys are relative descendant paths.
     Directory,
+    /// Canonical root is one regular file and the connector exposes only that item.
     SingleFile {
+        /// Stable key/reference derived from the root file name at initialization.
         file_name: Box<[u8]>,
         /// (dev, ino) recorded at init to detect file replacement.
         expected_id: (u64, u64),
@@ -491,6 +482,10 @@ impl FilesystemConnector {
         ))
     }
 
+    /// Return ordered-content capability flags used by the shared trait adapter.
+    ///
+    /// The filesystem connector supports key-based pagination and range reads,
+    /// but does not currently emit split hints or resume tokens.
     fn ordered_content_caps(&self) -> OrderedContentCapabilities {
         OrderedContentCapabilities {
             range_read: true,
@@ -499,6 +494,11 @@ impl FilesystemConnector {
         }
     }
 
+    /// Return the connector-instance hash derived from the canonical root path.
+    ///
+    /// # Panics
+    /// Panics if called before [`FilesystemConnector::ensure_root_ready`]
+    /// initializes connector identity state.
     fn connector_instance(&self) -> ConnectorInstanceIdHash {
         self.connector_instance
             .expect("root connector instance is initialized by ensure_root_ready")
@@ -677,10 +677,6 @@ impl FilesystemConnector {
         .map_err(|error| EnumerateError::permanent(format!("invalid filesystem page: {error}")))
     }
 
-    // ---------------------------------------------------------------
-    // Split-point selection
-    // ---------------------------------------------------------------
-
     /// Return a split-point hint over the explicit half-open key range
     /// `[start, end)`.
     ///
@@ -745,10 +741,6 @@ impl FilesystemConnector {
             .map_err(|error| EnumerateError::permanent(format!("invalid split key: {error}")))?;
         Ok(Some(split))
     }
-
-    // ---------------------------------------------------------------
-    // Read-path helpers
-    // ---------------------------------------------------------------
 
     /// Open a file beneath `root_fd` using component-by-component `openat`
     /// with `O_NOFOLLOW` at every step.
@@ -821,6 +813,11 @@ impl FilesystemConnector {
         Ok((file, metadata))
     }
 
+    /// Open and validate a concrete file for a previously emitted `item_ref`.
+    ///
+    /// Directory roots resolve the full relative path beneath the pinned root
+    /// descriptor. Single-file roots additionally enforce that the requested
+    /// `item_ref` matches the configured file name and unchanged `(dev, ino)`.
     fn open_file_for_ref(&self, item_ref: &ItemRef) -> Result<(fs::File, fs::Metadata), ReadError> {
         match self
             .root_mode
@@ -873,10 +870,6 @@ impl FilesystemConnector {
         Ok(&self.cached_file.as_ref().expect("cache must exist").file)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Ordered-content and read operations (inherent methods)
-// ---------------------------------------------------------------------------
 
 impl FilesystemConnector {
     /// Advertise connector capabilities used by orchestration planning.
@@ -1092,10 +1085,6 @@ impl OrderedContentSource for FilesystemConnector {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Filesystem identity and ordering helpers
-// ---------------------------------------------------------------------------
-
 /// Build the externally visible item identity for one filesystem entry.
 ///
 /// Relative path bytes are reused as both the stable ordering key and the
@@ -1146,6 +1135,11 @@ fn derive_filesystem_version(rel_path: &[u8], metadata: &fs::Metadata) -> Object
 /// later; this cap guards the intermediate sort buffer.
 const MAX_DIR_ENTRIES: usize = 500_000;
 
+/// Read one directory, buffer regular names with file types, and return entries
+/// sorted for globally correct depth-first key order.
+///
+/// The function enforces deadline checks and a hard cap on buffered entries to
+/// prevent unbounded memory growth before page-level budgets apply.
 fn read_sorted_dir_entries(
     dir: &Path,
     deadline: Option<Instant>,
@@ -1303,10 +1297,6 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// Key-range intersection
-// ---------------------------------------------------------------------------
-
 /// Intersect request `[start, end)` with connector-level key-range bounds.
 ///
 /// Returns the tighter of each pair, or `None` when the intersection
@@ -1337,10 +1327,6 @@ fn intersect_key_bounds<'a>(
         bounds => Some(bounds),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Low-level fd helpers
-// ---------------------------------------------------------------------------
 
 /// Open a directory file descriptor for use with `openat`.
 ///
