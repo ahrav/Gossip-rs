@@ -398,6 +398,10 @@ The cache is **not thread-safe**. Interior mutability (`UnsafeCell`, `Cell`) is 
 | `JavaClassExtractor` | Struct (unit) | Java class file handler |
 | `JarWarExtractor` | Struct (unit) | JAR/WAR archive handler |
 | `PycExtractor` | Struct (unit) | Python bytecode handler |
+| `LineResult` | Enum | DotEnv line parsing outcome |
+| `ValueResult` | Enum | DotEnv value parsing outcome |
+| `Notebook` | Struct | Typed struct for Jupyter Notebook deserialization |
+| `Cell` | Struct | Typed struct for Notebook cell deserialization |
 
 ### YARA Base64 Gate
 
@@ -409,6 +413,7 @@ The cache is **not thread-safe**. Interior mutability (`UnsafeCell`, `Cell`) is 
 | `PaddingPolicy` | Enum | `StopAndHalt` or `ResetAndContinue` |
 | `WhitespacePolicy` | Enum | `Rfc4648` (SP/TAB/CR/LF) or `AsciiWhitespace` (+ VT/FF) |
 | `Ac64` | Struct (private) | Dense automaton: `next: Box<[u32]>`, `out: Box<[u8]>` |
+| `Node` | Struct (private) | Node used during AC construction |
 
 ### Set-Associative Cache
 
@@ -423,6 +428,7 @@ The cache is **not thread-safe**. Interior mutability (`UnsafeCell`, `Cell`) is 
 | `Options` | Struct | `name: &str` for diagnostics |
 | `UpsertResult<V>` | Struct | `index`, `updated` (Update/Insert), `evicted: Option<V>` |
 | `UpdateOrInsert` | Enum | `Update` (replaced existing) or `Insert` (new entry) |
+| `Set` | Struct (private) | Internal representation of a cache set |
 
 ## Performance Characteristics
 
@@ -465,6 +471,7 @@ The cache is **not thread-safe**. Interior mutability (`UnsafeCell`, `Cell`) is 
 | Aligned buffer | `lsm/set_associative_cache.rs` |
 | Cache metrics | `lsm/set_associative_cache.rs` |
 | Engine integration | `engine/core.rs` |
+| Cache tests | `lsm/set_associative_cache_tests.rs` |
 
 ## Related Modules
 
