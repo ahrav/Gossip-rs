@@ -167,6 +167,8 @@ pub mod path_policy;
 /// Synthetic commit-ref materialization for explicit-commit lowering.
 mod synthetic_ref;
 use gossip_stdx::perf_stats;
+/// Dense seen-bitset indexed by MIDX ordinal positions.
+pub mod ordinal_seen;
 /// Defines the write-only persistence store contract and helpers.
 pub mod persist;
 /// Provides RocksDB-backed persistence adapters (feature-gated).
@@ -365,6 +367,7 @@ pub use finalize::{
     build_finalize_ops, FinalizeInput, FinalizeOutcome, FinalizeOutput, FinalizeStats, RefEntry,
     WriteOp, NS_BLOB_CTX, NS_FINDING, NS_SEEN_BLOB, NS_SEEN_STAGING,
 };
+pub use ordinal_seen::{MidxOrdinalBitset, OrdinalSeenError};
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};
 pub use roaring_seen::{RoaringSeenBitmap, RoaringSeenStore};
 pub use roaring_seen::{SeenBitmapDelta, SeenBitmapError};

@@ -200,6 +200,11 @@ impl FlatOidIndex {
     }
 
     #[inline]
+    fn heap_bytes(&self) -> usize {
+        self.data.capacity()
+    }
+
+    #[inline]
     fn push(&mut self, oid: &[u8]) {
         debug_assert_eq!(
             oid.len(),
@@ -515,6 +520,18 @@ impl RoaringSeenBitmap {
     #[must_use]
     pub fn serialized_size(&self) -> usize {
         4 + 1 + 4 + self.oids.as_bytes().len() + 4 + self.seen.serialized_size()
+    }
+
+    /// Returns an approximate heap footprint for the bitmap and OID index.
+    ///
+    /// The Roaring bitmap portion uses `serialized_size()` as a proxy for
+    /// in-memory overhead. This can understate actual heap usage by 20-50%
+    /// for sparse bitmaps because the in-memory container representation
+    /// carries per-`Vec` metadata that the compact serialized form omits.
+    /// For dense bitmaps the approximation is closer.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.oids.heap_bytes() + self.seen.serialized_size()
     }
 
     /// Returns true when the OID has already been seen in this scope.
