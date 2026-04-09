@@ -18,6 +18,7 @@ mod git_commit_walk;
 mod git_engine_adapter;
 mod git_inmem_artifacts;
 mod git_mapping_bridge;
+mod git_pack_differential;
 mod git_pack_exec;
 mod git_pack_inflate;
 mod git_pack_inflate_corpus;
