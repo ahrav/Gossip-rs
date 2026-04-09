@@ -10,8 +10,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use ahash::AHashMap;
-
 use anyhow::{Error as AnyError, Result, anyhow};
 use gossip_connectors::FilesystemConnector;
 use gossip_contracts::{
@@ -28,7 +26,7 @@ use gossip_contracts::{
     },
 };
 use gossip_coordination::{AcquireScratch, CoordinationFacade, CursorSemantics};
-use scanner_git::{FinalizeOutcome, GitEventOutput};
+use scanner_git::{FinalizeOutcome, GitEventOutput, PersistenceStore};
 use scanner_scheduler::events::EventOutput;
 
 use super::commit_bridge::{
@@ -549,13 +547,13 @@ pub(super) struct GitRepoPersistenceInput<'a> {
     pub(super) repo_id: u64,
     pub(super) bytes_scanned: u64,
     pub(super) findings: &'a [GitFindingForPersistence],
-    pub(super) commit_oid_map: &'a AHashMap<u32, scanner_git::OidBytes>,
     pub(super) tenant_secret_key: TenantSecretKey,
     pub(super) rule_fingerprint: &'a dyn Fn(u32) -> RuleFingerprint,
     pub(super) claim_time: LogicalTime,
-    /// Wall-clock timestamp captured after scan execution *and* persistence
-    /// finalize complete. The `(claim_time, complete_time)` interval therefore
-    /// measures claim-to-durable-finalize, not claim-to-scan-completion alone.
+    /// Wall-clock timestamp captured after scan execution completes but before
+    /// persistence submissions. The `(claim_time, complete_time)` interval
+    /// measures claim-to-scan-completion; it does not include persistence
+    /// latency.
     pub(super) complete_time: LogicalTime,
 }
 
@@ -568,7 +566,6 @@ impl fmt::Debug for GitRepoPersistenceInput<'_> {
             .field("repo_id", &self.repo_id)
             .field("bytes_scanned", &self.bytes_scanned)
             .field("findings", &self.findings)
-            .field("commit_oid_map_len", &self.commit_oid_map.len())
             .field("tenant_secret_key", &self.tenant_secret_key)
             .field("rule_fingerprint", &"<fn>")
             .field("claim_time", &self.claim_time)
@@ -614,7 +611,6 @@ where
         input.bytes_scanned,
         timing,
         input.findings,
-        input.commit_oid_map,
         input.rule_fingerprint,
     )
     .map_err(|error| {
@@ -791,11 +787,7 @@ where
     let cancel = CancellationToken::new();
     let lease_uncertainty = LeaseUncertaintySignal::default();
     let lease_watch_done = Arc::new(AtomicBool::new(false));
-    let capture_sink = Arc::new(FindingsCaptureSink::new(
-        Arc::clone(&stage_sink),
-        cancel.clone(),
-        FindingsCaptureSink::DEFAULT_COMMIT_OID_CAPACITY,
-    ));
+    let capture_sink = Arc::new(FindingsCaptureSink::new(Arc::clone(&stage_sink)));
     let event_sink: Arc<dyn GitEventOutput + Send + Sync> =
         Arc::clone(&capture_sink) as Arc<dyn GitEventOutput + Send + Sync>;
     let (execution, watch_result) = std::thread::scope(|scope| {
@@ -885,56 +877,34 @@ where
     });
     watch_result
         .map_err(|error| DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(error)))?;
+
     if let Some(reason) = lease_uncertainty.current() {
         return Err(DistributedRuntimeError::LeaseUncertain(reason));
     }
 
-    let (execution, mut stage_metrics) = match execution {
-        Ok(result) => result,
-        Err(err) => {
-            // Saturation-specific context helps operators distinguish OID-map
-            // exhaustion from generic scan errors. Lease-uncertain errors keep
-            // their original classification because they have different
-            // operational semantics (alerting, coordinator response).
-            //
-            // Defense-in-depth: fires only when execute_repo returns Err
-            // for a non-abort reason (e.g., I/O error) concurrent with
-            // OID-map saturation. The primary saturation path exits through
-            // the is_oid_map_saturated() check after the match because
-            // execute_repo converts abort-signalled errors to
-            // Ok(FinalizeOutcome::Partial).
-            if capture_sink.is_oid_map_saturated()
-                && !matches!(err, DistributedRuntimeError::LeaseUncertain(_))
-            {
-                tracing::warn!(
-                    original_error = %err,
-                    "OID-map saturation supersedes scan error; \
-                     original cause preserved in this log entry"
-                );
-                return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
-                    anyhow!(
-                        "git repo-frontier shard '{}': commit OID map saturated \
-                     at {} entries; scan error superseded by OID-map saturation \
-                     (original: {err})",
-                        stage_sink.redacted_shard_id(),
-                        FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES,
-                    ),
-                )));
-            }
-            return Err(err);
-        }
-    };
+    let (execution, mut stage_metrics) = execution?;
     let complete_time = wall_clock_now();
-    // Single check covers both the common case (cancellation propagated as
-    // partial finalize) and the race where execute_repo completed its last
-    // commit before polling the abort flag set by OID-map saturation.
-    if capture_sink.is_oid_map_saturated() {
-        return Err(oid_map_saturation_error(
-            stage_sink.redacted_shard_id(),
-            "scan cancelled cooperatively to prevent consistency violation in findings translation",
-        ));
-    }
     if !matches!(execution.finalize_outcome, FinalizeOutcome::Complete) {
+        // Only checkpoint when the scan was externally interrupted (cooperative
+        // abort via the cancellation token). A natural Partial finalize (e.g.,
+        // corrupt blobs, decode failures) is permanent — retrying from a
+        // checkpoint loops indefinitely on the same unrecoverable errors.
+        if cancel.is_cancelled() {
+            let checkpoint = execution.resume_checkpoint.clone().or_else(|| {
+                lease
+                    .resume_cursor()
+                    .last_key()
+                    .map(|_| lease.resume_cursor().clone())
+            });
+            if let Some(checkpoint) = checkpoint {
+                ensure_post_drain_lease_trust(&lease_uncertainty)?;
+                return Ok((
+                    execution.report,
+                    ShardCompletionOutcome::Checkpoint { checkpoint },
+                    stage_metrics,
+                ));
+            }
+        }
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow!(
                 "git repo-frontier shard '{}' finalized partially; outer repo-frontier progress requires a complete durable repo receipt",
@@ -943,16 +913,12 @@ where
         )));
     }
 
-    // Findings must be durable BEFORE shard checkpoint advances. The in-memory
-    // GitPersistenceBackend makes post-execution batch write safe: a crash
-    // clears in-memory watermarks, causing full re-scan on re-claim. A durable
-    // GitPersistenceBackend would require splitting finalize into: seen-bitmaps
-    // → findings persistence → watermark commit.
+    // External findings and done-ledger state must land before a complete Git
+    // finalize advances the repo's durable scan state. The scan phase buffers
+    // complete finalizes via `DeferredCompleteFinalizeStore` so the git-kv
+    // commit can run after these receipts succeed; partial finalizes remain
+    // inline because they never advance watermarks.
     let captured_findings = capture_sink.take_captured_findings();
-    // Drain the sparse commit-OID map alongside captured findings so the
-    // translation step can derive per-object version identity from stable
-    // commit OIDs instead of the lossy ordinal alone.
-    let commit_oid_map = capture_sink.drain_commit_oid_map();
     let detected_count = capture_sink.detected_finding_count();
     if detected_count != captured_findings.len() as u64 {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
@@ -973,7 +939,6 @@ where
         repo_id: lease.payload().repo_id(),
         bytes_scanned: execution.report.bytes_scanned,
         findings: &captured_findings,
-        commit_oid_map: &commit_oid_map,
         tenant_secret_key: identity.tenant_secret_key,
         rule_fingerprint: &*execution.rule_fingerprint,
         claim_time: lease.claim_wall_clock(),
@@ -1001,6 +966,33 @@ where
         latency_ms: stage_metrics.durable_receipt_ms,
         receipts: GIT_REPO_RECEIPT_FAMILIES,
     });
+
+    // At-least-once guarantee: findings and done-ledger records are already
+    // durable at this point. If commit_finalize fails (connection drop,
+    // constraint violation) or the process is killed before it completes,
+    // watermarks remain at their pre-scan position. The next lease re-scans
+    // the same blobs and re-emits findings. Done-ledger and findings
+    // consumers must tolerate duplicate submissions.
+    if matches!(execution.finalize_outcome, FinalizeOutcome::Complete)
+        && execution.deferred_finalize.is_none()
+    {
+        return Err(DistributedRuntimeError::Durability(anyhow!(
+            "complete finalize for shard '{}' must produce a deferred finalize output; \
+             watermarks would be silently dropped",
+            stage_sink.redacted_shard_id()
+        )));
+    }
+    if let Some(finalize) = execution.deferred_finalize.as_ref() {
+        execution
+            .persistence
+            .commit_finalize(finalize)
+            .map_err(|error| {
+                DistributedRuntimeError::Durability(AnyError::new(error).context(format!(
+                    "git repo-frontier shard '{}' git state finalize commit failed",
+                    stage_sink.redacted_shard_id()
+                )))
+            })?;
+    }
 
     tracing::debug!(
         shard_id = %stage_sink.redacted_shard_id(),
@@ -1083,21 +1075,6 @@ where
 
     ensure_post_drain_lease_trust(&lease_uncertainty)?;
     Ok((execution.report, completion, stage_metrics))
-}
-
-/// Construct a non-retryable runtime error for OID-map saturation.
-///
-/// Centralizes the error shape so the error-path and success-path saturation
-/// checks produce the same `Driver` variant with consistent formatting.
-fn oid_map_saturation_error(
-    redacted_shard_id: &ToxicDigest,
-    detail: &str,
-) -> DistributedRuntimeError {
-    DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(anyhow!(
-        "git repo-frontier shard '{redacted_shard_id}': commit OID map saturated \
-         at {} entries; {detail}",
-        FindingsCaptureSink::MAX_COMMIT_OID_MAP_ENTRIES,
-    )))
 }
 
 // ---------------------------------------------------------------------------

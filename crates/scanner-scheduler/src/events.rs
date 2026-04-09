@@ -9,6 +9,11 @@ use crate::source_kind::SourceKind;
 use std::fmt;
 use std::sync::Mutex;
 
+/// Wire-encoded length of a blob OID: 1 byte length prefix + 32 bytes
+/// zero-padded payload. Must match `OidBytes::WIRE_LEN` in `scanner-git`;
+/// enforced by a compile-time assert in `gossip-scanner-runtime`.
+pub const BLOB_OID_WIRE_LEN: usize = 33;
+
 /// Scheduler event emitted during a scan run.
 ///
 /// Covers finding reports, progress ticks, end-of-scan summaries, and
@@ -55,6 +60,12 @@ pub struct FindingEvent<'a> {
     /// sinks can derive durable finding identity without a parallel side
     /// channel.
     pub norm_hash: [u8; 32],
+    /// Encoded Git blob object ID for the scanned payload.
+    ///
+    /// `None` means the finding did not come from the Git scan path. When
+    /// present, byte 0 stores the raw OID length (20 for SHA-1, 32 for
+    /// SHA-256) and bytes 1..=32 store the zero-padded raw OID bytes.
+    pub blob_oid: Option<[u8; BLOB_OID_WIRE_LEN]>,
     /// Commit-graph position for Git findings.
     pub commit_id: Option<u32>,
     /// Git diff classification associated with the finding.
@@ -83,6 +94,7 @@ impl fmt::Debug for FindingEvent<'_> {
             .field("rule_name", &self.rule_name)
             // Secret-derived digests are redacted to keep debug output safe.
             .field("norm_hash", &RedactedNormHash)
+            .field("blob_oid", &self.blob_oid)
             .field("commit_id", &self.commit_id)
             .field("change_kind", &self.change_kind)
             .field("confidence_score", &self.confidence_score)
@@ -229,6 +241,8 @@ impl EventOutput for VecEventOutput {
                 write_i8(&mut line, f.confidence_score);
 
                 // norm_hash intentionally omitted — secret-derived digest must not appear in event logs.
+                // blob_oid intentionally omitted — raw binary OID is surfaced through the
+                // git-specific event channel and would need hex encoding for JSON.
                 if let Some(commit_id) = f.commit_id {
                     line.extend_from_slice(b",\"commit_id\":");
                     write_u64(&mut line, u64::from(commit_id));
@@ -398,6 +412,7 @@ mod tests {
             rule_id: 7,
             rule_name: "rule",
             norm_hash: [0xAB; 32],
+            blob_oid: None,
             commit_id: Some(3),
             change_kind: Some("modify"),
             confidence_score: 85,
@@ -412,6 +427,12 @@ mod tests {
 
     #[test]
     fn finding_event_debug_redacts_norm_hash() {
+        // Valid SHA-1 wire encoding: byte 0 = length (20), bytes 1..=20 = OID
+        // content, bytes 21..=32 = zero-padding.
+        let mut wire_oid = [0u8; BLOB_OID_WIRE_LEN];
+        wire_oid[0] = 20;
+        wire_oid[1..=20].fill(0xAA);
+
         let finding = FindingEvent {
             source: SourceKind::Git,
             object_path: b"dir/file.txt",
@@ -420,6 +441,7 @@ mod tests {
             rule_id: 7,
             rule_name: "rule",
             norm_hash: [0xDE; 32],
+            blob_oid: Some(wire_oid),
             commit_id: Some(3),
             change_kind: Some("modify"),
             confidence_score: 85,

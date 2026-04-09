@@ -27,14 +27,11 @@ use std::{
     sync::Arc,
 };
 
-use ahash::AHashMap;
-
 use gossip_contracts::{
     connector::{GIT_CONNECTOR_TAG, Location, ScanItem, VersionId, git::RepoKey},
     identity::{
-        CanonicalBytes, ConnectorInstanceIdHash, IdentityInputError, ItemIdentityKey, LogicalTime,
-        NormHash, ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey, domain,
-        domain_hasher, finalize_32, key_secret_hash,
+        ConnectorInstanceIdHash, IdentityInputError, ItemIdentityKey, LogicalTime, NormHash,
+        ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey, key_secret_hash,
     },
     persistence::{
         DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
@@ -431,12 +428,6 @@ pub enum ResultTranslationError {
     /// Scan timing was inverted: `started_at` exceeded `finished_at`.
     #[error("scan timing inverted: started_at ({started_at}) > finished_at ({finished_at})")]
     InvalidScanTiming { started_at: u64, finished_at: u64 },
-    /// Git finding payload omitted the commit ordinal required for object identity.
-    #[error("git finding at index {index} is missing commit identity")]
-    MissingGitCommitId { index: usize },
-    /// Git finding referenced a commit ordinal absent from the sparse OID map.
-    #[error("git finding at index {index} references unknown commit_id {commit_id}")]
-    MissingGitCommitOid { index: usize, commit_id: u32 },
     /// Git finding could not derive a stable per-object item identity.
     #[error("git finding at index {index} has invalid object identity: {source}")]
     GitItemIdentity {
@@ -545,7 +536,7 @@ pub fn translate_item_result(
 /// Git repo-frontier scans keep the done-ledger row repo-scoped via `repo_id`,
 /// while each observation derives its stable item identity from the connector
 /// instance plus the repository-relative object path and its strong version
-/// identity from the scanned commit OID for that path.
+/// identity from the scanned blob OID.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn translate_git_item_result(
     write_context: WriteContext,
@@ -555,7 +546,6 @@ pub(crate) fn translate_git_item_result(
     bytes_scanned: u64,
     timing: ScanTiming,
     findings: &[GitFindingForPersistence],
-    commit_oid_map: &AHashMap<u32, OidBytes>,
     rule_fingerprint: &dyn Fn(u32) -> RuleFingerprint,
 ) -> Result<PersistenceTranslation, ResultTranslationError> {
     let done_ledger_item = git_repo_ovid_inputs(repo_id);
@@ -564,7 +554,6 @@ pub(crate) fn translate_git_item_result(
         write_context,
         tenant_secret_key,
         repo_key,
-        commit_oid_map,
         timing.finished_at(),
         findings,
         rule_fingerprint,
@@ -659,11 +648,21 @@ where
     Ok(acc.into_layers())
 }
 
+/// Translate Git findings into three-layer persistence rows.
+///
+/// Each finding's occurrence identity is derived from the blob OID carried in
+/// `GitFindingForPersistence::blob_oid` via `git_blob_version_id`. This means
+/// two findings at the same byte offset in different blobs produce distinct
+/// `OccurrenceId` values.
+///
+/// The done-ledger row, by contrast, uses the repo-scoped `OvidHash` produced
+/// by `git_repo_ovid_inputs(repo_id)` (passed by the caller in
+/// `translate_git_item_result`). This split keeps done-ledger cardinality at
+/// one row per repo while giving each finding blob-level identity.
 fn translate_git_findings<R>(
     write_context: WriteContext,
     tenant_secret_key: &TenantSecretKey,
     repo_key: &RepoKey,
-    commit_oid_map: &AHashMap<u32, OidBytes>,
     seen_at: LogicalTime,
     findings_input: &[GitFindingForPersistence],
     rule_fingerprint: &R,
@@ -677,14 +676,14 @@ where
 
     let mut acc = TranslationAccumulator::with_capacity(findings_input.len());
     let connector_instance = ConnectorInstanceIdHash::from_instance_id_bytes(repo_key.as_bytes());
-    // Heuristic: distinct (object_path, commit) pairs are typically much fewer
+    // Heuristic: distinct (object_path, blob_oid) pairs are typically much fewer
     // than total findings — many findings cluster on the same source file.
     let estimated_groups = (findings_input.len() / 4).max(8);
     // Cache derived (TranslationItem, OvidHash) per unique (object_path,
-    // commit_id) so findings referencing the same file in the same commit share
+    // blob_oid) so findings referencing the same file with the same blob share
     // the three BLAKE3 derivations (stable_id, object_version_id, ovid_hash)
     // instead of repeating them.
-    let mut identity_cache: HashMap<(&[u8], u32), (TranslationItem, OvidHash)> =
+    let mut identity_cache: HashMap<(&[u8], OidBytes), (TranslationItem, OvidHash)> =
         HashMap::with_capacity(estimated_groups);
     // Cache sanitized location per unique object path so findings on the same
     // file share a single Arc<Location> instead of re-allocating per finding.
@@ -692,13 +691,7 @@ where
         HashMap::with_capacity(estimated_groups);
 
     for (index, finding) in findings_input.iter().enumerate() {
-        let commit_id = finding
-            .commit_id
-            .ok_or(ResultTranslationError::MissingGitCommitId { index })?;
-        let commit_oid = commit_oid_map
-            .get(&commit_id)
-            .ok_or(ResultTranslationError::MissingGitCommitOid { index, commit_id })?;
-        let cache_key = (finding.object_path.as_ref(), commit_id);
+        let cache_key = (finding.object_path.as_ref(), finding.blob_oid);
         let &(item, observation_ovid_hash) = &*match identity_cache.entry(cache_key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -710,10 +703,7 @@ where
                 .map_err(|source| ResultTranslationError::GitItemIdentity { index, source })?;
                 let item = TranslationItem {
                     stable_item_id: identity.stable_id(),
-                    version: VersionId::Strong(git_object_version_id(
-                        commit_oid,
-                        finding.object_path.as_ref(),
-                    )),
+                    version: VersionId::Strong(git_blob_version_id(finding.blob_oid)),
                 };
                 let ovid_hash = item.ovid_hash();
                 e.insert((item, ovid_hash))
@@ -860,19 +850,9 @@ fn build_translation<F>(
     Ok(translation)
 }
 
-/// Derive the strong object-version identity for a Git finding.
-///
-/// Hashes `commit_oid || object_path` under the `OBJECT_VERSION_V1` domain
-/// separator, producing a deterministic [`ObjectVersionId`]. This mirrors the
-/// canonical derivation in `gossip_contracts::identity` — both use
-/// [`domain_hasher`] + [`CanonicalBytes::write_canonical`] + [`finalize_32`] —
-/// but operates on the raw OID bytes and repository-relative path available in
-/// the scanner-runtime layer rather than the higher-level connector types.
-fn git_object_version_id(commit_oid: &OidBytes, object_path: &[u8]) -> ObjectVersionId {
-    let mut hasher = domain_hasher(domain::OBJECT_VERSION_V1);
-    commit_oid.as_slice().write_canonical(&mut hasher);
-    object_path.write_canonical(&mut hasher);
-    ObjectVersionId::from_bytes(finalize_32(&hasher))
+/// Derive the strong object-version identity for a Git finding from the blob OID.
+fn git_blob_version_id(blob_oid: OidBytes) -> ObjectVersionId {
+    ObjectVersionId::from_version_bytes(blob_oid.as_slice())
 }
 
 fn git_observation_location(object_path: &[u8]) -> Option<Arc<Location>> {
@@ -896,8 +876,8 @@ mod tests {
             GIT_CONNECTOR_TAG, ItemKey, ItemRef, Location, ScanItem, VersionId, git::RepoKey,
         },
         identity::{
-            CanonicalBytes, ConnectorInstanceIdHash, ItemIdentityKey, LogicalTime, NormHash,
-            ObjectVersionId, StableItemId, domain, domain_hasher, finalize_32,
+            ConnectorInstanceIdHash, ItemIdentityKey, LogicalTime, NormHash, ObjectVersionId,
+            StableItemId,
         },
         persistence::{DoneLedgerErrorCode, DoneLedgerStatus, PersistenceFinding},
     };
@@ -908,10 +888,8 @@ mod tests {
 
     use super::{
         FsFindingRef, ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
-        translate_git_item_result, translate_item_result,
+        git_blob_version_id, translate_git_item_result, translate_item_result,
     };
-
-    use ahash::AHashMap;
 
     use crate::coordination_sink::GitFindingForPersistence;
     use crate::event_sink::sanitize_path;
@@ -952,12 +930,8 @@ mod tests {
         RepoKey::for_local_path(b"/tmp/runtime-git-identity").expect("repo key")
     }
 
-    fn git_commit_oid() -> OidBytes {
-        OidBytes::sha1([0x11; 20])
-    }
-
-    fn git_commit_oid_map() -> AHashMap<u32, OidBytes> {
-        AHashMap::from_iter([(7, git_commit_oid())])
+    fn git_blob_oid(seed: u8) -> OidBytes {
+        OidBytes::sha1([seed; 20])
     }
 
     fn boxed_path(path: &[u8]) -> Box<[u8]> {
@@ -967,16 +941,13 @@ mod tests {
     fn git_object_scan_item(
         repo_key: &RepoKey,
         object_path: &[u8],
-        commit_oid: OidBytes,
+        blob_oid: OidBytes,
     ) -> ScanItem {
         let connector_instance =
             ConnectorInstanceIdHash::from_instance_id_bytes(repo_key.as_bytes());
         let identity = ItemIdentityKey::try_new(GIT_CONNECTOR_TAG, connector_instance, object_path)
             .expect("git item identity");
-        let mut hasher = domain_hasher(domain::OBJECT_VERSION_V1);
-        commit_oid.as_slice().write_canonical(&mut hasher);
-        object_path.write_canonical(&mut hasher);
-        let version = VersionId::Strong(ObjectVersionId::from_bytes(finalize_32(&hasher)));
+        let version = VersionId::Strong(git_blob_version_id(blob_oid));
         ScanItem::new(
             ItemKey::try_from_slice(b"tenant/repo/git/object").expect("item key"),
             ItemRef::try_from_vec(b"git-item-ref".to_vec()).expect("item ref"),
@@ -1005,9 +976,27 @@ mod tests {
         blob_offset_end: u64,
         hash_seed: u8,
     ) -> GitFindingForPersistence {
+        git_finding_with_blob_oid(
+            b"src/lib.rs",
+            git_blob_oid(0x11),
+            rule_id,
+            blob_offset_start,
+            blob_offset_end,
+            hash_seed,
+        )
+    }
+
+    fn git_finding_with_blob_oid(
+        object_path: &[u8],
+        blob_oid: OidBytes,
+        rule_id: u32,
+        blob_offset_start: u64,
+        blob_offset_end: u64,
+        hash_seed: u8,
+    ) -> GitFindingForPersistence {
         GitFindingForPersistence {
-            object_path: boxed_path(b"src/lib.rs"),
-            commit_id: Some(7),
+            object_path: boxed_path(object_path),
+            blob_oid,
             blob_offset_start,
             blob_offset_end,
             norm_hash: NormHash::from_digest([hash_seed; 32]),
@@ -1037,7 +1026,6 @@ mod tests {
 
     fn translate_git_scanned(findings: &[GitFindingForPersistence]) -> PersistenceTranslation {
         let repo_key = git_repo_key();
-        let commit_oid_map = git_commit_oid_map();
         translate_git_item_result(
             write_context(),
             &tenant_secret_key(),
@@ -1046,7 +1034,6 @@ mod tests {
             4_096,
             timing(),
             findings,
-            &commit_oid_map,
             &test_rule_fingerprint,
         )
         .expect("git translation should succeed")
@@ -1236,7 +1223,7 @@ mod tests {
         let fs_translation = translate_item_result(
             write_context(),
             &tenant_secret_key(),
-            &git_object_scan_item(&repo_key, git.object_path.as_ref(), git_commit_oid()),
+            &git_object_scan_item(&repo_key, git.object_path.as_ref(), git.blob_oid),
             4_096,
             timing(),
             ItemResult::Scanned { findings: &[fs] },
@@ -1276,7 +1263,7 @@ mod tests {
         let fs_translation = translate_item_result(
             write_context(),
             &tenant_secret_key(),
-            &git_object_scan_item(&git_repo_key(), b"src/lib.rs", git_commit_oid()),
+            &git_object_scan_item(&git_repo_key(), b"src/lib.rs", git.blob_oid),
             4_096,
             timing(),
             ItemResult::Scanned { findings: &[fs] },
@@ -1415,14 +1402,13 @@ mod tests {
     fn translate_git_item_result_rejects_inverted_spans() {
         let finding = GitFindingForPersistence {
             object_path: boxed_path(b"src/lib.rs"),
-            commit_id: Some(7),
+            blob_oid: git_blob_oid(0x11),
             rule_id: 1,
             norm_hash: NormHash::from_digest([0xAA; 32]),
             blob_offset_start: 50,
             blob_offset_end: 10,
         };
         let repo_key = git_repo_key();
-        let commit_oid_map = git_commit_oid_map();
         let err = translate_git_item_result(
             write_context(),
             &tenant_secret_key(),
@@ -1431,7 +1417,6 @@ mod tests {
             4096,
             timing(),
             &[finding],
-            &commit_oid_map,
             &test_rule_fingerprint,
         )
         .expect_err("inverted spans must be rejected");
@@ -1817,14 +1802,13 @@ mod tests {
         let hash_bytes = [0xDE; 32];
         let bad_finding = GitFindingForPersistence {
             object_path: boxed_path(b"src/lib.rs"),
-            commit_id: Some(7),
+            blob_oid: git_blob_oid(0x11),
             rule_id: 7,
             norm_hash: NormHash::from_digest(hash_bytes),
             blob_offset_start: 50,
             blob_offset_end: 10, // inverted span triggers InvalidFindingSpan
         };
         let repo_key = git_repo_key();
-        let commit_oid_map = git_commit_oid_map();
         let err = translate_git_item_result(
             write_context(),
             &tenant_secret_key(),
@@ -1833,7 +1817,6 @@ mod tests {
             4096,
             timing(),
             &[bad_finding],
-            &commit_oid_map,
             &test_rule_fingerprint,
         )
         .expect_err("inverted span must fail");
@@ -1871,10 +1854,16 @@ mod tests {
             root_hint_len in 1..1000u64,
             fs_span_offset in 0..1000u64,
             object_path in prop::collection::vec(1u8..=127, 1..64),
-            commit_oid_bytes in proptest::array::uniform20(0u8..),
+            use_sha256 in proptest::bool::ANY,
+            blob_oid_bytes_20 in proptest::array::uniform20(0u8..),
+            blob_oid_bytes_32 in proptest::array::uniform32(0u8..),
         ) {
             let root_hint_end = root_hint_start.saturating_add(root_hint_len);
-            let commit_oid = OidBytes::sha1(commit_oid_bytes);
+            let blob_oid = if use_sha256 {
+                OidBytes::sha256(blob_oid_bytes_32)
+            } else {
+                OidBytes::sha1(blob_oid_bytes_20)
+            };
             // FS records carry an independent buffer-local span. Derive one
             // from the proptest-generated offset so cases include both
             // span == root_hint and span != root_hint.
@@ -1893,7 +1882,7 @@ mod tests {
             // blob-absolute root-hint offsets.
             let git_rec = GitFindingForPersistence {
                 object_path: object_path.clone().into_boxed_slice(),
-                commit_id: Some(7),
+                blob_oid,
                 rule_id,
                 norm_hash: NormHash::from_digest(hash_seed),
                 blob_offset_start: root_hint_start,
@@ -1901,8 +1890,7 @@ mod tests {
             };
 
             let repo_key = git_repo_key();
-            let commit_oid_map = AHashMap::from_iter([(7, commit_oid)]);
-            let item = git_object_scan_item(&repo_key, &object_path, commit_oid);
+            let item = git_object_scan_item(&repo_key, &object_path, blob_oid);
 
             let fs_t = translate_item_result(
                 write_context(), &tenant_secret_key(), &item, 4096, timing(),
@@ -1910,7 +1898,7 @@ mod tests {
             ).expect("fs translation");
             let git_t = translate_git_item_result(
                 write_context(), &tenant_secret_key(), &repo_key, 42, 4096, timing(),
-                &[git_rec], &commit_oid_map, &test_rule_fingerprint,
+                &[git_rec], &test_rule_fingerprint,
             ).expect("git translation");
 
             prop_assert_eq!(
@@ -1943,68 +1931,8 @@ mod tests {
     }
 
     #[test]
-    fn translate_git_item_result_rejects_missing_commit_id() {
-        let repo_key = git_repo_key();
-        let err = translate_git_item_result(
-            write_context(),
-            &tenant_secret_key(),
-            &repo_key,
-            42,
-            4_096,
-            timing(),
-            &[GitFindingForPersistence {
-                object_path: boxed_path(b"src/lib.rs"),
-                commit_id: None,
-                blob_offset_start: 10,
-                blob_offset_end: 20,
-                norm_hash: NormHash::from_digest([0xAA; 32]),
-                rule_id: 7,
-            }],
-            &git_commit_oid_map(),
-            &test_rule_fingerprint,
-        )
-        .expect_err("missing commit identity must be rejected");
-        assert!(matches!(
-            err,
-            ResultTranslationError::MissingGitCommitId { index: 0 }
-        ));
-    }
-
-    #[test]
-    fn translate_git_item_result_rejects_unknown_commit_oid() {
-        let repo_key = git_repo_key();
-        let err = translate_git_item_result(
-            write_context(),
-            &tenant_secret_key(),
-            &repo_key,
-            42,
-            4_096,
-            timing(),
-            &[GitFindingForPersistence {
-                object_path: boxed_path(b"src/lib.rs"),
-                commit_id: Some(99),
-                blob_offset_start: 10,
-                blob_offset_end: 20,
-                norm_hash: NormHash::from_digest([0xAA; 32]),
-                rule_id: 7,
-            }],
-            &git_commit_oid_map(),
-            &test_rule_fingerprint,
-        )
-        .expect_err("unknown commit OID must be rejected");
-        assert!(matches!(
-            err,
-            ResultTranslationError::MissingGitCommitOid {
-                index: 0,
-                commit_id: 99
-            }
-        ));
-    }
-
-    #[test]
     fn translate_git_item_result_rejects_empty_object_path() {
         let repo_key = git_repo_key();
-        let commit_oid_map = git_commit_oid_map();
         let err = translate_git_item_result(
             write_context(),
             &tenant_secret_key(),
@@ -2014,13 +1942,12 @@ mod tests {
             timing(),
             &[GitFindingForPersistence {
                 object_path: boxed_path(b""),
-                commit_id: Some(7),
+                blob_oid: git_blob_oid(0x11),
                 blob_offset_start: 10,
                 blob_offset_end: 20,
                 norm_hash: NormHash::from_digest([0xAA; 32]),
                 rule_id: 7,
             }],
-            &commit_oid_map,
             &test_rule_fingerprint,
         )
         .expect_err("empty object_path must be rejected");
@@ -2034,24 +1961,24 @@ mod tests {
     }
 
     #[test]
+    fn git_blob_version_id_distinguishes_sha1_from_sha256_with_same_prefix() {
+        let sha1 = OidBytes::sha1([0xAA; 20]);
+        let mut sha256_bytes = [0u8; 32];
+        sha256_bytes[..20].copy_from_slice(&[0xAA; 20]);
+        let sha256 = OidBytes::sha256(sha256_bytes);
+        assert_ne!(
+            git_blob_version_id(sha1),
+            git_blob_version_id(sha256),
+            "SHA-1 and SHA-256 OIDs with identical 20-byte prefix must produce \
+             distinct ObjectVersionId values"
+        );
+    }
+
+    #[test]
     fn translate_git_item_result_uses_distinct_observation_ovids_for_distinct_objects() {
         let translated = translate_git_scanned(&[
-            GitFindingForPersistence {
-                object_path: boxed_path(b"src/lib.rs"),
-                commit_id: Some(7),
-                blob_offset_start: 10,
-                blob_offset_end: 20,
-                norm_hash: NormHash::from_digest([0xAA; 32]),
-                rule_id: 7,
-            },
-            GitFindingForPersistence {
-                object_path: boxed_path(b"src/main.rs"),
-                commit_id: Some(7),
-                blob_offset_start: 10,
-                blob_offset_end: 20,
-                norm_hash: NormHash::from_digest([0xBB; 32]),
-                rule_id: 7,
-            },
+            git_finding_with_blob_oid(b"src/lib.rs", git_blob_oid(0x11), 7, 10, 20, 0xAA),
+            git_finding_with_blob_oid(b"src/main.rs", git_blob_oid(0x11), 7, 10, 20, 0xAA),
         ]);
         assert_eq!(translated.observation_count(), 2);
         assert_ne!(
@@ -2067,10 +1994,7 @@ mod tests {
     }
 
     #[test]
-    fn translate_git_item_result_uses_distinct_ovids_for_same_path_different_commits() {
-        let commit_oid_a = OidBytes::sha1([0x11; 20]);
-        let commit_oid_b = OidBytes::sha1([0x22; 20]);
-        let commit_oid_map = AHashMap::from_iter([(7, commit_oid_a), (8, commit_oid_b)]);
+    fn translate_git_item_result_splits_observations_for_same_path_different_blob_oids() {
         let repo_key = git_repo_key();
         let translated = translate_git_item_result(
             write_context(),
@@ -2080,32 +2004,29 @@ mod tests {
             4_096,
             timing(),
             &[
-                GitFindingForPersistence {
-                    object_path: boxed_path(b"src/lib.rs"),
-                    commit_id: Some(7),
-                    blob_offset_start: 10,
-                    blob_offset_end: 20,
-                    norm_hash: NormHash::from_digest([0xAA; 32]),
-                    rule_id: 7,
-                },
-                GitFindingForPersistence {
-                    object_path: boxed_path(b"src/lib.rs"),
-                    commit_id: Some(8),
-                    blob_offset_start: 10,
-                    blob_offset_end: 20,
-                    norm_hash: NormHash::from_digest([0xBB; 32]),
-                    rule_id: 7,
-                },
+                git_finding_with_blob_oid(b"src/lib.rs", git_blob_oid(0x11), 7, 10, 20, 0xAA),
+                git_finding_with_blob_oid(b"src/lib.rs", git_blob_oid(0x22), 7, 10, 20, 0xAA),
             ],
-            &commit_oid_map,
             &test_rule_fingerprint,
         )
         .expect("git translation should succeed");
+        assert_eq!(translated.finding_count(), 1);
+        assert_eq!(translated.occurrence_count(), 2);
         assert_eq!(translated.observation_count(), 2);
+        assert_ne!(
+            translated.observations()[0].occurrence_id(),
+            translated.observations()[1].occurrence_id(),
+            "changing blob OID must split the version-sensitive occurrence layer",
+        );
+        assert_ne!(
+            translated.observations()[0].observation_id(),
+            translated.observations()[1].observation_id(),
+            "different blob OIDs must produce distinct observation IDs",
+        );
         assert_ne!(
             translated.observations()[0].ovid_hash(),
             translated.observations()[1].ovid_hash(),
-            "same object_path at different commits must produce distinct observation OVIDs",
+            "same object_path at different blob versions must produce distinct observation OVIDs",
         );
         assert_ne!(
             translated.observations()[0].ovid_hash(),
@@ -2118,7 +2039,6 @@ mod tests {
     fn translate_git_item_result_rejects_zero_length_span() {
         let bad = git_finding(1, 30, 30, 0xAA);
         let repo_key = git_repo_key();
-        let commit_oid_map = git_commit_oid_map();
         let err = translate_git_item_result(
             write_context(),
             &tenant_secret_key(),
@@ -2127,7 +2047,6 @@ mod tests {
             64,
             timing(),
             &[bad],
-            &commit_oid_map,
             &test_rule_fingerprint,
         )
         .expect_err("zero-length git span must fail");
@@ -2151,7 +2070,7 @@ mod tests {
         let long_path = vec![b'a'; 5000];
         let translated = translate_git_scanned(&[GitFindingForPersistence {
             object_path: long_path.into_boxed_slice(),
-            commit_id: Some(7),
+            blob_oid: git_blob_oid(0x11),
             blob_offset_start: 0,
             blob_offset_end: 10,
             norm_hash: NormHash::from_digest([0xAA; 32]),
@@ -2167,22 +2086,8 @@ mod tests {
     #[test]
     fn distinct_object_paths_produce_distinct_git_finding_ids() {
         let translated = translate_git_scanned(&[
-            GitFindingForPersistence {
-                object_path: boxed_path(b"src/lib.rs"),
-                commit_id: Some(7),
-                blob_offset_start: 10,
-                blob_offset_end: 20,
-                norm_hash: NormHash::from_digest([0xAA; 32]),
-                rule_id: 7,
-            },
-            GitFindingForPersistence {
-                object_path: boxed_path(b"src/main.rs"),
-                commit_id: Some(7),
-                blob_offset_start: 10,
-                blob_offset_end: 20,
-                norm_hash: NormHash::from_digest([0xAA; 32]),
-                rule_id: 7,
-            },
+            git_finding_with_blob_oid(b"src/lib.rs", git_blob_oid(0x11), 7, 10, 20, 0xAA),
+            git_finding_with_blob_oid(b"src/main.rs", git_blob_oid(0x11), 7, 10, 20, 0xAA),
         ]);
         assert_eq!(
             translated.finding_count(),

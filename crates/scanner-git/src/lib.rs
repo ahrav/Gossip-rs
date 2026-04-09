@@ -89,6 +89,8 @@ pub mod byte_arena;
 /// Defines a minimal read-only byte container for Git artifact data.
 pub mod bytes;
 pub(crate) mod cache_common;
+/// Defines durable stage checkpoints and resume-state codecs for git scans.
+pub mod checkpoint;
 /// Provides commit-graph indexing helpers for attribution-first ODB scans.
 pub mod commit_graph;
 /// Implements an in-memory commit graph built from loaded commit objects.
@@ -129,6 +131,8 @@ pub mod midx_build;
 pub mod midx_error;
 #[cfg(test)]
 pub(crate) mod midx_test_builder;
+#[cfg(test)]
+pub(crate) mod multi_pack_test_helpers;
 /// Native git-reference resolution backed by `gix-ref`.
 pub mod native_ref_resolver;
 /// Defines fixed-size, zero-heap object ID types for SHA-1 and SHA-256.
@@ -162,6 +166,14 @@ pub mod pack_plan_model;
 pub mod pack_reader;
 /// Implements a path policy classifier for tree diff candidates.
 pub mod path_policy;
+/// In-memory pack I/O for tests when the full sim-harness feature is disabled.
+///
+/// Re-includes `sim_git_scan/pack_io.rs` under a separate module path. This
+/// file must only use `crate::` imports (never `super::`) for the `#[path]`
+/// re-inclusion to compile correctly.
+#[cfg(all(test, not(feature = "sim-harness")))]
+#[path = "sim_git_scan/pack_io.rs"]
+pub(crate) mod sim_pack_io;
 /// Synthetic commit-ref materialization for explicit-commit lowering.
 mod synthetic_ref;
 use gossip_stdx::perf_stats;
@@ -361,7 +373,7 @@ pub use events::{
 // ── Stage 7: Finalize & persist ─────────────────────────────────────────
 pub use finalize::{
     build_finalize_ops, FinalizeInput, FinalizeOutcome, FinalizeOutput, FinalizeStats, RefEntry,
-    WriteOp, NS_SEEN_BLOB,
+    WriteOp, NS_BLOB_CTX, NS_FINDING, NS_SEEN_BLOB, NS_SEEN_STAGING,
 };
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};
 pub use roaring_seen::{RoaringSeenBitmap, RoaringSeenStore};
@@ -375,6 +387,11 @@ pub use watermark_keys::{
 // ── Cross-cutting: errors, config, runner, I/O ──────────────────────────
 pub use byte_arena::{ByteArena, ByteRef};
 pub use bytes::BytesView;
+pub use checkpoint::{
+    CheckpointAck, CommitPlanResumeState, LoadedScanCheckpoint, NoopCheckpointSink, PrefixStage,
+    ScanCheckpointError, ScanCheckpointSink, ScanCheckpointStage, ScanResumeBaseState,
+    ScanResumePrefixState, ScanResumeState, StageCheckpoint,
+};
 pub use errors::PersistError;
 pub use errors::{CommitPlanError, MappingCandidateKind, RepoOpenError, SpillError, TreeDiffError};
 pub use policy_hash::{policy_hash, MergeDiffMode, PolicyHash};
@@ -383,8 +400,9 @@ pub use run_reader::RunReader;
 pub use run_writer::RunWriter;
 pub use runner::auto_pack_exec_workers_for_in_pack;
 pub use runner::{
-    run_git_scan, CandidateSkipReason, GitScanAllocStats, GitScanConfig, GitScanError, GitScanMode,
-    GitScanReport, GitScanResult, GitScanStageNanos, PackMmapLimits, SkippedCandidate,
+    run_git_scan, run_git_scan_with_context, CandidateSkipReason, GitScanAllocStats, GitScanConfig,
+    GitScanError, GitScanMode, GitScanReport, GitScanResult, GitScanRunContext, GitScanStageNanos,
+    PackMmapLimits, SkippedCandidate,
 };
 pub use scanner_engine::perf_counters::{
     reset as reset_git_perf, snapshot as git_perf_snapshot, GitPerfStats,

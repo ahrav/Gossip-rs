@@ -1079,7 +1079,7 @@ struct ArchiveWork {
 struct UringArchiveSink<'a, E: ScanEngine> {
     engine: &'a E,
     scratch: &'a mut E::Scratch,
-    pending: &'a mut Vec<Finding>,
+    pending: &'a mut Vec<<E::Scratch as EngineScratch>::Finding>,
     event_sink: &'a dyn EventOutput,
     display: Vec<u8>,               // Current entry display path
     container_file_id: FileId,      // ID of the archive file itself
@@ -1099,13 +1099,14 @@ struct UringArchiveSink<'a, E: ScanEngine> {
 // Main loop for I/O worker thread
 fn io_worker_loop<E: ScanEngine>(
     _wid: usize,
-    rx: chan::Receiver<FileWork>,      // File queue
-    pool: Arc<FixedBufferPool>,         // Shared buffer pool
-    cpu: ExecutorHandle<CpuTask>,       // CPU executor handle
+    rx: chan::Receiver<FileWork>,
+    pool: Arc<FixedBufferPool>,
+    cpu: ExecutorHandle<CpuTask>,
     engine: Arc<E>,
     cfg: LocalFsUringConfig,
-    stop: Arc<AtomicBool>,              // Graceful shutdown flag
-    archive_tx: Option<chan::Sender<ArchiveWork>>, // Archive routing channel
+    stop: Arc<AtomicBool>,
+    archive_tx: Option<chan::Sender<ArchiveWork>>,
+    extract_tx: Option<chan::Sender<ExtractWork>>,
 ) -> io::Result<UringIoStats>;
 
 // Archive worker loop (blocking decompression + scan)
@@ -1153,11 +1154,11 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
 // apply_cross_rule_dedupe<F, E>(findings: &mut Vec<F>, engine: &E) -> usize;
 
 // Emit findings as structured events
-fn emit_findings<E: ScanEngine, F: FindingRecord>(
+fn emit_findings<E: ScanEngine, F: FindingWithHashRecord>(
     engine: &E,
     event_sink: &dyn EventOutput,
-    display: &[u8],
-    recs: &[F],
+    path: &[u8],
+    findings: &[F],
 );
 ```
 

@@ -29,7 +29,7 @@ use crate::{
         CommitProgressRecord, CoordinationEventRecorder, StageSignal, StoredGitEvent,
     },
     distributed::{DistributedPersistence, DistributedRuntimeConfig, WorkerIdentity, run_worker},
-    test_fixtures::{init_git_repo, run_git_in},
+    test_fixtures::{init_git_repo, run_git},
 };
 
 fn create_test_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
@@ -49,8 +49,8 @@ fn create_test_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     }
 
     if !files.is_empty() {
-        run_git_in(dir.path(), &["add", "."]);
-        run_git_in(dir.path(), &["commit", "-q", "-m", "fixture"]);
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-q", "-m", "fixture"]);
     }
 
     dir
@@ -1091,6 +1091,7 @@ fn owned_core_event_finding_with_norm_hash_round_trips() {
         rule_id: 7,
         rule_name: "test-rule",
         norm_hash: [0xAB; 32],
+        blob_oid: None,
         commit_id: Some(3),
         change_kind: Some("modify"),
         confidence_score: 85,
@@ -1136,6 +1137,7 @@ fn owned_core_event_finding_round_trips_with_distinct_norm_hash() {
         rule_id: 7,
         rule_name: "test-rule",
         norm_hash: [0xCD; 32],
+        blob_oid: None,
         commit_id: Some(3),
         change_kind: Some("modify"),
         confidence_score: 85,
@@ -1181,6 +1183,7 @@ fn owned_core_event_finding_partial_eq_includes_norm_hash() {
         rule_id: 7,
         rule_name: "test-rule".to_owned(),
         norm_hash: [0xAA; 32],
+        blob_oid: None,
         commit_id: Some(3),
         change_kind: Some("modify".to_owned()),
         confidence_score: 85,
@@ -1193,6 +1196,7 @@ fn owned_core_event_finding_partial_eq_includes_norm_hash() {
         rule_id: 7,
         rule_name: "test-rule".to_owned(),
         norm_hash: [0xBB; 32],
+        blob_oid: None,
         commit_id: Some(3),
         change_kind: Some("modify".to_owned()),
         confidence_score: 85,
@@ -1211,6 +1215,7 @@ fn owned_core_event_debug_redacts_norm_hash() {
         rule_id: 7,
         rule_name: "test-rule".to_owned(),
         norm_hash: [0xDE; 32],
+        blob_oid: None,
         commit_id: Some(3),
         change_kind: Some("modify".to_owned()),
         confidence_score: 85,
@@ -1339,7 +1344,7 @@ fn scan_git_with_perf_debug_handles_empty_pack_exec_reports() {
     // empty-vector path in format_git_debug_output's Perf branch.
     let repo = create_test_repo(&[]);
     // Create an empty commit so the repo has at least one ref.
-    run_git_in(
+    run_git(
         repo.path(),
         &["commit", "-q", "--allow-empty", "-m", "empty"],
     );

@@ -24,6 +24,8 @@ use gossip_coordination::{
     AcquireResultView, AcquireScratch, CheckpointError, ClaimError, CompleteError,
     CoordinationFacade, OpKind,
 };
+#[cfg(test)]
+use gossip_coordination::{ParkError, ParkReason};
 use gossip_frontier::decode_connector_extra;
 use gossip_orchestrator::{FilesystemPathKind, FilesystemShardPayload, GitShardPayload};
 
@@ -714,6 +716,48 @@ where
             shard_id = %lease.shard_id(),
             operation = operation_name,
             "{operation_name} was an idempotent replay",
+        );
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shard parking
+// ---------------------------------------------------------------------------
+
+/// Park a claimed shard directly against the coordination backend.
+///
+/// Uses a deterministic [`OpId`] so repeated park attempts are idempotent. The
+/// helper is intended for best-effort cleanup after a permanent lease failure:
+/// callers should log any returned [`ParkError`] but preserve the original
+/// failure that triggered the park attempt.
+#[cfg(test)]
+pub(super) fn park_shard_on_error<C, L>(
+    coordinator: &mut C,
+    tenant: TenantId,
+    lease: &L,
+    reason: ParkReason,
+) -> Result<(), ParkError>
+where
+    C: CoordinationFacade,
+    L: LeaseView,
+{
+    if lease.lease().tenant() != tenant {
+        return Err(ParkError::TenantMismatch { expected: tenant });
+    }
+
+    let op_id = deterministic_op_id(
+        lease.lease().shard_key(),
+        lease.lease().fence(),
+        OpKind::Park,
+    );
+    let applied =
+        coordinator.park_shard(wall_clock_now(), tenant, &lease.lease(), reason, op_id)?;
+    if !applied.is_executed() {
+        tracing::info!(
+            shard_id = %lease.shard_id(),
+            "park was an idempotent replay",
         );
     }
 

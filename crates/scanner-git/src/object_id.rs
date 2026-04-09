@@ -148,6 +148,42 @@ impl OidBytes {
         self.len
     }
 
+    /// Returns the full 32-byte backing array (zero-padded for SHA-1).
+    ///
+    /// Used by checkpoint serialization to avoid heap allocation — the
+    /// caller stores the raw array alongside the length discriminant.
+    #[inline]
+    #[must_use]
+    pub const fn raw_bytes(&self) -> [u8; 32] {
+        self.bytes
+    }
+
+    /// Reconstruct an `OidBytes` from a raw length + backing array pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` is not 20 or 32.
+    ///
+    /// Callers deserializing from untrusted storage should validate the length
+    /// before calling this function. The checkpoint module validates OID lengths
+    /// during `from_loaded`, ensuring the assert never fires for well-formed
+    /// checkpoint blobs.
+    #[inline]
+    #[must_use]
+    pub fn from_raw(len: u8, bytes: [u8; 32]) -> Self {
+        assert!(
+            len == Self::SHA1_LEN || len == Self::SHA256_LEN,
+            "invalid OID len: {len}"
+        );
+        let mut bytes = bytes;
+        // Enforce the zero-padding invariant documented on the struct:
+        // only `bytes[0..len]` carries valid data.
+        if len == Self::SHA1_LEN {
+            bytes[Self::SHA1_LEN as usize..].fill(0);
+        }
+        Self { len, bytes }
+    }
+
     /// Returns true if the OID is empty.
     ///
     /// OIDs are always 20 or 32 bytes; this is provided for API symmetry
@@ -177,6 +213,40 @@ impl OidBytes {
     #[must_use]
     pub fn is_null(&self) -> bool {
         self.as_slice().iter().all(|&b| b == 0)
+    }
+
+    /// Wire-encoded length: 1 byte length prefix + 32 bytes payload
+    /// (OID bytes followed by zero-padding for SHA-1).
+    pub const WIRE_LEN: usize = 33;
+
+    /// Encode to the fixed-size wire format used by `FindingEvent::blob_oid`.
+    ///
+    /// Byte 0 stores the OID length (20 or 32), bytes 1..=len store the raw
+    /// OID bytes, and the remainder is zero-padded.
+    #[inline]
+    #[must_use]
+    pub fn encode_to_wire(&self) -> [u8; Self::WIRE_LEN] {
+        let mut buf = [0u8; Self::WIRE_LEN];
+        let len = self.len as usize;
+        buf[0] = self.len;
+        buf[1..=len].copy_from_slice(self.as_slice());
+        buf
+    }
+
+    /// Decode from the fixed-size wire format.
+    ///
+    /// Returns `None` if the length byte is invalid (not 20 or 32),
+    /// trailing bytes are non-zero, or the payload fails validation.
+    #[must_use]
+    pub fn decode_from_wire(raw: [u8; Self::WIRE_LEN]) -> Option<Self> {
+        let len = raw[0] as usize;
+        if len != Self::SHA1_LEN as usize && len != Self::SHA256_LEN as usize {
+            return None;
+        }
+        if raw[(len + 1)..].iter().any(|&b| b != 0) {
+            return None;
+        }
+        Self::try_from_slice(&raw[1..=len])
     }
 }
 
@@ -335,5 +405,37 @@ mod tests {
     #[should_panic(expected = "OID must be 20 or 32 bytes")]
     fn oid_bytes_invalid_len() {
         let _ = OidBytes::from_slice(&[0u8; 10]);
+    }
+
+    #[test]
+    fn wire_round_trip_sha1() {
+        let oid = OidBytes::sha1([0xAB; 20]);
+        assert_eq!(OidBytes::decode_from_wire(oid.encode_to_wire()), Some(oid));
+    }
+
+    #[test]
+    fn wire_round_trip_sha256() {
+        let oid = OidBytes::sha256([0xCD; 32]);
+        assert_eq!(OidBytes::decode_from_wire(oid.encode_to_wire()), Some(oid));
+    }
+
+    #[test]
+    fn wire_decode_rejects_invalid_length() {
+        let mut raw = [0u8; OidBytes::WIRE_LEN];
+        raw[0] = 21;
+        assert!(OidBytes::decode_from_wire(raw).is_none());
+    }
+
+    #[test]
+    fn wire_decode_rejects_nonzero_padding() {
+        let oid = OidBytes::sha1([0x11; 20]);
+        let mut raw = oid.encode_to_wire();
+        raw[22] = 0xFF;
+        assert!(OidBytes::decode_from_wire(raw).is_none());
+    }
+
+    #[test]
+    fn wire_decode_rejects_zero_length() {
+        assert!(OidBytes::decode_from_wire([0u8; OidBytes::WIRE_LEN]).is_none());
     }
 }

@@ -94,6 +94,9 @@ pub mod spsc;
 /// Implements a hashed timing wheel with FIFO buckets and bitmap occupancy.
 pub mod timing_wheel;
 
+/// Shared git CLI helpers for test and benchmark fixtures.
+#[cfg(any(test, feature = "git-test-support"))]
+pub mod git_test_support;
 /// Shared proptest configuration helpers for consistent test case counts.
 #[cfg(any(test, feature = "stdx-proptest"))]
 pub mod test_support;

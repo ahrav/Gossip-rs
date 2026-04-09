@@ -384,6 +384,9 @@ pub struct FindingRec {
     /// Best-effort root span hint (absolute byte offset in file).
     pub root_hint_start: u64,
     /// Best-effort root span hint (absolute byte offset in file).
+    ///
+    /// Base64 transform findings snap this to the padding-free minimum before
+    /// emission so root-file identity remains stable across chunk alignment.
     pub root_hint_end: u64,
     /// Whether `span_start`/`span_end` should participate in dedupe for this finding.
     ///

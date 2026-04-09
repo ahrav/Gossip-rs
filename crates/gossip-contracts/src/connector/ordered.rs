@@ -41,12 +41,23 @@ pub struct OrderedContentCapabilities {
 /// expose corresponding bytes through [`open`](Self::open) and optionally
 /// [`read_range`](Self::read_range).
 ///
+/// ## Ordering Invariant
+/// For a fixed shard and cursor progression, emitted item keys must be
+/// monotonic and stable for the duration of a scan run. This guarantees
+/// deterministic checkpointing and resume semantics in the worker loop.
+///
 /// ## Mutability
 /// Methods take `&mut self` because implementations maintain mutable internal
 /// state (e.g., connection handles, cached pagination position, directory
 /// iterators, or lazy index structures). For concurrent multi-shard enumeration,
 /// clone the source instance or wrap in `Arc<Mutex<dyn OrderedContentSource>>`.
 pub trait OrderedContentSource: Send {
+    /// Returns connector capabilities that influence worker behavior.
+    ///
+    /// Callers should treat this as a stable descriptor for a source instance
+    /// during a run. For example, `range_read` controls whether the worker may
+    /// issue [`read_range`](Self::read_range) calls instead of opening full
+    /// streams.
     fn capabilities(&self) -> OrderedContentCapabilities;
 
     /// Fills one bounded page of ordered content items within `shard`.
@@ -77,6 +88,10 @@ pub trait OrderedContentSource: Send {
     ///
     /// ## Errors
     /// Returns `EnumerateError` if hint generation fails.
+    ///
+    /// ## Boundaries
+    /// Any returned key must lie strictly inside the unprocessed shard suffix;
+    /// callers treat out-of-range hints as invalid.
     fn choose_split_point(
         &mut self,
         _shard: &ShardSpec,
@@ -87,6 +102,10 @@ pub trait OrderedContentSource: Send {
     }
 
     /// Opens the full content stream for an item.
+    ///
+    /// Implementations may ignore `budgets` when opening and enforce limits
+    /// only during subsequent reads, but they must still honor cancellation or
+    /// timeout signals represented by the budget context.
     ///
     /// ## Errors
     /// Returns `ReadError` if the item stream cannot be opened.
@@ -105,6 +124,9 @@ pub trait OrderedContentSource: Send {
     /// ## Errors
     /// - Returns `ReadError::unsupported` if the source does not advertise `range_read`.
     /// - Returns `ReadError` if `offset + dst.len()` would overflow `u64`.
+    ///
+    /// Implementations must not write beyond `dst.len()` and should avoid
+    /// partial multibyte decoding semantics; the operation is byte-oriented.
     fn read_range(
         &mut self,
         _item_ref: &ItemRef,

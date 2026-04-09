@@ -6,6 +6,7 @@ members = [
     "crates/gossip-pg-common",
     "crates/gossip-done-ledger-postgres",
     "crates/gossip-findings-postgres",
+    "crates/gossip-git-persistence-postgres",
     "crates/scanner-engine",
     "crates/scanner-scheduler",
     "crates/scanner-git",
@@ -37,6 +38,7 @@ gossip-contracts = { path = "crates/gossip-contracts" }
 gossip-pg-common = { path = "crates/gossip-pg-common" }
 gossip-done-ledger-postgres = { path = "crates/gossip-done-ledger-postgres" }
 gossip-findings-postgres = { path = "crates/gossip-findings-postgres" }
+gossip-git-persistence-postgres = { path = "crates/gossip-git-persistence-postgres" }
 scanner-engine = { path = "crates/scanner-engine" }
 scanner-scheduler = { path = "crates/scanner-scheduler" }
 scanner-git = { path = "crates/scanner-git" }

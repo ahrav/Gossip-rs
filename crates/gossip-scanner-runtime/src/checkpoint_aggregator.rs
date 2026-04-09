@@ -60,7 +60,11 @@ impl PendingPrefixCheckpoint {
         self.page.scope().committed_units().get()
     }
 
-    /// Tokenless cursor that will be stored durably if checkpointing succeeds.
+    /// Cursor that will be stored durably if checkpointing succeeds.
+    ///
+    /// Ordered-content boundaries persist only the authoritative `last_key`
+    /// (token stripped). Repo-frontier boundaries preserve both `last_key`
+    /// and token for inner-stage resume.
     #[inline]
     #[must_use]
     pub fn checkpoint_cursor(&self) -> &Cursor {
@@ -494,10 +498,11 @@ impl PrefixCheckpointAggregator {
         // because both are set in the same loop iteration.
         let boundary = last_boundary.expect("set in the same iteration as last_sequence_no");
 
-        let checkpoint_boundary =
-            strip_checkpoint_token(boundary).ok_or(PrefixCheckpointError::MissingProgressKey {
+        let checkpoint_boundary = normalize_checkpoint_cursor(boundary).ok_or(
+            PrefixCheckpointError::MissingProgressKey {
                 sequence_no: last_seq,
-            })?;
+            },
+        )?;
         let committed_units = NonZeroU64::new(totals.committed_units).ok_or(
             PrefixCheckpointError::InternalInconsistency {
                 detail: "non-empty contiguous prefix committed zero units",
@@ -576,13 +581,29 @@ fn validate_receipt(
     Ok(receipt.completed_unit().checkpoint_boundary_kind())
 }
 
-fn strip_checkpoint_token(boundary: &CheckpointBoundary) -> Option<CheckpointBoundary> {
-    let last_key = boundary.cursor().last_key().cloned()?;
-    let cursor = Cursor::with_last_key(last_key);
-
+/// Normalizes a checkpoint cursor for persistence.
+///
+/// The behavior is asymmetric by boundary kind:
+///  - **OrderedContent**: strips the token, preserving only the authoritative
+///    `last_key`. Tokens here are seek optimizations that must not leak into
+///    persisted checkpoints.
+///  - **RepoFrontier**: preserves the full cursor including the token. The
+///    token encodes inner-stage resume state (e.g. mid-scan progress) that
+///    the discovery source needs for resumption.
+fn normalize_checkpoint_cursor(boundary: &CheckpointBoundary) -> Option<CheckpointBoundary> {
     Some(match boundary {
-        CheckpointBoundary::OrderedContent(_) => CheckpointBoundary::ordered_content(cursor),
-        CheckpointBoundary::RepoFrontier(_) => CheckpointBoundary::repo_frontier(cursor),
+        CheckpointBoundary::OrderedContent(_) => {
+            // Ordered-content tokens are seek optimizations — strip them so
+            // checkpoints carry only the authoritative last_key.
+            let last_key = boundary.cursor().last_key().cloned()?;
+            CheckpointBoundary::ordered_content(Cursor::with_last_key(last_key))
+        }
+        CheckpointBoundary::RepoFrontier(_) => {
+            // Repo-frontier tokens encode inner-stage resume state (e.g.
+            // mid-scan checkpoint progress). Preserve them so the discovery
+            // source can re-emit the target for resumption.
+            CheckpointBoundary::repo_frontier(boundary.cursor().clone())
+        }
     })
 }
 
@@ -1434,13 +1455,17 @@ mod tests {
             pending.scope().checkpoint_boundary_kind(),
             CheckpointBoundaryKind::RepoFrontier
         );
-        // Token stripped, last key preserved from the final receipt in
-        // sequence order (seq 1 carries key 'r').
+        // Repo-frontier checkpoints preserve the final receipt token so the
+        // singleton source can resume the same repo from an inner stage
+        // checkpoint.
         assert_eq!(
             pending.checkpoint_cursor().last_key(),
             Some(&item_key(b'r'))
         );
-        assert!(pending.checkpoint_cursor().token().is_none());
+        assert_eq!(
+            pending.checkpoint_cursor().token(),
+            Some(&TokenBytes::try_from_slice(&[0xCC]).unwrap())
+        );
         // Aggregated findings: seq 0 (1,2,3) + seq 1 (3,4,5) = (4,6,8).
         assert_eq!(
             pending.item_commit_receipt().findings(),

@@ -46,9 +46,8 @@ fill_page(shard, cursor, budgets)
 **Concrete connectors:**
 `FilesystemConnector` directly implements `OrderedContentSource` and keeps
 matching inherent helper methods in `gossip-connectors/src/filesystem.rs`.
-`GitConnector` (git-tracked files via `ls-files`) and
-`InMemoryDeterministicConnector` expose the same read/split surface as
-inherent methods in `gossip-connectors/src/`.
+`InMemoryDeterministicConnector` exposes the same read/split surface as
+inherent methods in `gossip-connectors/src/in_memory.rs`.
 
 **Submission staging:**
 
@@ -158,12 +157,17 @@ and `types.rs`.
 | `crates/gossip-contracts/src/connector/api.rs` | Error taxonomy, capabilities |
 | `crates/gossip-contracts/src/connector/conformance.rs` | Ordered-content conformance harness shared by concrete connector implementations |
 | `crates/gossip-contracts/src/connector/mod.rs` | Re-export hub, canonical connector tags |
-| `crates/gossip-connectors/src/lib.rs` | Crate root re-exports for concrete filesystem, Git, and in-memory connector implementations |
+| `crates/gossip-contracts/src/connector/api_tests.rs` | Unit tests for error taxonomy and capabilities |
+| `crates/gossip-contracts/src/connector/common_tests.rs` | Unit tests for shared paging vocabulary |
+| `crates/gossip-contracts/src/connector/types_tests.rs` | Unit tests for toxic-byte wrappers, cursor, and budgets |
+| `crates/gossip-connectors/src/lib.rs` | Crate root re-exports for concrete filesystem and in-memory connector implementations |
 | `crates/gossip-connectors/src/filesystem.rs` | Filesystem ordered-content connector |
-| `crates/gossip-connectors/src/git.rs` | Git `ls-files` ordered-content connector |
 | `crates/gossip-connectors/src/in_memory.rs` | Deterministic in-memory test connector |
 | `crates/gossip-connectors/src/common.rs` | Shared connector utilities |
 | `crates/gossip-connectors/src/split_estimator.rs` | Streaming byte-weighted split-point estimator (internal; used by `common.rs` and `FilesystemConnector`) |
+| `crates/gossip-connectors/src/filesystem_tests.rs` | Unit tests for filesystem connector |
+| `crates/gossip-connectors/src/in_memory_tests.rs` | Unit tests for in-memory connector |
+| `crates/gossip-connectors/src/split_estimator_tests.rs` | Unit tests for split-point estimator |
 | `crates/gossip-orchestrator/src/lib.rs` | Re-export hub for filesystem and Git request normalization, planning, and run setup |
 | `crates/gossip-orchestrator/src/git_payload.rs` | Typed Git shard payload wire format for repo-frontier shards (encode/decode) |
 | `crates/gossip-orchestrator/src/git_planner.rs` | Deterministic Git initial shard geometry planner |
@@ -193,6 +197,17 @@ and `types.rs`.
 | `crates/gossip-scanner-runtime/src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregation |
 | `crates/gossip-scanner-runtime/src/coordination_sink.rs` | Coordination event recorder payloads for distributed scans |
 | `crates/gossip-scanner-runtime/src/distributed.rs` | Distributed worker-loop runtime and receipt-backed commit plumbing |
+| `crates/gossip-scanner-runtime/src/cli_tests.rs` | CLI argument parsing and entrypoint configuration tests |
+| `crates/gossip-scanner-runtime/src/distributed/commit_bridge.rs` | Scan-to-commit adapter and commit pipeline draining |
+| `crates/gossip-scanner-runtime/src/distributed/execution.rs` | Scan execution, per-lease orchestration, and top-level worker loops |
+| `crates/gossip-scanner-runtime/src/distributed/integration_tests.rs` | End-to-end integration tests for the distributed module |
+| `crates/gossip-scanner-runtime/src/distributed/lease_ops.rs` | Lease lifecycle: claiming, hydration, deadline watchdog, and shard advancement |
+| `crates/gossip-scanner-runtime/src/distributed/test_support.rs` | Shared test doubles and fixture builders for distributed module tests |
+| `crates/gossip-scanner-runtime/src/distributed/types.rs` | Distributed runtime types, errors, and shared definitions |
+| `crates/gossip-scanner-runtime/src/distributed/unit_tests.rs` | Component-level unit tests for distributed coordination and state transitions |
+| `crates/gossip-scanner-runtime/src/lib_tests.rs` | Runtime tests for parsing, validation, and local scan execution |
+| `crates/gossip-scanner-runtime/src/runtime_durability_tests.rs` | Durability integration tests for translation, commit, and receipt-driven checkpoint aggregation |
+| `crates/gossip-scanner-runtime/src/test_fixtures.rs` | Shared test data builders and git repository setup helpers |
 
 ---
 

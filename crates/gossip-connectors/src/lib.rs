@@ -1,9 +1,8 @@
-//! Source connectors: filesystem, git, and in-memory implementations.
+//! Source connectors: filesystem and in-memory implementations.
 //!
 //! This crate provides concrete source-family implementations that bridge
-//! specific data sources (local filesystem, git repository snapshots, or
-//! deterministic in-memory fixtures) into the shared connector contracts
-//! defined in `gossip-contracts`.
+//! specific data sources (local filesystem or deterministic in-memory fixtures)
+//! into the shared connector contracts defined in `gossip-contracts`.
 //!
 //! Shared connector value types (`ScanItem`, `ItemRef`, etc.) live in the
 //! `gossip_contracts::connector` module. This crate supplies concrete adapters
@@ -27,18 +26,22 @@
 //! **Dependency direction:** This crate depends on `gossip-contracts` for value
 //! types and traits. It must not depend on persistence backends or
 //! coordination backend implementations.
+//!
+//! # Platform Boundaries
+//!
+//! - Filesystem connectors are exported only on Unix (`#[cfg(unix)]`).
+//! - In-memory connectors are always available for deterministic tests and
+//!   benchmarks across platforms.
 
 mod common;
 #[cfg(unix)]
 pub mod filesystem;
-pub mod git;
 pub mod in_memory;
 mod split_estimator;
 
 pub use common::{is_permanent_io_error, is_symlink_loop, path_buf_from_bytes};
 #[cfg(unix)]
 pub use filesystem::FilesystemConnector;
-pub use git::GitConnector;
 pub use gossip_contracts::connector::{
     FILESYSTEM_CONNECTOR_TAG, GIT_CONNECTOR_TAG, IN_MEMORY_CONNECTOR_TAG,
 };
@@ -61,6 +64,11 @@ pub use in_memory::{InMemoryDeterministicConnector, MemItem};
 /// `sample_cap` is forwarded directly to
 /// `split_estimator::StreamingSplitEstimator::new`, so benchmark callers can
 /// exercise the estimator under different sampling budgets.
+///
+/// # Complexity
+///
+/// Runs in `O(count)` time and `O(sample_cap)` additional memory, matching the
+/// estimator's streaming sample budget.
 pub fn benchmark_streaming_split_estimator_observe_fixed_size(
     sample_cap: usize,
     count: usize,

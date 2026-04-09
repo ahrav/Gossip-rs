@@ -2,6 +2,9 @@
 //!
 //! Run with: `cargo test --features integration-tests --test integration`
 
+#[path = "../support/git_test_support.rs"]
+mod git_test_support;
+
 mod anchor_optimization;
 mod archive_scanning;
 mod bench_guards;

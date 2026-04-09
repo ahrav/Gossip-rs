@@ -730,6 +730,7 @@ impl SanitizedCoordinationRecord {
                 rule_id,
                 rule_name,
                 norm_hash: _,
+                blob_oid: _,
                 commit_id,
                 change_kind,
                 confidence_score,
@@ -788,13 +789,13 @@ impl SanitizedCoordinationRecord {
     }
 
     /// Converts a git event into a sanitized record, redacting `shard_id`,
-    /// commit OIDs, and identity dictionary values (raw name/email bytes).
+    /// commit OID bytes, and identity dictionary values (raw name/email bytes).
     fn from_git_event(shard_id: &str, event: StoredGitEvent) -> Self {
         let shard_id = RedactedDigest::text("shard_id", shard_id);
         match event {
             StoredGitEvent::CommitMeta {
                 commit_id,
-                oid_hex,
+                commit_oid,
                 timestamp,
                 author_name_id,
                 author_email_id,
@@ -803,7 +804,8 @@ impl SanitizedCoordinationRecord {
             } => Self::GitCommitMeta {
                 shard_id,
                 commit_id,
-                oid: RedactedDigest::text("git_commit_oid", &oid_hex),
+                // Redaction operates on the raw OID bytes, not a hex-text representation.
+                oid: RedactedDigest::bytes("git_commit_oid", commit_oid.as_slice()),
                 timestamp,
                 author_name_id,
                 author_email_id,
@@ -1043,6 +1045,7 @@ mod tests {
                     rule_id: 17,
                     rule_name: canary.to_owned(),
                     norm_hash: [0xAB; 32],
+                    blob_oid: None,
                     commit_id: Some(99),
                     change_kind: Some(canary.to_owned()),
                     confidence_score: 7,
@@ -1083,9 +1086,9 @@ mod tests {
                 format!("git-commit-shard-{canary}"),
                 StoredGitEvent::CommitMeta {
                     commit_id: 17,
-                    // Use a distinctive 20-byte pattern (SHA-1 length) whose hex
-                    // representation contains the canary's first 8 hex chars.
-                    oid_hex: gossip_stdx::HexOid::from_oid_bytes(&[
+                    // A recognisable 20-byte (SHA-1) pattern that is easy to
+                    // spot in test output without leaking the canary string.
+                    commit_oid: scanner_git::OidBytes::sha1([
                         0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67,
                         0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98,
                     ]),
@@ -1335,6 +1338,75 @@ mod tests {
     }
 
     #[test]
+    fn from_git_event_redacts_commit_oid_bytes() {
+        let commit_oid = scanner_git::OidBytes::sha1([
+            0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB,
+            0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98,
+        ]);
+        let record = SanitizedCoordinationRecord::from_git_event(
+            "git-shard",
+            StoredGitEvent::CommitMeta {
+                commit_id: 17,
+                commit_oid,
+                timestamp: 1234,
+                author_name_id: Some(1),
+                author_email_id: Some(2),
+                committer_name_id: Some(3),
+                committer_email_id: Some(4),
+            },
+        );
+        let debug = format!("{record:?}");
+
+        assert!(
+            !debug.contains("cafebabedeadbeef0123456789abcdeffedcba98"),
+            "sanitized debug output must not expose raw OID hex: {debug}"
+        );
+        assert!(
+            !debug.contains("0xca"),
+            "sanitized debug output must not contain raw OID byte representations: {debug}"
+        );
+        assert!(
+            !debug.contains("[ca,"),
+            "sanitized debug output must not contain OidBytes debug format: {debug}"
+        );
+
+        match record {
+            SanitizedCoordinationRecord::GitCommitMeta { shard_id, oid, .. } => {
+                assert_eq!(shard_id, RedactedDigest::text("shard_id", "git-shard"));
+                assert_eq!(
+                    oid,
+                    RedactedDigest::bytes("git_commit_oid", commit_oid.as_slice())
+                );
+                // Digest reflects raw byte length (20 for SHA-1), not hex string length (40).
+                let display = format!("{oid}");
+                assert!(
+                    display.starts_with("len=20,"),
+                    "redaction len must reflect raw OID byte count: {display}"
+                );
+            }
+            other => panic!("expected GitCommitMeta, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_oid_redaction_is_deterministic() {
+        let event = StoredGitEvent::CommitMeta {
+            commit_id: 9,
+            commit_oid: scanner_git::OidBytes::sha1([0x55; 20]),
+            timestamp: 777,
+            author_name_id: Some(1),
+            author_email_id: None,
+            committer_name_id: Some(3),
+            committer_email_id: None,
+        };
+
+        let left = SanitizedCoordinationRecord::from_git_event("git-shard", event.clone());
+        let right = SanitizedCoordinationRecord::from_git_event("git-shard", event);
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
     fn sanitized_stage_signal_records_redact_shard_id() {
         let canary = secret_canary();
         let (_, _, _, stage) = canary_raw_events(&canary);
@@ -1360,6 +1432,7 @@ mod tests {
                 rule_id: 1,
                 rule_name: "rule".to_owned(),
                 norm_hash: [0xDE; 32],
+                blob_oid: None,
                 commit_id: None,
                 change_kind: None,
                 confidence_score: 5,
@@ -1522,6 +1595,7 @@ mod tests {
                         rule_id: 1,
                         rule_name: "rule".to_owned(),
                         norm_hash: [0xBC; 32],
+                        blob_oid: None,
                         commit_id: None,
                         change_kind: None,
                         confidence_score: 5,
@@ -1535,7 +1609,10 @@ mod tests {
                     "none-git-shard",
                     StoredGitEvent::CommitMeta {
                         commit_id: 1,
-                        oid_hex: gossip_stdx::HexOid::from_oid_bytes(&[0xAB, 0xC1, 0x23]),
+                        commit_oid: scanner_git::OidBytes::sha1([
+                            0xAB, 0xC1, 0x23, 0x99, 0x10, 0x42, 0x54, 0x76, 0x88, 0x9A, 0xBC, 0xDE,
+                            0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                        ]),
                         timestamp: 100,
                         author_name_id: None,
                         author_email_id: None,

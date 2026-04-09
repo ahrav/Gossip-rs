@@ -402,12 +402,12 @@ sequenceDiagram
     C-->>W: Ok(split_point)
 ```
 
-**Split point strategies.** `FilesystemConnector`,
-`InMemoryDeterministicConnector`, and `GitConnector` all use
+**Split point strategies.** `FilesystemConnector`
+and `InMemoryDeterministicConnector` both use
 `StreamingSplitEstimator` for byte-weighted split selection.
 `FilesystemConnector` feeds the estimator incrementally during
-pagination walks; in-memory and git connectors bulk-load their
-already-sorted ranges via `from_sorted_entries`. The estimator falls
+pagination walks; the in-memory connector bulk-loads its
+already-sorted range via `from_sorted_entries`. The estimator falls
 back to a count-balanced midpoint when all entries are zero-size or
 weight concentrates in the leading entry.
 
@@ -417,7 +417,6 @@ The worker uses these flags to choose the optimal enumeration and split strategy
 
 Source: `crates/gossip-contracts/src/connector/api.rs`,
 `crates/gossip-connectors/src/filesystem.rs`,
-`crates/gossip-connectors/src/git.rs`,
 `crates/gossip-connectors/src/in_memory.rs`,
 `crates/gossip-connectors/src/split_estimator.rs`
 
@@ -544,5 +543,4 @@ Source: `crates/gossip-frontier/src/hint.rs`
 | `crates/gossip-frontier/src/builder.rs`                  | `PreallocShardBuilder`, `split_range_by_boundaries()`                                                                  |
 | `crates/gossip-contracts/src/connector/api.rs`           | `ConnectorCapabilities`                                                                                                |
 | `crates/gossip-connectors/src/filesystem.rs`             | `FilesystemConnector` split point selection (`choose_split_point`)                                                     |
-| `crates/gossip-connectors/src/git.rs`                    | `GitConnector` split point selection (`choose_split_point`)                                                            |
 | `crates/gossip-connectors/src/in_memory.rs`              | `InMemoryDeterministicConnector` split point selection (`choose_split_point`)                                          |

@@ -309,6 +309,7 @@ mod tests {
             rule_id: 7,
             rule_name: "rule",
             norm_hash: [0xAB; 32],
+            blob_oid: None,
             commit_id: Some(3),
             change_kind: Some("modify"),
             confidence_score: 2,

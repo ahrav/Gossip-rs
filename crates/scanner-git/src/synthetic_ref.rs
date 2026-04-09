@@ -710,7 +710,7 @@ mod tests {
     use super::*;
     use crate::delta_test_helpers::{make_add_delta, zlib_compress, SyntheticPackBuilder};
     use crate::midx_test_builder::MidxBuilder;
-    use crate::native_ref_resolver::tests::{git, init_repo, parse_oid, resolve_with, try_git};
+    use crate::native_ref_resolver::tests::{create_repo, git, parse_oid, resolve_with, try_git};
     use crate::repo::RepoKind;
     use crate::StartSetConfig;
 
@@ -799,7 +799,7 @@ mod tests {
     #[test]
     fn materialize_synthetic_commit_ref_writes_only_inside_mirror() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let source = init_repo(&tmp);
+        let source = create_repo(&tmp);
 
         fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
         git(&source, &["add", "."]);
@@ -837,7 +837,7 @@ mod tests {
     #[test]
     fn materialize_synthetic_commit_ref_is_idempotent() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let source = init_repo(&tmp);
+        let source = create_repo(&tmp);
 
         fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
         git(&source, &["add", "."]);
@@ -868,7 +868,7 @@ mod tests {
     #[test]
     fn materialize_synthetic_commit_ref_rejects_missing_commit() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mirror = init_repo(&tmp);
+        let mirror = create_repo(&tmp);
         git(&mirror, &["commit", "--allow-empty", "-m", "first"]);
 
         let missing = parse_oid("1111111111111111111111111111111111111111");
@@ -884,7 +884,7 @@ mod tests {
     #[test]
     fn materialize_synthetic_commit_ref_rejects_non_commit_object() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mirror = init_repo(&tmp);
+        let mirror = create_repo(&tmp);
         git(&mirror, &["commit", "--allow-empty", "-m", "first"]);
 
         fs::write(mirror.join("blob.txt"), "test-blob\n").expect("write blob source");
@@ -902,7 +902,7 @@ mod tests {
     #[test]
     fn materialize_synthetic_commit_ref_rejects_format_mismatch() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mirror = init_repo(&tmp);
+        let mirror = create_repo(&tmp);
         git(&mirror, &["commit", "--allow-empty", "-m", "first"]);
 
         // SHA-256 OID against a SHA-1 mirror triggers the format guard.
@@ -921,7 +921,7 @@ mod tests {
     #[test]
     fn synthetic_commit_ref_resolves_through_explicit_refs_start_set() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let source = init_repo(&tmp);
+        let source = create_repo(&tmp);
 
         fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
         git(&source, &["add", "."]);
@@ -954,7 +954,7 @@ mod tests {
     #[test]
     fn materialize_synthetic_commit_ref_resolves_pack_only_commit() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let source = init_repo(&tmp);
+        let source = create_repo(&tmp);
 
         fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
         git(&source, &["add", "."]);
@@ -1118,7 +1118,7 @@ mod tests {
     #[test]
     fn lookup_commit_graph_kind_reads_commit_from_commit_graph() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let source = init_repo(&tmp);
+        let source = create_repo(&tmp);
 
         fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
         git(&source, &["add", "."]);
@@ -1157,7 +1157,7 @@ mod tests {
     #[test]
     fn lookup_object_kind_rejects_commit_graph_hits_when_the_object_is_missing() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let source = init_repo(&tmp);
+        let source = create_repo(&tmp);
 
         fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
         git(&source, &["add", "."]);

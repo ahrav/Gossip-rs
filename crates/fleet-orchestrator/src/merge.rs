@@ -172,7 +172,23 @@ pub fn merge_section(
     let mut conflicts = Vec::new();
 
     for branch in agent_branches {
-        // Ensure we have the latest remote ref for this branch.
+        // Check that the branch exists on the remote before attempting fetch.
+        // Agents that find no drift skip the push, so the branch may not exist.
+        let ls_output = git(
+            &worktree.path,
+            &[
+                "ls-remote",
+                "--exit-code",
+                "origin",
+                &format!("refs/heads/{branch}"),
+            ],
+        )?;
+
+        if !ls_output.status.success() {
+            debug!(branch = %branch, section = %section_id, "no branch pushed, skipping");
+            continue;
+        }
+
         git_ok(&worktree.path, &["fetch", "origin", branch])
             .with_context(|| format!("fetch origin/{branch}"))?;
 

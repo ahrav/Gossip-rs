@@ -3,6 +3,8 @@
 //! This module defines the reusable page container and validation helpers that
 //! connector families use to emit ordered enumeration results without
 //! re-specifying page shape rules at each family boundary.
+//! Validation is intentionally fail-fast: each helper reports the first
+//! detected violation so callers can surface deterministic diagnostics.
 //!
 //! ## Surface overview
 //!
@@ -46,6 +48,9 @@ use super::{Cursor, ItemKey, ScanItem};
 /// This constructor enforces only the non-empty invariant. Call
 /// [`validate_filled_page`] when the page items must also satisfy ordering,
 /// uniqueness, and shard-bound rules.
+///
+/// The page state is preserved alongside the items so consumers can inspect
+/// payload and continuation semantics together.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageBuf<T> {
     items: Vec<T>,
@@ -210,6 +215,9 @@ pub trait KeyedPageItem {
     fn item_key(&self) -> &ItemKey;
 
     /// Returns the optional item byte-size estimate used for budget tracking.
+    ///
+    /// `None` means "size is unknown". Validation routines in this module do
+    /// not consult this value.
     fn size_hint(&self) -> Option<u64>;
 }
 
@@ -287,6 +295,8 @@ pub fn validate_filled_page<T: KeyedPageItem>(
         });
     }
 
+    // Because keys are required to be strictly increasing, proving the first
+    // key is >= shard_start is sufficient to prove all later keys are too.
     for (offset, item) in rest.iter().enumerate() {
         let index = offset + 1;
         let key = item.item_key().as_bytes();
@@ -383,6 +393,7 @@ pub fn validate_page_sequence<T: KeyedPageItem>(
         });
     }
 
+    // `Complete` pages have no additional cursor-shape requirements.
     if let PageState::HasMore { cursor } = page_state {
         let Some(cursor_last) = cursor.last_key() else {
             return Err(PageSequenceViolation::HasMoreWithoutLastKey);

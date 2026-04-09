@@ -304,10 +304,11 @@ pub enum CursorInputError {
 
 /// Result of comparing two cursor updates for monotonic forward progress.
 ///
-/// Used by the coordination layer to reject checkpoint and complete
-/// operations that would move a shard's scan position backwards.
-/// `Forward` covers both strict advancement and idempotent replays
-/// at the same position.
+/// Coordination calls this before accepting a checkpoint or complete
+/// operation so that a shard's scan position never regresses. Replays
+/// at the same `last_key` are treated as `Forward`, a strictly lower key
+/// yields `Regression`, and dropping an established key produces
+/// `ResetToNone`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use = "advance check result must be inspected to enforce monotonicity"]
 #[non_exhaustive]
@@ -326,7 +327,7 @@ pub enum CursorAdvance {
 ///
 /// Comparison uses lexicographic byte ordering on `last_key`. The token
 /// field is ignored because it is connector-opaque and has no defined
-/// ordering.
+/// ordering, so only the coordinator-visible progress key governs monotonicity.
 ///
 /// Returns [`CursorAdvance::Forward`] for any transition that does not
 /// move backwards, including same-position idempotent replays.
@@ -355,9 +356,11 @@ pub fn check_cursor_advance(old: CursorUpdate<'_>, new: CursorUpdate<'_>) -> Cur
 /// Result of checking a cursor update against a shard's half-open key range
 /// `[start, end)`.
 ///
-/// Empty `start` or `end` in the shard spec means that boundary is
-/// unbounded (negative or positive infinity, respectively). A fully
-/// unbounded spec (`start = []`, `end = []`) always yields [`InBounds`](Self::InBounds)
+/// Coordination layers call this whenever a shard reports progress to ensure
+/// its `last_key` remains inside the assigned `ShardSpecRef`. An empty
+/// `start` or `end` in the shard spec makes that boundary unbounded (negative
+/// or positive infinity, respectively), so a fully unbounded spec
+/// (`start = []`, `end = []`) always yields [`InBounds`](Self::InBounds)
 /// for any non-`None` key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use = "bounds check result must be inspected to enforce range safety"]
@@ -378,6 +381,8 @@ pub enum CursorBoundsCheck {
 ///
 /// An empty `start` or `end` in `spec` is treated as unbounded on that
 /// side, so bounds checking is skipped for that boundary.
+/// If the cursor contains no `last_key`, the check immediately returns
+/// [`CursorBoundsCheck::NoKey`] because there is nothing to compare.
 #[inline]
 #[must_use = "ignoring the bounds check defeats the range safety invariant"]
 pub fn check_cursor_bounds(cursor: CursorUpdate<'_>, spec: ShardSpecRef<'_>) -> CursorBoundsCheck {
@@ -417,6 +422,9 @@ pub fn check_cursor_bounds(cursor: CursorUpdate<'_>, spec: ShardSpecRef<'_>) -> 
 ///
 /// Writes into caller-owned `out` so the result borrows from the caller's
 /// scratch buffer rather than allocating.
+/// The returned slice always points at the scratch buffer's prefix up to
+/// the last non-`0xFF` byte that was incremented, keeping the representation
+/// minimal for range math.
 #[inline]
 pub fn prefix_successor_into<'a>(
     prefix: &[u8],
@@ -439,6 +447,10 @@ pub fn prefix_successor_into<'a>(
 /// than `key` in the lexicographic byte order. Two strategies are used
 /// depending on the key length:
 ///
+/// Callers (for example shard-splitting helpers) use this to produce the
+/// minimal exclusive upper bound for a key while reusing the provided
+/// `out` buffer to avoid allocating.
+///
 /// 1. **Short keys** (`len < MAX_KEY_SIZE`): append a `0x00` byte.
 ///    `"abc"` becomes `"abc\x00"`. This is the immediate successor
 ///    because no byte string exists between `"abc"` and `"abc\x00"` in
@@ -451,6 +463,8 @@ pub fn prefix_successor_into<'a>(
 ///    keyspace).
 ///
 /// Keys longer than `MAX_KEY_SIZE` are rejected (returns `None`).
+/// An all-`0xFF` key at `MAX_KEY_SIZE` is already the lexicographic ceiling,
+/// so no successor exists and `None` is returned in that case as well.
 #[inline]
 pub fn key_successor_into<'a>(key: &[u8], out: &'a mut [u8; MAX_KEY_SIZE]) -> Option<&'a [u8]> {
     if key.len() > MAX_KEY_SIZE {

@@ -25,7 +25,13 @@
 > plus thin wrappers around the shared advisory-locked checksum-verifying
 > runner and shared PostgreSQL test-support lifecycle, findings-specific
 > type-mapping support, and a `FindingsPgMigrationError` alias re-exporting
-> `PgMigrationError` from `gossip-pg-common`.
+> `PgMigrationError` from `gossip-pg-common`. Git runtime key/value storage,
+> schema, migrations, and the concrete `GitPersistenceBackend`
+> implementation live in `gossip-git-persistence-postgres`
+> (`crates/gossip-git-persistence-postgres/src/`); that crate stores opaque
+> scanner-owned keys and values for ref watermarks, seen bitmaps, and
+> mid-scan checkpoints behind one PostgreSQL table plus the shared
+> advisory-locked migration runner from `gossip-pg-common`.
 
 Boundary 5 defines the persistence contracts for three subsystems:
 
@@ -59,7 +65,7 @@ Non-negotiables (project-wide):
 
 | Trait | Purpose | Key methods |
 |-------|---------|-------------|
-| `PersistenceFinding` | Unified finding-identity surface consumed by persistence translation, regardless of source family | `rule_id(&self) -> u32`, `norm_hash(&self) -> NormHash`, `span_start(&self) -> u64`, `span_end(&self) -> u64`, `span_len(&self) -> u64` |
+| `PersistenceFinding` | Unified finding-identity surface consumed by persistence translation, regardless of source family | `rule_id(&self) -> u32`, `norm_hash(&self) -> NormHash`, `blob_offset_start(&self) -> u64`, `blob_offset_end(&self) -> u64`, `blob_offset_len(&self) -> u64` |
 | `DoneLedger` | Dedupe index: "was this object-version scanned under this policy?" | `batch_get(&self, TenantId, PolicyHash, &[OvidHash]) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error>`, `list_done_hashes(&self, TenantId, PolicyHash) -> Result<Vec<OvidHash>, Self::Error>`, `batch_upsert(&self, &[DoneLedgerRecord]) -> Result<Self::CommitHandle, Self::Error>` |
 | `FindingsSink` | Triage/query plane: findings + occurrences + observations persistence | `upsert_batch(&self, FindingsUpsertBatch<'_>) -> Result<Self::CommitHandle, Self::Error>` |
 | `CommitHandle` | Durable acknowledgement handle; `wait()` consumes self and returns a receipt | `wait(self) -> Result<Self::Receipt, Self::Error>` |
@@ -101,8 +107,8 @@ Non-negotiables (project-wide):
 
 Source-specific finding carriers do not flow into persistence directly. The
 translation boundary consumes `PersistenceFinding`, which exposes only the
-identity-relevant fields (`rule_id`, redacted `NormHash`, `span_start`,
-`span_end`). Filesystem and Git paths are free to keep extra metadata such as
+identity-relevant fields (`rule_id`, redacted `NormHash`, `blob_offset_start`,
+`blob_offset_end`). Filesystem and Git paths are free to keep extra metadata such as
 root hints, object paths, commit IDs, or confidence scores on their local
 telemetry paths without affecting stable persistence identity.
 
@@ -153,6 +159,7 @@ telemetry paths without affecting stable persistence identity.
 | `gossip-pg-common` | Shared PostgreSQL type-mapping, migration, and test-support primitives | Owns `PgU64ConversionError`, the four `u64 ↔ BIGINT` conversion helpers (bit-pattern and ordered non-negative modes), `PgByteDecodeError` and `decode_fixed_32` for zero-copy `BYTEA` → `[u8; 32]` decoding, `EmbeddedMigration`, `MigrationConfig`, `PgMigrationError`, checksum-verification helpers, the shared advisory-locked migration runner, the `MigrationOperation` enum, and the shared PostgreSQL integration-test lifecycle (`create_test_db`, `test_client_bare`, `test_client_with`) used by the Postgres persistence crates. All PostgreSQL persistence backends depend on this crate instead of duplicating these primitives. |
 | `gossip-done-ledger-postgres` | Synchronous PostgreSQL `DoneLedger` backend plus schema/migration/type-mapping support | Implements monotonic done-ledger upsert semantics with durable-before-return commits and provides the done-ledger migration set plus thin wrappers around the shared forward-only runner and shared PostgreSQL test-support lifecycle. Migration application remains checksum-verified, advisory-locked, and transaction-scoped, so migration SQL cannot use commands that require running outside a transaction block (for example `CREATE INDEX CONCURRENTLY`). Passes `run_done_ledger_conformance`. |
 | `gossip-findings-postgres` | Synchronous PostgreSQL `FindingsSink` backend plus schema/migration/type-mapping/read-API support | Implements `FindingsSinkPg` with single-transaction findings → occurrences → observations upserts, prepared statement reuse, a `FindingsConformanceProbe` count reader, and tenant-scoped read helpers: `count_observations_by_tenant_policy` (returns `Vec<ObservationCountByPolicy>`) and `list_findings_needing_triage` (returns `Vec<PendingTriageFinding>` ordered by `seen_at DESC`). Read API result types live in `read_api.rs`. The crate also provides findings-specific schema constants, row projections, Rust-side tenant validation and duplicate folding that mirrors the observation SQL merge rules, and the findings migration set plus thin wrappers around the shared advisory-locked checksum-verifying runner and shared PostgreSQL test-support lifecycle. See [findings-postgres-dedup diagram](../../diagrams/21-findings-postgres-dedup.md) for the batch dedup pipeline, observation merge decision tree, and dual-convergence property. |
+| `gossip-git-persistence-postgres` | Synchronous PostgreSQL `GitPersistenceBackend` plus schema/migration support for scanner-owned key/value state | Implements `GitPersistencePg` over a single `git_kv` table keyed by opaque `BYTEA` blobs. The backend preserves input order for `multi_get`, normalizes duplicate keys inside one `apply_batch` call with last-op-wins semantics, and commits the resulting put/delete set in one PostgreSQL transaction so `supports_atomic_batches()` can return `true`. The crate also owns the git-persistence migration set plus thin wrappers around the shared advisory-locked checksum-verifying runner and shared PostgreSQL test-support lifecycle. |
 
 ---
 

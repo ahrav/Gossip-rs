@@ -208,8 +208,9 @@ Each blob flows through four stages inside the adapter:
    skips the ring buffer memcpy entirely (`engine_adapter.rs`). Larger
    blobs stream through `RingChunker` (`engine_adapter.rs`).
 3. **Stream** (`stream_findings`, `engine_adapter.rs`) -- findings are
-   emitted to the structured `EventSink`. A `CommitMeta` event is emitted at
-   most once per commit via `AtomicBitSet::test_and_set`.
+   emitted to the structured `EventSink` with the blob OID wire-encoded
+   into each `FindingEvent`. A `CommitMeta` event is emitted at most once
+   per commit via `AtomicBitSet::test_and_set`.
 4. **Record** (`record_findings`, `engine_adapter.rs`) -- findings are
    appended to the shared arena and the resulting `FindingSpan` is attached to
    the `ScannedBlob`.

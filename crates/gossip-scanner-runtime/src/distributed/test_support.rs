@@ -80,7 +80,7 @@ use crate::{
     git_persistence::{GitPersistenceBackend, GitPersistenceOp},
     join_scoped,
     ordered_content::OrderedContentSkipReason,
-    test_fixtures::{init_git_repo, run_git_in},
+    test_fixtures::{init_git_repo, run_git},
 };
 
 // ============================================================================
@@ -104,6 +104,12 @@ pub(super) struct TestGitBackendState {
     pub(super) kv: BTreeMap<Vec<u8>, Vec<u8>>,
     pub(super) batch_call_count: usize,
     pub(super) fail_after_n_batches: Option<usize>,
+    /// Fail any `apply_batch` call that contains a `Delete` op AND has more
+    /// than two operations. Complete-finalize commits include data ops,
+    /// checkpoint deletes, staging delete, and watermark puts (4+ ops).
+    /// Scan-phase checkpoint writes have at most 2 ops. This flag targets
+    /// post-scan finalize failures without knowledge of batch counts.
+    pub(super) fail_on_finalize_commit: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -124,6 +130,13 @@ impl TestGitBackend {
             .lock()
             .expect("git backend state lock")
             .fail_after_n_batches = Some(n);
+    }
+
+    pub(super) fn fail_on_finalize_commit(&self) {
+        self.state
+            .lock()
+            .expect("git backend state lock")
+            .fail_on_finalize_commit = true;
     }
 
     pub(super) fn stored_keys(&self) -> Vec<Vec<u8>> {
@@ -157,6 +170,16 @@ impl GitPersistenceBackend for TestGitBackend {
         {
             return Err(TestGitBackendError {
                 message: "injected persistence failure",
+            });
+        }
+        if state.fail_on_finalize_commit
+            && ops.len() > 2
+            && ops
+                .iter()
+                .any(|op| matches!(op, GitPersistenceOp::Delete { .. }))
+        {
+            return Err(TestGitBackendError {
+                message: "injected finalize commit failure",
             });
         }
         state.batch_call_count += 1;
@@ -430,17 +453,40 @@ pub(super) fn successor_bytes(bytes: &[u8]) -> Vec<u8> {
     next
 }
 
-/// Git repo fixture seeded with a secret so scans produce at least one finding.
+/// Single-commit git repo fixture seeded with a secret so scans produce at least one finding.
 pub(super) fn create_git_repo_fixture_with_secrets() -> tempfile::TempDir {
+    create_git_repo_fixture_with_secret_history(1)
+}
+
+/// Git repo fixture where each commit introduces a secret in a distinct file.
+///
+/// Every commit adds a new `secret-{N}.txt`, so each commit's diff independently
+/// contains a detectable secret regardless of whether the scanner operates on
+/// full blobs or diffs.
+pub(super) fn create_git_repo_fixture_with_secret_history(
+    commit_count: usize,
+) -> tempfile::TempDir {
+    assert!(
+        commit_count > 0,
+        "secret-history fixture requires at least one commit"
+    );
+
     let dir = tempdir().expect("tempdir");
     init_git_repo(
         dir.path(),
         "distributed-runtime-tests@example.com",
         "Distributed Runtime Tests",
     );
-    fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
-    run_git_in(dir.path(), &["add", "."]);
-    run_git_in(dir.path(), &["commit", "-q", "-m", "fixture"]);
+
+    for commit in 0..commit_count {
+        let filename = format!("secret-{commit}.txt");
+        let contents = format!("{}\ncommit-{commit}\n", secret_fixture());
+        fs::write(dir.path().join(&filename), contents).expect("write fixture");
+        run_git(dir.path(), &["add", "."]);
+        let message = format!("fixture-{commit}");
+        run_git(dir.path(), &["commit", "-q", "-m", message.as_str()]);
+    }
+
     dir
 }
 
@@ -453,8 +499,8 @@ pub(super) fn create_clean_git_repo_fixture() -> tempfile::TempDir {
         "Distributed Runtime Tests",
     );
     fs::write(dir.path().join("readme.txt"), "hello world\n").expect("write fixture");
-    run_git_in(dir.path(), &["add", "."]);
-    run_git_in(dir.path(), &["commit", "-q", "-m", "fixture"]);
+    run_git(dir.path(), &["add", "."]);
+    run_git(dir.path(), &["commit", "-q", "-m", "fixture"]);
     dir
 }
 
@@ -875,8 +921,8 @@ pub(super) fn create_git_repo_fixture_with_corrupt_blob() -> tempfile::TempDir {
         "Distributed Runtime Tests",
     );
     fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
-    run_git_in(dir.path(), &["add", "."]);
-    run_git_in(dir.path(), &["commit", "-q", "-m", "fixture"]);
+    run_git(dir.path(), &["add", "."]);
+    run_git(dir.path(), &["commit", "-q", "-m", "fixture"]);
 
     // Locate and corrupt the blob loose object. Walk .git/objects
     // fan-out directories looking for loose files, then use `git

@@ -4,8 +4,8 @@
 //! repos created via `git init` (for pack-based fingerprinting).
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
+use crate::git_test_support::{git_available, init_git_repo, run_git};
 use scanner_git::OidBytes;
 use scanner_git::{
     ArtifactBuildLimits, RefWatermarkStore, RepoOpenError, RepoOpenLimits, StartSetConfig,
@@ -224,7 +224,7 @@ fn repo_open_detects_lock_files() {
 #[test]
 fn repo_open_detects_artifact_changes() {
     // Skip if git is not available.
-    if Command::new("git").arg("--version").output().is_err() {
+    if !git_available() {
         eprintln!("git not available; skipping artifact change detection test");
         return;
     }
@@ -232,13 +232,11 @@ fn repo_open_detects_artifact_changes() {
     let tmp = TempDir::new().unwrap();
 
     // Create a real repo with a commit so there are pack files.
-    run_git_cmd(tmp.path(), &["init", "-b", "main"]);
-    run_git_cmd(tmp.path(), &["config", "user.email", "test@example.com"]);
-    run_git_cmd(tmp.path(), &["config", "user.name", "Test User"]);
+    init_git_repo(tmp.path(), "test@example.com", "Test User");
     fs::write(tmp.path().join("file.txt"), "data\n").unwrap();
-    run_git_cmd(tmp.path(), &["add", "."]);
-    run_git_cmd(tmp.path(), &["commit", "-m", "initial"]);
-    run_git_cmd(tmp.path(), &["repack", "-ad"]);
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "initial"]);
+    run_git(tmp.path(), &["repack", "-ad"]);
 
     let resolver = TestResolver { refs: vec![] };
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
@@ -264,20 +262,10 @@ fn repo_open_detects_artifact_changes() {
 
     // Add a new commit and repack so the pack files change on disk.
     fs::write(tmp.path().join("file2.txt"), "more\n").unwrap();
-    run_git_cmd(tmp.path(), &["add", "."]);
-    run_git_cmd(tmp.path(), &["commit", "-m", "second"]);
-    run_git_cmd(tmp.path(), &["repack", "-ad"]);
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "second"]);
+    run_git(tmp.path(), &["repack", "-ad"]);
 
     // The fingerprint should now differ from the new pack set.
     assert!(!state.artifacts_unchanged().unwrap());
-}
-
-/// Run a git command and assert success.
-fn run_git_cmd(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .status()
-        .expect("failed to run git");
-    assert!(status.success(), "git command failed: {args:?}");
 }
