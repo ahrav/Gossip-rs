@@ -77,16 +77,24 @@ pub(crate) fn borrowed_shard_bound<'a>(
 ///
 /// Enables generic binary search (`lower_bound`, `upper_bound`) over both
 /// `FileEntry` (filesystem connector) and `PreparedItem` (in-memory connector).
+/// Implementations must expose the exact byte sequences that participate in
+/// the sorted order so the helpers can make deterministic decisions without
+/// allocating during the search.
 pub(crate) trait KeyedEntry {
     /// Returns the canonical key bytes used for ordering and bound checks.
     ///
     /// Implementations must return bytes consistent with the sorted order of
     /// the surrounding collection whenever used with [`lower_bound`] or
     /// [`upper_bound`].
+    /// The returned slice must stay valid for the lifetime of the entry so
+    /// callers can reuse it during repeated binary searches.
     fn key_bytes(&self) -> &[u8];
 }
 
 /// Return the first index whose key is `>= key`.
+///
+/// Equivalent to `items.partition_point(|item| item.key_bytes() < key)`
+/// and remains fast (`O(log n)`) because it never copies entry data.
 ///
 /// `items` must be sorted in ascending byte-lexicographic key order.
 /// Runs in `O(log n)`.
@@ -99,6 +107,10 @@ pub(crate) fn lower_bound<T: KeyedEntry>(items: &[T], key: &[u8]) -> usize {
 /// Used for resume progression so the last emitted key is never re-emitted.
 /// `items` must be sorted in ascending byte-lexicographic key order.
 /// Runs in `O(log n)`.
+///
+/// Equivalent to `items.partition_point(|item| item.key_bytes() <= key)` and
+/// therefore advances past the last matching entry while keeping the search
+/// logarithmic.
 pub(crate) fn upper_bound<T: KeyedEntry>(items: &[T], key: &[u8]) -> usize {
     items.partition_point(|item| item.key_bytes() <= key)
 }
@@ -107,7 +119,9 @@ pub(crate) fn upper_bound<T: KeyedEntry>(items: &[T], key: &[u8]) -> usize {
 ///
 /// Produced by [`resolve_bounds`]. Callers combine these indices with
 /// connector-specific cursor resume logic to determine the effective start
-/// position.
+/// position. Invariants: `range_start <= range_end`, `range_start == 0` when
+/// the shard start is unbounded, and `range_end == items.len()` when the
+/// shard end is unbounded.
 pub(crate) struct ResolvedBounds {
     /// Inclusive lower bound index (first item whose key is `>= shard start`,
     /// or `0` when the shard start is unbounded).
@@ -126,6 +140,10 @@ pub(crate) struct ResolvedBounds {
 /// `items` must be sorted in ascending byte-lexicographic key order. Given
 /// that precondition and valid bounds, the returned range satisfies
 /// `range_start <= range_end`.
+///
+/// `start` and `end` are optional: `None` indicates an unbounded side and
+/// maps to `0` or `items.len()` respectively, while `Some` values are resolved
+/// by binary searching for the first entry that lies at or beyond the bound.
 ///
 /// # Errors
 ///
@@ -158,6 +176,8 @@ pub(crate) fn resolve_bounds<T: KeyedEntry>(
 /// never behind this position.
 ///
 /// `items` must be sorted in ascending byte-lexicographic key order.
+/// The returned index is always ≥ `range_start`, ensuring progress even when
+/// the cursor has not emitted any keys.
 pub(crate) fn key_resume_start<T: KeyedEntry>(
     items: &[T],
     cursor: &Cursor,
@@ -174,6 +194,8 @@ pub(crate) fn key_resume_start<T: KeyedEntry>(
 /// Both connectors apply identical post-selection guards after choosing a
 /// byte-weighted split index. This helper centralizes the check so the guards
 /// stay in sync.
+/// The candidate is valid only if it is strictly greater than the cursor's
+/// last emitted key (when present) and strictly less than the shard end.
 pub(crate) fn is_valid_split_candidate(
     candidate: &[u8],
     cursor: &Cursor,
@@ -197,6 +219,14 @@ pub(crate) fn is_valid_split_candidate(
 /// Returns `Ok(None)` when the estimator produces no candidate or the
 /// candidate fails validation (does not advance past the cursor, or lands
 /// at or beyond the upper shard bound).
+///
+/// The iterator must yield entries sorted in ascending key order so the sample
+/// stream reflects the actual data distribution.
+///
+/// # Panics
+///
+/// Panics if the estimator returns bytes that did not originate from
+/// previously validated [`ItemKey`] values.
 pub(crate) fn estimate_split_from_sorted<'a>(
     entries: impl Iterator<Item = (&'a [u8], u64)>,
     entry_count: usize,
@@ -220,6 +250,9 @@ pub(crate) fn estimate_split_from_sorted<'a>(
 }
 
 /// Returns `true` when a deadline is present and has already passed.
+///
+/// `None` always yields `false`, and the comparison uses the monotonic clock so
+/// repeated checks stay consistent even if the system time jumps.
 #[inline]
 pub(crate) fn deadline_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|value| Instant::now() >= value)
@@ -235,6 +268,10 @@ pub(crate) fn deadline_expired(deadline: Option<Instant>) -> bool {
 /// mismatches, read-only mounts, and symlink loops — will not resolve on
 /// retry. Everything else (interrupted, would-block, connection-reset, etc.)
 /// is assumed transient and therefore retryable.
+///
+/// Symlink loops are treated as permanent even when the OS reports them via
+/// `raw_os_error`, which is why we delegate to [`is_symlink_loop`] instead of
+/// relying on `ErrorKind`.
 pub fn is_permanent_io_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -249,12 +286,18 @@ pub fn is_permanent_io_error(err: &io::Error) -> bool {
 }
 
 /// Detect `ELOOP` (too many levels of symbolic links) on Unix.
+///
+/// Interpreting `raw_os_error` lets us treat symlink loops as permanent even
+/// though `ErrorKind` does not expose a dedicated variant.
 #[cfg(unix)]
 pub fn is_symlink_loop(err: &io::Error) -> bool {
     err.raw_os_error() == Some(libc::ELOOP)
 }
 
 /// Non-Unix stub: symlink loops cannot be detected via `raw_os_error`.
+///
+/// Always returns `false` because other platforms lack a consistent errno that
+/// points at `ELOOP`.
 #[cfg(not(unix))]
 pub fn is_symlink_loop(_err: &io::Error) -> bool {
     false
