@@ -251,6 +251,10 @@ impl ShardRecordKey {
     }
     /// Parses the exact key from a byte slice.
     ///
+    /// Accepts keys shaped like `.../shards/{shard_hex}` where the suffix is
+    /// exactly 16 lowercase hex characters. Owner-child keys or malformed
+    /// UTF-8/hex are rejected with `None`.
+    ///
     /// # Complexity
     /// `O(L)` where `L` is the length of the slice.
     pub(crate) fn from_encoded_key(key: &[u8]) -> Option<Self> {
@@ -265,6 +269,10 @@ impl ShardRecordKey {
 impl ShardOwnerKey {
     /// Parses the exact key from a byte slice.
     ///
+    /// Accepts only owner entries shaped like `.../shards/{shard_hex}/owner`
+    /// with a 16-character lowercase hex shard suffix. Returns `None` for
+    /// record keys, malformed UTF-8, or non-hex shard IDs.
+    ///
     /// # Complexity
     /// `O(L)` where `L` is the length of the slice.
     pub(crate) fn from_encoded_key(key: &[u8]) -> Option<Self> {
@@ -276,6 +284,11 @@ impl ShardOwnerKey {
     }
 
     /// Parse the owned shard ID from an owner key under `shards_scan_prefix`.
+    ///
+    /// Expects `shards_scan_prefix` to include the trailing slash produced by
+    /// [`EtcdKeyspace::shard_records_scan_prefix`]. Returns `None` when the key
+    /// is not an owner entry directly under that prefix or when the shard
+    /// component is not 16 lowercase hex characters.
     ///
     /// # Complexity
     /// `O(P)` where `P` is the length of `shards_scan_prefix`.
@@ -289,6 +302,11 @@ impl ShardOwnerKey {
 impl RunRecordKey {
     /// Parse the run ID of a direct child under `prefix`.
     ///
+    /// `prefix` should already include the trailing slash for the parent
+    /// directory (for example `.../runs/`). Returns `None` if `key` does not
+    /// start with `prefix`, if the suffix is not exactly 16 lowercase hex
+    /// characters, or if UTF-8 conversion fails.
+    ///
     /// # Complexity
     /// `O(P)` where `P` is the length of `prefix`.
     pub(crate) fn parse_direct_run_id(prefix: &str, key: &[u8]) -> Option<RunId> {
@@ -298,6 +316,11 @@ impl RunRecordKey {
 
 impl RunActiveIndexKey {
     /// Parse the run ID of a direct child under `prefix`.
+    ///
+    /// `prefix` should already include the trailing slash for the parent
+    /// directory (for example `.../runs_active/`). Returns `None` when the
+    /// `key` is not under that prefix or the child segment is not 16 lowercase
+    /// hex characters.
     ///
     /// # Complexity
     /// `O(P)` where `P` is the length of `prefix`.
@@ -309,6 +332,11 @@ impl RunActiveIndexKey {
 impl ShardActiveIndexKey {
     /// Parse the shard ID of a direct child under `prefix`.
     ///
+    /// `prefix` should already include the trailing slash for the parent
+    /// directory (for example `.../shards_active/`). Returns `None` when the
+    /// `key` is not under that prefix or when the child segment is not 16
+    /// lowercase hex characters.
+    ///
     /// # Complexity
     /// `O(P)` where `P` is the length of `prefix`.
     pub(crate) fn parse_direct_shard_id(prefix: &str, key: &[u8]) -> Option<ShardId> {
@@ -318,6 +346,12 @@ impl ShardActiveIndexKey {
 
 impl PersistedShardSubtreeKey {
     /// Classify a persisted key read from a `.../shards/` subtree.
+    ///
+    /// The classifier scans for the final `/shards/` segment and inspects the
+    /// suffix. Keys ending with `{shard_hex}` are tagged as [`Record`], while
+    /// keys ending with `{shard_hex}/owner` are tagged as [`Owner`]. Any other
+    /// shape, malformed UTF-8, or non-hex shard component returns `None` so
+    /// callers can skip unrelated entries.
     ///
     /// # Complexity
     /// `O(L)` where `L` is the length of `key`.
