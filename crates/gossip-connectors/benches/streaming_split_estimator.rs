@@ -18,6 +18,10 @@
 //! estimator's hot-path `observe` cost from dataset-shape drift.
 
 #[cfg(unix)]
+/// Unix-only benchmark module for the split estimator `observe` hot path.
+///
+/// The benchmark hook it exercises is exported only on Unix because the
+/// production estimator implementation depends on Unix filesystem APIs.
 mod unix_bench {
     use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group};
     use gossip_connectors::benchmark_streaming_split_estimator_observe_fixed_size;
@@ -42,6 +46,8 @@ mod unix_bench {
         group.sample_size(30);
         group.throughput(Throughput::Elements(count as u64));
 
+        // Sweep small/medium/large reservoir caps to catch regressions that
+        // depend on retained-sample footprint.
         for &sample_cap in &[128usize, 512, 1024] {
             group.bench_with_input(
                 BenchmarkId::from_parameter(sample_cap),
@@ -69,9 +75,10 @@ mod unix_bench {
 #[cfg(unix)]
 criterion::criterion_main!(unix_bench::benches);
 
-// On non-Unix platforms the estimator (and its benchmark hook) is unavailable,
-// so the bench binary compiles but does nothing.
-#[cfg(not(unix))]
 /// No-op entrypoint for non-Unix targets where the estimator benchmark hook is
 /// not exported.
+///
+/// This keeps the bench target buildable in cross-platform workspaces while
+/// preserving the Unix-only implementation boundary.
+#[cfg(not(unix))]
 fn main() {}
