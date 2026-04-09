@@ -14,6 +14,8 @@ use bytemuck::{cast_slice, try_cast_slice};
 use gossip_stdx::bitset::DynamicBitSet;
 use gossip_stdx::words_for_bits;
 
+use tracing::debug;
+
 use super::bytes::BytesView;
 use super::errors::SpillError;
 use super::midx::{MidxCursor, MidxView, ValidatedMidxLayout};
@@ -403,14 +405,14 @@ impl MidxOrdinalBitset {
 
 /// Raw MIDX bytes and metadata for one snapshot.
 ///
-/// The snapshot is set once via [`HybridSeenStore::set_midx_snapshot`] and
-/// re-parsed into a short-lived [`MidxView`] on each query batch. Storing
-/// the raw bytes (rather than a pre-parsed view) avoids self-referential
-/// lifetime issues since `MidxView` borrows from the byte slice.
+/// Replaced via [`HybridSeenStore::set_midx_snapshot`] whenever the pack
+/// index changes. Reconstructed into a short-lived [`MidxView`] via cached
+/// layout offsets (no re-parsing) on each query batch. Storing the raw bytes
+/// (rather than a pre-parsed view) avoids self-referential lifetime issues
+/// since `MidxView` borrows from the byte slice.
 #[derive(Clone, Debug)]
 struct ConfiguredMidxSnapshot {
     bytes: BytesView,
-    object_format: ObjectFormat,
     artifact_fingerprint: RepoArtifactFingerprint,
     /// Pre-validated chunk offsets for zero-parse `MidxView` reconstruction.
     layout: ValidatedMidxLayout,
@@ -445,10 +447,16 @@ struct OrdinalCache {
 /// # Thread Safety
 ///
 /// This type uses [`RefCell`] for interior mutability of the ordinal cache
-/// and is therefore `!Sync`. It is designed for single-threaded scan loops
-/// where `batch_check_seen` and `fallback_mut` are never called concurrently.
-/// If multi-threaded access is needed in the future, the `RefCell` should be
-/// replaced with a `Mutex`.
+/// and is therefore `!Sync`. It is designed for single-threaded scan loops.
+/// The following methods access the `RefCell`: [`batch_check_seen`](SeenBlobStore::batch_check_seen),
+/// [`rebuild_from_fallback`](Self::rebuild_from_fallback),
+/// [`is_valid_for_fingerprint`](Self::is_valid_for_fingerprint),
+/// [`fallback_mut`](Self::fallback_mut),
+/// [`set_midx_snapshot`](Self::set_midx_snapshot), and
+/// [`clear_midx_snapshot`](Self::clear_midx_snapshot).
+/// None of these may be called concurrently. If multi-threaded access is
+/// needed in the future, the `RefCell` should be replaced with an `RwLock`
+/// (to allow concurrent reads on the fast path).
 #[derive(Clone, Debug)]
 pub struct HybridSeenStore {
     fallback: RoaringSeenStore,
@@ -498,8 +506,8 @@ impl HybridSeenStore {
         &mut self.fallback
     }
 
-    /// Replaces the current MIDX snapshot and invalidates the ordinal cache
-    /// when the fingerprint changes.
+    /// Replaces the current MIDX snapshot and unconditionally invalidates the
+    /// ordinal cache.
     ///
     /// # Errors
     ///
@@ -515,20 +523,16 @@ impl HybridSeenStore {
         let midx = MidxView::parse(midx_bytes.as_slice(), object_format)?;
         let layout = midx.layout(midx_bytes.as_slice());
         let folded_fingerprint = fold_artifact_fingerprint(&artifact_fingerprint);
-        let changed = self
-            .midx_snapshot
-            .as_ref()
-            .is_none_or(|current| current.artifact_fingerprint != artifact_fingerprint);
         self.midx_snapshot = Some(ConfiguredMidxSnapshot {
             bytes: midx_bytes,
-            object_format,
             artifact_fingerprint,
             layout,
             folded_fingerprint,
         });
-        if changed {
-            self.ordinal.get_mut().take();
-        }
+        // Always invalidate: RepoArtifactFingerprint hashes file metadata
+        // (basename, size, mtime), not content. Two different MIDX files can
+        // share a fingerprint, so a stale cache must never be reused.
+        self.ordinal.get_mut().take();
         Ok(())
     }
 
@@ -562,7 +566,7 @@ impl HybridSeenStore {
             return Ok(());
         };
 
-        let midx = MidxView::parse(snapshot.bytes.as_slice(), snapshot.object_format)?;
+        let midx = snapshot.view();
         self.rebuild_with_midx(&midx, snapshot)
     }
 
@@ -574,17 +578,29 @@ impl HybridSeenStore {
         snapshot: &ConfiguredMidxSnapshot,
     ) -> Result<(), SpillError> {
         let mut bitset = MidxOrdinalBitset::new(midx.object_count(), snapshot.folded_fingerprint);
-        // Per-OID cursor-based lookup: O(n * log(N/k)) where n = seen count,
-        // N = MIDX object count, k = fanout bucket size. A merge-join against
-        // the sorted OIDL chunk would be O(n + N) but requires MIDX OIDL
-        // iteration support not yet available.
+        // Per-OID galloping search with cursor reuse: amortized O(log(gap)) per
+        // OID where gap is the ordinal distance between consecutive matches.
+        // Total cost across all n seen OIDs is O(n * log(N/n)) in the average
+        // case. A merge-join against the sorted OIDL chunk would be O(n + N)
+        // but requires MIDX OIDL iteration support not yet available.
         let mut cursor = MidxCursor::default();
+        let mut length_mismatches = 0u32;
         for oid in self.fallback.bitmap().seen_oids() {
             match midx.find_oid_sorted(&mut cursor, &oid) {
                 Ok(Some(ordinal)) => bitset.set(ordinal),
-                Ok(None) | Err(MidxError::InputOidLengthMismatch { .. }) => {}
+                Ok(None) => {}
+                Err(MidxError::InputOidLengthMismatch { .. }) => {
+                    length_mismatches += 1;
+                }
                 Err(err) => return Err(err.into()),
             }
+        }
+        if length_mismatches > 0 {
+            debug!(
+                length_mismatches,
+                object_count = midx.object_count(),
+                "skipped OIDs with mismatched hash length during ordinal rebuild"
+            );
         }
 
         *self.ordinal.borrow_mut() = Some(OrdinalCache {
@@ -604,14 +620,13 @@ impl HybridSeenStore {
         snapshot: &'a ConfiguredMidxSnapshot,
     ) -> Result<MidxView<'a>, SpillError> {
         let midx = snapshot.view();
-        // Single borrow to check cache validity. The guard is dropped before
-        // any potential borrow_mut in rebuild_with_midx.
-        let valid = self
-            .ordinal
-            .borrow()
-            .as_ref()
-            .is_some_and(|c| c.artifact_fingerprint == snapshot.artifact_fingerprint);
-        if !valid {
+        let needs_rebuild = {
+            let guard = self.ordinal.borrow();
+            !guard
+                .as_ref()
+                .is_some_and(|c| c.artifact_fingerprint == snapshot.artifact_fingerprint)
+        };
+        if needs_rebuild {
             self.ordinal.borrow_mut().take();
             self.rebuild_with_midx(&midx, snapshot)?;
         }
@@ -642,13 +657,19 @@ impl SeenBlobStore for HybridSeenStore {
         // roaring bitmap handles the small fallback set efficiently.
         let mut fallback_indices: Vec<usize> = Vec::new();
         let mut cursor = MidxCursor::default();
-        let oid_len = snapshot.object_format.oid_len();
+        let oid_len = snapshot.layout.format.oid_len();
 
         // Process first OID outside the loop to eliminate the Option branch
         // on `prev_oid` from every subsequent iteration.
         let first_oid = &oids[0];
         let (first_seen, first_is_fallback) =
-            probe_ordinal(first_oid, oid_len, &midx, &cache.bitset, &mut cursor);
+            match probe_ordinal(first_oid, oid_len, &midx, &cache.bitset, &mut cursor) {
+                Ok(result) => result,
+                Err(e) => {
+                    drop(cache_guard);
+                    return Err(e.into());
+                }
+            };
         result.push(first_seen);
         if first_is_fallback {
             fallback_indices.push(0);
@@ -661,6 +682,11 @@ impl SeenBlobStore for HybridSeenStore {
             if prev_oid > oid {
                 // Input violates sorted contract. Fall back to per-element
                 // binary search which handles arbitrary order correctly.
+                debug!(
+                    batch_size = oids.len(),
+                    violation_index = idx,
+                    "unsorted input detected in batch_check_seen, falling back to per-element search"
+                );
                 drop(cache_guard);
                 return Ok(self.fallback.bitmap().batch_contains(oids));
             }
@@ -675,7 +701,13 @@ impl SeenBlobStore for HybridSeenStore {
             }
 
             let (seen, is_fallback) =
-                probe_ordinal(oid, oid_len, &midx, &cache.bitset, &mut cursor);
+                match probe_ordinal(oid, oid_len, &midx, &cache.bitset, &mut cursor) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        drop(cache_guard);
+                        return Err(e.into());
+                    }
+                };
             result.push(seen);
             if is_fallback {
                 fallback_indices.push(idx);
@@ -701,9 +733,12 @@ impl SeenBlobStore for HybridSeenStore {
 
 /// Probes the ordinal bitset for a single OID via the MIDX cursor.
 ///
-/// Returns `(seen, is_fallback)`. When `is_fallback` is true, the OID was
+/// Returns `Ok((seen, is_fallback))`. When `is_fallback` is true, the OID was
 /// not resolved through the MIDX (wrong OID length or not found) and the
 /// caller must check the roaring fallback for a definitive answer.
+///
+/// Returns `Err` for MIDX corruption or structural errors that should not be
+/// silently masked.
 #[inline]
 fn probe_ordinal(
     oid: &OidBytes,
@@ -711,17 +746,14 @@ fn probe_ordinal(
     midx: &MidxView<'_>,
     bitset: &MidxOrdinalBitset,
     cursor: &mut MidxCursor,
-) -> (bool, bool) {
+) -> Result<(bool, bool), MidxError> {
     if oid.len() != expected_oid_len {
-        return (false, true);
+        return Ok((false, true));
     }
     match midx.find_oid_sorted(cursor, oid) {
-        Ok(Some(ordinal)) => (bitset.test(ordinal), false),
-        Ok(None) | Err(MidxError::InputOidLengthMismatch { .. }) => (false, true),
-        // Propagation of unexpected MIDX errors is handled by returning the
-        // OID to the fallback path. The roaring bitmap is authoritative, so
-        // this is safe even if the ordinal lookup is unreliable.
-        Err(_) => (false, true),
+        Ok(Some(ordinal)) => Ok((bitset.test(ordinal), false)),
+        Ok(None) | Err(MidxError::InputOidLengthMismatch { .. }) => Ok((false, true)),
+        Err(e) => Err(e),
     }
 }
 
@@ -1375,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_seen_store_preserves_cache_on_same_fingerprint() {
+    fn hybrid_seen_store_invalidates_cache_on_same_fingerprint_reset() {
         let fingerprint = test_fingerprint(0x80);
         let mut store = build_hybrid_store(&[1, 3], &[0, 1, 2, 3, 4, 5, 6, 7], fingerprint.clone());
         let probes = vec![oid_from_u32(1), oid_from_u32(3)];
@@ -1393,8 +1425,13 @@ mod tests {
             )
             .expect("re-set");
 
-        // Cache should be preserved (not invalidated).
-        assert!(store.ordinal.borrow().is_some());
+        // Cache must be invalidated even with the same fingerprint, because
+        // RepoArtifactFingerprint hashes metadata, not content.
+        assert!(store.ordinal.borrow().is_none());
+
+        // Verify the cache rebuilds correctly on the next query.
+        let actual = store.batch_check_seen(&probes).expect("post-reset query");
+        assert_eq!(actual, vec![true, true]);
         assert!(store.is_valid_for_fingerprint(&fingerprint));
     }
 
@@ -1409,17 +1446,67 @@ mod tests {
         assert_eq!(actual, vec![true, true]);
     }
 
+    #[test]
+    fn hybrid_seen_store_handles_all_loose_batch_with_warm_cache() {
+        let fingerprint = test_fingerprint(0x91);
+        // MIDX covers [0..8], roaring has seen OIDs 9, 10, 11 (all loose).
+        let store = build_hybrid_store(&[9, 10, 11], &[0, 1, 2, 3, 4, 5, 6, 7], fingerprint);
+
+        // Warm the ordinal cache with a mixed query containing some MIDX OIDs.
+        let warmup = vec![oid_from_u32(1), oid_from_u32(5), oid_from_u32(9)];
+        let _ = store.batch_check_seen(&warmup).expect("warmup query");
+        assert!(
+            store.ordinal.borrow().is_some(),
+            "cache must be populated after warmup"
+        );
+
+        // All probes are outside the MIDX range (sorted).
+        let probes = vec![
+            oid_from_u32(9),
+            oid_from_u32(10),
+            oid_from_u32(11),
+            oid_from_u32(12),
+        ];
+        let actual = store.batch_check_seen(&probes).expect("all-loose query");
+        assert_eq!(actual, vec![true, true, true, false]);
+
+        // Oracle comparison via the fallback bitmap.
+        let expected = store
+            .fallback()
+            .batch_check_seen(&probes)
+            .expect("roaring query");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn hybrid_seen_store_handles_duplicate_midx_oids_in_sorted_input() {
+        let fingerprint = test_fingerprint(0x92);
+        // MIDX covers [0..8], roaring has seen OID 1 (MIDX-resident).
+        let store = build_hybrid_store(&[1], &[0, 1, 2, 3, 4, 5, 6, 7], fingerprint);
+        // Sorted duplicates of an MIDX-resident OID.
+        let probes = vec![oid_from_u32(1), oid_from_u32(1)];
+        let actual = store.batch_check_seen(&probes).expect("duplicate midx");
+        assert_eq!(actual, vec![true, true]);
+    }
+
     #[derive(Debug, Clone)]
     enum HybridOp {
         Insert(u16),
         Query(Vec<u16>),
+        /// Queries without pre-sorting, exercising the unsorted-input fallback.
+        QueryUnsorted(Vec<u16>),
+        /// Replaces the MIDX snapshot with a shifted range, invalidating the
+        /// ordinal cache without changing the roaring oracle.
+        ChangeMidx,
     }
 
     fn hybrid_ops() -> impl Strategy<Value = Vec<HybridOp>> {
         vec(
             prop_oneof![
-                (0u16..96).prop_map(HybridOp::Insert),
-                vec(0u16..96, 0..16).prop_map(HybridOp::Query),
+                5 => (0u16..96).prop_map(HybridOp::Insert),
+                4 => vec(0u16..96, 0..16).prop_map(HybridOp::Query),
+                2 => vec(0u16..96, 0..16).prop_map(HybridOp::QueryUnsorted),
+                1 => Just(HybridOp::ChangeMidx),
             ],
             0..96,
         )
@@ -1527,6 +1614,9 @@ mod tests {
             let mut oracle = std::collections::HashSet::new();
             let midx_values: Vec<u32> = (0..64).collect();
             let mut store = build_hybrid_store(&[], &midx_values, test_fingerprint(0x40));
+            // Generation counter for producing distinct fingerprints after
+            // ChangeMidx operations.
+            let mut midx_gen: u8 = 0x40;
 
             for op in ops {
                 match op {
@@ -1547,6 +1637,32 @@ mod tests {
                             probes.iter().map(|oid| oracle.contains(oid)).collect();
                         let actual = store.batch_check_seen(&probes).expect("query");
                         prop_assert_eq!(actual, expected);
+                    }
+                    HybridOp::QueryUnsorted(values) => {
+                        // Deliberately unsorted probes to exercise the
+                        // unsorted-input fallback path.
+                        let probes: Vec<OidBytes> =
+                            values.into_iter().map(|value| oid_from_u32(value as u32)).collect();
+                        let actual = store.batch_check_seen(&probes).expect("unsorted query");
+                        // Compare element-by-element since order matches
+                        // input order, not sorted order.
+                        for (got, oid) in actual.iter().zip(probes.iter()) {
+                            let want = oracle.contains(oid);
+                            prop_assert_eq!(*got, want);
+                        }
+                    }
+                    HybridOp::ChangeMidx => {
+                        // Shift the MIDX range to invalidate the ordinal
+                        // cache. The oracle (HashSet) is unaffected.
+                        midx_gen = midx_gen.wrapping_add(1);
+                        let shifted: Vec<u32> = (32..96).collect();
+                        store
+                            .set_midx_snapshot(
+                                BytesView::from_vec(build_test_midx_from_values(&shifted)),
+                                ObjectFormat::Sha1,
+                                test_fingerprint(midx_gen),
+                            )
+                            .expect("change midx");
                     }
                 }
             }
