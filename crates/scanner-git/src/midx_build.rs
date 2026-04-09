@@ -922,8 +922,7 @@ mod tests {
 
     #[test]
     fn merge_entry_ordering() {
-        // Build a minimal IDX with two OIDs so we can create MergeEntry values
-        // whose Ord impl actually gets exercised.
+        // Two-OID ordering case: the lower OID must pop before the higher OID.
         let oid_lo = test_oid(0x11, 0x01);
         let oid_hi = test_oid(0x22, 0x02);
 
@@ -1265,9 +1264,8 @@ mod tests {
         );
     }
 
-    /// Exercises the exact LOFF threshold boundary: 0x7FFF_FFFF (max small offset)
-    /// must NOT trigger LOFF indirection, while 0x8000_0000 (min large offset) must.
-    /// An off-by-one in the `>= LARGE_OFFSET_FLAG` check would corrupt one of these.
+    /// LOFF threshold boundary: 0x7FFF_FFFF stays inline in OOFF, while
+    /// 0x8000_0000 is encoded through LOFF indirection.
     #[test]
     fn build_midx_loff_boundary_values() {
         let just_below: u64 = 0x7FFF_FFFF; // max value that fits in 31 bits
@@ -1426,10 +1424,9 @@ mod tests {
         );
     }
 
-    /// Maximum-deduplication case: every object in every pack is identical.
-    /// Verifies merge produces exactly `objects_per_pack` unique entries
-    /// regardless of pack input order, with all winners resolved to
-    /// PNAM-position 0 (whichever pack is first in the permuted input).
+    /// Maximum-deduplication case: every pack contains the same OIDs.
+    /// The merged MIDX contains exactly `objects_per_pack` entries, and each
+    /// winner resolves to PNAM position 0 for the current input permutation.
     #[test]
     fn all_duplicate_merge_deduplicates_to_lowest_pack_id() {
         let objects_per_pack = 4;
