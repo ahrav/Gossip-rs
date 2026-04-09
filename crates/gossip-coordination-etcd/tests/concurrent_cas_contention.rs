@@ -44,6 +44,10 @@ const DEFAULT_SEED_COUNT: usize = 4;
 const VERIFY_COOLDOWN_INTERVAL: u64 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Individual operations that a worker can run during a single round.
+///
+/// The harness mixes root-level acquire races with mixed traffic to exercise
+/// every major coordinator endpoint.
 enum PlannedOp {
     Acquire(ShardKey),
     Checkpoint(ShardKey),
@@ -71,12 +75,14 @@ impl PlannedOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The outcome a worker observed when racing to acquire a root shard.
 enum AcquireRaceOutcome {
     Won,
     LostContention,
 }
 
 #[derive(Clone, Debug)]
+/// Cached metadata for a lease that a worker currently holds.
 struct HeldLease {
     lease: Lease,
     range_start: Vec<u8>,
@@ -85,6 +91,10 @@ struct HeldLease {
 }
 
 #[derive(Debug, Default)]
+/// Per-thread statistics gathered during a seed run.
+///
+/// Tracks every operation attempt, success count, and which shards were
+/// discovered so the verifier can know whether splits occurred.
 struct ThreadReport {
     attempts: BTreeMap<&'static str, usize>,
     successes: BTreeMap<&'static str, usize>,
@@ -115,6 +125,7 @@ impl ThreadReport {
     }
 }
 
+/// Responsibilities and behavior of a single test worker.
 struct WorkerHarness {
     worker_index: usize,
     worker: gossip_coordination::WorkerId,
@@ -160,6 +171,13 @@ impl WorkerHarness {
         )
     }
 
+    /// Choose the operation for a specific round, giving root-race acquires precedence
+    /// and then sampling a weighted mix of aging operations.
+    ///
+    /// When a worker holds no leases it prefers to acquire or unpark shards to
+    /// bootstrap participation; once it holds leases it follows the documented
+    /// probability table to exercise checkpoints, renewals, complete, park, and
+    /// split helpers.
     fn plan_for_round(&mut self, round: usize) -> PlannedOp {
         if round < ROOT_RACE_ROUNDS {
             return PlannedOp::Acquire(root_key_for_round(round));
@@ -189,6 +207,10 @@ impl WorkerHarness {
         }
     }
 
+    /// Execute the planned operation for this round and log successes.
+    ///
+    /// The round argument is used to track strict root-acquire races versus
+    /// mixed-mode work and to generate round-specific checkpoint op IDs.
     fn run_round(&mut self, round: usize, logical_now: LogicalTime) -> Result<(), String> {
         let op = self.plan_for_round(round);
         self.report.record_attempt(op.label());
@@ -625,6 +647,11 @@ impl WorkerHarness {
 
 #[test]
 #[ignore = "requires a live etcd endpoint or Docker-backed testcontainers"]
+/// Exercise concurrent CAS-heavy traffic against a live etcd backend and
+/// assert that the coordinator converges back to a valid quiescent state.
+///
+/// The suite runs multiple deterministic seeds so a single flaky schedule does
+/// not mask invariant drift in the mixed operation phase.
 fn concurrent_cas_contention_preserves_invariants() {
     let seeds = selected_seeds(DEFAULT_SEED_COUNT);
     let mut aggregate = ThreadReport::default();
@@ -675,6 +702,12 @@ fn concurrent_cas_contention_preserves_invariants() {
     );
 }
 
+/// Run one deterministic contention scenario from namespace setup through final
+/// invariant verification, returning the merged per-thread statistics.
+///
+/// All workers share the same namespace and synchronize each round with
+/// barriers so root-shard races are comparable across threads and failures can
+/// stop the whole seed promptly.
 fn run_seed(seed: u64) -> Result<ThreadReport, String> {
     let namespace = contention_namespace();
     seed_shared_namespace(&namespace)?;
@@ -812,6 +845,7 @@ fn run_seed(seed: u64) -> Result<ThreadReport, String> {
     Ok(aggregate)
 }
 
+/// Seed the live namespace with the shared run and root shards used by all workers.
 fn seed_shared_namespace(namespace: &str) -> Result<(), String> {
     let mut setup = test_coordinator_in_namespace(namespace);
     setup
@@ -900,6 +934,7 @@ fn verify_quiescent_state(
     Ok(())
 }
 
+/// Verify that each root shard race observed exactly one winner and N_WORKERS total events.
 fn assert_single_winner_per_race(reports: &[ThreadReport]) -> Result<(), String> {
     for (root_id, _, _) in root_shards() {
         let winners = reports
@@ -930,6 +965,7 @@ fn assert_single_winner_per_race(reports: &[ThreadReport]) -> Result<(), String>
     Ok(())
 }
 
+/// Build the initial shard registration manifest for the shared run.
 fn root_manifest() -> [InitialShardInput<'static>; ROOT_RACE_ROUNDS] {
     root_shards().map(|(shard, start, end)| {
         InitialShardInput::new(
@@ -940,6 +976,10 @@ fn root_manifest() -> [InitialShardInput<'static>; ROOT_RACE_ROUNDS] {
     })
 }
 
+/// Return the fixed root shard layout used to seed each contention run.
+///
+/// The ranges are intentionally wide enough to admit several split operations
+/// before the midpoint helpers run out of space.
 fn root_shards() -> [(ShardId, &'static [u8], &'static [u8]); ROOT_RACE_ROUNDS] {
     // Wide single-byte ranges (~64 values each) allow multiple levels of
     // binary splits before the range becomes too narrow.
@@ -951,15 +991,18 @@ fn root_shards() -> [(ShardId, &'static [u8], &'static [u8]); ROOT_RACE_ROUNDS] 
     ]
 }
 
+/// Map each root-race round to the shard key all workers should contend on.
 fn root_key_for_round(round: usize) -> ShardKey {
     let (shard, _, _) = root_shards()[round];
     ShardKey::new(run_id(), shard)
 }
 
+/// Return the stable run identifier shared by all workers in this harness.
 fn run_id() -> RunId {
     RunId::from_raw(0x9020_1400)
 }
 
+/// Compute the cursor the next checkpoint operation should push, if possible.
 fn next_checkpoint_cursor(held: &HeldLease) -> Option<Vec<u8>> {
     let low = *held.range_start.first()?;
     let high = held.range_end.first().copied()?.checked_sub(1)?;
@@ -975,11 +1018,13 @@ fn next_checkpoint_cursor(held: &HeldLease) -> Option<Vec<u8>> {
     Some(vec![next])
 }
 
+/// Return the rightmost cursor that still lies within the shard range.
 fn terminal_cursor(held: &HeldLease) -> Option<Vec<u8>> {
     let final_byte = held.range_end.first().copied()?.checked_sub(1)?;
     Some(vec![final_byte])
 }
 
+/// Pick a split point for `SplitReplace` that lies strictly inside the held range.
 fn split_replace_midpoint(held: &HeldLease, rng: &mut ChaCha8Rng) -> Option<Vec<u8>> {
     let start = *held.range_start.first()?;
     let end = *held.range_end.first()?;
@@ -994,6 +1039,7 @@ fn split_replace_midpoint(held: &HeldLease, rng: &mut ChaCha8Rng) -> Option<Vec<
 /// Candidate discovery in [`WorkerHarness::random_split_op`] must not advance
 /// the RNG — doing so would make the operation sequence seed-dependent on which
 /// shards happen to be held, breaking reproducibility.
+/// Returns `true` if the range is wide enough to split without consuming RNG.
 fn can_split_replace(held: &HeldLease) -> bool {
     held.range_start
         .first()
@@ -1001,6 +1047,7 @@ fn can_split_replace(held: &HeldLease) -> bool {
         .is_some_and(|(&start, &end)| end > start.saturating_add(1))
 }
 
+/// Choose a residual split point above the last checkpoint cursor but within range.
 fn split_residual_midpoint(held: &HeldLease, rng: &mut ChaCha8Rng) -> Option<Vec<u8>> {
     let start = *held.range_start.first()?;
     let end = *held.range_end.first()?;
@@ -1022,6 +1069,7 @@ fn split_residual_midpoint(held: &HeldLease, rng: &mut ChaCha8Rng) -> Option<Vec
 /// Predicate form of [`split_residual_midpoint`] that avoids consuming RNG state.
 ///
 /// See [`can_split_replace`] for rationale.
+/// Returns `true` if there is room above the checkpoint cursor for another split.
 fn can_split_residual(held: &HeldLease) -> bool {
     let Some(&start) = held.range_start.first() else {
         return false;
@@ -1040,10 +1088,18 @@ fn can_split_residual(held: &HeldLease) -> bool {
     cursor.saturating_add(1).max(start.saturating_add(1)) < end
 }
 
+/// Generate a deterministic `OpId` for round-scoped mutating operations.
+///
+/// Encoding the round and worker index keeps retries reproducible across runs
+/// while still giving each worker a distinct operation identifier.
 fn op_id_for_round(round: usize, worker_index: usize) -> OpId {
     OpId::from_raw(((round as u64 + 1) << 8) | (worker_index as u64 + 1))
 }
 
+/// Read `GOSSIP_CAS_SEEDS`, returning `default` when the variable is absent.
+///
+/// Invalid values panic so misconfigured reproductions fail loudly instead of
+/// silently changing the test matrix.
 fn parse_seed_count(default: usize) -> usize {
     match std::env::var("GOSSIP_CAS_SEEDS") {
         Ok(value) => value
@@ -1053,6 +1109,9 @@ fn parse_seed_count(default: usize) -> usize {
     }
 }
 
+/// Read `GOSSIP_CAS_SEED` when the caller wants to run one deterministic seed.
+///
+/// Invalid values panic for the same reason as [`parse_seed_count`].
 fn parse_single_seed() -> Option<u64> {
     std::env::var("GOSSIP_CAS_SEED").ok().map(|value| {
         value
@@ -1061,6 +1120,10 @@ fn parse_single_seed() -> Option<u64> {
     })
 }
 
+/// Determine which seed values the harness should execute in this run.
+///
+/// `GOSSIP_CAS_SEED` overrides `GOSSIP_CAS_SEEDS` so reproduction requests can
+/// target one schedule exactly.
 fn selected_seeds(default_count: usize) -> Vec<u64> {
     if let Some(seed) = parse_single_seed() {
         vec![seed]
@@ -1069,6 +1132,7 @@ fn selected_seeds(default_count: usize) -> Vec<u64> {
     }
 }
 
+/// Return the shell command that reproduces a run for the given seed.
 fn repro_command(seed: u64) -> String {
     format!(
         "GOSSIP_CAS_SEED={seed} cargo test -p gossip-coordination-etcd --features test-support \
