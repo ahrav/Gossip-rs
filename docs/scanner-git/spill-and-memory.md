@@ -400,6 +400,8 @@ are approximate.
 | Tree diff limits | `crates/scanner-git/src/tree_diff_limits.rs` |
 | Durable seen bitmap (flat-packed OID index + roaring) | `crates/scanner-git/src/roaring_seen.rs` |
 | Finalize-time seen-bitmap delta | `crates/scanner-git/src/roaring_seen.rs` |
+| MIDX ordinal bitset (dense seen-bitset indexed by ordinal position) | `crates/scanner-git/src/ordinal_seen.rs` |
+| Hybrid seen store (ordinal hot-path + roaring fallback) | `crates/scanner-git/src/ordinal_seen.rs` |
 
 ## Related Docs
 

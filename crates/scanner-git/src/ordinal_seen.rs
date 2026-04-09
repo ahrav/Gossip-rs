@@ -1308,6 +1308,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hybrid_seen_store_falls_back_correctly_for_unsorted_input() {
+        let fingerprint = test_fingerprint(0x50);
+        let store = build_hybrid_store(&[1, 3, 5, 7], &[0, 1, 2, 3, 4, 5, 6, 7], fingerprint);
+        // Deliberately unsorted probes.
+        let probes = vec![
+            oid_from_u32(5),
+            oid_from_u32(3),
+            oid_from_u32(1),
+            oid_from_u32(7),
+            oid_from_u32(9),
+        ];
+
+        let actual = store.batch_check_seen(&probes).expect("unsorted query");
+        let expected: Vec<bool> = probes
+            .iter()
+            .map(|oid| store.fallback().bitmap().contains(oid))
+            .collect();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn hybrid_seen_store_rejects_oid_format_mismatch() {
+        let bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        let midx_bytes = build_test_midx(4);
+        let err = HybridSeenStore::with_midx(
+            RoaringSeenStore::new(bitmap),
+            BytesView::from_vec(midx_bytes),
+            ObjectFormat::Sha256,
+            test_fingerprint(0x60),
+        )
+        .expect_err("format mismatch");
+        assert!(
+            matches!(
+                err,
+                SpillError::OidLengthMismatch {
+                    got: 32,
+                    expected: 20
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn hybrid_seen_store_clears_midx_snapshot_and_degrades() {
+        let fingerprint = test_fingerprint(0x70);
+        let mut store =
+            build_hybrid_store(&[1, 3, 5], &[0, 1, 2, 3, 4, 5, 6, 7], fingerprint.clone());
+        let probes = vec![oid_from_u32(1), oid_from_u32(3), oid_from_u32(5)];
+
+        // Warm the ordinal cache.
+        let _ = store.batch_check_seen(&probes).expect("warm query");
+        assert!(store.is_valid_for_fingerprint(&fingerprint));
+
+        // Clear and verify cache is gone.
+        store.clear_midx_snapshot();
+        assert!(store.ordinal.borrow().is_none());
+
+        // Queries still work via roaring fallback.
+        let actual = store.batch_check_seen(&probes).expect("post-clear query");
+        let expected = store.fallback().batch_check_seen(&probes).expect("roaring");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn hybrid_seen_store_preserves_cache_on_same_fingerprint() {
+        let fingerprint = test_fingerprint(0x80);
+        let mut store = build_hybrid_store(&[1, 3], &[0, 1, 2, 3, 4, 5, 6, 7], fingerprint.clone());
+        let probes = vec![oid_from_u32(1), oid_from_u32(3)];
+
+        // Warm the ordinal cache.
+        let _ = store.batch_check_seen(&probes).expect("warm query");
+        assert!(store.ordinal.borrow().is_some());
+
+        // Re-set snapshot with the same fingerprint.
+        store
+            .set_midx_snapshot(
+                BytesView::from_vec(build_test_midx_from_values(&[0, 1, 2, 3, 4, 5, 6, 7])),
+                ObjectFormat::Sha1,
+                fingerprint.clone(),
+            )
+            .expect("re-set");
+
+        // Cache should be preserved (not invalidated).
+        assert!(store.ordinal.borrow().is_some());
+        assert!(store.is_valid_for_fingerprint(&fingerprint));
+    }
+
+    #[test]
+    fn hybrid_seen_store_handles_duplicate_loose_oids_in_sorted_input() {
+        let fingerprint = test_fingerprint(0x90);
+        // MIDX covers [0..8], OID 9 is loose-only but present in roaring.
+        let store = build_hybrid_store(&[1, 9], &[0, 1, 2, 3, 4, 5, 6, 7], fingerprint);
+        // Sorted probes with consecutive duplicate of a loose OID.
+        let probes = vec![oid_from_u32(9), oid_from_u32(9)];
+        let actual = store.batch_check_seen(&probes).expect("duplicate loose");
+        assert_eq!(actual, vec![true, true]);
+    }
+
     #[derive(Debug, Clone)]
     enum HybridOp {
         Insert(u16),
