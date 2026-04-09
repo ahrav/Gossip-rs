@@ -39,12 +39,27 @@ pub mod filesystem;
 pub mod in_memory;
 mod split_estimator;
 
+/// I/O classification helpers shared by connector implementations.
+///
+/// These functions normalize platform and OS-level errors into stable checks
+/// used by retry and traversal logic in higher layers.
 pub use common::{is_permanent_io_error, is_symlink_loop, path_buf_from_bytes};
+/// Local filesystem-backed connector implementation.
+///
+/// Available only on Unix platforms where path and metadata semantics match the
+/// implementation assumptions.
 #[cfg(unix)]
 pub use filesystem::FilesystemConnector;
+/// Canonical connector-family tags used in metadata and fixtures.
+///
+/// These constants are defined in `gossip-contracts` and re-exported here so
+/// callers can select source families without depending on the contracts crate
+/// directly.
 pub use gossip_contracts::connector::{
     FILESYSTEM_CONNECTOR_TAG, GIT_CONNECTOR_TAG, IN_MEMORY_CONNECTOR_TAG,
 };
+/// Deterministic in-memory connector and item fixture type used by tests and
+/// benchmarks.
 pub use in_memory::{InMemoryDeterministicConnector, MemItem};
 
 #[doc(hidden)]
@@ -69,6 +84,12 @@ pub use in_memory::{InMemoryDeterministicConnector, MemItem};
 ///
 /// Runs in `O(count)` time and `O(sample_cap)` additional memory, matching the
 /// estimator's streaming sample budget.
+///
+/// # Panics
+///
+/// Panics if:
+/// - A generated benchmark key index does not fit into `u64`.
+/// - The estimator returns a split key that is not exactly 8 bytes long.
 pub fn benchmark_streaming_split_estimator_observe_fixed_size(
     sample_cap: usize,
     count: usize,
