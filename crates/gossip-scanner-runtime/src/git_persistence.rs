@@ -19,12 +19,13 @@
 //!
 //! Between finalize calls the scan pipeline spills processed OIDs through
 //! [`SeenBitmapPersister::persist_seen_delta`]. These land in a **staging
-//! key** that is invisible to [`SeenBlobStore::batch_check_seen`] — the
-//! query path reads only from the committed **scope key**. On a complete
-//! finalize, staging OIDs are merged into the scope key atomically (or in
-//! a crash-safe multi-phase write on non-atomic backends). On a partial
-//! finalize, staging OIDs are discarded because they may include blobs
-//! from skipped candidates.
+//! key** that stays separate from the committed **scope key**. On a complete
+//! finalize, staging OIDs are merged into the scope key atomically (or in a
+//! crash-safe multi-phase write on non-atomic backends). On a partial finalize,
+//! staging OIDs are discarded because they may include blobs from skipped
+//! candidates. When the adapter is configured with the current MIDX snapshot,
+//! successful staging writes also update the in-memory ordinal cache so the
+//! current scan can dedupe repeated MIDX-resident OIDs before finalize.
 //!
 //! # Complete vs. partial finalizes
 //!
@@ -52,10 +53,11 @@ use gossip_contracts::{
     },
 };
 use scanner_git::{
-    CheckpointAck, FinalizeOutcome, FinalizeOutput, LoadedScanCheckpoint, NS_SEEN_BLOB, OidBytes,
-    PersistError, PersistenceStore, RefWatermark, RefWatermarkStore, RepoOpenError,
-    ScanCheckpointError, ScanCheckpointSink, SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore,
-    SpillError, StageCheckpoint, StartSetId, WriteOp, decode_ref_watermark_value,
+    BytesView, CheckpointAck, FinalizeOutcome, FinalizeOutput, HybridSeenStore,
+    LoadedScanCheckpoint, NS_SEEN_BLOB, ObjectFormat, OidBytes, PersistError, PersistenceStore,
+    RefWatermark, RefWatermarkStore, RepoArtifactFingerprint, RepoOpenError, ScanCheckpointError,
+    ScanCheckpointSink, SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore, SpillError,
+    StageCheckpoint, StartSetId, WriteOp, build_seen_ordinal_key, decode_ref_watermark_value,
     finalize::{build_ref_wm_key, build_seen_scope_key, build_seen_staging_key},
     roaring_seen::{RoaringSeenBitmap, RoaringSeenStore},
 };
@@ -202,7 +204,7 @@ pub struct GitPersistenceAdapter<B> {
     repo_id: u64,
     policy_hash: [u8; 32],
     start_set_id: StartSetId,
-    seen_store: RefCell<Option<RoaringSeenStore>>,
+    seen_store: RefCell<Option<HybridSeenStore>>,
     staging_seen: RefCell<Option<RoaringSeenBitmap>>,
     finalizing: Cell<bool>,
 }
@@ -502,7 +504,7 @@ where
             .seen_store
             .borrow()
             .as_ref()
-            .is_none_or(|store| store.bitmap().oid_len() != oid_len);
+            .is_none_or(|store| store.fallback().bitmap().oid_len() != oid_len);
         if needs_load {
             let loaded = self.load_seen_store_from_backend(oid_len)?;
             *self.seen_store.borrow_mut() = Some(loaded);
@@ -513,11 +515,13 @@ where
     /// Cold-path: read and deserialize the committed scope bitmap from the
     /// backend. Returns an empty bitmap when no scope key exists yet (first
     /// scan of this repo/policy pair).
-    fn load_seen_store_from_backend(&self, oid_len: u8) -> Result<RoaringSeenStore, String> {
+    fn load_seen_store_from_backend(&self, oid_len: u8) -> Result<HybridSeenStore, String> {
         let scope_key = self.seen_scope_key();
         match self.backend.get(&scope_key) {
             Ok(Some(bytes)) => match RoaringSeenBitmap::deserialize(bytes.as_ref()) {
-                Ok(bitmap) if bitmap.oid_len() == oid_len => Ok(RoaringSeenStore::new(bitmap)),
+                Ok(bitmap) if bitmap.oid_len() == oid_len => {
+                    Ok(HybridSeenStore::new(RoaringSeenStore::new(bitmap)))
+                }
                 Ok(bitmap) => Err(format!(
                     "seen-bitmap OID length mismatch: stored={}, requested={}",
                     bitmap.oid_len(),
@@ -525,7 +529,9 @@ where
                 )),
                 Err(err) => Err(format!("corrupt seen-bitmap: {err}")),
             },
-            Ok(None) => Ok(RoaringSeenStore::new(RoaringSeenBitmap::new(oid_len))),
+            Ok(None) => Ok(HybridSeenStore::new(RoaringSeenStore::new(
+                RoaringSeenBitmap::new(oid_len),
+            ))),
             Err(err) => Err(err.to_string()),
         }
     }
@@ -535,8 +541,10 @@ where
 ///
 /// Each call merges the supplied OIDs into a cached staging bitmap, then
 /// writes the merged result to the staging key. The staging bitmap is
-/// invisible to `batch_check_seen` and only folded into the committed scope
-/// on a complete finalize.
+/// kept separate from the committed scope and only folded into the durable
+/// scope key on a complete finalize. When the adapter has an active MIDX
+/// snapshot, the in-memory ordinal cache is updated after the durable staging
+/// write succeeds.
 ///
 /// # Take-mutate-restore caching
 ///
@@ -608,15 +616,20 @@ where
         // Install the merged bitmap into the cache only after the
         // backend write succeeds.
         *guard = Some(merged);
+        drop(guard);
+        if let Some(store) = self.seen_store.borrow_mut().as_mut() {
+            store.mark_seen_batch(oids)?;
+        }
         Ok(())
     }
 }
 
 /// Committed-scope queries: checks OIDs against the durable seen-bitmap only.
 ///
-/// Staging OIDs are intentionally invisible here. The scan pipeline relies
-/// on this separation to avoid false positives from OIDs that may belong to
-/// skipped candidates (which would be discarded on partial finalize).
+/// The committed roaring scope remains the durable source of truth. When the
+/// adapter has an active MIDX snapshot, the in-memory ordinal cache may also
+/// reflect successfully staged OIDs from the current process so repeated
+/// MIDX-resident probes can short-circuit before finalize.
 ///
 /// # Preconditions (debug-asserted)
 ///
@@ -656,7 +669,49 @@ where
                 "seen-store not initialized after successful load",
             ))
         })?;
-        Ok(store.bitmap().batch_contains_sorted(oids))
+        store.batch_check_seen(oids)
+    }
+
+    fn configure_midx_snapshot(
+        &self,
+        midx_bytes: BytesView,
+        object_format: ObjectFormat,
+        artifact_fingerprint: RepoArtifactFingerprint,
+    ) -> Result<(), SpillError> {
+        self.load_seen_store(object_format.oid_len())
+            .map_err(|err| {
+                SpillError::Io(io::Error::other(format!(
+                    "seen-store initialization failed: {err}"
+                )))
+            })?;
+        let ordinal_key = build_seen_ordinal_key(self.repo_id, &self.policy_hash);
+        let ordinal_bytes = self
+            .backend
+            .get(&ordinal_key)
+            .map_err(|err| SpillError::Io(io::Error::other(err.to_string())))?;
+        let mut guard = self.seen_store.borrow_mut();
+        let Some(store) = guard.as_mut() else {
+            return Err(SpillError::Io(io::Error::other(
+                "seen-store not initialized after successful load",
+            )));
+        };
+        store.set_midx_snapshot(midx_bytes, object_format, artifact_fingerprint)?;
+        if let Some(bytes) = ordinal_bytes {
+            match store.load_persisted_ordinal(&bytes) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!("discarded stale persisted seen-ordinal cache");
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        error = %err,
+                        "discarded corrupt persisted seen-ordinal cache"
+                    );
+                    store.clear_ordinal_cache();
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -870,37 +925,64 @@ where
             seen_oids.extend(staging.all_oids());
         }
 
-        let mut staged_bitmap = None;
-        if !seen_oids.is_empty() {
-            // Both sources are already sorted; `from_oids` re-sorts as a
-            // simplicity trade-off.
-            let delta = SeenBitmapDelta::from_oids(&seen_oids)
-                .map_err(|err| PersistError::backend(err.to_string()))?;
-            let oid_len = delta.oid_len();
-
-            self.load_seen_store(oid_len)
-                .map_err(PersistError::backend)?;
-            // Take ownership of the cached bitmap to avoid cloning. The
-            // cache is repopulated with the merged result below.
-            let merged = {
-                let base = self.seen_store.borrow_mut().take().map_or_else(
-                    || RoaringSeenBitmap::new(oid_len),
-                    RoaringSeenStore::into_bitmap,
-                );
-                let mut staged = base;
-                staged
-                    .merge_delta(&delta)
-                    .map_err(|err| PersistError::backend(err.to_string()))?;
-                staged
+        let mut staged_seen_store = None;
+        let had_seen_cache = self.seen_store.borrow().is_some();
+        if !seen_oids.is_empty() || had_seen_cache {
+            let delta = if seen_oids.is_empty() {
+                None
+            } else {
+                Some(
+                    SeenBitmapDelta::from_oids(&seen_oids)
+                        .map_err(|err| PersistError::backend(err.to_string()))?,
+                )
             };
-            let serialized = merged
-                .serialize()
-                .map_err(|err| PersistError::backend(err.to_string()))?;
-            first_phase_ops.push(GitPersistenceOp::Put {
-                key: seen_scope_key,
-                value: serialized,
-            });
-            staged_bitmap = Some(merged);
+            if let Some(delta) = &delta {
+                self.load_seen_store(delta.oid_len())
+                    .map_err(PersistError::backend)?;
+            }
+            let mut guard = self.seen_store.borrow_mut();
+            let Some(mut store) = guard.take() else {
+                if delta.is_some() {
+                    return Err(PersistError::backend(
+                        "seen-store not initialized after successful load",
+                    ));
+                }
+                unreachable!("had_seen_cache implies a cached seen store");
+            };
+            drop(guard);
+
+            if let Some(delta) = &delta {
+                store
+                    .fallback_mut()
+                    .bitmap_mut()
+                    .merge_delta(delta)
+                    .map_err(|err| PersistError::backend(err.to_string()))?;
+                let serialized = store
+                    .fallback()
+                    .bitmap()
+                    .serialize()
+                    .map_err(|err| PersistError::backend(err.to_string()))?;
+                first_phase_ops.push(GitPersistenceOp::Put {
+                    key: seen_scope_key.clone(),
+                    value: serialized,
+                });
+            }
+
+            if is_complete {
+                if let Some(ordinal_bytes) = store
+                    .persisted_ordinal_bytes()
+                    .map_err(|err| PersistError::backend(err.to_string()))?
+                {
+                    first_phase_ops.push(GitPersistenceOp::Put {
+                        key: build_seen_ordinal_key(self.repo_id, &self.policy_hash),
+                        value: ordinal_bytes,
+                    });
+                }
+            } else {
+                store.clear_ordinal_cache();
+            }
+
+            staged_seen_store = Some(store);
         }
 
         let watermark_ops: Vec<_> = if is_complete {
@@ -944,8 +1026,8 @@ where
                     .apply_batch(&all_ops)
                     .map_err(|err| PersistError::backend(err.to_string()))?;
             }
-            if let Some(bitmap) = staged_bitmap {
-                *self.seen_store.borrow_mut() = Some(RoaringSeenStore::new(bitmap));
+            if let Some(store) = staged_seen_store {
+                *self.seen_store.borrow_mut() = Some(store);
             }
             return Ok(());
         }
@@ -982,8 +1064,8 @@ where
                 .apply_batch(&first_phase_ops)
                 .map_err(|err| PersistError::backend(err.to_string()))?;
         }
-        if let Some(bitmap) = staged_bitmap {
-            *self.seen_store.borrow_mut() = Some(RoaringSeenStore::new(bitmap));
+        if let Some(store) = staged_seen_store {
+            *self.seen_store.borrow_mut() = Some(store);
         }
         if has_staging && is_complete {
             self.backend
@@ -1111,7 +1193,9 @@ pub mod test_support {
     use std::collections::BTreeMap;
     use std::rc::Rc;
 
-    use scanner_git::{NS_BLOB_CTX, NS_FINDING, NS_REF_WATERMARK, NS_SEEN_STAGING};
+    use scanner_git::{
+        NS_BLOB_CTX, NS_FINDING, NS_REF_WATERMARK, NS_SEEN_ORDINAL, NS_SEEN_STAGING,
+    };
 
     use super::{
         GitPersistenceBackend, GitPersistenceOp, NS_GIT_SCAN_CHECKPOINT_BASE,
@@ -1134,6 +1218,7 @@ pub mod test_support {
         Finding,
         CheckpointBase,
         CheckpointPrefix,
+        SeenOrdinal,
         SeenScope,
         SeenStaging,
         Watermark,
@@ -1154,6 +1239,8 @@ pub mod test_support {
                 Self::CheckpointBase
             } else if key.starts_with(&NS_GIT_SCAN_CHECKPOINT_PREFIX) {
                 Self::CheckpointPrefix
+            } else if key.starts_with(&NS_SEEN_ORDINAL) {
+                Self::SeenOrdinal
             } else if key.starts_with(&NS_SEEN_BLOB) {
                 Self::SeenScope
             } else if key.starts_with(&NS_SEEN_STAGING) {

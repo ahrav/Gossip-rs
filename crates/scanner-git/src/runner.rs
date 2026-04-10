@@ -1074,6 +1074,14 @@ pub fn run_git_scan_with_context(
         .artifact_fingerprint
         .clone()
         .ok_or_else(|| GitScanError::Io(io::Error::other("artifact fingerprint missing")))?;
+    context
+        .seen_store
+        .configure_midx_snapshot(
+            midx_result.bytes.clone(),
+            repo.object_format,
+            artifact_fingerprint.clone(),
+        )
+        .map_err(GitScanError::Spill)?;
     let resume_state = ScanResumeState::from_loaded(
         context.checkpoint_sink.load_resume_state()?,
         config.scan_mode,

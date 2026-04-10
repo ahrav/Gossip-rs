@@ -48,7 +48,7 @@ and validation, and Git connector mode uses the direct path.
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_discovery.rs` | Static single-target Git repository discovery source for payload-backed repo-frontier shards |
 | `src/git_executor.rs` | Contract-level adapter that implements `GitRepoExecutor` for mirror-backed repo scans by translating `GitSelection` + `GitExecutionLimits` into `scanner-git` config, propagating repo/policy identity into persistence-aware runs, and reusing the shared runtime runner |
-| `src/git_persistence.rs` | Runtime-backed adapters for `scanner-git` watermark/seen/finalize seams plus repo-frontier receipt/checkpoint helpers. Non-atomic backends use a multi-phase commit (data+seen, then staging delete, then watermarks) so a mid-commit failure cannot expose watermarks without matching data writes |
+| `src/git_persistence.rs` | Runtime-backed adapters for `scanner-git` watermark/seen/finalize seams plus repo-frontier receipt/checkpoint helpers. When a scan configures a MIDX snapshot, the adapter restores a fingerprint-scoped ordinal seen cache for the live worker, keeps staged OIDs visible between spill batches and finalize, and only durably publishes that cache on complete finalize. Non-atomic backends use a multi-phase commit (data+seen, then staging delete, then watermarks) so a mid-commit failure cannot expose watermarks without matching data writes |
 | `src/git_mirror.rs` | Worker-local Git mirror lifecycle, deterministic cache-path derivation, and stale control-file cleanup |
 | `src/git_repo.rs` | Git-repository runtime boundary: direct local scan execution, singleton repo-frontier discovery execution, prepared-mirror repo execution, and durable repo-frontier checkpoint synthesis from Git finalize receipts |
 | `src/ordered_content.rs` | Ordered-content page validation, explicit terminal page / exhausted-empty outcomes, scan-miss execution, and direct local filesystem execution helpers |
@@ -143,7 +143,8 @@ Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
 git report into the local `ScanReport` plus optional debug output.
 When the caller owns durable Git state, `git_persistence::GitPersistenceAdapter`
-implements `scanner-git`'s ref-watermark, seen-blob, and finalize seams and
+implements `scanner-git`'s ref-watermark, seen-blob, and finalize seams,
+restores the configured MIDX ordinal cache when artifact metadata matches, and
 plugs into `git_repo::run_runtime_git_scan_with_stores`. Distributed
 repo-frontier execution wraps the event sink with `FindingsCaptureSink`, lifts
 Git `FindingEvent` values into `GitFindingForPersistence` by decoding the

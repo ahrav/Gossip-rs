@@ -482,10 +482,12 @@ impl Spiller {
     ///   1..k were emitted but not staged, so they will be re-emitted on
     ///   the next run — the same at-least-once guarantee as the crash path.
     ///
-    /// Staging writes are invisible to `batch_check_seen` and only become
-    /// visible when `commit_finalize` folds them into the live bitmap.
-    /// If the process crashes before finalize, staging is discarded on the
-    /// next store open — no blobs are permanently hidden.
+    /// The committed roaring scope remains unchanged until `commit_finalize`
+    /// folds staging into the live bitmap. Implementations may still make
+    /// successfully staged OIDs visible through in-memory acceleration
+    /// structures for the current process, as long as a restart reloads only
+    /// committed state. If the process crashes before finalize, staging is
+    /// discarded on the next store open — no blobs are permanently hidden.
     ///
     /// # Errors
     /// - `SpillError::SeenResponseMismatch` if the seen store returns a

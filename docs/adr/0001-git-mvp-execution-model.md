@@ -17,7 +17,7 @@ page loop. The repository already has most of the building blocks for that path:
 | `CheckpointAggregatorInput` | `crates/gossip-scanner-runtime/src/commit_model.rs` | Outer progress already advances from durable receipts only. |
 | `PersistenceStore::commit_finalize(&FinalizeOutput)` | `crates/scanner-git/src/persist.rs` | Inner Git execution already has an atomic finalize seam. |
 | `FinalizeOutcome::{Complete, Partial}` with suppressed `watermark_ops` on `Partial` | `crates/scanner-git/src/finalize.rs` | Partial runs already prevent ref-frontier advancement. |
-| `SeenBlobStore` and `seen_blob` markers | `crates/scanner-git/src/seen_store.rs`, `crates/scanner-git/src/finalize.rs` | Replay already has an idempotent dedupe surface. |
+| `SeenBlobStore`, `seen_blob` markers, and MIDX ordinal caches | `crates/scanner-git/src/seen_store.rs`, `crates/scanner-git/src/finalize.rs`, `crates/scanner-git/src/ordinal_seen.rs` | Replay already has an idempotent dedupe surface plus a fingerprint-scoped acceleration cache for configured snapshots. |
 | `GitRepoDiscoverySource`, `GitMirrorManager`, `GitRepoExecutor`, `GitRunError` | `crates/gossip-contracts/src/connector/git.rs` | The repo-family contract surface already exists. |
 
 This document locks how those pieces compose. It does not introduce a second
@@ -155,6 +155,9 @@ That window is safe because:
 - inner writes are keyed deterministically, so reissuing them converges on the
   same persisted state;
 - `seen_blob` markers provide replay-time dedupe for already-scanned blobs;
+- configured MIDX ordinal caches are keyed by the repo artifact fingerprint, so
+  replay only reuses them when the snapshot metadata still matches the committed
+  seen scope;
 - `FinalizeOutcome::Partial` suppresses `watermark_ops`, so partial replays never
   advance ref-frontier watermarks; and
 - outer repo-frontier advancement still has not happened, because only the

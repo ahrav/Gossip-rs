@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use super::errors::{PersistError, SpillError};
 #[cfg(feature = "rocksdb")]
-use super::finalize::{build_seen_scope_key, NS_SEEN_BLOB};
+use super::finalize::{build_seen_scope_key, NS_SEEN_BLOB, NS_SEEN_ORDINAL};
 use super::finalize::{FinalizeOutcome, FinalizeOutput, WriteOp};
 #[cfg(feature = "rocksdb")]
 use super::roaring_seen::{RoaringSeenBitmap, SeenBitmapDelta};
@@ -88,6 +88,9 @@ pub struct InMemoryPersistenceStore {
     /// `seen_scopes`. `commit_finalize` merges staging into the live bitmap.
     #[cfg(feature = "rocksdb")]
     seen_staging: std::cell::RefCell<HashMap<Vec<u8>, RoaringSeenBitmap>>,
+    /// Current serialized ordinal cache per scope key.
+    #[cfg(feature = "rocksdb")]
+    ordinal_scopes: std::cell::RefCell<HashMap<Vec<u8>, Vec<u8>>>,
     /// Optional default scope for incremental seen-bitmap writes.
     #[cfg(feature = "rocksdb")]
     seen_scope_key: Option<Vec<u8>>,
@@ -103,6 +106,7 @@ impl InMemoryPersistenceStore {
             watermark_ops: std::cell::RefCell::new(Vec::new()),
             seen_scopes: std::cell::RefCell::new(HashMap::new()),
             seen_staging: std::cell::RefCell::new(HashMap::new()),
+            ordinal_scopes: std::cell::RefCell::new(HashMap::new()),
             seen_scope_key: Some(build_seen_scope_key(repo_id, &policy_hash)),
         }
     }
@@ -198,6 +202,8 @@ impl PersistenceStore for InMemoryPersistenceStore {
         #[cfg(feature = "rocksdb")]
         let mut staged_scopes: HashMap<Vec<u8>, RoaringSeenBitmap> =
             self.seen_scopes.borrow().clone();
+        #[cfg(feature = "rocksdb")]
+        let mut staged_ordinals: HashMap<Vec<u8>, Vec<u8>> = self.ordinal_scopes.borrow().clone();
 
         // Fold staging bitmaps into staged_scopes only for complete runs.
         // On partial finalize, staging may contain OIDs for blobs that were
@@ -273,6 +279,13 @@ impl PersistenceStore for InMemoryPersistenceStore {
                 continue;
             }
 
+            #[cfg(feature = "rocksdb")]
+            if op.key.starts_with(&NS_SEEN_ORDINAL) {
+                staged_ordinals.insert(op.key.clone(), op.value.clone());
+                staged_data.push(op.clone());
+                continue;
+            }
+
             staged_data.push(op.clone());
         }
 
@@ -302,6 +315,7 @@ impl PersistenceStore for InMemoryPersistenceStore {
         #[cfg(feature = "rocksdb")]
         {
             *self.seen_scopes.borrow_mut() = staged_scopes;
+            *self.ordinal_scopes.borrow_mut() = staged_ordinals;
             self.seen_staging.borrow_mut().clear();
         }
         if matches!(output.outcome, FinalizeOutcome::Complete) {
@@ -316,8 +330,9 @@ impl PersistenceStore for InMemoryPersistenceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finalize::{build_seen_scope_key, FinalizeStats};
+    use crate::finalize::{build_seen_ordinal_key, build_seen_scope_key, FinalizeStats};
     use crate::object_id::OidBytes;
+    use crate::ordinal_seen::MidxOrdinalBitset;
 
     #[cfg(feature = "rocksdb")]
     use crate::roaring_seen::SeenBitmapDelta;
@@ -557,6 +572,38 @@ mod tests {
         assert!(
             err.to_string().contains("multiple seen-bitmap scope keys"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn in_memory_store_records_seen_ordinal_ops() {
+        let store = InMemoryPersistenceStore::default();
+        let ordinal_key = build_seen_ordinal_key(42, &[0xAB; 32]);
+        let ordinal_value = MidxOrdinalBitset::new(8, [0xCD; 32]).serialize();
+
+        let output = FinalizeOutput {
+            data_ops: vec![WriteOp {
+                key: ordinal_key.clone(),
+                value: ordinal_value.clone(),
+            }],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+        store.commit_finalize(&output).expect("commit");
+
+        assert_eq!(
+            store.ordinal_scopes.borrow().get(&ordinal_key),
+            Some(&ordinal_value)
+        );
+        assert!(
+            store
+                .data_ops
+                .borrow()
+                .iter()
+                .any(|op| op.key == ordinal_key && op.value == ordinal_value),
+            "ordinal WriteOp must be logged"
         );
     }
 

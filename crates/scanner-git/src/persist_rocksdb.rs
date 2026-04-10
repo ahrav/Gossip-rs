@@ -16,17 +16,24 @@ use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::Path;
 
+use tracing::debug;
+
 use super::errors::{PersistError, RepoOpenError, SpillError};
 #[cfg(feature = "rocksdb")]
 use super::finalize::FinalizeOutcome;
 use super::finalize::FinalizeOutput;
 #[cfg(feature = "rocksdb")]
-use super::finalize::NS_SEEN_BLOB;
+use super::finalize::{
+    build_ref_wm_key, build_seen_ordinal_key, build_seen_scope_key, build_seen_staging_key,
+};
 #[cfg(feature = "rocksdb")]
-use super::finalize::{build_ref_wm_key, build_seen_scope_key, build_seen_staging_key};
-use super::object_id::OidBytes;
+use super::finalize::{NS_SEEN_BLOB, NS_SEEN_ORDINAL};
+use super::object_id::{ObjectFormat, OidBytes};
+#[cfg(feature = "rocksdb")]
+use super::ordinal_seen::HybridSeenStore;
 use super::persist::PersistenceStore;
 use super::repo_open::RefWatermarkStore;
+use super::repo_open::RepoArtifactFingerprint;
 #[cfg(feature = "rocksdb")]
 use super::roaring_seen::{RoaringSeenBitmap, RoaringSeenStore, SeenBitmapDelta};
 use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
@@ -59,7 +66,7 @@ pub struct RocksDbStore {
     #[cfg(feature = "rocksdb")]
     policy_hash: [u8; 32],
     #[cfg(feature = "rocksdb")]
-    seen_store: RefCell<Option<RoaringSeenStore>>,
+    seen_store: RefCell<Option<HybridSeenStore>>,
     /// Set during `commit_finalize` to detect re-entrant calls in debug builds.
     /// The single-writer invariant (one lease owner per scope) guarantees this
     /// never trips in production; if it does, the caller has a lease bug.
@@ -111,7 +118,7 @@ impl RocksDbStore {
             .seen_store
             .borrow()
             .as_ref()
-            .is_none_or(|s| s.bitmap().oid_len() != oid_len);
+            .is_none_or(|s| s.fallback().bitmap().oid_len() != oid_len);
         if needs_load {
             let loaded = self.load_seen_store_from_db(oid_len)?;
             *self.seen_store.borrow_mut() = Some(loaded);
@@ -120,11 +127,13 @@ impl RocksDbStore {
     }
 
     #[cfg(feature = "rocksdb")]
-    fn load_seen_store_from_db(&self, oid_len: u8) -> Result<RoaringSeenStore, String> {
+    fn load_seen_store_from_db(&self, oid_len: u8) -> Result<HybridSeenStore, String> {
         let scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
         match self.db.get(&scope_key) {
             Ok(Some(bytes)) => match RoaringSeenBitmap::deserialize(bytes.as_ref()) {
-                Ok(bitmap) if bitmap.oid_len() == oid_len => Ok(RoaringSeenStore::new(bitmap)),
+                Ok(bitmap) if bitmap.oid_len() == oid_len => {
+                    Ok(HybridSeenStore::new(RoaringSeenStore::new(bitmap)))
+                }
                 Ok(bitmap) => Err(format!(
                     "seen-bitmap OID length mismatch: stored={}, requested={}",
                     bitmap.oid_len(),
@@ -132,20 +141,22 @@ impl RocksDbStore {
                 )),
                 Err(err) => Err(format!("corrupt seen-bitmap: {err}")),
             },
-            Ok(None) => Ok(RoaringSeenStore::new(RoaringSeenBitmap::new(oid_len))),
+            Ok(None) => Ok(HybridSeenStore::new(RoaringSeenStore::new(
+                RoaringSeenBitmap::new(oid_len),
+            ))),
             Err(err) => Err(err.to_string()),
         }
     }
 
     /// Writes a seen-bitmap delta to the staging key (`ss\0`).
     ///
-    /// Staging writes are invisible to `batch_check_seen` — only
-    /// `commit_finalize` folds them into the live `sb\0` key. If the
-    /// process crashes before finalize, the staging key is orphaned
-    /// and cleaned up on the next `RocksDbStore::open`.
-    ///
-    /// The in-memory bitmap cache is NOT mutated here. This ensures
-    /// crash safety: a restart loads only committed state.
+    /// The authoritative roaring scope remains invisible to
+    /// `batch_check_seen` until `commit_finalize` folds staging into `sb\0`.
+    /// When the store has been configured with the current MIDX snapshot,
+    /// `persist_seen_delta` also updates the in-memory ordinal cache after the
+    /// staging write succeeds so the current process can dedupe repeated
+    /// MIDX-resident OIDs within the same scan. On restart, only committed
+    /// state is reloaded.
     #[cfg(feature = "rocksdb")]
     fn persist_seen_delta_inner(&self, delta: &SeenBitmapDelta) -> Result<(), SpillError> {
         let staging_key = build_seen_staging_key(self.repo_id, &self.policy_hash);
@@ -202,7 +213,11 @@ impl SeenBitmapPersister for RocksDbStore {
             }
 
             let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())?;
-            self.persist_seen_delta_inner(&delta)
+            self.persist_seen_delta_inner(&delta)?;
+            if let Some(store) = self.seen_store.borrow_mut().as_mut() {
+                store.mark_seen_batch(oids)?;
+            }
+            Ok(())
         }
 
         #[cfg(not(feature = "rocksdb"))]
@@ -274,10 +289,10 @@ impl PersistenceStore for RocksDbStore {
                 }
             }
 
-            // Staged bitmap built from a clone of the cache. Applied to the
-            // in-memory cache only after db.write succeeds, so a write failure
-            // leaves the cache consistent with what is persisted.
-            let mut staged_bitmap: Option<RoaringSeenBitmap> = None;
+            // The seen-store cache is moved out, updated, and restored only
+            // after db.write succeeds. A failed write leaves the cache empty so
+            // the next access reloads authoritative state from RocksDB.
+            let mut staged_seen_store: Option<HybridSeenStore> = None;
 
             // Fold spill-stage staging bitmap into seen_oids only for
             // complete runs. On partial finalize, staging may contain OIDs
@@ -317,45 +332,76 @@ impl PersistenceStore for RocksDbStore {
                 }
             }
 
-            if !seen_oids.is_empty() {
+            let had_seen_cache = self.seen_store.borrow().is_some();
+            if !seen_oids.is_empty() || had_seen_cache {
                 // Multiple same-scope deltas may have individually sorted OID
                 // lists, but their concatenation is not necessarily globally
                 // sorted. Use `from_oids` to sort and dedup the combined set.
-                let delta = SeenBitmapDelta::from_oids(&seen_oids)
-                    .map_err(|err| PersistError::backend(err.to_string()))?;
+                let delta = if seen_oids.is_empty() {
+                    None
+                } else {
+                    Some(
+                        SeenBitmapDelta::from_oids(&seen_oids)
+                            .map_err(|err| PersistError::backend(err.to_string()))?,
+                    )
+                };
 
-                let oid_len = delta.oid_len();
-                let scope_key_for_bitmap = seen_scope_key
-                    .unwrap_or_else(|| build_seen_scope_key(self.repo_id, &self.policy_hash));
-
-                let expected_scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
-                if scope_key_for_bitmap != expected_scope_key {
-                    return Err(PersistError::backend(
-                        "seen-bitmap scope key does not match store identity",
-                    ));
+                if let Some(delta) = &delta {
+                    let scope_key_for_bitmap = seen_scope_key
+                        .unwrap_or_else(|| build_seen_scope_key(self.repo_id, &self.policy_hash));
+                    let expected_scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
+                    if scope_key_for_bitmap != expected_scope_key {
+                        return Err(PersistError::backend(
+                            "seen-bitmap scope key does not match store identity",
+                        ));
+                    }
+                    self.load_seen_store(delta.oid_len())
+                        .map_err(PersistError::backend)?;
                 }
 
-                self.load_seen_store(oid_len)
-                    .map_err(PersistError::backend)?;
-
-                // Build the merged bitmap in a separate clone so the in-memory
-                // cache is not mutated until db.write succeeds.
-                let merged = {
-                    let guard = self.seen_store.borrow();
-                    let base = guard
-                        .as_ref()
-                        .map_or_else(|| RoaringSeenBitmap::new(oid_len), |s| s.bitmap().clone());
-                    let mut staged = base;
-                    staged
-                        .merge_delta(&delta)
-                        .map_err(|err| PersistError::backend(err.to_string()))?;
-                    staged
+                let mut guard = self.seen_store.borrow_mut();
+                let Some(mut store) = guard.take() else {
+                    if delta.is_some() {
+                        return Err(PersistError::backend(
+                            "seen-store not initialized after successful load",
+                        ));
+                    }
+                    drop(guard);
+                    unreachable!("had_seen_cache implies a cached seen store");
                 };
-                let serialized = merged
-                    .serialize()
-                    .map_err(|err| PersistError::backend(err.to_string()))?;
-                batch.put(&scope_key_for_bitmap, serialized);
-                staged_bitmap = Some(merged);
+                drop(guard);
+
+                if let Some(delta) = &delta {
+                    let scope_key_for_bitmap =
+                        build_seen_scope_key(self.repo_id, &self.policy_hash);
+                    store
+                        .fallback_mut()
+                        .bitmap_mut()
+                        .merge_delta(delta)
+                        .map_err(|err| PersistError::backend(err.to_string()))?;
+                    let serialized = store
+                        .fallback()
+                        .bitmap()
+                        .serialize()
+                        .map_err(|err| PersistError::backend(err.to_string()))?;
+                    batch.put(&scope_key_for_bitmap, serialized);
+                }
+
+                if is_complete {
+                    if let Some(ordinal_bytes) = store
+                        .persisted_ordinal_bytes()
+                        .map_err(|err| PersistError::backend(err.to_string()))?
+                    {
+                        batch.put(
+                            build_seen_ordinal_key(self.repo_id, &self.policy_hash),
+                            ordinal_bytes,
+                        );
+                    }
+                } else {
+                    store.clear_ordinal_cache();
+                }
+
+                staged_seen_store = Some(store);
             }
 
             if matches!(output.outcome, FinalizeOutcome::Complete) {
@@ -367,10 +413,10 @@ impl PersistenceStore for RocksDbStore {
                 .write(batch)
                 .map_err(|err| PersistError::backend(err.to_string()))?;
 
-            // Promote the staged bitmap into the cache only after the write
-            // succeeds. On failure the cache retains the pre-finalize state.
-            if let Some(bitmap) = staged_bitmap {
-                *self.seen_store.borrow_mut() = Some(RoaringSeenStore::new(bitmap));
+            // Promote the staged seen store into the cache only after the
+            // write succeeds. On failure the cache is reloaded from RocksDB.
+            if let Some(store) = staged_seen_store {
+                *self.seen_store.borrow_mut() = Some(store);
             }
 
             Ok(())
@@ -407,6 +453,52 @@ impl SeenBlobStore for RocksDbStore {
         #[cfg(not(feature = "rocksdb"))]
         {
             let _ = oids;
+            Err(SpillError::Io(io::Error::other(
+                "rocksdb support not enabled",
+            )))
+        }
+    }
+
+    fn configure_midx_snapshot(
+        &self,
+        midx_bytes: super::bytes::BytesView,
+        object_format: ObjectFormat,
+        artifact_fingerprint: RepoArtifactFingerprint,
+    ) -> Result<(), SpillError> {
+        #[cfg(feature = "rocksdb")]
+        {
+            self.load_seen_store(object_format.oid_len())
+                .map_err(|err| SpillError::Io(io::Error::other(err)))?;
+            let ordinal_key = build_seen_ordinal_key(self.repo_id, &self.policy_hash);
+            let ordinal_bytes = self
+                .db
+                .get(&ordinal_key)
+                .map_err(|err| SpillError::Io(io::Error::other(err.to_string())))?;
+            let mut guard = self.seen_store.borrow_mut();
+            let Some(store) = guard.as_mut() else {
+                return Err(SpillError::Io(io::Error::other(
+                    "seen-store not initialized after successful load",
+                )));
+            };
+            store.set_midx_snapshot(midx_bytes, object_format, artifact_fingerprint)?;
+            if let Some(bytes) = ordinal_bytes {
+                match store.load_persisted_ordinal(&bytes) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        debug!("discarded stale persisted seen-ordinal cache");
+                    }
+                    Err(err) => {
+                        debug!(error = %err, "discarded corrupt persisted seen-ordinal cache");
+                        store.clear_ordinal_cache();
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        #[cfg(not(feature = "rocksdb"))]
+        {
+            let _ = (midx_bytes, object_format, artifact_fingerprint);
             Err(SpillError::Io(io::Error::other(
                 "rocksdb support not enabled",
             )))
@@ -471,7 +563,11 @@ impl RefWatermarkStore for RocksDbStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finalize::{build_seen_scope_key, FinalizeStats, WriteOp};
+    use crate::finalize::{build_seen_ordinal_key, build_seen_scope_key, FinalizeStats, WriteOp};
+    use crate::midx_test_builder::MidxBuilder;
+    use crate::ordinal_seen::MidxOrdinalBitset;
+    use crate::repo_open::RepoArtifactFingerprint;
+    use crate::{BytesView, ObjectFormat};
 
     #[cfg(feature = "rocksdb")]
     use tempfile::tempdir;
@@ -492,6 +588,35 @@ mod tests {
             outcome: FinalizeOutcome::Complete,
             stats: FinalizeStats::default(),
         }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn test_fingerprint(tag: u8) -> RepoArtifactFingerprint {
+        RepoArtifactFingerprint {
+            packs_hash: [tag; 32],
+            idx_hash: [tag.wrapping_add(1); 32],
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn test_midx(values: &[u32]) -> BytesView {
+        let mut builder = MidxBuilder::new();
+        builder.add_pack(b"pack-0.pack");
+        for &value in values {
+            let mut bytes = [0u8; 20];
+            bytes[..4].copy_from_slice(&value.to_be_bytes());
+            builder.add_object(bytes, 0, value as u64);
+        }
+        BytesView::from_vec(builder.build())
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn fold_fingerprint(fingerprint: &RepoArtifactFingerprint) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"scanner-git::hybrid-seen-store");
+        hasher.update(&fingerprint.packs_hash);
+        hasher.update(&fingerprint.idx_hash);
+        *hasher.finalize().as_bytes()
     }
 
     #[cfg(feature = "rocksdb")]
@@ -716,7 +841,7 @@ mod tests {
     }
 
     /// Spill-stage deltas go to the staging key, NOT the live scope key.
-    /// After `commit_finalize` folds them, the OIDs become visible.
+    /// After `commit_finalize` folds them, the OIDs become durably visible.
     #[cfg(feature = "rocksdb")]
     #[test]
     fn spill_delta_staged_then_folded_on_finalize() {
@@ -956,5 +1081,54 @@ mod tests {
                 .is_none(),
             "staging key must be deleted after finalize"
         );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn configured_store_persists_seen_ordinal_and_exposes_staged_midx_oids() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 22;
+        let policy_hash = [0xEE; 32];
+        let fingerprint = test_fingerprint(0x22);
+        let mut oid_a_bytes = [0u8; 20];
+        oid_a_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        let oid_a = OidBytes::sha1(oid_a_bytes);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint.clone(),
+            )
+            .expect("configure midx");
+
+        store.persist_seen_delta(&[oid_a]).expect("stage oid");
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a])
+                .expect("staged oid should be visible in-process"),
+            vec![true]
+        );
+
+        let empty_finalize = FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+        store
+            .commit_finalize(&empty_finalize)
+            .expect("complete finalize");
+
+        let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
+        let ordinal_bytes = store
+            .db
+            .get(&ordinal_key)
+            .expect("ordinal lookup")
+            .expect("ordinal key must exist after complete finalize");
+        let ordinal = MidxOrdinalBitset::deserialize(&ordinal_bytes).expect("ordinal decode");
+        assert_eq!(ordinal.midx_fingerprint(), &fold_fingerprint(&fingerprint));
+        assert_eq!(ordinal.cardinality(), 1);
     }
 }
