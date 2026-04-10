@@ -102,6 +102,7 @@ impl RocksDbStore {
                 finalizing: Cell::new(false),
             };
             store.cleanup_orphaned_staging()?;
+            store.cleanup_orphaned_ordinal()?;
             Ok(store)
         }
 
@@ -200,6 +201,20 @@ impl RocksDbStore {
         let staging_key = build_seen_staging_key(self.repo_id, &self.policy_hash);
         self.db
             .delete(&staging_key)
+            .map_err(|err| PersistError::backend(err.to_string()))
+    }
+
+    /// Deletes any orphaned ordinal key left by a crashed previous run.
+    ///
+    /// Ordinal keys are only valid when paired with a matching MIDX snapshot.
+    /// A stale ordinal key from a prior scan with a different MIDX would cause
+    /// `configure_midx_snapshot` to load an inconsistent bitset. Deleting it
+    /// on open forces the ordinal cache to be rebuilt from scratch.
+    #[cfg(feature = "rocksdb")]
+    fn cleanup_orphaned_ordinal(&self) -> Result<(), PersistError> {
+        let ordinal_key = build_seen_ordinal_key(self.repo_id, &self.policy_hash);
+        self.db
+            .delete(&ordinal_key)
             .map_err(|err| PersistError::backend(err.to_string()))
     }
 }
@@ -1476,6 +1491,175 @@ mod tests {
                 .expect("batch_check_seen after partial finalize"),
             vec![false],
             "staging-only OID must not be visible after partial finalize"
+        );
+    }
+
+    /// Reconfiguring the MIDX snapshot with a different artifact fingerprint
+    /// discards the persisted ordinal (keyed to the old fingerprint) and
+    /// rebuilds the ordinal cache from the roaring fallback on the next query.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn configure_midx_snapshot_discards_stale_ordinal() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 35;
+        let policy_hash = [0xF5; 32];
+        let fingerprint_a = test_fingerprint(0x60);
+        let fingerprint_b = test_fingerprint(0x61);
+
+        // Build an OID that is MIDX-resident (matches the 0x11 entry).
+        let mut oid_a_bytes = [0u8; 20];
+        oid_a_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        let oid_a = OidBytes::sha1(oid_a_bytes);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint_a,
+            )
+            .expect("configure midx with fingerprint A");
+
+        // Stage an OID and complete finalize to persist the ordinal key.
+        store.persist_seen_delta(&[oid_a]).expect("stage oid");
+        let empty_finalize = FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+        store
+            .commit_finalize(&empty_finalize)
+            .expect("complete finalize with fingerprint A");
+
+        // The ordinal key exists and is keyed to fingerprint A.
+        let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
+        assert!(
+            store
+                .db
+                .get(&ordinal_key)
+                .expect("ordinal lookup")
+                .is_some(),
+            "ordinal key must exist after complete finalize"
+        );
+
+        // Reconfigure with a different fingerprint. The persisted ordinal
+        // (fingerprint A) is stale and should be discarded via Ok(false).
+        store
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint_b,
+            )
+            .expect("reconfigure with different fingerprint");
+
+        // The OID is still found via the roaring fallback bitmap, not the
+        // (now-discarded) ordinal cache.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a])
+                .expect("oid_a should remain visible via roaring fallback"),
+            vec![true],
+            "oid_a must be found through roaring after stale ordinal discard"
+        );
+    }
+
+    /// Corrupt bytes in the persisted ordinal key are gracefully discarded
+    /// during `configure_midx_snapshot`. The store falls back to rebuilding
+    /// the ordinal cache from the roaring bitmap.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn configure_midx_snapshot_handles_corrupt_ordinal() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 36;
+        let policy_hash = [0xF6; 32];
+        let fingerprint = test_fingerprint(0x62);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+
+        // Seed garbage bytes directly into the ordinal key before configuring.
+        let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
+        store
+            .db
+            .put(&ordinal_key, b"corrupt data")
+            .expect("seed corrupt ordinal");
+
+        // Also persist a real OID into the roaring bitmap so we can verify
+        // fallback correctness after the corrupt ordinal is discarded.
+        let mut oid_a_bytes = [0u8; 20];
+        oid_a_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        let oid_a = OidBytes::sha1(oid_a_bytes);
+        store
+            .commit_finalize(&seen_finalize_output(repo_id, policy_hash, &[oid_a]))
+            .expect("persist oid into roaring bitmap");
+
+        // Re-seed the corrupt ordinal (finalize above may have overwritten it).
+        store
+            .db
+            .put(&ordinal_key, b"corrupt data")
+            .expect("re-seed corrupt ordinal");
+
+        // configure_midx_snapshot must return Ok(()) despite the corrupt
+        // ordinal payload — the corrupt data is gracefully discarded.
+        store
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint,
+            )
+            .expect("configure with corrupt ordinal must succeed");
+
+        // batch_check_seen must work correctly via roaring fallback.
+        let mut oid_unseen_bytes = [0u8; 20];
+        oid_unseen_bytes[..4].copy_from_slice(&0x22u32.to_be_bytes());
+        let oid_unseen = OidBytes::sha1(oid_unseen_bytes);
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_unseen])
+                .expect("batch_check_seen after corrupt ordinal recovery"),
+            vec![true, false],
+            "roaring fallback must serve correct results after corrupt ordinal discard"
+        );
+    }
+
+    /// A stale ordinal key left by a prior scan (e.g. after a crash between
+    /// `commit_finalize` and the next `configure_midx_snapshot`) is deleted
+    /// when `RocksDbStore::open` runs its cleanup pass.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn orphaned_ordinal_key_cleaned_on_store_open() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 34;
+        let policy_hash = [0xF4; 32];
+
+        // Seed a stale ordinal key directly into the database.
+        let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
+        {
+            let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+            store
+                .db
+                .put(&ordinal_key, b"stale-ordinal-payload")
+                .expect("seed stale ordinal key");
+            // Confirm the key is present before we drop.
+            assert!(
+                store
+                    .db
+                    .get(&ordinal_key)
+                    .expect("ordinal lookup")
+                    .is_some(),
+                "ordinal key must be present after seeding"
+            );
+        }
+
+        // Reopen — open() must delete the orphaned ordinal key.
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("reopen");
+        assert!(
+            store
+                .db
+                .get(&ordinal_key)
+                .expect("ordinal lookup after reopen")
+                .is_none(),
+            "open() must delete the orphaned ordinal key"
         );
     }
 }

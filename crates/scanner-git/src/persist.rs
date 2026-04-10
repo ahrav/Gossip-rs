@@ -281,7 +281,9 @@ impl PersistenceStore for InMemoryPersistenceStore {
 
             #[cfg(feature = "rocksdb")]
             if op.key.starts_with(&NS_SEEN_ORDINAL) {
-                staged_ordinals.insert(op.key.clone(), op.value.clone());
+                if is_complete {
+                    staged_ordinals.insert(op.key.clone(), op.value.clone());
+                }
                 staged_data.push(op.clone());
                 continue;
             }
@@ -807,16 +809,14 @@ mod tests {
         );
     }
 
-    /// Ordinal ops delivered via `data_ops` on a partial finalize are still
-    /// recorded in `ordinal_scopes` because `InMemoryPersistenceStore`
-    /// processes ordinal namespace ops unconditionally. This differs from
-    /// `RocksDbStore`, which skips ordinal persistence on partial finalize
-    /// and clears the ordinal cache instead. The in-memory store records
-    /// them for test observability; callers should not rely on ordinal
-    /// presence after partial finalize in production.
+    /// Partial finalize skips ordinal scope tracking to match production
+    /// stores (`RocksDbStore`, `GitPersistenceAdapter`), which call
+    /// `clear_ordinal_cache()` on partial finalize. The ordinal `WriteOp`
+    /// is still logged to `data_ops` for test observability, but the live
+    /// `ordinal_scopes` map remains unmodified.
     #[cfg(feature = "rocksdb")]
     #[test]
-    fn in_memory_store_ordinal_cleared_on_partial_finalize() {
+    fn partial_finalize_skips_ordinal_scope_tracking() {
         let store = InMemoryPersistenceStore::default();
         let ordinal_key = build_seen_ordinal_key(42, &[0xAB; 32]);
         let ordinal_value = MidxOrdinalBitset::new(8, [0xCD; 32]).serialize();
@@ -832,17 +832,14 @@ mod tests {
         };
         store.commit_finalize(&output).expect("partial commit");
 
-        // InMemoryPersistenceStore records ordinal ops from data_ops
-        // regardless of outcome. This is acceptable for test doubles
-        // because the real RocksDbStore guards ordinal persistence behind
-        // the is_complete check.
-        assert_eq!(
-            store.ordinal_scopes.borrow().get(&ordinal_key),
-            Some(&ordinal_value),
-            "in-memory store records ordinal ops from data_ops unconditionally"
+        // Ordinal scopes must NOT be populated on partial finalize,
+        // matching the RocksDbStore which clears the ordinal cache instead.
+        assert!(
+            store.ordinal_scopes.borrow().is_empty(),
+            "ordinal scopes must remain empty on partial finalize"
         );
 
-        // The op is also present in the data_ops log.
+        // The ordinal op IS logged to data_ops for test observability.
         assert!(
             store
                 .data_ops
