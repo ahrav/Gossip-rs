@@ -822,6 +822,8 @@ mod tests {
                     continue;
                 }
 
+                // Stride 10,000 separates packs; coprime factor 17 prevents
+                // aliasing across OID indices within a pack.
                 let offset =
                     1_000 + pack_idx as u64 * 10_000 + oid_idx as u64 * 17 + objects.len() as u64;
                 objects.push((oid, offset));
@@ -1445,6 +1447,16 @@ mod tests {
                     &actual_oids, &canonical_oids,
                     "OIDL must be invariant across pack permutations: order={:?}", permutation
                 );
+
+                let expected_pnam: Vec<&[u8]> = permutation
+                    .iter()
+                    .map(|&pack_idx| packs[pack_idx].pack_name.as_slice())
+                    .collect();
+                let actual_pnam: Vec<&[u8]> = midx.pack_names().collect();
+                prop_assert_eq!(
+                    actual_pnam, expected_pnam,
+                    "PNAM order must match input permutation: order={:?}", permutation
+                );
                 Ok(())
             })?;
         }
@@ -1462,38 +1474,15 @@ mod tests {
                 })
                 .collect();
             let total_objects: usize = packs.iter().map(|pack| pack.objects.len()).sum();
-            let order: Vec<_> = (0..packs.len()).collect();
-            let views: Vec<_> = order
-                .iter()
-                .enumerate()
-                .map(|(pack_id, &pack_idx)| {
-                    (
-                        pack_id as u16,
-                        packs[pack_idx].pack_name.clone(),
-                        idx_views[pack_idx],
-                    )
-                })
-                .collect();
 
-            let expected = expected_midx_for_order(&packs, &order);
-            let midx_bytes = build_midx_in_memory(&views, ObjectFormat::Sha1, total_objects)
-                .expect("generated MIDX should build");
-            let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1)
-                .expect("generated MIDX should parse");
-            let actual = canonicalize_midx(&midx);
-
-            prop_assert_eq!(
-                &actual, &expected,
-                "duplicate winners must be the lowest pack position in canonical order"
-            );
-
+            // Verify the generator invariant: every OID appears in exactly
+            // `duplicate_width` packs.
             let mut occurrence_counts = BTreeMap::new();
             for pack in &packs {
                 for &(oid, _) in &pack.objects {
                     *occurrence_counts.entry(oid).or_insert(0usize) += 1;
                 }
             }
-
             prop_assert!(!occurrence_counts.is_empty(), "generated case must contain at least one OID");
             for (&oid, &count) in &occurrence_counts {
                 prop_assert_eq!(
@@ -1501,17 +1490,107 @@ mod tests {
                     "OID {:02x?} must appear in exactly {} packs", oid, duplicate_width
                 );
             }
-            prop_assert_eq!(
-                actual.entries.len(),
-                occurrence_counts.len(),
-                "dedup must emit one entry per unique OID"
-            );
-            prop_assert_eq!(
-                midx.object_count() as usize,
-                occurrence_counts.len(),
-                "object_count must equal the number of unique OIDs"
-            );
+            let unique_oid_count = occurrence_counts.len();
+
+            // Under uniform duplication, the dedup invariant must hold for
+            // every pack presentation order: each winner resolves to PNAM
+            // position 0 (the lowest pack_id in that permutation).
+            let mut order: Vec<_> = (0..packs.len()).collect();
+            try_for_each_permutation(&mut order, 0, &mut |permutation| {
+                let views: Vec<_> = permutation
+                    .iter()
+                    .enumerate()
+                    .map(|(perm_pos, &pack_idx)| {
+                        (
+                            perm_pos as u16,
+                            packs[pack_idx].pack_name.clone(),
+                            idx_views[pack_idx],
+                        )
+                    })
+                    .collect();
+                let expected = expected_midx_for_order(&packs, permutation);
+                let midx_bytes = build_midx_in_memory(&views, ObjectFormat::Sha1, total_objects)
+                    .expect("generated MIDX should build");
+                let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1)
+                    .expect("generated MIDX should parse");
+                let actual = canonicalize_midx(&midx);
+
+                prop_assert_eq!(
+                    &actual, &expected,
+                    "dedup winners must follow lowest pack position for order {:?}", permutation
+                );
+                prop_assert_eq!(
+                    actual.entries.len(), unique_oid_count,
+                    "dedup must emit one entry per unique OID: order={:?}", permutation
+                );
+                prop_assert_eq!(
+                    midx.object_count() as usize, unique_oid_count,
+                    "object_count must equal unique OIDs: order={:?}", permutation
+                );
+                Ok(())
+            })?;
         }
+    }
+
+    /// LOFF indirection combined with duplicate OIDs: the merge must select
+    /// the correct dedup winner and round-trip large offsets through LOFF
+    /// entries regardless of pack input order.
+    #[test]
+    fn loff_with_duplicate_oids_across_permutations() {
+        let large: u64 = 0x1_0000_0000; // 4 GiB — triggers LOFF indirection
+        let shared_oid = test_oid(0x42, 0xAA);
+        let unique_a = test_oid(0x10, 0x01);
+        let unique_b = test_oid(0xFE, 0x02);
+
+        // Pack 0: shared_oid at large offset, unique_a at small offset.
+        // Pack 1: shared_oid at different large offset, unique_b at small offset.
+        let objects_by_pack: Vec<PackObjects> = vec![
+            vec![(shared_oid, large), (unique_a, 42)],
+            vec![(shared_oid, large + 8192), (unique_b, 99)],
+        ];
+        let packs = build_test_packs(&objects_by_pack);
+        let idx_views: Vec<_> = packs
+            .iter()
+            .map(|p| IdxView::parse(&p.idx_bytes, ObjectFormat::Sha1).unwrap())
+            .collect();
+        let total_objects: usize = packs.iter().map(|p| p.objects.len()).sum();
+
+        let mut order: Vec<_> = (0..packs.len()).collect();
+        for_each_permutation(&mut order, 0, &mut |permutation| {
+            let views: Vec<_> = permutation
+                .iter()
+                .enumerate()
+                .map(|(perm_pos, &pack_idx)| {
+                    (
+                        perm_pos as u16,
+                        packs[pack_idx].pack_name.clone(),
+                        idx_views[pack_idx],
+                    )
+                })
+                .collect();
+            let expected = expected_midx_for_order(&packs, permutation);
+            let midx_bytes = build_midx_in_memory(&views, ObjectFormat::Sha1, total_objects)
+                .expect("LOFF dedup MIDX should build");
+            let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1)
+                .expect("LOFF dedup MIDX should parse");
+            let actual = canonicalize_midx(&midx);
+
+            assert_eq!(
+                actual, expected,
+                "LOFF dedup winners must follow lowest pack position: order={permutation:?}"
+            );
+            // 3 unique OIDs: shared_oid, unique_a, unique_b.
+            assert_eq!(
+                midx.object_count(),
+                3,
+                "dedup must coalesce the shared OID: order={permutation:?}"
+            );
+            // LOFF chunk must be present (chunk_count == 5 means LOFF is included).
+            assert_eq!(
+                midx_bytes[6], 5,
+                "large offsets must produce a LOFF chunk: order={permutation:?}"
+            );
+        });
     }
 
     /// Offsets on both sides of the 2^31 LOFF threshold: the serialized MIDX
