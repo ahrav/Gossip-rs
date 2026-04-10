@@ -39,6 +39,7 @@ gossip-persistence-inmemory.workspace = true
 gossip-stdx = { workspace = true, features = ["git-test-support"] }
 proptest.workspace = true
 rstest.workspace = true
+scanner-git = { workspace = true, features = ["bench"] }
 tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]

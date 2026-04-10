@@ -518,6 +518,13 @@ impl HybridSeenStore {
         &self.fallback
     }
 
+    /// Consumes the store and returns the roaring fallback, discarding any
+    /// MIDX snapshot and ordinal cache.
+    #[must_use]
+    pub fn into_fallback(self) -> RoaringSeenStore {
+        self.fallback
+    }
+
     /// Returns the authoritative roaring fallback store, clearing any cached
     /// ordinal bits before the caller mutates the bitmap.
     pub fn fallback_mut(&mut self) -> &mut RoaringSeenStore {
@@ -525,8 +532,61 @@ impl HybridSeenStore {
         &mut self.fallback
     }
 
+    /// Replaces the roaring fallback store while preserving the MIDX snapshot
+    /// configuration. The ordinal cache is cleared because it may reference
+    /// OIDs from the old fallback that are absent in the replacement.
+    ///
+    /// Used to roll back the roaring bitmap after a failed durable write
+    /// without losing the in-memory MIDX ordinal acceleration config.
+    pub fn replace_fallback(&mut self, fallback: RoaringSeenStore) {
+        self.fallback = fallback;
+        self.ordinal.get_mut().take();
+    }
+
+    /// Merges a delta into the roaring fallback bitmap and incrementally
+    /// updates the ordinal cache with the delta OIDs.
+    ///
+    /// Unlike [`fallback_mut`](Self::fallback_mut) followed by a manual merge,
+    /// this method preserves the ordinal cache and only marks the new delta
+    /// OIDs in it, avoiding an O(n) full rebuild on every finalize.
+    ///
+    /// Requires `&mut self` — callers must hold exclusive ownership (e.g.,
+    /// after moving the store out of a `RefCell`). The delta's OIDs must be
+    /// sorted in non-decreasing order (the contract of `SeenBitmapDelta`).
+    pub fn merge_fallback_delta(
+        &mut self,
+        delta: &super::roaring_seen::SeenBitmapDelta,
+    ) -> Result<(), SpillError> {
+        self.fallback.bitmap_mut().merge_delta(delta)?;
+
+        // Incrementally mark the delta's OIDs in the ordinal cache when the
+        // configured MIDX snapshot and cache are both present and consistent.
+        if let Some(snapshot) = self.midx_snapshot.get_mut().as_ref() {
+            if let Some(cache) = self.ordinal.get_mut().as_mut() {
+                if cache.artifact_fingerprint == snapshot.artifact_fingerprint {
+                    let midx = snapshot.view();
+                    let mut cursor = MidxCursor::default();
+                    for oid in delta.oids() {
+                        match midx.find_oid_sorted(&mut cursor, oid) {
+                            Ok(Some(ordinal)) => cache.bitset.set(ordinal),
+                            Ok(None) | Err(MidxError::InputOidLengthMismatch { .. }) => {}
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Replaces the current MIDX snapshot and unconditionally invalidates the
     /// ordinal cache.
+    ///
+    /// Takes `&self` (not `&mut self`) to allow calls through shared references
+    /// required by the `SeenBlobStore::configure_midx_snapshot` trait method.
+    /// The mutations use separate `RefCell` borrows that do not overlap. Callers
+    /// must not invoke this concurrently with `batch_check_seen` or any other
+    /// `RefCell`-accessing method; the single-threaded scan loop enforces this.
     ///
     /// # Errors
     ///
@@ -661,6 +721,39 @@ impl HybridSeenStore {
         self.ordinal.borrow_mut().take();
     }
 
+    /// Configures the MIDX snapshot and attempts to restore the ordinal cache
+    /// from a persisted payload.
+    ///
+    /// Encapsulates the common "set snapshot, try load persisted ordinal, handle
+    /// stale/corrupt" pattern used by both `RocksDbStore` and
+    /// `GitPersistenceAdapter`.
+    ///
+    /// Returns `Ok(())` unconditionally: stale or corrupt persisted ordinal
+    /// payloads are silently discarded with a debug log because the ordinal
+    /// cache is a rebuildable optimization.
+    pub fn configure_with_persisted_ordinal(
+        &self,
+        midx_bytes: BytesView,
+        object_format: ObjectFormat,
+        artifact_fingerprint: RepoArtifactFingerprint,
+        persisted_ordinal: Option<&[u8]>,
+    ) -> Result<(), SpillError> {
+        self.set_midx_snapshot(midx_bytes, object_format, artifact_fingerprint)?;
+        if let Some(bytes) = persisted_ordinal {
+            match self.load_persisted_ordinal(bytes) {
+                Ok(true) => {}
+                Ok(false) => {
+                    debug!("discarded stale persisted seen-ordinal cache");
+                }
+                Err(err) => {
+                    debug!(error = %err, "discarded corrupt persisted seen-ordinal cache");
+                    self.clear_ordinal_cache();
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Seeds the ordinal cache from a persisted `MidxOrdinalBitset` payload.
     ///
     /// Returns `Ok(true)` when the persisted payload matches the configured
@@ -692,13 +785,24 @@ impl HybridSeenStore {
 
     /// Serializes the current ordinal cache, rebuilding it from the roaring
     /// fallback if needed.
+    ///
+    /// The `midx_snapshot` borrow is released before accessing `ordinal` for
+    /// serialization, so `rebuild_with_midx` can safely access any field
+    /// without risking a cross-`RefCell` double-borrow panic.
     pub fn persisted_ordinal_bytes(&self) -> Result<Option<Vec<u8>>, SpillError> {
-        let snapshot_guard = self.midx_snapshot.borrow();
-        let Some(snapshot) = snapshot_guard.as_ref() else {
-            return Ok(None);
+        let has_snapshot = {
+            let snapshot_guard = self.midx_snapshot.borrow();
+            match snapshot_guard.as_ref() {
+                Some(snapshot) => {
+                    self.ensure_cache_and_view(snapshot)?;
+                    true
+                }
+                None => false,
+            }
         };
-        let midx = self.ensure_cache_and_view(snapshot)?;
-        let _ = midx;
+        if !has_snapshot {
+            return Ok(None);
+        }
         Ok(self
             .ordinal
             .borrow()
@@ -876,7 +980,7 @@ fn validate_snapshot_format(
     Ok(())
 }
 
-fn fold_artifact_fingerprint(fingerprint: &RepoArtifactFingerprint) -> [u8; 32] {
+pub(crate) fn fold_artifact_fingerprint(fingerprint: &RepoArtifactFingerprint) -> [u8; 32] {
     let mut hasher = Hasher::new();
     hasher.update(b"scanner-git::hybrid-seen-store");
     hasher.update(&fingerprint.packs_hash);
@@ -1474,6 +1578,38 @@ mod tests {
                 .fallback()
                 .batch_check_seen(&[staged])
                 .expect("fallback query"),
+            vec![false]
+        );
+    }
+
+    #[test]
+    fn hybrid_seen_store_mark_seen_batch_skips_non_midx_oids() {
+        let fingerprint = test_fingerprint(0x33);
+        // MIDX covers ordinals 0-7; no OIDs pre-seen.
+        let store = build_hybrid_store(&[], &[0, 1, 2, 3, 4, 5, 6, 7], fingerprint);
+
+        // oid(3) is in MIDX; oid(9) and oid(10) are outside the MIDX range.
+        let marked = store
+            .mark_seen_batch(&[oid_from_u32(3), oid_from_u32(9), oid_from_u32(10)])
+            .expect("mark mixed batch");
+        assert_eq!(marked, 1, "only oid(3) is resolvable in the ordinal bitset");
+
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_from_u32(3)])
+                .expect("query oid in MIDX"),
+            vec![true]
+        );
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_from_u32(9)])
+                .expect("query oid outside MIDX"),
+            vec![false]
+        );
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_from_u32(10)])
+                .expect("query oid outside MIDX"),
             vec![false]
         );
     }

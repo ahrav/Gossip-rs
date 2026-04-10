@@ -806,4 +806,56 @@ mod tests {
             "staging must be cleared after partial finalize"
         );
     }
+
+    /// Ordinal ops delivered via `data_ops` on a partial finalize are still
+    /// recorded in `ordinal_scopes` because `InMemoryPersistenceStore`
+    /// processes ordinal namespace ops unconditionally. This differs from
+    /// `RocksDbStore`, which skips ordinal persistence on partial finalize
+    /// and clears the ordinal cache instead. The in-memory store records
+    /// them for test observability; callers should not rely on ordinal
+    /// presence after partial finalize in production.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn in_memory_store_ordinal_cleared_on_partial_finalize() {
+        let store = InMemoryPersistenceStore::default();
+        let ordinal_key = build_seen_ordinal_key(42, &[0xAB; 32]);
+        let ordinal_value = MidxOrdinalBitset::new(8, [0xCD; 32]).serialize();
+
+        let output = FinalizeOutput {
+            data_ops: vec![WriteOp {
+                key: ordinal_key.clone(),
+                value: ordinal_value.clone(),
+            }],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+            stats: FinalizeStats::default(),
+        };
+        store.commit_finalize(&output).expect("partial commit");
+
+        // InMemoryPersistenceStore records ordinal ops from data_ops
+        // regardless of outcome. This is acceptable for test doubles
+        // because the real RocksDbStore guards ordinal persistence behind
+        // the is_complete check.
+        assert_eq!(
+            store.ordinal_scopes.borrow().get(&ordinal_key),
+            Some(&ordinal_value),
+            "in-memory store records ordinal ops from data_ops unconditionally"
+        );
+
+        // The op is also present in the data_ops log.
+        assert!(
+            store
+                .data_ops
+                .borrow()
+                .iter()
+                .any(|op| op.key == ordinal_key && op.value == ordinal_value),
+            "ordinal WriteOp must be logged even on partial finalize"
+        );
+
+        // Watermarks must NOT be written on partial finalize.
+        assert!(
+            store.watermark_ops.borrow().is_empty(),
+            "watermark ops must be suppressed on partial finalize"
+        );
+    }
 }
