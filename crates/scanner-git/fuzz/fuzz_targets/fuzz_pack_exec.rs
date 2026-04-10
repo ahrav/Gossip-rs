@@ -35,6 +35,8 @@ const MAX_OBJ_SIZE: usize = 256;
 // ---------------------------------------------------------------------------
 
 /// External base provider that always reports bases as missing.
+///
+/// This keeps the harness focused on pack-local structure and decode logic.
 struct NoExternalBases;
 
 impl ExternalBaseProvider for NoExternalBases {
@@ -44,6 +46,9 @@ impl ExternalBaseProvider for NoExternalBases {
 }
 
 /// Object sink that discards all emitted blobs.
+///
+/// The harness validates decode stability, not engine-side scanning or event
+/// emission behavior.
 struct NullSink;
 
 impl PackObjectSink for NullSink {

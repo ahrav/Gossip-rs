@@ -129,8 +129,11 @@ pub mod midx;
 pub mod midx_build;
 /// Defines error types for multi-pack index parsing and lookup.
 pub mod midx_error;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "bench")))]
 pub(crate) mod midx_test_builder;
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub mod midx_test_builder;
 #[cfg(test)]
 pub(crate) mod multi_pack_test_helpers;
 /// Native git-reference resolution backed by `gix-ref`.
@@ -141,6 +144,8 @@ pub mod object_id;
 pub mod object_store;
 /// Implements a fixed-capacity OID hash table for fast MIDX index lookups.
 pub mod oid_index;
+/// Dense seen-bitset indexed by MIDX ordinal positions.
+pub mod ordinal_seen;
 /// Implements a tiered set-associative cache for decoded pack objects.
 pub mod pack_cache;
 /// Defines pack and loose candidate output types for scan planning.
@@ -176,6 +181,8 @@ pub mod path_policy;
 pub(crate) mod sim_pack_io;
 /// Synthetic commit-ref materialization for explicit-commit lowering.
 mod synthetic_ref;
+#[cfg(test)]
+mod trait_coverage_audit_tests;
 use gossip_stdx::perf_stats;
 /// Defines the write-only persistence store contract and helpers.
 pub mod persist;
@@ -375,6 +382,7 @@ pub use finalize::{
     build_finalize_ops, FinalizeInput, FinalizeOutcome, FinalizeOutput, FinalizeStats, RefEntry,
     WriteOp, NS_BLOB_CTX, NS_FINDING, NS_SEEN_BLOB, NS_SEEN_STAGING,
 };
+pub use ordinal_seen::{HybridSeenStore, MidxOrdinalBitset, OrdinalSeenError};
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};
 pub use roaring_seen::{RoaringSeenBitmap, RoaringSeenStore};
 pub use roaring_seen::{SeenBitmapDelta, SeenBitmapError};
@@ -416,6 +424,8 @@ pub use scanner_engine::{
 pub use work_items::WorkItems;
 
 // ── Benchmark support ───────────────────────────────────────────────────
+#[cfg(feature = "bench")]
+pub use midx_test_builder::MidxBuilder;
 #[cfg(feature = "bench")]
 #[doc(hidden)]
 pub use pack_inflate_libdeflate::{LibdeflateDecompressor, LIBDEFLATE_THRESHOLD_BYTES};

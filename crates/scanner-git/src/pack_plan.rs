@@ -1041,6 +1041,8 @@ fn is_sorted_unique(offsets: &[u64]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::midx_test_builder::MidxBuilder;
+    use crate::ObjectFormat;
     use std::collections::HashMap;
 
     use rstest::rstest;
@@ -1108,6 +1110,24 @@ mod tests {
             exec_order: None,
             stats: PackPlanStats::empty(),
         }
+    }
+
+    #[test]
+    fn midx_view_resolve_returns_pack_offset_and_none_for_missing_oid() {
+        let mut builder = MidxBuilder::new();
+        builder.add_pack(b"pack-a");
+        builder.add_pack(b"pack-b");
+        builder.add_object([0x11; 20], 0, 64);
+        builder.add_object([0x22; 20], 1, 128);
+        let bytes = builder.build();
+
+        let midx = MidxView::parse(&bytes, ObjectFormat::Sha1).unwrap();
+
+        let resolved = OidResolver::resolve(&midx, &OidBytes::sha1([0x22; 20])).unwrap();
+        assert_eq!(resolved, Some((1, 128)));
+
+        let missing = OidResolver::resolve(&midx, &OidBytes::sha1([0x33; 20])).unwrap();
+        assert_eq!(missing, None);
     }
 
     #[test]

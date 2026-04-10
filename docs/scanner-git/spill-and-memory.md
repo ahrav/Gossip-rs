@@ -101,6 +101,7 @@ For repositories where candidates fit in a single chunk, no disk I/O occurs.
 | `SeenBitmapPersister` (trait) | `seen_store.rs` | Incremental write interface for scope-scoped seen-bitmap updates. Inputs must already be sorted and unique. |
 | `SeenBitmapDelta` | `roaring_seen.rs` | Finalize-time `sb\0` payload. Holds canonical OIDs as `Vec<OidBytes>` because batches are short-lived. |
 | `RoaringSeenBitmap` | `roaring_seen.rs` | Durable per-scope seen snapshot. Keeps the sorted OID index flat-packed as `oid_count * oid_len` bytes in memory and overlays a roaring bitmap over positions in that table. |
+| `HybridSeenStore` | `ordinal_seen.rs` | Query-time wrapper that serves MIDX-resident OIDs from a lazily rebuilt ordinal bitset and delegates loose or out-of-MIDX probes to the authoritative roaring store. |
 | `NullSeenBitmapPersister` | `seen_store.rs` | No-op persister used when a scan has no durable mid-spill checkpoint target. |
 | `NeverSeenStore` | `seen_store.rs` | Marks all blobs unseen (full-scan mode). |
 | `AlwaysSeenStore` | `seen_store.rs` | Marks all blobs seen (testing). |
@@ -399,6 +400,8 @@ are approximate.
 | Tree diff limits | `crates/scanner-git/src/tree_diff_limits.rs` |
 | Durable seen bitmap (flat-packed OID index + roaring) | `crates/scanner-git/src/roaring_seen.rs` |
 | Finalize-time seen-bitmap delta | `crates/scanner-git/src/roaring_seen.rs` |
+| MIDX ordinal bitset (dense seen-bitset indexed by ordinal position) | `crates/scanner-git/src/ordinal_seen.rs` |
+| Hybrid seen store (ordinal hot-path + roaring fallback) | `crates/scanner-git/src/ordinal_seen.rs` |
 
 ## Related Docs
 
