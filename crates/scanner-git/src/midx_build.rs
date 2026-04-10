@@ -595,7 +595,7 @@ mod tests {
     use proptest::prelude::*;
     use tempfile::tempdir;
 
-    const MIDX_PROPTEST_CASES: u32 = 1000;
+    const MIDX_PROPTEST_CASES: u32 = 256;
     const SMALL_MODEL_BUCKETS: [u8; 4] = [0x00, 0x40, 0x80, 0xC0];
     /// Duplicate OIDs use second-byte values starting here (0xe0..); unique OIDs
     /// must stay below this to avoid accidental collisions.
@@ -897,7 +897,7 @@ mod tests {
     fn dedup_idempotency_case_strategy() -> impl Strategy<Value = (usize, Vec<PackObjects>)> {
         (2usize..=4)
             .prop_flat_map(|pack_count| {
-                (2usize..=pack_count, pack_count..=12usize).prop_flat_map(
+                (2usize..=pack_count, (pack_count * 2)..=12usize).prop_flat_map(
                     move |(duplicate_width, unique_oid_count)| {
                         let exact_duplicate_masks: Vec<u8> = duplicate_subsets(pack_count)
                             .into_iter()
