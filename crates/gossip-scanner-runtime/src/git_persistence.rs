@@ -4154,4 +4154,223 @@ mod tests {
             "staging-only OID must not be visible after partial finalize"
         );
     }
+
+    /// Helper: builds a two-object MIDX snapshot and its `BytesView`.
+    ///
+    /// Returns `(midx_bytes, oid_a_bytes, oid_b_bytes)` where `oid_a` is
+    /// `0x11`-prefixed and `oid_b` is `0x22`-prefixed, both 20-byte SHA-1.
+    fn build_two_object_midx() -> (scanner_git::BytesView, [u8; 20], [u8; 20]) {
+        let mut builder = scanner_git::MidxBuilder::new();
+        builder.add_pack(b"pack-test.pack");
+        let mut oid_a = [0u8; 20];
+        oid_a[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        builder.add_object(oid_a, 0, 0x11);
+        let mut oid_b = [0u8; 20];
+        oid_b[..4].copy_from_slice(&0x22u32.to_be_bytes());
+        builder.add_object(oid_b, 0, 0x22);
+        (
+            scanner_git::BytesView::from_vec(builder.build()),
+            oid_a,
+            oid_b,
+        )
+    }
+
+    /// Without a persisted ordinal key in the backend, `configure_midx_snapshot`
+    /// still activates ordinal acceleration. The ordinal cache is lazily rebuilt
+    /// from the roaring fallback on the first `batch_check_seen` call, so OIDs
+    /// that have been staged and finalized are visible through the ordinal path.
+    #[test]
+    fn configure_midx_fresh_start_without_persisted_ordinal() {
+        let backend = TestBackend::atomic();
+        let repo_id = 60;
+        let policy_hash = [0x60; 32];
+        let ordinal_key = ordinal_key_builder(repo_id, &policy_hash);
+
+        // No ordinal key exists in the backend.
+        assert!(
+            backend.get_value(&ordinal_key).is_none(),
+            "precondition: no ordinal key in backend"
+        );
+
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+
+        let (midx_bytes, oid_a_raw, oid_b_raw) = build_two_object_midx();
+        let fingerprint = RepoArtifactFingerprint {
+            packs_hash: [0xCC; 32],
+            idx_hash: [0xDD; 32],
+        };
+        adapter
+            .configure_midx_snapshot(midx_bytes, scanner_git::ObjectFormat::Sha1, fingerprint)
+            .expect("configure midx snapshot");
+
+        // Stage oid_a and run a complete finalize so it lands in the committed
+        // scope bitmap. This makes it visible to batch_check_seen.
+        let oid_a = OidBytes::sha1(oid_a_raw);
+        let oid_b = OidBytes::sha1(oid_b_raw);
+        adapter.persist_seen_delta(&[oid_a]).expect("stage oid_a");
+        adapter
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Complete,
+                stats: Default::default(),
+            })
+            .expect("complete finalize");
+
+        // oid_a was staged and finalized so it is seen. oid_b was never staged
+        // so it remains unseen. The ordinal cache is rebuilt from the roaring
+        // fallback on demand.
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("batch_check_seen after fresh-start configure"),
+            vec![true, false],
+            "oid_a must be seen (finalized), oid_b must be unseen (never staged)"
+        );
+    }
+
+    /// After a complete finalize persists the ordinal key, a fresh adapter that
+    /// calls `configure_midx_snapshot` with the same fingerprint restores the
+    /// ordinal cache from the persisted payload. OIDs that were seen in the
+    /// original session remain visible without a roaring rebuild.
+    #[test]
+    fn configure_midx_restores_matching_persisted_ordinal() {
+        let backend = TestBackend::atomic();
+        let repo_id = 61;
+        let policy_hash = [0x61; 32];
+        let ordinal_key = ordinal_key_builder(repo_id, &policy_hash);
+
+        let (midx_bytes, oid_a_raw, oid_b_raw) = build_two_object_midx();
+        let fingerprint = RepoArtifactFingerprint {
+            packs_hash: [0xEE; 32],
+            idx_hash: [0xFF; 32],
+        };
+
+        // First session: configure, stage both OIDs, and complete finalize.
+        // This writes the ordinal key to the backend.
+        {
+            let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+            adapter
+                .configure_midx_snapshot(
+                    midx_bytes.clone(),
+                    scanner_git::ObjectFormat::Sha1,
+                    fingerprint,
+                )
+                .expect("configure midx snapshot (session 1)");
+            let oid_a = OidBytes::sha1(oid_a_raw);
+            let oid_b = OidBytes::sha1(oid_b_raw);
+            adapter
+                .persist_seen_delta(&[oid_a, oid_b])
+                .expect("stage both oids");
+            adapter
+                .commit_finalize(&FinalizeOutput {
+                    data_ops: Vec::new(),
+                    watermark_ops: Vec::new(),
+                    outcome: FinalizeOutcome::Complete,
+                    stats: Default::default(),
+                })
+                .expect("complete finalize (session 1)");
+        }
+
+        // The ordinal key must be present in the backend after a complete
+        // finalize with an active MIDX snapshot.
+        assert!(
+            backend.get_value(&ordinal_key).is_some(),
+            "complete finalize must persist the ordinal key"
+        );
+
+        // Second session: fresh adapter simulating a process restart.
+        // configure_midx_snapshot reads the persisted ordinal and restores it
+        // because the fingerprint matches.
+        let adapter2 = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+        adapter2
+            .configure_midx_snapshot(midx_bytes, scanner_git::ObjectFormat::Sha1, fingerprint)
+            .expect("configure midx snapshot (session 2)");
+
+        let oid_a = OidBytes::sha1(oid_a_raw);
+        let oid_b = OidBytes::sha1(oid_b_raw);
+        assert_eq!(
+            adapter2
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("batch_check_seen after restart with matching fingerprint"),
+            vec![true, true],
+            "both OIDs must be seen after restoring persisted ordinal with matching fingerprint"
+        );
+    }
+
+    /// When the persisted ordinal key was written for a different fingerprint
+    /// (e.g., the MIDX was repacked between scans), `configure_midx_snapshot`
+    /// discards the stale payload. The ordinal cache is rebuilt from the roaring
+    /// fallback on the next query, so OIDs in the committed scope are still
+    /// visible but only through the roaring path.
+    #[test]
+    fn configure_midx_discards_stale_persisted_ordinal() {
+        let backend = TestBackend::atomic();
+        let repo_id = 62;
+        let policy_hash = [0x62; 32];
+        let ordinal_key = ordinal_key_builder(repo_id, &policy_hash);
+
+        let (midx_bytes_a, oid_a_raw, oid_b_raw) = build_two_object_midx();
+        let fingerprint_a = RepoArtifactFingerprint {
+            packs_hash: [0xA0; 32],
+            idx_hash: [0xA1; 32],
+        };
+
+        // First session: configure with fingerprint_a, stage oid_a, finalize.
+        {
+            let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+            adapter
+                .configure_midx_snapshot(
+                    midx_bytes_a,
+                    scanner_git::ObjectFormat::Sha1,
+                    fingerprint_a,
+                )
+                .expect("configure midx snapshot (fingerprint A)");
+            let oid_a = OidBytes::sha1(oid_a_raw);
+            adapter.persist_seen_delta(&[oid_a]).expect("stage oid_a");
+            adapter
+                .commit_finalize(&FinalizeOutput {
+                    data_ops: Vec::new(),
+                    watermark_ops: Vec::new(),
+                    outcome: FinalizeOutcome::Complete,
+                    stats: Default::default(),
+                })
+                .expect("complete finalize (fingerprint A)");
+        }
+        assert!(
+            backend.get_value(&ordinal_key).is_some(),
+            "ordinal key must exist after finalize with fingerprint A"
+        );
+
+        // Second session: configure with fingerprint_b (different from A).
+        // The persisted ordinal belongs to fingerprint_a and must be discarded.
+        let fingerprint_b = RepoArtifactFingerprint {
+            packs_hash: [0xB0; 32],
+            idx_hash: [0xB1; 32],
+        };
+
+        // Rebuild the MIDX with the same objects so the snapshot is structurally
+        // valid but the artifact fingerprint differs.
+        let (midx_bytes_b, _, _) = build_two_object_midx();
+
+        let adapter2 = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+        adapter2
+            .configure_midx_snapshot(midx_bytes_b, scanner_git::ObjectFormat::Sha1, fingerprint_b)
+            .expect("configure midx snapshot (fingerprint B)");
+
+        // oid_a is in the committed scope bitmap (from the first session's
+        // finalize), so it remains visible through the roaring fallback even
+        // though the persisted ordinal was discarded. oid_b was never staged,
+        // so it remains unseen.
+        let oid_a = OidBytes::sha1(oid_a_raw);
+        let oid_b = OidBytes::sha1(oid_b_raw);
+        assert_eq!(
+            adapter2
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("batch_check_seen after stale ordinal discard"),
+            vec![true, false],
+            "oid_a must be seen (in committed scope), oid_b must be unseen \
+             (ordinal cache rebuilt from roaring, not stale persisted payload)"
+        );
+    }
 }
