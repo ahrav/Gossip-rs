@@ -419,9 +419,17 @@ impl PersistenceStore for RocksDbStore {
                 }
             }
             if let Err(err) = self.db.write(batch) {
-                // Restore the seen store so MIDX ordinal config and
-                // in-memory merge state survive a transient write failure.
-                if let Some(store) = staged_seen_store {
+                // The batch failed so the merged roaring bitmap was never
+                // durably written. Restore the store with the pre-merge
+                // bitmap from RocksDB so the cache does not reflect
+                // phantom writes, while preserving the MIDX snapshot
+                // config so ordinal acceleration survives the failure.
+                if let Some(mut store) = staged_seen_store {
+                    let reloaded =
+                        self.load_seen_store_from_db(store.fallback().bitmap().oid_len());
+                    if let Ok(fresh) = reloaded {
+                        store.replace_fallback(fresh.into_fallback());
+                    }
                     *self.seen_store.borrow_mut() = Some(store);
                 }
                 return Err(PersistError::backend(err.to_string()));
@@ -1403,6 +1411,71 @@ mod tests {
                 .expect("both OIDs should be seen"),
             vec![true, true],
             "oid_a (roaring) and oid_b (ordinal) must both be seen"
+        );
+    }
+
+    /// Partial finalize must clear the ordinal cache, delete the persisted
+    /// ordinal key, and discard staging so that spill-only OIDs do not
+    /// permanently hide blobs from future scans.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn partial_finalize_clears_ordinal_and_skips_persist() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 33;
+        let policy_hash = [0xF3; 32];
+        let fingerprint = test_fingerprint(0x40);
+
+        // Build an OID that is MIDX-resident (matches the 0x11 entry).
+        let mut oid_bytes = [0u8; 20];
+        oid_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        let oid_staged = OidBytes::sha1(oid_bytes);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint,
+            )
+            .expect("configure midx");
+
+        // Stage an OID via spill-time delta so the ordinal cache is populated.
+        store
+            .persist_seen_delta(&[oid_staged])
+            .expect("stage oid via spill");
+
+        // Partial finalize with empty ops — staging is discarded, ordinal is
+        // cleared, and no ordinal key is persisted.
+        let output = FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+            stats: FinalizeStats::default(),
+        };
+        store
+            .commit_finalize(&output)
+            .expect("partial finalize must succeed");
+
+        // The ordinal key must NOT exist after partial finalize.
+        let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
+        assert!(
+            store
+                .db
+                .get(&ordinal_key)
+                .expect("ordinal lookup")
+                .is_none(),
+            "partial finalize must not persist the ordinal key"
+        );
+
+        // The staged OID must NOT be visible because partial finalize
+        // discards the staging bitmap instead of folding it into the
+        // committed scope.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_staged])
+                .expect("batch_check_seen after partial finalize"),
+            vec![false],
+            "staging-only OID must not be visible after partial finalize"
         );
     }
 }

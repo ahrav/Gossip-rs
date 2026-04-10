@@ -1029,9 +1029,8 @@ where
                 // phantom writes, while preserving the MIDX snapshot
                 // config so ordinal acceleration survives the failure.
                 if let Some(mut store) = staged_seen_store {
-                    let reloaded = self.load_seen_store_from_backend(
-                        store.fallback().bitmap().oid_len(),
-                    );
+                    let reloaded =
+                        self.load_seen_store_from_backend(store.fallback().bitmap().oid_len());
                     if let Ok(fresh) = reloaded {
                         store.replace_fallback(fresh.into_fallback());
                     }
@@ -1081,9 +1080,8 @@ where
             // phantom writes, while preserving the MIDX snapshot
             // config so ordinal acceleration survives the failure.
             if let Some(mut store) = staged_seen_store {
-                let reloaded = self.load_seen_store_from_backend(
-                    store.fallback().bitmap().oid_len(),
-                );
+                let reloaded =
+                    self.load_seen_store_from_backend(store.fallback().bitmap().oid_len());
                 if let Ok(fresh) = reloaded {
                     store.replace_fallback(fresh.into_fallback());
                 }
@@ -3962,26 +3960,21 @@ mod tests {
         }
     }
 
-    /// Complete finalize without a configured MIDX snapshot must NOT write an
-    /// `so\0` ordinal key. The ordinal key is only written when the adapter
-    /// has been configured with a MIDX snapshot (tested at the RocksDB level
-    /// in `configured_store_persists_seen_ordinal_and_exposes_staged_midx_oids`).
-    ///
-    /// Partial finalize must discard ordinal state (tested via the cache clear
-    /// in the partial finalize path).
     /// Verifies that a failed `apply_batch` in the atomic `commit_finalize` path
-    /// does not drop the `HybridSeenStore`. When the store is dropped, the
-    /// in-memory MIDX ordinal configuration built during scan setup is silently
-    /// lost. The next `batch_check_seen` re-creates a bare store from backend
-    /// state without ordinal acceleration — MIDX-resident OIDs that were marked
-    /// seen via `persist_seen_delta` become invisible, causing duplicate scans.
+    /// preserves the MIDX snapshot configuration on the `HybridSeenStore`.
     ///
-    /// Detection strategy: configure a MIDX snapshot, stage a MIDX-resident OID
-    /// (which marks it in the ordinal cache), then fail the finalize. If the
-    /// store survives, `batch_check_seen` returns `true` via the ordinal path.
-    /// If the store was dropped, the reload creates a bare store without MIDX
-    /// config, and the roaring fallback (which only reads the committed scope
-    /// bitmap — not the staging key) returns `false`.
+    /// When the store is dropped on write failure, the next `load_seen_store`
+    /// re-creates a bare store without the MIDX snapshot configured during
+    /// scan setup. Subsequent `persist_seen_delta` calls then cannot update the
+    /// ordinal cache, causing MIDX-resident OIDs to become invisible to
+    /// `batch_check_seen` until a full finalize or reconfiguration.
+    ///
+    /// Detection strategy: configure a MIDX snapshot with two objects, fail a
+    /// finalize, then stage a *new* MIDX-resident OID. If the MIDX snapshot
+    /// survived, `persist_seen_delta` updates the ordinal cache and
+    /// `batch_check_seen` returns `true`. If the snapshot was lost, the
+    /// ordinal update is skipped and the OID is invisible (only in the staging
+    /// key, not the committed scope).
     #[test]
     fn atomic_commit_finalize_failure_preserves_seen_store() {
         let backend = TestBackend::atomic();
@@ -3990,13 +3983,16 @@ mod tests {
 
         let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
 
-        // Build a MIDX snapshot containing one object (0x11) and configure the
+        // Build a MIDX snapshot containing two objects and configure the
         // adapter so the HybridSeenStore has ordinal acceleration active.
         let mut builder = scanner_git::MidxBuilder::new();
         builder.add_pack(b"pack-test.pack");
-        let mut oid_bytes = [0u8; 20];
-        oid_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
-        builder.add_object(oid_bytes, 0, 0x11);
+        let mut oid_a_bytes = [0u8; 20];
+        oid_a_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        builder.add_object(oid_a_bytes, 0, 0x11);
+        let mut oid_b_bytes = [0u8; 20];
+        oid_b_bytes[..4].copy_from_slice(&0x22u32.to_be_bytes());
+        builder.add_object(oid_b_bytes, 0, 0x22);
         let midx_bytes = scanner_git::BytesView::from_vec(builder.build());
         let fingerprint = RepoArtifactFingerprint {
             packs_hash: [0xAA; 32],
@@ -4006,25 +4002,11 @@ mod tests {
             .configure_midx_snapshot(midx_bytes, scanner_git::ObjectFormat::Sha1, fingerprint)
             .expect("configure midx snapshot");
 
-        // Stage the MIDX-resident OID. persist_seen_delta writes the staging
-        // bitmap to the backend AND calls mark_seen_batch on the in-memory
-        // HybridSeenStore, which sets the ordinal bit for this MIDX-resident
-        // OID. batch_check_seen resolves it via the ordinal path (true),
-        // not the roaring fallback (which only reads the committed scope).
-        let oid = OidBytes::sha1(oid_bytes);
-        adapter.persist_seen_delta(&[oid]).expect("stage OID");
-        assert_eq!(
-            adapter
-                .batch_check_seen(&[oid])
-                .expect("pre-finalize check"),
-            vec![true],
-            "MIDX-resident staged OID must be seen via ordinal cache"
-        );
+        // Stage oid_a so commit_finalize has seen-bitmap work to do.
+        let oid_a = OidBytes::sha1(oid_a_bytes);
+        adapter.persist_seen_delta(&[oid_a]).expect("stage oid_a");
 
         // Inject a fault so the atomic apply_batch in commit_finalize fails.
-        // commit_finalize takes the HybridSeenStore out of the RefCell, merges
-        // the delta, then calls apply_batch. On failure the `?` returns before
-        // the restore line, dropping the store (and its MIDX ordinal config).
         backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
         let result = adapter.commit_finalize(&FinalizeOutput {
             data_ops: Vec::new(),
@@ -4037,20 +4019,35 @@ mod tests {
             "commit_finalize must fail on injected batch fault"
         );
 
-        // After the failed finalize, the HybridSeenStore must still be present
-        // with its MIDX config intact. If the store was dropped, load_seen_store
-        // re-creates a bare store without ordinal acceleration, and the OID
-        // (which was only in the ordinal cache, not the committed scope) appears
-        // unseen.
+        // Stage oid_b after the failed finalize. If the MIDX snapshot survived,
+        // persist_seen_delta calls mark_seen_batch which updates the ordinal
+        // cache for this MIDX-resident OID. If the snapshot was lost (store
+        // dropped and reloaded bare), mark_seen_batch finds no snapshot and
+        // skips the ordinal update.
+        let oid_b = OidBytes::sha1(oid_b_bytes);
+        adapter.persist_seen_delta(&[oid_b]).expect("stage oid_b");
+
+        // batch_check_seen queries the HybridSeenStore. With MIDX ordinal
+        // acceleration, oid_b resolves as seen via the ordinal cache. Without
+        // it, the roaring fallback checks only the committed scope bitmap
+        // (which has no entries since the finalize failed) and returns false.
         assert_eq!(
             adapter
-                .batch_check_seen(&[oid])
+                .batch_check_seen(&[oid_b])
                 .expect("post-failure batch_check_seen must succeed"),
             vec![true],
-            "MIDX ordinal config must survive a failed atomic commit_finalize"
+            "MIDX snapshot must survive a failed atomic commit_finalize \
+             so ordinal acceleration continues working"
         );
     }
 
+    /// Complete finalize without a configured MIDX snapshot must NOT write an
+    /// `so\0` ordinal key. The ordinal key is only written when the adapter
+    /// has been configured with a MIDX snapshot (tested at the RocksDB level
+    /// in `configured_store_persists_seen_ordinal_and_exposes_staged_midx_oids`).
+    ///
+    /// Partial finalize must discard ordinal state (tested via the cache clear
+    /// in the partial finalize path).
     #[test]
     fn complete_finalize_without_midx_omits_ordinal_key() {
         let repo_id = 42;
@@ -4085,6 +4082,76 @@ mod tests {
                 .expect("batch check after finalize"),
             vec![true],
             "staged OID must be visible after complete finalize"
+        );
+    }
+
+    /// Partial finalize must clear the ordinal cache, delete the persisted
+    /// ordinal key, and discard staging so that spill-only OIDs do not
+    /// permanently hide blobs from future scans.
+    #[test]
+    fn partial_finalize_clears_ordinal_and_skips_persist() {
+        let backend = TestBackend::atomic();
+        let repo_id = 51;
+        let policy_hash = [0x51; 32];
+
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+
+        // Build a MIDX snapshot containing three objects and configure the
+        // adapter so the HybridSeenStore has ordinal acceleration active.
+        let mut builder = scanner_git::MidxBuilder::new();
+        builder.add_pack(b"pack-test.pack");
+        let mut oid_a_bytes = [0u8; 20];
+        oid_a_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        builder.add_object(oid_a_bytes, 0, 0x11);
+        let mut oid_b_bytes = [0u8; 20];
+        oid_b_bytes[..4].copy_from_slice(&0x22u32.to_be_bytes());
+        builder.add_object(oid_b_bytes, 0, 0x22);
+        let mut oid_c_bytes = [0u8; 20];
+        oid_c_bytes[..4].copy_from_slice(&0x33u32.to_be_bytes());
+        builder.add_object(oid_c_bytes, 0, 0x33);
+        let midx_bytes = scanner_git::BytesView::from_vec(builder.build());
+        let fingerprint = RepoArtifactFingerprint {
+            packs_hash: [0x40; 32],
+            idx_hash: [0x41; 32],
+        };
+        adapter
+            .configure_midx_snapshot(midx_bytes, scanner_git::ObjectFormat::Sha1, fingerprint)
+            .expect("configure midx snapshot");
+
+        // Stage an OID via spill-time delta so the ordinal cache is populated.
+        let oid_staged = OidBytes::sha1(oid_a_bytes);
+        adapter
+            .persist_seen_delta(&[oid_staged])
+            .expect("stage oid via spill");
+
+        // Partial finalize with empty data_ops and watermark_ops — staging
+        // is discarded, ordinal is cleared, and no ordinal key is persisted.
+        let output = FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+            stats: Default::default(),
+        };
+        adapter
+            .commit_finalize(&output)
+            .expect("partial finalize must succeed");
+
+        // The ordinal key must NOT exist after partial finalize.
+        let ordinal_key = ordinal_key_builder(repo_id, &policy_hash);
+        assert!(
+            backend.get(&ordinal_key).expect("ordinal lookup").is_none(),
+            "partial finalize must not persist the ordinal key"
+        );
+
+        // The staged OID must NOT be visible because partial finalize
+        // discards the staging bitmap instead of folding it into the
+        // committed scope.
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid_staged])
+                .expect("batch_check_seen after partial finalize"),
+            vec![false],
+            "staging-only OID must not be visible after partial finalize"
         );
     }
 }
