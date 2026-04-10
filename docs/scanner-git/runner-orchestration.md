@@ -339,7 +339,7 @@ effects. It transforms scan results into stably-ordered write operations.
    - Gather findings across all contexts for this OID, sort + dedupe by
      identity `(start, end, rule_id, norm_hash)`, emit `finding` (`fn\0`) ops.
    - Accumulate this OID into the scope-scoped seen-bitmap delta (`sb\0`).
-3. Assemble data ops in namespace order: `bc\0` < `fn\0` < `sb\0`.
+3. Assemble data ops in namespace order: `bc\0` < `fn\0` < `sb\0` < `so\0`.
 4. If the run is complete (no skipped candidates), emit ref watermark (`rw`)
    ops. If partial, watermark ops are empty.
 
@@ -350,6 +350,7 @@ effects. It transforms scan results into stably-ordered write operations.
 | `bc\0` | blob_ctx       | Canonical context per scanned blob   |
 | `fn\0` | finding        | Individual finding records           |
 | `sb\0` | seen_blob      | Scope-scoped seen-bitmap delta       |
+| `so\0` | seen_ordinal   | Persisted MIDX ordinal cache         |
 | `rw`   | ref_watermark  | Ref tip watermarks (complete only)   |
 
 All keys use big-endian numeric fields to preserve lexicographic ordering.

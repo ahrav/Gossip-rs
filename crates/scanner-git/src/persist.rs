@@ -212,6 +212,10 @@ impl PersistenceStore for InMemoryPersistenceStore {
         #[cfg(feature = "rocksdb")]
         let is_complete = matches!(output.outcome, FinalizeOutcome::Complete);
         #[cfg(feature = "rocksdb")]
+        if !is_complete {
+            staged_ordinals.clear();
+        }
+        #[cfg(feature = "rocksdb")]
         {
             if is_complete {
                 let staging = self.seen_staging.borrow();
@@ -820,6 +824,24 @@ mod tests {
         let store = InMemoryPersistenceStore::default();
         let ordinal_key = build_seen_ordinal_key(42, &[0xAB; 32]);
         let ordinal_value = MidxOrdinalBitset::new(8, [0xCD; 32]).serialize();
+
+        // Seed an existing ordinal entry via a complete finalize to verify
+        // that partial finalize clears pre-existing state rather than
+        // preserving it.
+        let seed_output = FinalizeOutput {
+            data_ops: vec![WriteOp {
+                key: ordinal_key.clone(),
+                value: ordinal_value.clone(),
+            }],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+        store.commit_finalize(&seed_output).expect("seed commit");
+        assert!(
+            store.ordinal_scopes.borrow().contains_key(&ordinal_key),
+            "ordinal scope must be populated after complete finalize"
+        );
 
         let output = FinalizeOutput {
             data_ops: vec![WriteOp {

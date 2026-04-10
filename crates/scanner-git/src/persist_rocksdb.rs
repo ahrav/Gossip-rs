@@ -102,7 +102,6 @@ impl RocksDbStore {
                 finalizing: Cell::new(false),
             };
             store.cleanup_orphaned_staging()?;
-            store.cleanup_orphaned_ordinal()?;
             Ok(store)
         }
 
@@ -151,8 +150,8 @@ impl RocksDbStore {
 
     /// Writes a seen-bitmap delta to the staging key (`ss\0`).
     ///
-    /// The authoritative roaring scope remains invisible to
-    /// `batch_check_seen` until `commit_finalize` folds staging into `sb\0`.
+    /// Staging OIDs remain absent from the authoritative roaring scope until
+    /// `commit_finalize` folds them into the live `sb\0` key.
     /// When the store has been configured with the current MIDX snapshot,
     /// `persist_seen_delta` also updates the in-memory ordinal cache after the
     /// staging write succeeds so the current process can dedupe repeated
@@ -201,20 +200,6 @@ impl RocksDbStore {
         let staging_key = build_seen_staging_key(self.repo_id, &self.policy_hash);
         self.db
             .delete(&staging_key)
-            .map_err(|err| PersistError::backend(err.to_string()))
-    }
-
-    /// Deletes any orphaned ordinal key left by a crashed previous run.
-    ///
-    /// Ordinal keys are only valid when paired with a matching MIDX snapshot.
-    /// A stale ordinal key from a prior scan with a different MIDX would cause
-    /// `configure_midx_snapshot` to load an inconsistent bitset. Deleting it
-    /// on open forces the ordinal cache to be rebuilt from scratch.
-    #[cfg(feature = "rocksdb")]
-    fn cleanup_orphaned_ordinal(&self) -> Result<(), PersistError> {
-        let ordinal_key = build_seen_ordinal_key(self.repo_id, &self.policy_hash);
-        self.db
-            .delete(&ordinal_key)
             .map_err(|err| PersistError::backend(err.to_string()))
     }
 }
@@ -439,13 +424,24 @@ impl PersistenceStore for RocksDbStore {
                 // bitmap from RocksDB so the cache does not reflect
                 // phantom writes, while preserving the MIDX snapshot
                 // config so ordinal acceleration survives the failure.
+                // When the reload also fails, drop the cache entirely to
+                // force a cold reload on the next access rather than
+                // exposing uncommitted merged state.
                 if let Some(mut store) = staged_seen_store {
-                    let reloaded =
-                        self.load_seen_store_from_db(store.fallback().bitmap().oid_len());
-                    if let Ok(fresh) = reloaded {
-                        store.replace_fallback(fresh.into_fallback());
+                    match self.load_seen_store_from_db(store.fallback().bitmap().oid_len()) {
+                        Ok(fresh) => {
+                            store.replace_fallback(fresh.into_fallback());
+                            *self.seen_store.borrow_mut() = Some(store);
+                        }
+                        Err(reload_err) => {
+                            tracing::warn!(
+                                error = %reload_err,
+                                "seen-store reload failed after batch write failure; \
+                                 clearing cache to force reload on next access"
+                            );
+                            *self.seen_store.borrow_mut() = None;
+                        }
                     }
-                    *self.seen_store.borrow_mut() = Some(store);
                 }
                 return Err(PersistError::backend(err.to_string()));
             }
@@ -1622,44 +1618,35 @@ mod tests {
         );
     }
 
-    /// A stale ordinal key left by a prior scan (e.g. after a crash between
-    /// `commit_finalize` and the next `configure_midx_snapshot`) is deleted
-    /// when `RocksDbStore::open` runs its cleanup pass.
+    /// Ordinal keys persist across `open()` calls; stale-key rejection is
+    /// handled by `load_persisted_ordinal`'s fingerprint+object-count check
+    /// inside `configure_midx_snapshot`.
     #[cfg(feature = "rocksdb")]
     #[test]
-    fn orphaned_ordinal_key_cleaned_on_store_open() {
+    fn ordinal_key_survives_store_reopen() {
         let dir = tempdir().expect("tempdir");
         let repo_id = 34;
         let policy_hash = [0xF4; 32];
 
-        // Seed a stale ordinal key directly into the database.
+        // Seed an ordinal key directly into the database.
         let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
         {
             let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
             store
                 .db
-                .put(&ordinal_key, b"stale-ordinal-payload")
-                .expect("seed stale ordinal key");
-            // Confirm the key is present before we drop.
-            assert!(
-                store
-                    .db
-                    .get(&ordinal_key)
-                    .expect("ordinal lookup")
-                    .is_some(),
-                "ordinal key must be present after seeding"
-            );
+                .put(&ordinal_key, b"persisted-ordinal-payload")
+                .expect("seed ordinal key");
         }
 
-        // Reopen — open() must delete the orphaned ordinal key.
+        // Reopen — ordinal key must survive for configure_midx_snapshot to read.
         let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("reopen");
         assert!(
             store
                 .db
                 .get(&ordinal_key)
                 .expect("ordinal lookup after reopen")
-                .is_none(),
-            "open() must delete the orphaned ordinal key"
+                .is_some(),
+            "ordinal key must survive open() for cross-scan restoration"
         );
     }
 }

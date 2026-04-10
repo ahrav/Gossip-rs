@@ -535,6 +535,33 @@ where
             Err(err) => Err(err.to_string()),
         }
     }
+
+    /// Restores the seen-store cache after a failed batch write.
+    ///
+    /// The staged store already has the merged delta applied (uncommitted).
+    /// When the backend reload succeeds, the fallback bitmap is swapped to
+    /// the last durably committed state while preserving the MIDX snapshot
+    /// config. When the reload also fails, the cache is cleared entirely so
+    /// the next access forces a cold reload rather than exposing uncommitted
+    /// merged state.
+    fn restore_seen_store_after_failure(&self, staged_seen_store: Option<HybridSeenStore>) {
+        if let Some(mut store) = staged_seen_store {
+            match self.load_seen_store_from_backend(store.fallback().bitmap().oid_len()) {
+                Ok(fresh) => {
+                    store.replace_fallback(fresh.into_fallback());
+                    *self.seen_store.borrow_mut() = Some(store);
+                }
+                Err(reload_err) => {
+                    tracing::warn!(
+                        error = %reload_err,
+                        "seen-store reload failed after batch write failure; \
+                         clearing cache to force reload on next access"
+                    );
+                    *self.seen_store.borrow_mut() = None;
+                }
+            }
+        }
+    }
 }
 
 /// Spill-stage persistence: accumulates processed OIDs in the staging bitmap.
@@ -633,7 +660,8 @@ where
     }
 }
 
-/// Committed-scope queries: checks OIDs against the durable seen-bitmap only.
+/// Committed-scope queries: checks OIDs against the durable seen-bitmap
+/// and, when configured, the in-memory ordinal cache.
 ///
 /// The committed roaring scope remains the durable source of truth. When the
 /// adapter has an active MIDX snapshot, the in-memory ordinal cache may also
@@ -1023,19 +1051,7 @@ where
             if !all_ops.is_empty()
                 && let Err(err) = self.backend.apply_batch(&all_ops)
             {
-                // The batch failed so the merged roaring bitmap was never
-                // durably written. Restore the store with the pre-merge
-                // bitmap from the backend so the cache does not reflect
-                // phantom writes, while preserving the MIDX snapshot
-                // config so ordinal acceleration survives the failure.
-                if let Some(mut store) = staged_seen_store {
-                    let reloaded =
-                        self.load_seen_store_from_backend(store.fallback().bitmap().oid_len());
-                    if let Ok(fresh) = reloaded {
-                        store.replace_fallback(fresh.into_fallback());
-                    }
-                    *self.seen_store.borrow_mut() = Some(store);
-                }
+                self.restore_seen_store_after_failure(staged_seen_store);
                 return Err(PersistError::backend(err.to_string()));
             }
             if let Some(store) = staged_seen_store {
@@ -1051,10 +1067,11 @@ where
         // AFTER the seen scope Put so a crash between batches cannot lose
         // staged OIDs (the scope key already contains them).
         //
-        // For partial finalize, there is no seen scope Put — staging OIDs
-        // are discarded. The staging Delete goes in first_phase_ops (same
-        // batch as data ops) so a failed batch doesn't leave stale staging
-        // for a later complete run to fold.
+        // For partial finalize, staging OIDs are discarded. The staging
+        // Delete is issued in a preceding batch BEFORE data ops so a
+        // data-op batch failure cannot leave stale staging for a later
+        // complete run to fold. If the staging Delete itself fails, we
+        // propagate the error before attempting data ops.
         //
         // Recovery posture: if the watermark write fails, the seen bitmap
         // is already durable and the in-memory cache reflects it. Callers
@@ -1067,26 +1084,16 @@ where
         // before watermarks are durable leaves the checkpoint intact for
         // resume instead of forcing a full re-scan.
         if has_staging && !is_complete {
-            first_phase_ops.push(GitPersistenceOp::Delete {
-                key: seen_staging_key.clone(),
-            });
+            self.backend
+                .apply_batch(&[GitPersistenceOp::Delete {
+                    key: seen_staging_key.clone(),
+                }])
+                .map_err(|err| PersistError::backend(err.to_string()))?;
         }
         if !first_phase_ops.is_empty()
             && let Err(err) = self.backend.apply_batch(&first_phase_ops)
         {
-            // The batch failed so the merged roaring bitmap was never
-            // durably written. Restore the store with the pre-merge
-            // bitmap from the backend so the cache does not reflect
-            // phantom writes, while preserving the MIDX snapshot
-            // config so ordinal acceleration survives the failure.
-            if let Some(mut store) = staged_seen_store {
-                let reloaded =
-                    self.load_seen_store_from_backend(store.fallback().bitmap().oid_len());
-                if let Ok(fresh) = reloaded {
-                    store.replace_fallback(fresh.into_fallback());
-                }
-                *self.seen_store.borrow_mut() = Some(store);
-            }
+            self.restore_seen_store_after_failure(staged_seen_store);
             return Err(PersistError::backend(err.to_string()));
         }
         if let Some(store) = staged_seen_store {
@@ -4037,6 +4044,63 @@ mod tests {
                 .expect("post-failure batch_check_seen must succeed"),
             vec![true],
             "MIDX snapshot must survive a failed atomic commit_finalize \
+             so ordinal acceleration continues working"
+        );
+    }
+
+    /// Non-atomic counterpart of
+    /// `atomic_commit_finalize_failure_preserves_seen_store`. The two-phase
+    /// write path used by non-atomic backends must also preserve the MIDX
+    /// snapshot and ordinal cache when `apply_batch` fails during
+    /// `commit_finalize`.
+    #[test]
+    fn non_atomic_commit_finalize_failure_preserves_seen_store() {
+        let backend = TestBackend::non_atomic();
+        let repo_id = 50;
+        let policy_hash = [0x50; 32];
+
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+
+        let (midx_bytes, oid_a_raw, oid_b_raw) = build_two_object_midx();
+        let fingerprint = RepoArtifactFingerprint {
+            packs_hash: [0xAA; 32],
+            idx_hash: [0xBB; 32],
+        };
+        adapter
+            .configure_midx_snapshot(midx_bytes, scanner_git::ObjectFormat::Sha1, fingerprint)
+            .expect("configure midx snapshot");
+
+        // Stage oid_a so commit_finalize has seen-bitmap work to do.
+        let oid_a = OidBytes::sha1(oid_a_raw);
+        adapter.persist_seen_delta(&[oid_a]).expect("stage oid_a");
+
+        // Inject a fault so the first-phase apply_batch in commit_finalize fails.
+        backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
+        let result = adapter.commit_finalize(&FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: Default::default(),
+        });
+        assert!(
+            result.is_err(),
+            "commit_finalize must fail on injected batch fault"
+        );
+
+        // Stage oid_b after the failed finalize. If the MIDX snapshot survived,
+        // persist_seen_delta updates the ordinal cache for this MIDX-resident
+        // OID. If the snapshot was lost, the ordinal update is skipped.
+        let oid_b = OidBytes::sha1(oid_b_raw);
+        adapter.persist_seen_delta(&[oid_b]).expect("stage oid_b");
+
+        // batch_check_seen queries the HybridSeenStore. With MIDX ordinal
+        // acceleration, oid_b resolves as seen via the ordinal cache.
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid_b])
+                .expect("post-failure batch_check_seen must succeed"),
+            vec![true],
+            "MIDX snapshot must survive a failed non-atomic commit_finalize \
              so ordinal acceleration continues working"
         );
     }

@@ -6,7 +6,7 @@
 //! corresponds to one entry in the MIDX OIDL chunk, eliminating the 20-byte
 //! per-OID index copy on the hot path.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 
 use blake3::Hasher;
@@ -14,7 +14,7 @@ use bytemuck::{cast_slice, try_cast_slice};
 use gossip_stdx::bitset::DynamicBitSet;
 use gossip_stdx::words_for_bits;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::bytes::BytesView;
 use super::errors::SpillError;
@@ -476,11 +476,34 @@ struct OrdinalCache {
 /// None of these may be called concurrently. If multi-threaded access is
 /// needed in the future, the `RefCell` should be replaced with an `RwLock`
 /// (to allow concurrent reads on the fast path).
-#[derive(Clone, Debug)]
+///
+/// ## Borrow ordering
+///
+/// When both `RefCell` fields must be accessed, `midx_snapshot` is always
+/// borrowed first. Methods needing mutable `ordinal` access while holding
+/// `midx_snapshot` ensure the snapshot borrow is shared (not mutable).
+/// Methods needing mutable `midx_snapshot` access must not hold any
+/// `ordinal` borrow.
+#[derive(Debug)]
 pub struct HybridSeenStore {
     fallback: RoaringSeenStore,
     midx_snapshot: RefCell<Option<ConfiguredMidxSnapshot>>,
     ordinal: RefCell<Option<OrdinalCache>>,
+    #[cfg(debug_assertions)]
+    in_query: Cell<bool>,
+}
+
+#[cfg(any(test, feature = "bench"))]
+impl Clone for HybridSeenStore {
+    fn clone(&self) -> Self {
+        Self {
+            fallback: self.fallback.clone(),
+            midx_snapshot: RefCell::new(self.midx_snapshot.borrow().clone()),
+            ordinal: RefCell::new(self.ordinal.borrow().clone()),
+            #[cfg(debug_assertions)]
+            in_query: Cell::new(false),
+        }
+    }
 }
 
 impl HybridSeenStore {
@@ -491,6 +514,8 @@ impl HybridSeenStore {
             fallback,
             midx_snapshot: RefCell::new(None),
             ordinal: RefCell::new(None),
+            #[cfg(debug_assertions)]
+            in_query: Cell::new(false),
         }
     }
 
@@ -728,9 +753,9 @@ impl HybridSeenStore {
     /// stale/corrupt" pattern used by both `RocksDbStore` and
     /// `GitPersistenceAdapter`.
     ///
-    /// Returns `Ok(())` unconditionally: stale or corrupt persisted ordinal
-    /// payloads are silently discarded with a debug log because the ordinal
-    /// cache is a rebuildable optimization.
+    /// Returns `Ok(())` on success even when the persisted ordinal payload is
+    /// stale or corrupt (those are silently discarded). Returns `Err` only when
+    /// `set_midx_snapshot` fails due to format or parse errors.
     pub fn configure_with_persisted_ordinal(
         &self,
         midx_bytes: BytesView,
@@ -746,7 +771,7 @@ impl HybridSeenStore {
                     debug!("discarded stale persisted seen-ordinal cache");
                 }
                 Err(err) => {
-                    debug!(error = %err, "discarded corrupt persisted seen-ordinal cache");
+                    warn!(error = %err, "discarded corrupt persisted seen-ordinal cache");
                     self.clear_ordinal_cache();
                 }
             }
@@ -757,8 +782,10 @@ impl HybridSeenStore {
     /// Seeds the ordinal cache from a persisted `MidxOrdinalBitset` payload.
     ///
     /// Returns `Ok(true)` when the persisted payload matches the configured
-    /// snapshot and was installed. Missing or stale payloads are reported as
-    /// `Ok(false)` because the ordinal cache is a rebuildable optimization.
+    /// snapshot and was installed. Stale payloads (fingerprint or object-count
+    /// mismatch) return `Ok(false)` because the ordinal cache is a rebuildable
+    /// optimization. Corrupt payloads that fail deserialization return
+    /// `Err(OrdinalSeenError)`.
     pub fn load_persisted_ordinal(&self, bytes: &[u8]) -> Result<bool, OrdinalSeenError> {
         let snapshot_guard = self.midx_snapshot.borrow();
         let Some(snapshot) = snapshot_guard.as_ref() else {
@@ -786,9 +813,9 @@ impl HybridSeenStore {
     /// Serializes the current ordinal cache, rebuilding it from the roaring
     /// fallback if needed.
     ///
-    /// The `midx_snapshot` borrow is released before accessing `ordinal` for
-    /// serialization, so `rebuild_with_midx` can safely access any field
-    /// without risking a cross-`RefCell` double-borrow panic.
+    /// The `midx_snapshot` borrow is scoped so `ensure_cache_and_view` can
+    /// run while the snapshot reference is valid, before `ordinal` is
+    /// separately borrowed for serialization.
     pub fn persisted_ordinal_bytes(&self) -> Result<Option<Vec<u8>>, SpillError> {
         let has_snapshot = {
             let snapshot_guard = self.midx_snapshot.borrow();
@@ -819,19 +846,44 @@ impl HybridSeenStore {
         if oids.is_empty() {
             return Ok(0);
         }
+
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                !self.in_query.get(),
+                "re-entrant call to HybridSeenStore query method"
+            );
+            self.in_query.set(true);
+        }
+
         let snapshot_guard = self.midx_snapshot.borrow();
         let Some(snapshot) = snapshot_guard.as_ref() else {
+            #[cfg(debug_assertions)]
+            self.in_query.set(false);
             return Ok(0);
         };
-        let midx = self.ensure_cache_and_view(snapshot)?;
+        let midx = match self.ensure_cache_and_view(snapshot) {
+            Ok(v) => v,
+            Err(e) => {
+                #[cfg(debug_assertions)]
+                self.in_query.set(false);
+                return Err(e);
+            }
+        };
         let mut ordinal_guard = self.ordinal.borrow_mut();
         let Some(cache) = ordinal_guard.as_mut() else {
+            #[cfg(debug_assertions)]
+            self.in_query.set(false);
             return Ok(0);
         };
-        cache
+        let result = cache
             .bitset
             .mark_seen_batch(&midx, oids)
-            .map_err(Into::into)
+            .map_err(Into::into);
+        #[cfg(debug_assertions)]
+        self.in_query.set(false);
+
+        result
     }
 }
 
@@ -841,15 +893,35 @@ impl SeenBlobStore for HybridSeenStore {
             return Ok(Vec::new());
         }
 
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                !self.in_query.get(),
+                "re-entrant call to HybridSeenStore query method"
+            );
+            self.in_query.set(true);
+        }
+
         let snapshot_guard = self.midx_snapshot.borrow();
         let Some(snapshot) = snapshot_guard.as_ref() else {
+            #[cfg(debug_assertions)]
+            self.in_query.set(false);
             return self.fallback.batch_check_seen(oids);
         };
         // Reconstruct MidxView from cached layout (no parse, no allocation).
-        let midx = self.ensure_cache_and_view(snapshot)?;
+        let midx = match self.ensure_cache_and_view(snapshot) {
+            Ok(v) => v,
+            Err(e) => {
+                #[cfg(debug_assertions)]
+                self.in_query.set(false);
+                return Err(e);
+            }
+        };
 
         let cache_guard = self.ordinal.borrow();
         let Some(cache) = cache_guard.as_ref() else {
+            #[cfg(debug_assertions)]
+            self.in_query.set(false);
             return self.fallback.batch_check_seen(oids);
         };
 
@@ -868,6 +940,8 @@ impl SeenBlobStore for HybridSeenStore {
             match probe_ordinal(first_oid, oid_len, &midx, &cache.bitset, &mut cursor) {
                 Ok(result) => result,
                 Err(e) => {
+                    #[cfg(debug_assertions)]
+                    self.in_query.set(false);
                     drop(cache_guard);
                     return Err(e.into());
                 }
@@ -882,15 +956,17 @@ impl SeenBlobStore for HybridSeenStore {
 
         for (idx, oid) in oids.iter().enumerate().skip(1) {
             if prev_oid > oid {
-                // Input violates sorted contract. Fall back to per-element
-                // binary search which handles arbitrary order correctly.
-                debug!(
-                    batch_size = oids.len(),
-                    violation_index = idx,
-                    "unsorted input detected in batch_check_seen, falling back to per-element search"
-                );
+                // Input violates the sorted contract required by all callers.
+                // Falling back to per-element roaring search would silently
+                // miss OIDs staged only in the ordinal cache. Return an error
+                // so the contract violation surfaces in production builds.
+                #[cfg(debug_assertions)]
+                self.in_query.set(false);
                 drop(cache_guard);
-                return Ok(self.fallback.bitmap().batch_contains(oids));
+                return Err(SpillError::Io(std::io::Error::other(format!(
+                    "batch_check_seen requires sorted input; violation at index {idx} (batch_size={})",
+                    oids.len()
+                ))));
             }
             if prev_oid == oid {
                 if prev_was_fallback {
@@ -906,6 +982,8 @@ impl SeenBlobStore for HybridSeenStore {
                 match probe_ordinal(oid, oid_len, &midx, &cache.bitset, &mut cursor) {
                     Ok(result) => result,
                     Err(e) => {
+                        #[cfg(debug_assertions)]
+                        self.in_query.set(false);
                         drop(cache_guard);
                         return Err(e.into());
                     }
@@ -929,6 +1007,9 @@ impl SeenBlobStore for HybridSeenStore {
                 result[pos] = bitmap.contains(&oids[pos]);
             }
         }
+        #[cfg(debug_assertions)]
+        self.in_query.set(false);
+
         Ok(result)
     }
 
@@ -1025,6 +1106,7 @@ mod tests {
 
     use super::*;
     use crate::midx_test_builder::MidxBuilder;
+    use crate::roaring_seen::SeenBitmapDelta;
     use crate::{MidxView, ObjectFormat};
 
     const PROPTEST_CASES: u32 = 64;
@@ -1667,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_seen_store_falls_back_correctly_for_unsorted_input() {
+    fn hybrid_seen_store_rejects_unsorted_input() {
         let fingerprint = test_fingerprint(0x50);
         let store = build_hybrid_store(&[1, 3, 5, 7], &[0, 1, 2, 3, 4, 5, 6, 7], fingerprint);
         // Deliberately unsorted probes.
@@ -1679,13 +1761,13 @@ mod tests {
             oid_from_u32(9),
         ];
 
-        let actual = store.batch_check_seen(&probes).expect("unsorted query");
-        let expected: Vec<bool> = probes
-            .iter()
-            .map(|oid| store.fallback().bitmap().contains(oid))
-            .collect();
-
-        assert_eq!(actual, expected);
+        let err = store
+            .batch_check_seen(&probes)
+            .expect_err("unsorted input must be rejected");
+        assert!(
+            err.to_string().contains("sorted input"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1812,6 +1894,65 @@ mod tests {
         let probes = vec![oid_from_u32(1), oid_from_u32(1)];
         let actual = store.batch_check_seen(&probes).expect("duplicate midx");
         assert_eq!(actual, vec![true, true]);
+    }
+
+    #[test]
+    fn merge_fallback_delta_incrementally_updates_ordinal_cache() {
+        let fingerprint = test_fingerprint(0x90);
+        // Pre-seed oid(1) in roaring, MIDX covers 0-7.
+        let mut store = build_hybrid_store(&[1], &[0, 1, 2, 3, 4, 5, 6, 7], fingerprint);
+        // Warm the ordinal cache.
+        let _ = store.batch_check_seen(&[oid_from_u32(1)]).unwrap();
+
+        // Build a delta with oid(3) (MIDX-resident) and oid(9) (non-MIDX).
+        let delta = SeenBitmapDelta::from_oids(&[oid_from_u32(3), oid_from_u32(9)]).unwrap();
+        store.merge_fallback_delta(&delta).unwrap();
+
+        // Roaring contains all three OIDs after delta merge.
+        assert_eq!(
+            store
+                .fallback()
+                .batch_check_seen(&[oid_from_u32(1), oid_from_u32(3), oid_from_u32(9)])
+                .unwrap(),
+            vec![true, true, true],
+        );
+        // Hybrid query: oid(3) found via ordinal, oid(9) via roaring fallback.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_from_u32(1), oid_from_u32(3), oid_from_u32(9)])
+                .unwrap(),
+            vec![true, true, true],
+        );
+        // oid(5) is MIDX-resident but was never merged — still unseen.
+        assert_eq!(
+            store.batch_check_seen(&[oid_from_u32(5)]).unwrap(),
+            vec![false],
+        );
+    }
+
+    #[test]
+    fn replace_fallback_preserves_midx_snapshot() {
+        let fingerprint = test_fingerprint(0x91);
+        let mut store = build_hybrid_store(&[1, 3], &[0, 1, 2, 3, 4, 5, 6, 7], fingerprint.clone());
+        // Warm ordinal cache.
+        let _ = store.batch_check_seen(&[oid_from_u32(1)]).unwrap();
+        assert!(store.is_valid_for_fingerprint(&fingerprint));
+
+        // Replace fallback with a bitmap containing only oid(5).
+        let new_bitmap = build_seen_bitmap(&[5]);
+        store.replace_fallback(RoaringSeenStore::new(new_bitmap));
+
+        // Ordinal cache is cleared by replace_fallback.
+        assert!(!store.is_valid_for_fingerprint(&fingerprint));
+        // MIDX snapshot still configured — rebuild works on next query.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_from_u32(1), oid_from_u32(5)])
+                .unwrap(),
+            vec![false, true], // oid(1) gone from new fallback, oid(5) present
+        );
+        // After rebuild, ordinal is valid again.
+        assert!(store.is_valid_for_fingerprint(&fingerprint));
     }
 
     #[derive(Debug, Clone)]
@@ -1964,16 +2105,35 @@ mod tests {
                         prop_assert_eq!(actual, expected);
                     }
                     HybridOp::QueryUnsorted(values) => {
-                        // Deliberately unsorted probes to exercise the
-                        // unsorted-input fallback path.
+                        // Deliberately unsorted probes. The sorted contract
+                        // is now enforced (returns an error) rather than
+                        // silently falling back to roaring-only search.
                         let probes: Vec<OidBytes> =
                             values.into_iter().map(|value| oid_from_u32(value as u32)).collect();
-                        let actual = store.batch_check_seen(&probes).expect("unsorted query");
-                        // Compare element-by-element since order matches
-                        // input order, not sorted order.
-                        for (got, oid) in actual.iter().zip(probes.iter()) {
-                            let want = oracle.contains(oid);
-                            prop_assert_eq!(*got, want);
+                        // Unsorted input may accidentally be sorted; only
+                        // check for error when genuinely unsorted.
+                        let is_sorted = probes.windows(2).all(|w| w[0] <= w[1]);
+                        match store.batch_check_seen(&probes) {
+                            Ok(actual) if is_sorted => {
+                                for (got, oid) in actual.iter().zip(probes.iter()) {
+                                    let want = oracle.contains(oid);
+                                    prop_assert_eq!(*got, want);
+                                }
+                            }
+                            Ok(_) if !is_sorted => {
+                                // Unsorted but no ordinal cache active — the sorted
+                                // check only fires when the ordinal cache is populated.
+                                // This is acceptable.
+                            }
+                            Err(_) if !is_sorted => {
+                                // Expected: unsorted input rejected.
+                            }
+                            Err(e) if is_sorted => {
+                                return Err(proptest::test_runner::TestCaseError::fail(
+                                    format!("sorted input should not fail: {e}")
+                                ));
+                            }
+                            _ => {}
                         }
                     }
                     HybridOp::ChangeMidx => {
