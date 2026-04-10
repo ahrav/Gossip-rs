@@ -701,6 +701,26 @@ mod tests {
         }
     }
 
+    /// Fallible variant of [`for_each_permutation`] — short-circuits on the
+    /// first `Err` returned by `visit`. Used inside `proptest!` blocks so that
+    /// `prop_assert_eq!` failures propagate cleanly instead of panicking.
+    fn try_for_each_permutation<E>(
+        indices: &mut [usize],
+        start: usize,
+        visit: &mut impl FnMut(&[usize]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if start == indices.len() {
+            return visit(indices);
+        }
+
+        for index in start..indices.len() {
+            indices.swap(start, index);
+            try_for_each_permutation(indices, start + 1, visit)?;
+            indices.swap(start, index);
+        }
+        Ok(())
+    }
+
     /// Enumerates all bitmasks of `pack_count` bits that have at least 2 bits set,
     /// representing subsets of packs that share a duplicate OID.
     fn duplicate_subsets(pack_count: usize) -> Vec<u8> {
@@ -750,14 +770,23 @@ mod tests {
         sequences
     }
 
+    /// Returns the set of single-pack bitmasks for `pack_count` packs
+    /// (e.g. `[0b0001, 0b0010, 0b0100, 0b1000]` for 4 packs).
     fn singleton_subsets(pack_count: usize) -> Vec<u8> {
         (0..pack_count).map(|pack_idx| 1u8 << pack_idx).collect()
     }
 
+    /// Returns `true` when every pack index in `0..pack_count` is covered by
+    /// at least one mask in `masks`.
     fn all_packs_present(pack_count: usize, masks: &[u8]) -> bool {
         (0..pack_count).all(|pack_idx| masks.iter().any(|&mask| mask & (1u8 << pack_idx) != 0))
     }
 
+    /// Proptest strategy that produces a membership bitmask for one OID.
+    ///
+    /// The 1:3 weighting biases toward duplicate-bearing masks (>=2 bits set)
+    /// so that most generated OIDs appear in multiple packs, exercising the
+    /// dedup merge path more heavily than pure single-pack placement.
     fn weighted_membership_mask_strategy(pack_count: usize) -> BoxedStrategy<u8> {
         let singleton_masks = singleton_subsets(pack_count);
         let duplicate_masks = duplicate_subsets(pack_count);
@@ -769,12 +798,17 @@ mod tests {
         .boxed()
     }
 
+    /// Distributes OIDs across packs according to `masks`.
+    ///
+    /// `masks[i]` is a bitmask specifying which packs contain `oids[i]`.
+    /// Offsets are deterministically derived from pack index, OID position, and
+    /// object count so that every `(pack, offset)` pair is unique.
     fn build_pack_objects_from_masks(
         pack_count: usize,
         oids: &[[u8; 20]],
         masks: &[u8],
     ) -> Vec<PackObjects> {
-        assert_eq!(
+        debug_assert_eq!(
             oids.len(),
             masks.len(),
             "every OID must have one membership mask"
@@ -782,7 +816,7 @@ mod tests {
 
         let mut objects_by_pack = vec![Vec::new(); pack_count];
         for (oid_idx, (&oid, &mask)) in oids.iter().zip(masks.iter()).enumerate() {
-            assert_ne!(mask, 0, "generated OID must appear in at least one pack");
+            debug_assert_ne!(mask, 0, "generated OID must appear in at least one pack");
             for (pack_idx, objects) in objects_by_pack.iter_mut().enumerate() {
                 if mask & (1u8 << pack_idx) == 0 {
                     continue;
@@ -797,24 +831,35 @@ mod tests {
         objects_by_pack
     }
 
+    /// Constructs a [`SmallModelPack`] from pre-built objects, generating the
+    /// idx bytes via [`TestIdxBuilder`].
+    fn pack_from_objects(pack_idx: usize, objects: Vec<([u8; 20], u64)>) -> SmallModelPack {
+        let mut builder = TestIdxBuilder::new();
+        for &(oid, offset) in &objects {
+            builder.add_object(oid, offset);
+        }
+        SmallModelPack {
+            pack_name: format!("pack-{pack_idx}.pack").into_bytes(),
+            idx_bytes: builder.build(),
+            objects,
+        }
+    }
+
+    /// Converts per-pack object lists into [`SmallModelPack`]s ready for
+    /// MIDX merge testing.
     fn build_test_packs(objects_by_pack: &[PackObjects]) -> Vec<SmallModelPack> {
         objects_by_pack
             .iter()
             .enumerate()
-            .map(|(pack_idx, objects)| {
-                let mut builder = TestIdxBuilder::new();
-                for &(oid, offset) in objects {
-                    builder.add_object(oid, offset);
-                }
-                SmallModelPack {
-                    pack_name: format!("pack-{pack_idx}.pack").into_bytes(),
-                    idx_bytes: builder.build(),
-                    objects: objects.clone(),
-                }
-            })
+            .map(|(pack_idx, objects)| pack_from_objects(pack_idx, objects.clone()))
             .collect()
     }
 
+    /// Proptest strategy for the *permutation invariance* property.
+    ///
+    /// Generates 2–4 packs with `pack_count..=15` unique OIDs, each assigned
+    /// to one or more packs via [`weighted_membership_mask_strategy`].
+    /// A `prop_filter` guarantees every pack receives at least one object.
     fn permutation_case_strategy() -> impl Strategy<Value = Vec<PackObjects>> {
         (2usize..=4)
             .prop_flat_map(|pack_count| {
@@ -844,6 +889,11 @@ mod tests {
             })
     }
 
+    /// Proptest strategy for the *dedup idempotency* property.
+    ///
+    /// Every generated OID appears in exactly `duplicate_width` packs (2..=pack_count).
+    /// The minimum OID count is `pack_count * 2` to keep the `prop_filter`
+    /// rejection rate below ~2% at worst-case parameters.
     fn dedup_idempotency_case_strategy() -> impl Strategy<Value = (usize, Vec<PackObjects>)> {
         (2usize..=4)
             .prop_flat_map(|pack_count| {
@@ -940,17 +990,7 @@ mod tests {
         objects_by_pack
             .into_iter()
             .enumerate()
-            .map(|(pack_idx, objects)| {
-                let mut builder = TestIdxBuilder::new();
-                for &(oid, offset) in &objects {
-                    builder.add_object(oid, offset);
-                }
-                SmallModelPack {
-                    pack_name: format!("pack-{pack_idx}.pack").into_bytes(),
-                    idx_bytes: builder.build(),
-                    objects,
-                }
-            })
+            .map(|(pack_idx, objects)| pack_from_objects(pack_idx, objects))
             .collect()
     }
 
@@ -1375,7 +1415,7 @@ mod tests {
                 .collect();
 
             let mut order = canonical_order;
-            for_each_permutation(&mut order, 0, &mut |permutation| {
+            try_for_each_permutation(&mut order, 0, &mut |permutation| {
                 let views: Vec<_> = permutation
                     .iter()
                     .enumerate()
@@ -1395,24 +1435,18 @@ mod tests {
                 let actual = canonicalize_midx(&midx);
                 let actual_oids: Vec<_> = actual.entries.iter().map(|(oid, _)| *oid).collect();
 
-                assert_eq!(
-                    actual, expected,
-                    "dedup winners must follow the lowest pack position for order {permutation:?}"
+                prop_assert_eq!(
+                    &actual, &expected,
+                    "dedup winners must follow the lowest pack position for order {:?}", permutation
                 );
-                assert_eq!(
-                    actual_oids, canonical_oids,
-                    "OIDL must be invariant across pack permutations: order={permutation:?}"
+                // Cross-permutation invariance: the unique OID set must not change
+                // regardless of pack presentation order.
+                prop_assert_eq!(
+                    &actual_oids, &canonical_oids,
+                    "OIDL must be invariant across pack permutations: order={:?}", permutation
                 );
-                assert_eq!(
-                    actual.fanout, canonical_expected.fanout,
-                    "fanout must stay invariant across pack permutations: order={permutation:?}"
-                );
-                assert_eq!(
-                    actual.entries.len(),
-                    canonical_expected.entries.len(),
-                    "object count must stay invariant across pack permutations: order={permutation:?}"
-                );
-            });
+                Ok(())
+            })?;
         }
 
         #[test]
@@ -1448,8 +1482,8 @@ mod tests {
                 .expect("generated MIDX should parse");
             let actual = canonicalize_midx(&midx);
 
-            assert_eq!(
-                actual, expected,
+            prop_assert_eq!(
+                &actual, &expected,
                 "duplicate winners must be the lowest pack position in canonical order"
             );
 
@@ -1460,19 +1494,19 @@ mod tests {
                 }
             }
 
-            assert!(!occurrence_counts.is_empty(), "generated case must contain at least one OID");
+            prop_assert!(!occurrence_counts.is_empty(), "generated case must contain at least one OID");
             for (&oid, &count) in &occurrence_counts {
-                assert_eq!(
+                prop_assert_eq!(
                     count, duplicate_width,
-                    "OID {oid:02x?} must appear in exactly {duplicate_width} packs"
+                    "OID {:02x?} must appear in exactly {} packs", oid, duplicate_width
                 );
             }
-            assert_eq!(
+            prop_assert_eq!(
                 actual.entries.len(),
                 occurrence_counts.len(),
                 "dedup must emit one entry per unique OID"
             );
-            assert_eq!(
+            prop_assert_eq!(
                 midx.object_count() as usize,
                 occurrence_counts.len(),
                 "object_count must equal the number of unique OIDs"
