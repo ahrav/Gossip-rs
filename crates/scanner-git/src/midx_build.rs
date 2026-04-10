@@ -591,13 +591,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::repo::RepoKind;
+    use crate::{repo::RepoKind, test_utils::proptest_cases};
+    use proptest::prelude::*;
     use tempfile::tempdir;
 
+    const MIDX_PROPTEST_CASES: u32 = 1000;
     const SMALL_MODEL_BUCKETS: [u8; 4] = [0x00, 0x40, 0x80, 0xC0];
     /// Duplicate OIDs use second-byte values starting here (0xe0..); unique OIDs
     /// must stay below this to avoid accidental collisions.
     const DUPLICATE_BYTE_BASE: u8 = 0xe0;
+    type PackObjects = Vec<([u8; 20], u64)>;
 
     /// Helper to build minimal pack index v2 bytes for MIDX merge tests.
     struct TestIdxBuilder {
@@ -745,6 +748,138 @@ mod tests {
 
         build_sequences(subsets, duplicate_count, &mut current, &mut sequences);
         sequences
+    }
+
+    fn singleton_subsets(pack_count: usize) -> Vec<u8> {
+        (0..pack_count).map(|pack_idx| 1u8 << pack_idx).collect()
+    }
+
+    fn all_packs_present(pack_count: usize, masks: &[u8]) -> bool {
+        (0..pack_count).all(|pack_idx| masks.iter().any(|&mask| mask & (1u8 << pack_idx) != 0))
+    }
+
+    fn weighted_membership_mask_strategy(pack_count: usize) -> BoxedStrategy<u8> {
+        let singleton_masks = singleton_subsets(pack_count);
+        let duplicate_masks = duplicate_subsets(pack_count);
+
+        prop_oneof![
+            1 => proptest::sample::select(singleton_masks),
+            3 => proptest::sample::select(duplicate_masks),
+        ]
+        .boxed()
+    }
+
+    fn build_pack_objects_from_masks(
+        pack_count: usize,
+        oids: &[[u8; 20]],
+        masks: &[u8],
+    ) -> Vec<PackObjects> {
+        assert_eq!(
+            oids.len(),
+            masks.len(),
+            "every OID must have one membership mask"
+        );
+
+        let mut objects_by_pack = vec![Vec::new(); pack_count];
+        for (oid_idx, (&oid, &mask)) in oids.iter().zip(masks.iter()).enumerate() {
+            assert_ne!(mask, 0, "generated OID must appear in at least one pack");
+            for (pack_idx, objects) in objects_by_pack.iter_mut().enumerate() {
+                if mask & (1u8 << pack_idx) == 0 {
+                    continue;
+                }
+
+                let offset =
+                    1_000 + pack_idx as u64 * 10_000 + oid_idx as u64 * 17 + objects.len() as u64;
+                objects.push((oid, offset));
+            }
+        }
+
+        objects_by_pack
+    }
+
+    fn build_test_packs(objects_by_pack: &[PackObjects]) -> Vec<SmallModelPack> {
+        objects_by_pack
+            .iter()
+            .enumerate()
+            .map(|(pack_idx, objects)| {
+                let mut builder = TestIdxBuilder::new();
+                for &(oid, offset) in objects {
+                    builder.add_object(oid, offset);
+                }
+                SmallModelPack {
+                    pack_name: format!("pack-{pack_idx}.pack").into_bytes(),
+                    idx_bytes: builder.build(),
+                    objects: objects.clone(),
+                }
+            })
+            .collect()
+    }
+
+    fn permutation_case_strategy() -> impl Strategy<Value = Vec<PackObjects>> {
+        (2usize..=4)
+            .prop_flat_map(|pack_count| {
+                (
+                    Just(pack_count),
+                    (pack_count..=15usize).prop_flat_map(move |unique_oid_count| {
+                        (
+                            prop::collection::vec(
+                                weighted_membership_mask_strategy(pack_count),
+                                unique_oid_count,
+                            )
+                            .prop_filter(
+                                "each pack must receive at least one object",
+                                move |masks| all_packs_present(pack_count, masks),
+                            ),
+                            prop::collection::btree_set(
+                                prop::array::uniform20(any::<u8>()),
+                                unique_oid_count,
+                            ),
+                        )
+                    }),
+                )
+            })
+            .prop_map(|(pack_count, (masks, oids))| {
+                let oids: Vec<_> = oids.into_iter().collect();
+                build_pack_objects_from_masks(pack_count, &oids, &masks)
+            })
+    }
+
+    fn dedup_idempotency_case_strategy() -> impl Strategy<Value = (usize, Vec<PackObjects>)> {
+        (2usize..=4)
+            .prop_flat_map(|pack_count| {
+                (2usize..=pack_count, pack_count..=12usize).prop_flat_map(
+                    move |(duplicate_width, unique_oid_count)| {
+                        let exact_duplicate_masks: Vec<u8> = duplicate_subsets(pack_count)
+                            .into_iter()
+                            .filter(|mask| mask.count_ones() == duplicate_width as u32)
+                            .collect();
+
+                        (
+                            Just(pack_count),
+                            Just(duplicate_width),
+                            prop::collection::vec(
+                                proptest::sample::select(exact_duplicate_masks),
+                                unique_oid_count,
+                            )
+                            .prop_filter(
+                                "each pack must participate in a duplicate set",
+                                move |masks| all_packs_present(pack_count, masks),
+                            ),
+                            prop::collection::btree_set(
+                                prop::array::uniform20(any::<u8>()),
+                                unique_oid_count,
+                            ),
+                        )
+                    },
+                )
+            })
+            .prop_map(|(pack_count, duplicate_width, masks, oids)| {
+                let oids: Vec<_> = oids.into_iter().collect();
+                (
+                    duplicate_width,
+                    build_pack_objects_from_masks(pack_count, &oids, &masks),
+                )
+            })
     }
 
     /// Constructs `pack_count` packs each containing `objects_per_pack` objects, with
@@ -1212,6 +1347,137 @@ mod tests {
             builds_tested, expected_builds,
             "iteration count mismatch — verify test coverage is not accidentally reduced"
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            proptest_cases(MIDX_PROPTEST_CASES)
+        ))]
+
+        #[test]
+        fn midx_merge_permutation_invariance(objects_by_pack in permutation_case_strategy()) {
+            let packs = build_test_packs(&objects_by_pack);
+            let idx_views: Vec<_> = packs
+                .iter()
+                .map(|pack| {
+                    IdxView::parse(&pack.idx_bytes, ObjectFormat::Sha1)
+                        .expect("generated idx bytes should parse")
+                })
+                .collect();
+            let total_objects: usize = packs.iter().map(|pack| pack.objects.len()).sum();
+
+            let canonical_order: Vec<_> = (0..packs.len()).collect();
+            let canonical_expected = expected_midx_for_order(&packs, &canonical_order);
+            let canonical_oids: Vec<_> = canonical_expected
+                .entries
+                .iter()
+                .map(|(oid, _)| *oid)
+                .collect();
+
+            let mut order = canonical_order;
+            for_each_permutation(&mut order, 0, &mut |permutation| {
+                let views: Vec<_> = permutation
+                    .iter()
+                    .enumerate()
+                    .map(|(perm_pos, &pack_idx)| {
+                        (
+                            perm_pos as u16,
+                            packs[pack_idx].pack_name.clone(),
+                            idx_views[pack_idx],
+                        )
+                    })
+                    .collect();
+                let expected = expected_midx_for_order(&packs, permutation);
+                let midx_bytes = build_midx_in_memory(&views, ObjectFormat::Sha1, total_objects)
+                    .expect("generated MIDX should build");
+                let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1)
+                    .expect("generated MIDX should parse");
+                let actual = canonicalize_midx(&midx);
+                let actual_oids: Vec<_> = actual.entries.iter().map(|(oid, _)| *oid).collect();
+
+                assert_eq!(
+                    actual, expected,
+                    "dedup winners must follow the lowest pack position for order {permutation:?}"
+                );
+                assert_eq!(
+                    actual_oids, canonical_oids,
+                    "OIDL must be invariant across pack permutations: order={permutation:?}"
+                );
+                assert_eq!(
+                    actual.fanout, canonical_expected.fanout,
+                    "fanout must stay invariant across pack permutations: order={permutation:?}"
+                );
+                assert_eq!(
+                    actual.entries.len(),
+                    canonical_expected.entries.len(),
+                    "object count must stay invariant across pack permutations: order={permutation:?}"
+                );
+            });
+        }
+
+        #[test]
+        fn midx_dedup_idempotency(
+            (duplicate_width, objects_by_pack) in dedup_idempotency_case_strategy()
+        ) {
+            let packs = build_test_packs(&objects_by_pack);
+            let idx_views: Vec<_> = packs
+                .iter()
+                .map(|pack| {
+                    IdxView::parse(&pack.idx_bytes, ObjectFormat::Sha1)
+                        .expect("generated idx bytes should parse")
+                })
+                .collect();
+            let total_objects: usize = packs.iter().map(|pack| pack.objects.len()).sum();
+            let order: Vec<_> = (0..packs.len()).collect();
+            let views: Vec<_> = order
+                .iter()
+                .enumerate()
+                .map(|(pack_id, &pack_idx)| {
+                    (
+                        pack_id as u16,
+                        packs[pack_idx].pack_name.clone(),
+                        idx_views[pack_idx],
+                    )
+                })
+                .collect();
+
+            let expected = expected_midx_for_order(&packs, &order);
+            let midx_bytes = build_midx_in_memory(&views, ObjectFormat::Sha1, total_objects)
+                .expect("generated MIDX should build");
+            let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1)
+                .expect("generated MIDX should parse");
+            let actual = canonicalize_midx(&midx);
+
+            assert_eq!(
+                actual, expected,
+                "duplicate winners must be the lowest pack position in canonical order"
+            );
+
+            let mut occurrence_counts = BTreeMap::new();
+            for pack in &packs {
+                for &(oid, _) in &pack.objects {
+                    *occurrence_counts.entry(oid).or_insert(0usize) += 1;
+                }
+            }
+
+            assert!(!occurrence_counts.is_empty(), "generated case must contain at least one OID");
+            for (&oid, &count) in &occurrence_counts {
+                assert_eq!(
+                    count, duplicate_width,
+                    "OID {oid:02x?} must appear in exactly {duplicate_width} packs"
+                );
+            }
+            assert_eq!(
+                actual.entries.len(),
+                occurrence_counts.len(),
+                "dedup must emit one entry per unique OID"
+            );
+            assert_eq!(
+                midx.object_count() as usize,
+                occurrence_counts.len(),
+                "object_count must equal the number of unique OIDs"
+            );
+        }
     }
 
     /// Offsets on both sides of the 2^31 LOFF threshold: the serialized MIDX
