@@ -801,8 +801,9 @@ mod tests {
                     continue;
                 }
 
-                // Stride 10,000 separates packs; coprime factor 17 prevents
-                // aliasing across OID indices within a pack.
+                // Stride 10,000 separates packs; factor 17 spaces OID indices
+                // far enough apart that the per-object counter (objects.len())
+                // cannot cause offset collisions within a pack.
                 let offset =
                     1_000 + pack_idx as u64 * 10_000 + oid_idx as u64 * 17 + objects.len() as u64;
                 objects.push((oid, offset));
@@ -1472,8 +1473,8 @@ mod tests {
             let unique_oid_count = occurrence_counts.len();
 
             // Under uniform duplication, the dedup invariant must hold for
-            // every pack presentation order: each winner resolves to PNAM
-            // position 0 (the lowest pack_id in that permutation).
+            // every pack presentation order: each winner resolves to the
+            // lowest pack_id among the packs that contain that OID.
             let mut order: Vec<_> = (0..packs.len()).collect();
             try_for_each_permutation(&mut order, 0, &mut |permutation| {
                 let views: Vec<_> = permutation
