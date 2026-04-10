@@ -715,8 +715,9 @@ mod tests {
 
         for index in start..indices.len() {
             indices.swap(start, index);
-            try_for_each_permutation(indices, start + 1, visit)?;
+            let result = try_for_each_permutation(indices, start + 1, visit);
             indices.swap(start, index);
+            result?;
         }
         Ok(())
     }
@@ -773,12 +774,20 @@ mod tests {
     /// Returns the set of single-pack bitmasks for `pack_count` packs
     /// (e.g. `[0b0001, 0b0010, 0b0100, 0b1000]` for 4 packs).
     fn singleton_subsets(pack_count: usize) -> Vec<u8> {
+        assert!(
+            pack_count <= 7,
+            "pack_count={pack_count} would overflow the u8 bitmask (max 7)"
+        );
         (0..pack_count).map(|pack_idx| 1u8 << pack_idx).collect()
     }
 
     /// Returns `true` when every pack index in `0..pack_count` is covered by
     /// at least one mask in `masks`.
     fn all_packs_present(pack_count: usize, masks: &[u8]) -> bool {
+        assert!(
+            pack_count <= 7,
+            "pack_count={pack_count} would overflow the u8 bitmask (max 7)"
+        );
         (0..pack_count).all(|pack_idx| masks.iter().any(|&mask| mask & (1u8 << pack_idx) != 0))
     }
 
@@ -1585,7 +1594,8 @@ mod tests {
                 3,
                 "dedup must coalesce the shared OID: order={permutation:?}"
             );
-            // LOFF chunk must be present (chunk_count == 5 means LOFF is included).
+            // MIDX header byte 6 is num_chunks: magic(4) + version(1) + hash_ver(1) + num_chunks(1).
+            // 5 chunks means LOFF is present alongside PNAM, OIDF, OIDL, OOFF.
             assert_eq!(
                 midx_bytes[6], 5,
                 "large offsets must produce a LOFF chunk: order={permutation:?}"
