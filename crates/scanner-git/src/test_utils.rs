@@ -1,6 +1,8 @@
 //! Test helpers — delegates to [`gossip_stdx::test_support`].
 
-pub use gossip_stdx::test_support::{proptest_cases, proptest_fuzz_multiplier};
+pub use gossip_stdx::test_support::{
+    for_each_permutation, proptest_cases, proptest_fuzz_multiplier, try_for_each_permutation,
+};
 
 /// Assert a `u64` perf counter in both perf-enabled and normal test builds.
 ///

@@ -591,7 +591,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::{repo::RepoKind, test_utils::proptest_cases};
+    use crate::{
+        repo::RepoKind,
+        test_utils::{for_each_permutation, proptest_cases, try_for_each_permutation},
+    };
     use proptest::prelude::*;
     use tempfile::tempdir;
 
