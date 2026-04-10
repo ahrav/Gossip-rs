@@ -5,6 +5,7 @@
 //! operation must be commutative, associative, idempotent, and monotonic,
 //! mimicking a semi-lattice to resolve out-of-order ledger updates consistently.
 
+use gossip_stdx::test_support::try_for_each_permutation;
 use proptest::{
     prelude::*,
     sample::select,
@@ -79,30 +80,12 @@ fn merge_all(
     Ok(merged)
 }
 
-fn for_each_permutation(
-    indices: &mut [usize],
-    start: usize,
-    visit: &mut impl FnMut(&[usize]) -> Result<(), TestCaseError>,
-) -> Result<(), TestCaseError> {
-    if start == indices.len() {
-        return visit(indices);
-    }
-
-    for index in start..indices.len() {
-        indices.swap(start, index);
-        for_each_permutation(indices, start + 1, visit)?;
-        indices.swap(start, index);
-    }
-
-    Ok(())
-}
-
 fn assert_permutation_convergence(records: &[DoneLedgerRecord]) -> Result<(), TestCaseError> {
     let baseline_order: Vec<_> = (0..records.len()).collect();
     let baseline = merge_all(records, &baseline_order)?;
     let mut indices = baseline_order;
 
-    for_each_permutation(&mut indices, 0, &mut |order| {
+    try_for_each_permutation(&mut indices, 0, &mut |order| {
         let merged = merge_all(records, order)?;
         prop_assert_eq!(
             &merged,

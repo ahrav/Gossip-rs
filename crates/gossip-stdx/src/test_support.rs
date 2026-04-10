@@ -83,3 +83,35 @@ pub fn miri_proptest_config(miri_cases: u32) -> proptest::test_runner::Config {
     }
     config
 }
+
+/// Enumerates all permutations of `indices[start..]`, calling `visit` for each.
+///
+/// Uses recursive swap-based generation (Heap's algorithm variant).
+/// The slice is restored to its original order after the call returns.
+pub fn try_for_each_permutation<E>(
+    indices: &mut [usize],
+    start: usize,
+    visit: &mut impl FnMut(&[usize]) -> Result<(), E>,
+) -> Result<(), E> {
+    if start == indices.len() {
+        return visit(indices);
+    }
+    for index in start..indices.len() {
+        indices.swap(start, index);
+        let result = try_for_each_permutation(indices, start + 1, visit);
+        indices.swap(start, index);
+        result?;
+    }
+    Ok(())
+}
+
+/// Infallible variant of [`try_for_each_permutation`] for deterministic tests
+/// that assert via `panic!` rather than returning `Result`.
+pub fn for_each_permutation(indices: &mut [usize], start: usize, visit: &mut impl FnMut(&[usize])) {
+    // Infallible is uninhabited — the Err branch is unreachable.
+    try_for_each_permutation(indices, start, &mut |perm| {
+        visit(perm);
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .unwrap()
+}
