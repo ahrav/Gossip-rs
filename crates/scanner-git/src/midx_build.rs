@@ -603,6 +603,7 @@ mod tests {
     /// Duplicate OIDs use second-byte values starting here (0xe0..); unique OIDs
     /// must stay below this to avoid accidental collisions.
     const DUPLICATE_BYTE_BASE: u8 = 0xe0;
+    /// Per-pack object list: each entry is an (OID, pack-file offset) pair.
     type PackObjects = Vec<([u8; 20], u64)>;
 
     /// Helper to build minimal pack index v2 bytes for MIDX merge tests.
@@ -689,40 +690,6 @@ mod tests {
     struct CanonicalMidx {
         fanout: [u32; FANOUT_ENTRIES],
         entries: Vec<([u8; 20], (u16, u64))>,
-    }
-
-    fn for_each_permutation(indices: &mut [usize], start: usize, visit: &mut impl FnMut(&[usize])) {
-        if start == indices.len() {
-            visit(indices);
-            return;
-        }
-
-        for index in start..indices.len() {
-            indices.swap(start, index);
-            for_each_permutation(indices, start + 1, visit);
-            indices.swap(start, index);
-        }
-    }
-
-    /// Fallible variant of [`for_each_permutation`] — short-circuits on the
-    /// first `Err` returned by `visit`. Used inside `proptest!` blocks so that
-    /// `prop_assert_eq!` failures propagate cleanly instead of panicking.
-    fn try_for_each_permutation<E>(
-        indices: &mut [usize],
-        start: usize,
-        visit: &mut impl FnMut(&[usize]) -> Result<(), E>,
-    ) -> Result<(), E> {
-        if start == indices.len() {
-            return visit(indices);
-        }
-
-        for index in start..indices.len() {
-            indices.swap(start, index);
-            let result = try_for_each_permutation(indices, start + 1, visit);
-            indices.swap(start, index);
-            result?;
-        }
-        Ok(())
     }
 
     /// Enumerates all bitmasks of `pack_count` bits that have at least 2 bits set,

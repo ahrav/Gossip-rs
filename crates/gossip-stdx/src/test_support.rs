@@ -98,19 +98,16 @@ pub fn try_for_each_permutation<E>(
     }
     for index in start..indices.len() {
         indices.swap(start, index);
-        try_for_each_permutation(indices, start + 1, visit)?;
+        let result = try_for_each_permutation(indices, start + 1, visit);
         indices.swap(start, index);
+        result?;
     }
     Ok(())
 }
 
 /// Infallible variant of [`try_for_each_permutation`] for deterministic tests
 /// that assert via `panic!` rather than returning `Result`.
-pub fn for_each_permutation(
-    indices: &mut [usize],
-    start: usize,
-    visit: &mut impl FnMut(&[usize]),
-) {
+pub fn for_each_permutation(indices: &mut [usize], start: usize, visit: &mut impl FnMut(&[usize])) {
     // Infallible is uninhabited — the Err branch is unreachable.
     try_for_each_permutation(indices, start, &mut |perm| {
         visit(perm);
