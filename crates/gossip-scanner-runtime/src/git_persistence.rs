@@ -4254,7 +4254,7 @@ mod tests {
                 .configure_midx_snapshot(
                     midx_bytes.clone(),
                     scanner_git::ObjectFormat::Sha1,
-                    fingerprint,
+                    fingerprint.clone(),
                 )
                 .expect("configure midx snapshot (session 1)");
             let oid_a = OidBytes::sha1(oid_a_raw);
@@ -4284,7 +4284,11 @@ mod tests {
         // because the fingerprint matches.
         let adapter2 = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
         adapter2
-            .configure_midx_snapshot(midx_bytes, scanner_git::ObjectFormat::Sha1, fingerprint)
+            .configure_midx_snapshot(
+                midx_bytes,
+                scanner_git::ObjectFormat::Sha1,
+                fingerprint.clone(),
+            )
             .expect("configure midx snapshot (session 2)");
 
         let oid_a = OidBytes::sha1(oid_a_raw);
