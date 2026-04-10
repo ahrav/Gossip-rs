@@ -2121,9 +2121,12 @@ mod tests {
                                 }
                             }
                             Ok(_) if !is_sorted => {
-                                // Unsorted but no ordinal cache active — the sorted
-                                // check only fires when the ordinal cache is populated.
-                                // This is acceptable.
+                                // The MIDX snapshot is always configured in
+                                // this harness, so the ordinal cache is always
+                                // active and unsorted input must be rejected.
+                                return Err(proptest::test_runner::TestCaseError::fail(
+                                    "unsorted input should be rejected when ordinal cache is active",
+                                ));
                             }
                             Err(_) if !is_sorted => {
                                 // Expected: unsorted input rejected.
