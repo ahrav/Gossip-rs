@@ -123,6 +123,8 @@ pub mod json_write;
 pub mod limits;
 /// Maps unique blobs to pack/loose candidates via MIDX lookup.
 pub mod mapping_bridge;
+#[cfg(test)]
+mod metamorphic_tests;
 /// Implements a zero-copy multi-pack index (MIDX) parser.
 pub mod midx;
 /// Builds MIDX byte buffers in-memory using k-way merge of pack indexes.
