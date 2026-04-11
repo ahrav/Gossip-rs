@@ -319,3 +319,83 @@ fn subset_consistency() {
     assert_eq!(full_resolved, subset_resolved);
     assert_eq!(full_resolved.1, b"subset-leaf");
 }
+
+/// Verifies that OFS_DELTA and REF_DELTA produce identical resolved bytes
+/// for the same logical delta operation.
+///
+/// OFS_DELTA uses an intra-pack backward offset to locate the base.
+/// REF_DELTA uses an OID that the executor resolves through the MIDX and
+/// an external base provider. Despite these distinct code paths, the
+/// resolved content must be byte-identical.
+#[test]
+fn ref_delta_ofs_delta_equivalence() {
+    // OFS path: base and delta in the same pack.
+    let mut ofs_builder = MultiPackFixture::builder();
+    let ofs_pack = ofs_builder.add_pack(b"pack-ofs");
+    let ofs_base = ofs_builder.add_blob(ofs_pack, b"delta-encoding-base");
+    let ofs_target = ofs_builder.add_ofs_delta_mixed(ofs_pack, ofs_base, 14, b"-ofs");
+    let ofs_fixture = ofs_builder.build().expect("OFS fixture");
+
+    // REF path: base in pack-b, delta in pack-a (cross-pack REF_DELTA).
+    let mut ref_builder = MultiPackFixture::builder();
+    let ref_pack_a = ref_builder.add_pack(b"pack-ref-a");
+    let ref_pack_b = ref_builder.add_pack(b"pack-ref-b");
+    let ref_base = ref_builder.add_blob(ref_pack_b, b"delta-encoding-base");
+    let ref_target = ref_builder.add_ref_delta_mixed(ref_pack_a, ref_base, 14, b"-ofs");
+    let ref_fixture = ref_builder.build().expect("REF fixture");
+
+    let ofs_oid = ofs_fixture.oid(ofs_target);
+    let ref_oid = ref_fixture.oid(ref_target);
+    assert_eq!(ofs_oid, ref_oid, "same content must produce same OID");
+
+    let ofs_resolved = resolve_via_pack_io(&ofs_fixture, &ofs_oid);
+    let ref_resolved = resolve_via_pack_io(&ref_fixture, &ref_oid);
+
+    assert_eq!(ofs_resolved.0, ObjectKind::Blob);
+    assert_eq!(ref_resolved.0, ObjectKind::Blob);
+    assert_eq!(
+        ofs_resolved.1, ref_resolved.1,
+        "OFS and REF delta must resolve to identical bytes"
+    );
+    assert_eq!(ofs_resolved.1, b"delta-encoding-ofs");
+}
+
+/// Verifies that delta resolution produces identical bytes regardless of
+/// the base object's kind.
+///
+/// The pack delta format is kind-agnostic: the base kind propagates to the
+/// result, but the delta application engine processes copy/add instructions
+/// identically for blobs, commits, trees, and tags. This test stores the
+/// same byte content as both a blob and a commit, applies the same delta
+/// to each, and asserts the resolved bytes match while the returned kinds
+/// differ.
+#[test]
+fn object_kind_equivalence() {
+    let content = b"kind-invariant-base-data";
+
+    let mut builder = MultiPackFixture::builder();
+    let pack = builder.add_pack(b"pack-kind");
+    let blob_base = builder.add_object(pack, ObjectKind::Blob, content);
+    let commit_base = builder.add_object(pack, ObjectKind::Commit, content);
+    let blob_delta = builder.add_ofs_delta_mixed(pack, blob_base, 14, b"-resolved");
+    let commit_delta = builder.add_ofs_delta_mixed(pack, commit_base, 14, b"-resolved");
+    let fixture = builder.build().expect("kind fixture");
+
+    let blob_oid = fixture.oid(blob_delta);
+    let commit_oid = fixture.oid(commit_delta);
+    assert_ne!(
+        blob_oid, commit_oid,
+        "different kinds produce different OIDs for the same content"
+    );
+
+    let blob_resolved = resolve_via_pack_io(&fixture, &blob_oid);
+    let commit_resolved = resolve_via_pack_io(&fixture, &commit_oid);
+
+    assert_eq!(blob_resolved.0, ObjectKind::Blob);
+    assert_eq!(commit_resolved.0, ObjectKind::Commit);
+    assert_eq!(
+        blob_resolved.1, commit_resolved.1,
+        "delta resolution must be kind-agnostic: same bytes regardless of base kind"
+    );
+    assert_eq!(blob_resolved.1, b"kind-invariant-resolved");
+}
