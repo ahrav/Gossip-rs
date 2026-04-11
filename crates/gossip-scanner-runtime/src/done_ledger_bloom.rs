@@ -24,7 +24,7 @@ use fastbloom::BloomFilter;
 use gossip_contracts::persistence::OvidHash;
 
 type RawU64BuildHasher = BuildHasherDefault<RawU64Hasher>;
-type InnerBloomFilter = BloomFilter<512, RawU64BuildHasher>;
+type InnerBloomFilter = BloomFilter<RawU64BuildHasher>;
 
 /// In-memory Bloom filter keyed by [`OvidHash`].
 ///
