@@ -579,14 +579,8 @@ mod tests {
         let fixture = builder.build().unwrap();
         let mut io = fixture.pack_io(test_limits()).unwrap();
 
-        let base_loaded = io.load_object(&fixture.oid(base)).unwrap().unwrap();
-        let delta_loaded = io.load_object(&fixture.oid(delta)).unwrap().unwrap();
-
-        assert_eq!(base_loaded.0, ObjectKind::Blob);
-        assert_eq!(base_loaded.1, fixture.expected(base).unwrap().1);
-        assert_eq!(delta_loaded.0, ObjectKind::Blob);
-        assert_eq!(delta_loaded.1, b"base!");
-        assert_eq!(delta_loaded.1, fixture.expected(delta).unwrap().1);
+        assert_object_matches(&mut io, &fixture, base, ObjectKind::Blob, b"base");
+        assert_object_matches(&mut io, &fixture, delta, ObjectKind::Blob, b"base!");
     }
 
     #[test]
@@ -607,19 +601,16 @@ mod tests {
         let fixture = builder.build().unwrap();
         let mut io = fixture.pack_io(test_limits()).unwrap();
 
-        let top_loaded = io.load_object(&fixture.oid(top)).unwrap().unwrap();
-        assert_eq!(top_loaded.0, ObjectKind::Blob);
-        assert_eq!(top_loaded.1, b"root-mid-leaf");
-        assert_eq!(top_loaded.1, fixture.expected(top).unwrap().1);
-
-        let mid_loaded = io.load_object(&fixture.oid(mid)).unwrap().unwrap();
-        assert_eq!(mid_loaded.0, ObjectKind::Blob);
-        assert_eq!(mid_loaded.1, b"root-mid");
-        assert_eq!(mid_loaded.1, fixture.expected(mid).unwrap().1);
+        assert_object_matches(&mut io, &fixture, top, ObjectKind::Blob, b"root-mid-leaf");
+        assert_object_matches(&mut io, &fixture, mid, ObjectKind::Blob, b"root-mid");
     }
 
     /// Asserts that `load_object` for `handle` returns the expected kind, literal
     /// bytes, and matches the fixture's golden value.
+    ///
+    /// Validates the test's literal expectation against the fixture's computed golden
+    /// value first, so a mismatch is reported as a test-authoring error rather than
+    /// appearing to be an implementation failure.
     #[track_caller]
     fn assert_object_matches(
         io: &mut PackIo<'_>,
@@ -628,13 +619,19 @@ mod tests {
         expected_kind: ObjectKind,
         expected_bytes: &[u8],
     ) {
+        let golden = fixture
+            .expected(handle)
+            .expect("assert_object_matches requires a handle with a golden value");
+        assert_eq!(
+            expected_bytes, golden.1,
+            "literal expectation does not match fixture golden value"
+        );
         let loaded = io
             .load_object(&fixture.oid(handle))
             .unwrap()
             .expect("object should be resolvable");
         assert_eq!(loaded.0, expected_kind);
         assert_eq!(loaded.1, expected_bytes);
-        assert_eq!(loaded.1, fixture.expected(handle).unwrap().1);
     }
 
     #[test]
@@ -803,6 +800,8 @@ mod tests {
             PackIoError::DeltaDepthExceeded { max_depth: 2 }
         ));
 
+        // Intentionally reuse fail_io after the error: verifies the instance remains
+        // usable for shorter chains that fit within the same depth limit.
         // hop_b is a 2-hop chain (hop_b -> hop_c -> base) and fits within depth=2.
         assert_object_matches(&mut fail_io, &fixture, hop_b, ObjectKind::Blob, b"root-c-b");
 
@@ -815,6 +814,55 @@ mod tests {
             ObjectKind::Blob,
             b"root-c-b-a",
         );
+    }
+
+    #[test]
+    fn cross_pack_ref_delta_depth_zero_rejects() {
+        let mut builder = MultiPackFixture::builder();
+        let pack_base = builder.add_pack(b"pack-base");
+        let pack_delta = builder.add_pack(b"pack-delta");
+
+        let base = builder.add_blob(pack_base, b"base");
+        let delta = builder.add_ref_delta_mixed(pack_delta, base, 4, b"!");
+
+        let fixture = builder.build().unwrap();
+        let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 0);
+        let mut io = fixture.pack_io(limits).unwrap();
+
+        let err = io.load_object(&fixture.oid(delta)).unwrap_err();
+        assert!(matches!(
+            err,
+            PackIoError::DeltaDepthExceeded { max_depth: 0 }
+        ));
+
+        // Non-delta base is still loadable at depth=0.
+        assert_object_matches(&mut io, &fixture, base, ObjectKind::Blob, b"base");
+    }
+
+    #[test]
+    fn cross_pack_ref_delta_depth_one_boundary() {
+        let mut builder = MultiPackFixture::builder();
+        let pack_c = builder.add_pack(b"pack-c");
+        let pack_b = builder.add_pack(b"pack-b");
+        let pack_a = builder.add_pack(b"pack-a");
+
+        let base = builder.add_blob(pack_c, b"root");
+        let mid = builder.add_ref_delta_mixed(pack_b, base, 4, b"-mid");
+        let top = builder.add_ref_delta_mixed(pack_a, mid, 8, b"-top");
+
+        let fixture = builder.build().unwrap();
+        let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 1);
+        let mut io = fixture.pack_io(limits).unwrap();
+
+        // 1-hop chain fits within depth=1.
+        assert_object_matches(&mut io, &fixture, mid, ObjectKind::Blob, b"root-mid");
+
+        // 2-hop chain exceeds depth=1.
+        let err = io.load_object(&fixture.oid(top)).unwrap_err();
+        assert!(matches!(
+            err,
+            PackIoError::DeltaDepthExceeded { max_depth: 1 }
+        ));
     }
 
     #[test]
