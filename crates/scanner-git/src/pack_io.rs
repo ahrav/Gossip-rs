@@ -609,9 +609,8 @@ mod tests {
     /// Asserts that `load_object` for `handle` returns the expected literal
     /// bytes and matches the fixture's golden kind and value.
     ///
-    /// Validates the test's literal expectation against the fixture's computed golden
-    /// value first, so a mismatch is reported as a test-authoring error rather than
-    /// appearing to be an implementation failure.
+    /// Validates the caller-provided literal against the fixture's golden value
+    /// before loading, then asserts the loaded object kind and bytes.
     #[track_caller]
     fn assert_object_matches(
         io: &mut PackIo<'_>,
