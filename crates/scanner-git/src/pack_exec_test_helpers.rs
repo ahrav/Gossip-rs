@@ -15,8 +15,8 @@ use crate::tree_candidate::{CandidateContext, ChangeKind};
 /// Default decode limits for pack execution tests.
 ///
 /// `max_header_bytes = 64`, `max_object_bytes = 1024`,
-/// `max_delta_bytes = 1024`. Matches the inner limits of
-/// [`multi_pack_test_helpers::test_limits`](super::multi_pack_test_helpers::test_limits).
+/// `max_delta_bytes = 1024`. [`multi_pack_test_helpers::test_limits`]
+/// wraps this constant with an additional `max_delta_depth` bound.
 pub(crate) const TEST_DECODE_LIMITS: PackDecodeLimits = PackDecodeLimits::new(64, 1024, 1024);
 
 /// Collects resolved blob bytes keyed by OID.
@@ -53,8 +53,8 @@ impl PackObjectSink for CollectingSink {
 pub(crate) struct NoExternal;
 
 impl ExternalBaseProvider for NoExternal {
-    fn load_base(&mut self, _oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError> {
-        panic!("unexpected external base lookup in test");
+    fn load_base(&mut self, oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError> {
+        panic!("unexpected external base lookup in test: OID {oid:?}");
     }
 }
 

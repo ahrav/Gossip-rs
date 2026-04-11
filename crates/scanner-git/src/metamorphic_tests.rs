@@ -22,7 +22,6 @@ use crate::pack_inflate::ObjectKind;
 use crate::pack_plan::{build_pack_plans, PackPlanConfig, PackPlanError, PackView};
 use crate::pack_plan_model::PackPlan;
 use crate::test_utils::{for_each_permutation, proptest_cases};
-use crate::tree_candidate::ChangeKind;
 
 /// Proptest iteration count — low because each case builds full pack plans.
 const PROPTEST_CASES: u32 = 8;
@@ -45,6 +44,7 @@ impl crate::pack_plan::OidResolver for NullResolver {
     }
 }
 
+/// Builds a [`PackCandidate`] for single-pack tests using [`PACK_ID`].
 fn candidate(path_ref: ByteRef, oid: OidBytes, offset: u64) -> PackCandidate {
     PackCandidate {
         oid,
@@ -72,9 +72,19 @@ fn single_pack_plan(pack_bytes: &[u8], candidates: Vec<PackCandidate>) -> PackPl
         1,
         "single-pack tests should produce exactly one plan"
     );
-    plans.pop().expect("single-pack test plan")
+    let plan = plans.pop().expect("single-pack test plan");
+    assert_eq!(
+        plan.stats().external_bases(),
+        0,
+        "single_pack_plan uses NullResolver so the plan must not have external bases; \
+         use MultiPackFixture for packs containing REF_DELTA entries"
+    );
+    plan
 }
 
+/// Executes a pack plan into a [`CollectingSink`], returning resolved blobs
+/// keyed by OID and the execution report. Uses [`NoExternal`], so REF_DELTA
+/// external lookups will panic.
 fn execute_collect(
     plan: &PackPlan,
     pack_bytes: &[u8],
@@ -98,6 +108,8 @@ fn execute_collect(
     (sink.blobs, report)
 }
 
+/// Resolves a single OID through a [`MultiPackFixture`]'s file-backed
+/// [`PackIo`].
 fn resolve_via_pack_io(fixture: &MultiPackFixture, oid: &OidBytes) -> (ObjectKind, Vec<u8>) {
     let mut pack_io = fixture.pack_io(test_limits()).expect("fixture pack_io");
     pack_io
@@ -106,6 +118,9 @@ fn resolve_via_pack_io(fixture: &MultiPackFixture, oid: &OidBytes) -> (ObjectKin
         .unwrap_or_else(|| panic!("fixture object {oid:?} should resolve"))
 }
 
+/// Builds a 3-pack fixture with a cross-pack REF_DELTA chain in the given
+/// pack registration order. Returns the fixture, target OID, and expected
+/// resolved bytes.
 fn build_permuted_fixture(order: &[usize]) -> (MultiPackFixture, OidBytes, Vec<u8>) {
     let mut builder = MultiPackFixture::builder();
     let mut packs = [None; 3];
@@ -137,14 +152,18 @@ fn build_permuted_fixture(order: &[usize]) -> (MultiPackFixture, OidBytes, Vec<u
     (fixture, oid, expected)
 }
 
-fn delta_equivalence_case() -> impl Strategy<Value = (Vec<u8>, usize, Vec<u8>)> {
+fn delta_equivalence_case() -> impl Strategy<Value = (Vec<u8>, usize, usize, Vec<u8>)> {
     prop::collection::vec(any::<u8>(), 1..=64usize).prop_flat_map(|base| {
         let base_len = base.len();
-        (
-            Just(base),
-            1..=base_len,
-            prop::collection::vec(any::<u8>(), 1..=32usize),
-        )
+        (Just(base), 0..base_len).prop_flat_map(move |(base, copy_off)| {
+            let max_copy = base_len - copy_off;
+            (
+                Just(base),
+                Just(copy_off),
+                1..=max_copy,
+                prop::collection::vec(any::<u8>(), 1..=32usize),
+            )
+        })
     })
 }
 
@@ -170,13 +189,23 @@ proptest! {
         let mut expected_mid = base_bytes[..mid_copy_len].to_vec();
         expected_mid.extend_from_slice(&mid_bytes);
 
+        // leaf copies the first half of mid then appends leaf_bytes, so
+        // resolved content depends on mid's actual bytes — a wrong base
+        // for the leaf would produce a content mismatch.
+        let leaf_copy_len = expected_mid.len().div_ceil(2);
+        let mut expected_leaf = expected_mid[..leaf_copy_len].to_vec();
+        expected_leaf.extend_from_slice(&leaf_bytes);
+
         let mut builder = SyntheticPackBuilder::new();
         let base_idx = builder.add_non_delta(3, &base_bytes);
         let mid_idx = builder.add_ofs_delta(
             base_idx,
             &make_mixed_delta(base_bytes.len(), 0, mid_copy_len, &mid_bytes),
         );
-        let leaf_idx = builder.add_ofs_delta(mid_idx, &make_add_delta(expected_mid.len(), &leaf_bytes));
+        let leaf_idx = builder.add_ofs_delta(
+            mid_idx,
+            &make_mixed_delta(expected_mid.len(), 0, leaf_copy_len, &leaf_bytes),
+        );
         let sibling_idx = builder.add_ofs_delta(base_idx, &make_add_delta(base_bytes.len(), &sibling_bytes));
         let (pack_bytes, offsets) = builder.build();
 
@@ -226,15 +255,17 @@ proptest! {
         prop_assert_eq!(&cache_off, &cache_on_warm2);
 
         // Ground-truth: resolved content matches expected values.
-        prop_assert_eq!(cache_on_warm.get(&base_oid), Some(&base_bytes));
-        prop_assert_eq!(cache_on_warm.get(&mid_oid), Some(&expected_mid));
-        prop_assert_eq!(cache_on_warm.get(&leaf_oid), Some(&leaf_bytes));
-        prop_assert_eq!(cache_on_warm.get(&sibling_oid), Some(&sibling_bytes));
+        // Uses the final idempotence pass (run 4) — equivalence with earlier
+        // runs was already proven above.
+        prop_assert_eq!(cache_on_warm2.get(&base_oid), Some(&base_bytes));
+        prop_assert_eq!(cache_on_warm2.get(&mid_oid), Some(&expected_mid));
+        prop_assert_eq!(cache_on_warm2.get(&leaf_oid), Some(&expected_leaf));
+        prop_assert_eq!(cache_on_warm2.get(&sibling_oid), Some(&sibling_bytes));
     }
 
     #[test]
-    fn delta_chain_equivalence((base_bytes, copy_len, suffix) in delta_equivalence_case()) {
-        let mut result_bytes = base_bytes[..copy_len].to_vec();
+    fn delta_chain_equivalence((base_bytes, copy_off, copy_len, suffix) in delta_equivalence_case()) {
+        let mut result_bytes = base_bytes[copy_off..copy_off + copy_len].to_vec();
         result_bytes.extend_from_slice(&suffix);
 
         let mut builder = SyntheticPackBuilder::new();
@@ -242,7 +273,7 @@ proptest! {
         let non_delta_idx = builder.add_non_delta(3, &result_bytes);
         let delta_idx = builder.add_ofs_delta(
             base_idx,
-            &make_mixed_delta(base_bytes.len(), 0, copy_len, &suffix),
+            &make_mixed_delta(base_bytes.len(), copy_off, copy_len, &suffix),
         );
         let (pack_bytes, offsets) = builder.build();
 
@@ -263,6 +294,117 @@ proptest! {
         prop_assert!(report.skips.is_empty());
         prop_assert_eq!(resolved.get(&non_delta_oid), Some(&result_bytes));
         prop_assert_eq!(resolved.get(&delta_oid), Some(&result_bytes));
+    }
+
+    /// Verifies that a depth-3 delta chain resolves identically under varying
+    /// cache pressure.
+    ///
+    /// Builds base → d1 → d2 → d3 (depth 3) plus a sibling off base
+    /// (5 entries total). d2 uses a non-zero copy offset to exercise
+    /// mid-stream copy encoding. A 4 KiB cache (4 slots) forces at least
+    /// one eviction across the 5 entries, testing the fallback re-decode
+    /// path when a mid-chain base is not in cache.
+    #[test]
+    fn deep_chain_cache_pressure(
+        base_bytes in prop::collection::vec(any::<u8>(), 8..=64usize),
+        d1_suffix in prop::collection::vec(any::<u8>(), 1..=16usize),
+        d2_suffix in prop::collection::vec(any::<u8>(), 1..=16usize),
+        d3_suffix in prop::collection::vec(any::<u8>(), 1..=16usize),
+        sibling_suffix in prop::collection::vec(any::<u8>(), 1..=16usize),
+    ) {
+        // d1: copy first half of base, append d1_suffix.
+        let d1_copy_len = base_bytes.len() / 2;
+        let mut expected_d1 = base_bytes[..d1_copy_len].to_vec();
+        expected_d1.extend_from_slice(&d1_suffix);
+
+        // d2: copy from non-zero offset in d1, append d2_suffix.
+        // copy_off = 1, copy_len = min(4, d1.len() - 1).
+        let d2_copy_off = 1usize;
+        let d2_copy_len = 4.min(expected_d1.len() - d2_copy_off);
+        let mut expected_d2 = expected_d1[d2_copy_off..d2_copy_off + d2_copy_len].to_vec();
+        expected_d2.extend_from_slice(&d2_suffix);
+
+        // d3: copy first min(3, d2.len()) bytes of d2, append d3_suffix.
+        let d3_copy_len = 3.min(expected_d2.len());
+        let mut expected_d3 = expected_d2[..d3_copy_len].to_vec();
+        expected_d3.extend_from_slice(&d3_suffix);
+
+        let mut builder = SyntheticPackBuilder::new();
+        let base_idx = builder.add_non_delta(3, &base_bytes);
+        let d1_idx = builder.add_ofs_delta(
+            base_idx,
+            &make_mixed_delta(base_bytes.len(), 0, d1_copy_len, &d1_suffix),
+        );
+        let d2_idx = builder.add_ofs_delta(
+            d1_idx,
+            &make_mixed_delta(expected_d1.len(), d2_copy_off, d2_copy_len, &d2_suffix),
+        );
+        let d3_idx = builder.add_ofs_delta(
+            d2_idx,
+            &make_mixed_delta(expected_d2.len(), 0, d3_copy_len, &d3_suffix),
+        );
+        let sibling_idx = builder.add_ofs_delta(
+            base_idx,
+            &make_add_delta(base_bytes.len(), &sibling_suffix),
+        );
+        let (pack_bytes, offsets) = builder.build();
+
+        let mut arena = ByteArena::with_capacity(PATH_ARENA_BYTES);
+        let path_ref = arena.intern(b"metamorphic/deep.bin").expect("path");
+        let base_oid = stable_oid(b"deep-base");
+        let d1_oid = stable_oid(b"deep-d1");
+        let d2_oid = stable_oid(b"deep-d2");
+        let d3_oid = stable_oid(b"deep-d3");
+        let sibling_oid = stable_oid(b"deep-sibling");
+        let plan = single_pack_plan(
+            &pack_bytes,
+            vec![
+                candidate(path_ref, base_oid, offsets[base_idx]),
+                candidate(path_ref, d1_oid, offsets[d1_idx]),
+                candidate(path_ref, d2_oid, offsets[d2_idx]),
+                candidate(path_ref, d3_oid, offsets[d3_idx]),
+                candidate(path_ref, sibling_oid, offsets[sibling_idx]),
+            ],
+        );
+
+        // 4 KiB cache = 4 slots of 1024 bytes (MIN_SLOT_SIZE * WAYS).
+        // 5 entries in 4 slots forces at least one CLOCK eviction.
+        const SMALL_CACHE: u32 = 4096;
+
+        // Run 1: no cache.
+        let mut no_cache = PackCache::new(0);
+        let (r_none, rpt_none) = execute_collect(&plan, &pack_bytes, &arena, &mut no_cache);
+        prop_assert!(rpt_none.skips.is_empty());
+        prop_assert_eq!(r_none.len(), 5);
+
+        // Run 2: small cache, cold.
+        let mut small_cache = PackCache::new(SMALL_CACHE);
+        let (r_small_cold, rpt_sc) = execute_collect(&plan, &pack_bytes, &arena, &mut small_cache);
+        prop_assert!(rpt_sc.skips.is_empty());
+        prop_assert_eq!(r_small_cold.len(), 5);
+
+        // Run 3: small cache, warm (some entries evicted and re-decoded).
+        let (r_small_warm, rpt_sw) = execute_collect(&plan, &pack_bytes, &arena, &mut small_cache);
+        prop_assert!(rpt_sw.skips.is_empty());
+        prop_assert_eq!(r_small_warm.len(), 5);
+
+        // Run 4: large cache (everything fits).
+        let mut large_cache = PackCache::new(CACHE_BYTES);
+        let (r_large, rpt_lg) = execute_collect(&plan, &pack_bytes, &arena, &mut large_cache);
+        prop_assert!(rpt_lg.skips.is_empty());
+        prop_assert_eq!(r_large.len(), 5);
+
+        // Metamorphic equivalence: all four runs produce identical blobs.
+        prop_assert_eq!(&r_none, &r_small_cold);
+        prop_assert_eq!(&r_none, &r_small_warm);
+        prop_assert_eq!(&r_none, &r_large);
+
+        // Ground-truth: resolved content matches expected values.
+        prop_assert_eq!(r_none.get(&base_oid), Some(&base_bytes));
+        prop_assert_eq!(r_none.get(&d1_oid), Some(&expected_d1));
+        prop_assert_eq!(r_none.get(&d2_oid), Some(&expected_d2));
+        prop_assert_eq!(r_none.get(&d3_oid), Some(&expected_d3));
+        prop_assert_eq!(r_none.get(&sibling_oid), Some(&sibling_suffix));
     }
 }
 
