@@ -121,6 +121,16 @@ impl scanner_git::SeenBlobStore for CountingPersistStore {
     fn batch_check_seen(&self, oids: &[OidBytes]) -> Result<Vec<bool>, SpillError> {
         self.inner.batch_check_seen(oids)
     }
+
+    fn configure_midx_snapshot(
+        &self,
+        midx_bytes: scanner_git::BytesView,
+        object_format: scanner_git::ObjectFormat,
+        artifact_fingerprint: scanner_git::RepoArtifactFingerprint,
+    ) -> Result<(), SpillError> {
+        self.inner
+            .configure_midx_snapshot(midx_bytes, object_format, artifact_fingerprint)
+    }
 }
 
 #[cfg(feature = "rocksdb")]

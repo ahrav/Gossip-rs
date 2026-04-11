@@ -16,17 +16,24 @@ use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::Path;
 
+use tracing::debug;
+
 use super::errors::{PersistError, RepoOpenError, SpillError};
 #[cfg(feature = "rocksdb")]
 use super::finalize::FinalizeOutcome;
 use super::finalize::FinalizeOutput;
 #[cfg(feature = "rocksdb")]
-use super::finalize::NS_SEEN_BLOB;
+use super::finalize::{
+    build_ref_wm_key, build_seen_ordinal_key, build_seen_scope_key, build_seen_staging_key,
+};
 #[cfg(feature = "rocksdb")]
-use super::finalize::{build_ref_wm_key, build_seen_scope_key, build_seen_staging_key};
-use super::object_id::OidBytes;
+use super::finalize::{NS_SEEN_BLOB, NS_SEEN_ORDINAL};
+use super::object_id::{ObjectFormat, OidBytes};
+#[cfg(feature = "rocksdb")]
+use super::ordinal_seen::HybridSeenStore;
 use super::persist::PersistenceStore;
 use super::repo_open::RefWatermarkStore;
+use super::repo_open::RepoArtifactFingerprint;
 #[cfg(feature = "rocksdb")]
 use super::roaring_seen::{RoaringSeenBitmap, RoaringSeenStore, SeenBitmapDelta};
 use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
@@ -59,7 +66,7 @@ pub struct RocksDbStore {
     #[cfg(feature = "rocksdb")]
     policy_hash: [u8; 32],
     #[cfg(feature = "rocksdb")]
-    seen_store: RefCell<Option<RoaringSeenStore>>,
+    seen_store: RefCell<Option<HybridSeenStore>>,
     /// Set during `commit_finalize` to detect re-entrant calls in debug builds.
     /// The single-writer invariant (one lease owner per scope) guarantees this
     /// never trips in production; if it does, the caller has a lease bug.
@@ -111,7 +118,7 @@ impl RocksDbStore {
             .seen_store
             .borrow()
             .as_ref()
-            .is_none_or(|s| s.bitmap().oid_len() != oid_len);
+            .is_none_or(|s| s.fallback().bitmap().oid_len() != oid_len);
         if needs_load {
             let loaded = self.load_seen_store_from_db(oid_len)?;
             *self.seen_store.borrow_mut() = Some(loaded);
@@ -120,11 +127,13 @@ impl RocksDbStore {
     }
 
     #[cfg(feature = "rocksdb")]
-    fn load_seen_store_from_db(&self, oid_len: u8) -> Result<RoaringSeenStore, String> {
+    fn load_seen_store_from_db(&self, oid_len: u8) -> Result<HybridSeenStore, String> {
         let scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
         match self.db.get(&scope_key) {
             Ok(Some(bytes)) => match RoaringSeenBitmap::deserialize(bytes.as_ref()) {
-                Ok(bitmap) if bitmap.oid_len() == oid_len => Ok(RoaringSeenStore::new(bitmap)),
+                Ok(bitmap) if bitmap.oid_len() == oid_len => {
+                    Ok(HybridSeenStore::new(RoaringSeenStore::new(bitmap)))
+                }
                 Ok(bitmap) => Err(format!(
                     "seen-bitmap OID length mismatch: stored={}, requested={}",
                     bitmap.oid_len(),
@@ -132,20 +141,22 @@ impl RocksDbStore {
                 )),
                 Err(err) => Err(format!("corrupt seen-bitmap: {err}")),
             },
-            Ok(None) => Ok(RoaringSeenStore::new(RoaringSeenBitmap::new(oid_len))),
+            Ok(None) => Ok(HybridSeenStore::new(RoaringSeenStore::new(
+                RoaringSeenBitmap::new(oid_len),
+            ))),
             Err(err) => Err(err.to_string()),
         }
     }
 
     /// Writes a seen-bitmap delta to the staging key (`ss\0`).
     ///
-    /// Staging writes are invisible to `batch_check_seen` — only
-    /// `commit_finalize` folds them into the live `sb\0` key. If the
-    /// process crashes before finalize, the staging key is orphaned
-    /// and cleaned up on the next `RocksDbStore::open`.
-    ///
-    /// The in-memory bitmap cache is NOT mutated here. This ensures
-    /// crash safety: a restart loads only committed state.
+    /// Staging OIDs remain absent from the authoritative roaring scope until
+    /// `commit_finalize` folds them into the live `sb\0` key.
+    /// When the store has been configured with the current MIDX snapshot,
+    /// `persist_seen_delta` also updates the in-memory ordinal cache after the
+    /// staging write succeeds so the current process can dedupe repeated
+    /// MIDX-resident OIDs within the same scan. On restart, only committed
+    /// state is reloaded.
     #[cfg(feature = "rocksdb")]
     fn persist_seen_delta_inner(&self, delta: &SeenBitmapDelta) -> Result<(), SpillError> {
         let staging_key = build_seen_staging_key(self.repo_id, &self.policy_hash);
@@ -202,7 +213,21 @@ impl SeenBitmapPersister for RocksDbStore {
             }
 
             let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())?;
-            self.persist_seen_delta_inner(&delta)
+            self.persist_seen_delta_inner(&delta)?;
+            // The ordinal cache is a derived optimization; its update failure
+            // must not abort the pipeline after a successful durable write.
+            #[allow(clippy::collapsible_if)]
+            if let Some(store) = self.seen_store.borrow_mut().as_mut() {
+                if let Err(err) = store.mark_seen_batch(oids) {
+                    tracing::warn!(
+                        error = %err,
+                        "ordinal cache update failed after staging write; \
+                         falling back to roaring-only dedup"
+                    );
+                    store.clear_ordinal_cache();
+                }
+            }
+            Ok(())
         }
 
         #[cfg(not(feature = "rocksdb"))]
@@ -274,10 +299,10 @@ impl PersistenceStore for RocksDbStore {
                 }
             }
 
-            // Staged bitmap built from a clone of the cache. Applied to the
-            // in-memory cache only after db.write succeeds, so a write failure
-            // leaves the cache consistent with what is persisted.
-            let mut staged_bitmap: Option<RoaringSeenBitmap> = None;
+            // The seen-store cache is moved out, updated, and restored only
+            // after db.write succeeds. A failed write leaves the cache empty so
+            // the next access reloads authoritative state from RocksDB.
+            let mut staged_seen_store: Option<HybridSeenStore> = None;
 
             // Fold spill-stage staging bitmap into seen_oids only for
             // complete runs. On partial finalize, staging may contain OIDs
@@ -317,45 +342,75 @@ impl PersistenceStore for RocksDbStore {
                 }
             }
 
-            if !seen_oids.is_empty() {
+            let has_active_seen_store = self.seen_store.borrow().is_some();
+            if !seen_oids.is_empty() || has_active_seen_store {
                 // Multiple same-scope deltas may have individually sorted OID
                 // lists, but their concatenation is not necessarily globally
                 // sorted. Use `from_oids` to sort and dedup the combined set.
-                let delta = SeenBitmapDelta::from_oids(&seen_oids)
-                    .map_err(|err| PersistError::backend(err.to_string()))?;
+                let delta = if seen_oids.is_empty() {
+                    None
+                } else {
+                    Some(
+                        SeenBitmapDelta::from_oids(&seen_oids)
+                            .map_err(|err| PersistError::backend(err.to_string()))?,
+                    )
+                };
 
-                let oid_len = delta.oid_len();
-                let scope_key_for_bitmap = seen_scope_key
-                    .unwrap_or_else(|| build_seen_scope_key(self.repo_id, &self.policy_hash));
-
-                let expected_scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
-                if scope_key_for_bitmap != expected_scope_key {
-                    return Err(PersistError::backend(
-                        "seen-bitmap scope key does not match store identity",
-                    ));
+                if let Some(delta) = &delta {
+                    let scope_key_for_bitmap = seen_scope_key
+                        .unwrap_or_else(|| build_seen_scope_key(self.repo_id, &self.policy_hash));
+                    let expected_scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
+                    if scope_key_for_bitmap != expected_scope_key {
+                        return Err(PersistError::backend(
+                            "seen-bitmap scope key does not match store identity",
+                        ));
+                    }
+                    self.load_seen_store(delta.oid_len())
+                        .map_err(PersistError::backend)?;
                 }
 
-                self.load_seen_store(oid_len)
-                    .map_err(PersistError::backend)?;
-
-                // Build the merged bitmap in a separate clone so the in-memory
-                // cache is not mutated until db.write succeeds.
-                let merged = {
-                    let guard = self.seen_store.borrow();
-                    let base = guard
-                        .as_ref()
-                        .map_or_else(|| RoaringSeenBitmap::new(oid_len), |s| s.bitmap().clone());
-                    let mut staged = base;
-                    staged
-                        .merge_delta(&delta)
-                        .map_err(|err| PersistError::backend(err.to_string()))?;
-                    staged
+                let mut guard = self.seen_store.borrow_mut();
+                let Some(mut store) = guard.take() else {
+                    if delta.is_some() {
+                        return Err(PersistError::backend(
+                            "seen-store not initialized after successful load",
+                        ));
+                    }
+                    drop(guard);
+                    return Err(PersistError::backend("seen-store cache unexpectedly empty"));
                 };
-                let serialized = merged
-                    .serialize()
-                    .map_err(|err| PersistError::backend(err.to_string()))?;
-                batch.put(&scope_key_for_bitmap, serialized);
-                staged_bitmap = Some(merged);
+                drop(guard);
+
+                if let Some(delta) = &delta {
+                    let scope_key_for_bitmap =
+                        build_seen_scope_key(self.repo_id, &self.policy_hash);
+                    store
+                        .merge_fallback_delta(delta)
+                        .map_err(|err| PersistError::backend(err.to_string()))?;
+                    let serialized = store
+                        .fallback()
+                        .bitmap()
+                        .serialize()
+                        .map_err(|err| PersistError::backend(err.to_string()))?;
+                    batch.put(&scope_key_for_bitmap, serialized);
+                }
+
+                if is_complete {
+                    if let Some(ordinal_bytes) = store
+                        .persisted_ordinal_bytes()
+                        .map_err(|err| PersistError::backend(err.to_string()))?
+                    {
+                        batch.put(
+                            build_seen_ordinal_key(self.repo_id, &self.policy_hash),
+                            ordinal_bytes,
+                        );
+                    }
+                } else {
+                    store.clear_ordinal_cache();
+                    batch.delete(build_seen_ordinal_key(self.repo_id, &self.policy_hash));
+                }
+
+                staged_seen_store = Some(store);
             }
 
             if matches!(output.outcome, FinalizeOutcome::Complete) {
@@ -363,14 +418,38 @@ impl PersistenceStore for RocksDbStore {
                     batch.put(&op.key, &op.value);
                 }
             }
-            self.db
-                .write(batch)
-                .map_err(|err| PersistError::backend(err.to_string()))?;
+            if let Err(err) = self.db.write(batch) {
+                // The batch failed so the merged roaring bitmap was never
+                // durably written. Restore the store with the pre-merge
+                // bitmap from RocksDB so the cache does not reflect
+                // phantom writes, while preserving the MIDX snapshot
+                // config so ordinal acceleration survives the failure.
+                // When the reload also fails, drop the cache entirely to
+                // force a cold reload on the next access rather than
+                // exposing uncommitted merged state.
+                if let Some(mut store) = staged_seen_store {
+                    match self.load_seen_store_from_db(store.fallback().bitmap().oid_len()) {
+                        Ok(fresh) => {
+                            store.replace_fallback(fresh.into_fallback());
+                            *self.seen_store.borrow_mut() = Some(store);
+                        }
+                        Err(reload_err) => {
+                            tracing::warn!(
+                                error = %reload_err,
+                                "seen-store reload failed after batch write failure; \
+                                 clearing cache to force reload on next access"
+                            );
+                            *self.seen_store.borrow_mut() = None;
+                        }
+                    }
+                }
+                return Err(PersistError::backend(err.to_string()));
+            }
 
-            // Promote the staged bitmap into the cache only after the write
-            // succeeds. On failure the cache retains the pre-finalize state.
-            if let Some(bitmap) = staged_bitmap {
-                *self.seen_store.borrow_mut() = Some(RoaringSeenStore::new(bitmap));
+            // Promote the staged seen store into the cache only after the
+            // write succeeds.
+            if let Some(store) = staged_seen_store {
+                *self.seen_store.borrow_mut() = Some(store);
             }
 
             Ok(())
@@ -407,6 +486,44 @@ impl SeenBlobStore for RocksDbStore {
         #[cfg(not(feature = "rocksdb"))]
         {
             let _ = oids;
+            Err(SpillError::Io(io::Error::other(
+                "rocksdb support not enabled",
+            )))
+        }
+    }
+
+    fn configure_midx_snapshot(
+        &self,
+        midx_bytes: super::bytes::BytesView,
+        object_format: ObjectFormat,
+        artifact_fingerprint: RepoArtifactFingerprint,
+    ) -> Result<(), SpillError> {
+        #[cfg(feature = "rocksdb")]
+        {
+            self.load_seen_store(object_format.oid_len())
+                .map_err(|err| SpillError::Io(io::Error::other(err)))?;
+            let ordinal_key = build_seen_ordinal_key(self.repo_id, &self.policy_hash);
+            let ordinal_bytes = self
+                .db
+                .get(&ordinal_key)
+                .map_err(|err| SpillError::Io(io::Error::other(err.to_string())))?;
+            let mut guard = self.seen_store.borrow_mut();
+            let Some(store) = guard.as_mut() else {
+                return Err(SpillError::Io(io::Error::other(
+                    "seen-store not initialized after successful load",
+                )));
+            };
+            store.configure_with_persisted_ordinal(
+                midx_bytes,
+                object_format,
+                artifact_fingerprint,
+                ordinal_bytes.as_deref(),
+            )
+        }
+
+        #[cfg(not(feature = "rocksdb"))]
+        {
+            let _ = (midx_bytes, object_format, artifact_fingerprint);
             Err(SpillError::Io(io::Error::other(
                 "rocksdb support not enabled",
             )))
@@ -471,7 +588,11 @@ impl RefWatermarkStore for RocksDbStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finalize::{build_seen_scope_key, FinalizeStats, WriteOp};
+    use crate::finalize::{build_seen_ordinal_key, build_seen_scope_key, FinalizeStats, WriteOp};
+    use crate::midx_test_builder::MidxBuilder;
+    use crate::ordinal_seen::{fold_artifact_fingerprint, MidxOrdinalBitset};
+    use crate::repo_open::RepoArtifactFingerprint;
+    use crate::{BytesView, ObjectFormat};
 
     #[cfg(feature = "rocksdb")]
     use tempfile::tempdir;
@@ -492,6 +613,31 @@ mod tests {
             outcome: FinalizeOutcome::Complete,
             stats: FinalizeStats::default(),
         }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn test_fingerprint(tag: u8) -> RepoArtifactFingerprint {
+        RepoArtifactFingerprint {
+            packs_hash: [tag; 32],
+            idx_hash: [tag.wrapping_add(1); 32],
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn test_midx(values: &[u32]) -> BytesView {
+        let mut builder = MidxBuilder::new();
+        builder.add_pack(b"pack-0.pack");
+        for &value in values {
+            let mut bytes = [0u8; 20];
+            bytes[..4].copy_from_slice(&value.to_be_bytes());
+            builder.add_object(bytes, 0, value as u64);
+        }
+        BytesView::from_vec(builder.build())
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn fold_fingerprint(fingerprint: &RepoArtifactFingerprint) -> [u8; 32] {
+        fold_artifact_fingerprint(fingerprint)
     }
 
     #[cfg(feature = "rocksdb")]
@@ -716,7 +862,7 @@ mod tests {
     }
 
     /// Spill-stage deltas go to the staging key, NOT the live scope key.
-    /// After `commit_finalize` folds them, the OIDs become visible.
+    /// After `commit_finalize` folds them, the OIDs become durably visible.
     #[cfg(feature = "rocksdb")]
     #[test]
     fn spill_delta_staged_then_folded_on_finalize() {
@@ -955,6 +1101,552 @@ mod tests {
                 .expect("staging after finalize")
                 .is_none(),
             "staging key must be deleted after finalize"
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn configured_store_persists_seen_ordinal_and_exposes_staged_midx_oids() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 22;
+        let policy_hash = [0xEE; 32];
+        let fingerprint = test_fingerprint(0x22);
+        let mut oid_a_bytes = [0u8; 20];
+        oid_a_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        let oid_a = OidBytes::sha1(oid_a_bytes);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint.clone(),
+            )
+            .expect("configure midx");
+
+        store.persist_seen_delta(&[oid_a]).expect("stage oid");
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a])
+                .expect("staged oid should be visible in-process"),
+            vec![true]
+        );
+
+        let empty_finalize = FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+        store
+            .commit_finalize(&empty_finalize)
+            .expect("complete finalize");
+
+        let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
+        let ordinal_bytes = store
+            .db
+            .get(&ordinal_key)
+            .expect("ordinal lookup")
+            .expect("ordinal key must exist after complete finalize");
+        let ordinal = MidxOrdinalBitset::deserialize(&ordinal_bytes).expect("ordinal decode");
+        assert_eq!(ordinal.midx_fingerprint(), &fold_fingerprint(&fingerprint));
+        assert_eq!(ordinal.cardinality(), 1);
+    }
+
+    /// Partial finalize clears the in-memory ordinal cache and explicitly
+    /// deletes any persisted ordinal key from RocksDB. The roaring bitmap
+    /// (scope key) still receives the data_ops delta so successfully
+    /// scanned blobs remain seen.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn partial_finalize_clears_ordinal_cache_and_preserves_roaring() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 30;
+        let policy_hash = [0xF0; 32];
+        let fingerprint = test_fingerprint(0x40);
+
+        // Build an OID that is MIDX-resident (matches the 0x11 entry).
+        let mut oid_a_bytes = [0u8; 20];
+        oid_a_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        let oid_a = OidBytes::sha1(oid_a_bytes);
+
+        // A second OID delivered via data_ops (successfully scanned).
+        let mut oid_scanned_bytes = [0u8; 20];
+        oid_scanned_bytes[..4].copy_from_slice(&0x22u32.to_be_bytes());
+        let oid_scanned = OidBytes::sha1(oid_scanned_bytes);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint.clone(),
+            )
+            .expect("configure midx");
+
+        // Stage oid_a via spill-time delta. The ordinal cache updates
+        // so batch_check_seen returns true for this MIDX-resident OID.
+        store.persist_seen_delta(&[oid_a]).expect("stage oid");
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a])
+                .expect("in-memory ordinal should report oid_a as seen"),
+            vec![true]
+        );
+
+        // Build a partial finalize with oid_scanned in the seen-bitmap
+        // data_ops.
+        let delta = SeenBitmapDelta::from_oids(&[oid_scanned]).expect("delta");
+        let scope_key = build_seen_scope_key(repo_id, &policy_hash);
+        let output = FinalizeOutput {
+            data_ops: vec![WriteOp {
+                key: scope_key.clone(),
+                value: delta.serialize(),
+            }],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+            stats: FinalizeStats::default(),
+        };
+        store
+            .commit_finalize(&output)
+            .expect("partial finalize must succeed");
+
+        // The ordinal key must NOT be persisted on partial finalize.
+        let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
+        assert!(
+            store
+                .db
+                .get(&ordinal_key)
+                .expect("ordinal lookup")
+                .is_none(),
+            "partial finalize must not persist the ordinal key"
+        );
+
+        // The roaring bitmap scope key should contain oid_scanned from
+        // the data_ops delta (staging was discarded on partial).
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_scanned])
+                .expect("scanned OID should be visible via roaring bitmap"),
+            vec![true]
+        );
+    }
+
+    /// Simulates a crash (store dropped without calling commit_finalize)
+    /// and verifies that ordinal state on reopen reflects only committed
+    /// data, not in-memory staging.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn crash_before_finalize_ordinal_not_persisted() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 31;
+        let policy_hash = [0xF1; 32];
+        let fingerprint = test_fingerprint(0x50);
+
+        // Build MIDX-resident OIDs.
+        let mut oid_a_bytes = [0u8; 20];
+        oid_a_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        let oid_a = OidBytes::sha1(oid_a_bytes);
+
+        let mut oid_b_bytes = [0u8; 20];
+        oid_b_bytes[..4].copy_from_slice(&0x22u32.to_be_bytes());
+        let oid_b = OidBytes::sha1(oid_b_bytes);
+
+        // First store instance: configure MIDX and stage OIDs.
+        {
+            let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+            store
+                .configure_midx_snapshot(
+                    test_midx(&[0x11, 0x22, 0x33]),
+                    ObjectFormat::Sha1,
+                    fingerprint.clone(),
+                )
+                .expect("configure midx");
+
+            store
+                .persist_seen_delta(&[oid_a, oid_b])
+                .expect("stage OIDs");
+
+            // In-memory ordinal reports the OIDs as seen.
+            assert_eq!(
+                store
+                    .batch_check_seen(&[oid_a, oid_b])
+                    .expect("check during active session"),
+                vec![true, true],
+                "staged MIDX-resident OIDs should be visible in the active session"
+            );
+            // Drop without calling commit_finalize — simulates a crash.
+        }
+
+        // Reopen at the same path. open() cleans up the orphaned staging
+        // key, so the staged OIDs are discarded.
+        let store2 = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("reopen");
+        store2
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint,
+            )
+            .expect("reconfigure midx on reopen");
+
+        // The ordinal key must not exist because commit_finalize was
+        // never called.
+        let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
+        assert!(
+            store2
+                .db
+                .get(&ordinal_key)
+                .expect("ordinal lookup after reopen")
+                .is_none(),
+            "ordinal key must not exist when commit_finalize was never called"
+        );
+
+        // batch_check_seen must return false for the staged OIDs because
+        // staging was orphaned and cleaned up on reopen.
+        assert_eq!(
+            store2
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("check after crash recovery"),
+            vec![false, false],
+            "staged OIDs must not be visible after crash-recovery reopen"
+        );
+    }
+
+    /// Calling `configure_midx_snapshot` a second time with a different
+    /// fingerprint invalidates the first ordinal cache. After a complete
+    /// finalize, the persisted ordinal key reflects the new fingerprint.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_store_reconfigure_midx_invalidates_ordinal() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 32;
+        let policy_hash = [0xF2; 32];
+        let fingerprint_a = test_fingerprint(0x60);
+        let fingerprint_b = test_fingerprint(0x70);
+
+        let mut oid_a_bytes = [0u8; 20];
+        oid_a_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        let oid_a = OidBytes::sha1(oid_a_bytes);
+
+        let mut oid_b_bytes = [0u8; 20];
+        oid_b_bytes[..4].copy_from_slice(&0x22u32.to_be_bytes());
+        let oid_b = OidBytes::sha1(oid_b_bytes);
+
+        // Phase 1: configure with fingerprint A, stage an OID, complete finalize.
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint_a.clone(),
+            )
+            .expect("configure midx A");
+
+        store.persist_seen_delta(&[oid_a]).expect("stage oid_a");
+
+        let empty_finalize = FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+        store
+            .commit_finalize(&empty_finalize)
+            .expect("complete finalize with fingerprint A");
+
+        // Ordinal key exists and carries fingerprint A.
+        let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
+        let ordinal_bytes_a = store
+            .db
+            .get(&ordinal_key)
+            .expect("ordinal lookup")
+            .expect("ordinal key must exist after complete finalize");
+        let ordinal_a = MidxOrdinalBitset::deserialize(&ordinal_bytes_a).expect("ordinal decode A");
+        assert_eq!(
+            ordinal_a.midx_fingerprint(),
+            &fold_fingerprint(&fingerprint_a),
+            "ordinal must carry fingerprint A after first complete finalize"
+        );
+        assert_eq!(ordinal_a.cardinality(), 1);
+
+        // Phase 2: reconfigure with fingerprint B (simulates concurrent gc/repack).
+        store
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint_b.clone(),
+            )
+            .expect("configure midx B");
+
+        // batch_check_seen still works — the roaring fallback handles OIDs
+        // that were in the previous ordinal cache.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a])
+                .expect("oid_a should still be visible via roaring fallback"),
+            vec![true],
+            "oid_a must remain visible through the roaring bitmap after reconfigure"
+        );
+
+        // Stage oid_b under fingerprint B and complete finalize.
+        store.persist_seen_delta(&[oid_b]).expect("stage oid_b");
+
+        store
+            .commit_finalize(&empty_finalize)
+            .expect("complete finalize with fingerprint B");
+
+        // Ordinal key now carries fingerprint B. The ordinal is rebuilt
+        // from the full roaring bitmap, so it includes both oid_a (merged
+        // into roaring during the first finalize) and oid_b.
+        let ordinal_bytes_b = store
+            .db
+            .get(&ordinal_key)
+            .expect("ordinal lookup")
+            .expect("ordinal key must exist after second complete finalize");
+        let ordinal_b = MidxOrdinalBitset::deserialize(&ordinal_bytes_b).expect("ordinal decode B");
+        assert_eq!(
+            ordinal_b.midx_fingerprint(),
+            &fold_fingerprint(&fingerprint_b),
+            "ordinal must carry fingerprint B after second complete finalize"
+        );
+        assert_eq!(
+            ordinal_b.cardinality(),
+            2,
+            "ordinal rebuilt from roaring includes oid_a and oid_b"
+        );
+
+        // Both OIDs are still seen (oid_a via roaring, oid_b via ordinal).
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("both OIDs should be seen"),
+            vec![true, true],
+            "oid_a (roaring) and oid_b (ordinal) must both be seen"
+        );
+    }
+
+    /// Partial finalize must clear the ordinal cache, delete the persisted
+    /// ordinal key, and discard staging so that spill-only OIDs do not
+    /// permanently hide blobs from future scans.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn partial_finalize_clears_ordinal_and_skips_persist() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 33;
+        let policy_hash = [0xF3; 32];
+        let fingerprint = test_fingerprint(0x40);
+
+        // Build an OID that is MIDX-resident (matches the 0x11 entry).
+        let mut oid_bytes = [0u8; 20];
+        oid_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        let oid_staged = OidBytes::sha1(oid_bytes);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint,
+            )
+            .expect("configure midx");
+
+        // Stage an OID via spill-time delta so the ordinal cache is populated.
+        store
+            .persist_seen_delta(&[oid_staged])
+            .expect("stage oid via spill");
+
+        // Partial finalize with empty ops — staging is discarded, ordinal is
+        // cleared, and no ordinal key is persisted.
+        let output = FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+            stats: FinalizeStats::default(),
+        };
+        store
+            .commit_finalize(&output)
+            .expect("partial finalize must succeed");
+
+        // The ordinal key must NOT exist after partial finalize.
+        let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
+        assert!(
+            store
+                .db
+                .get(&ordinal_key)
+                .expect("ordinal lookup")
+                .is_none(),
+            "partial finalize must not persist the ordinal key"
+        );
+
+        // The staged OID must NOT be visible because partial finalize
+        // discards the staging bitmap instead of folding it into the
+        // committed scope.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_staged])
+                .expect("batch_check_seen after partial finalize"),
+            vec![false],
+            "staging-only OID must not be visible after partial finalize"
+        );
+    }
+
+    /// Reconfiguring the MIDX snapshot with a different artifact fingerprint
+    /// discards the persisted ordinal (keyed to the old fingerprint) and
+    /// rebuilds the ordinal cache from the roaring fallback on the next query.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn configure_midx_snapshot_discards_stale_ordinal() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 35;
+        let policy_hash = [0xF5; 32];
+        let fingerprint_a = test_fingerprint(0x60);
+        let fingerprint_b = test_fingerprint(0x61);
+
+        // Build an OID that is MIDX-resident (matches the 0x11 entry).
+        let mut oid_a_bytes = [0u8; 20];
+        oid_a_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        let oid_a = OidBytes::sha1(oid_a_bytes);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint_a,
+            )
+            .expect("configure midx with fingerprint A");
+
+        // Stage an OID and complete finalize to persist the ordinal key.
+        store.persist_seen_delta(&[oid_a]).expect("stage oid");
+        let empty_finalize = FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+        store
+            .commit_finalize(&empty_finalize)
+            .expect("complete finalize with fingerprint A");
+
+        // The ordinal key exists and is keyed to fingerprint A.
+        let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
+        assert!(
+            store
+                .db
+                .get(&ordinal_key)
+                .expect("ordinal lookup")
+                .is_some(),
+            "ordinal key must exist after complete finalize"
+        );
+
+        // Reconfigure with a different fingerprint. The persisted ordinal
+        // (fingerprint A) is stale and should be discarded via Ok(false).
+        store
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint_b,
+            )
+            .expect("reconfigure with different fingerprint");
+
+        // The OID is still found via the roaring fallback bitmap, not the
+        // (now-discarded) ordinal cache.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a])
+                .expect("oid_a should remain visible via roaring fallback"),
+            vec![true],
+            "oid_a must be found through roaring after stale ordinal discard"
+        );
+    }
+
+    /// Corrupt bytes in the persisted ordinal key are gracefully discarded
+    /// during `configure_midx_snapshot`. The store falls back to rebuilding
+    /// the ordinal cache from the roaring bitmap.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn configure_midx_snapshot_handles_corrupt_ordinal() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 36;
+        let policy_hash = [0xF6; 32];
+        let fingerprint = test_fingerprint(0x62);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+
+        // Seed garbage bytes directly into the ordinal key before configuring.
+        let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
+        store
+            .db
+            .put(&ordinal_key, b"corrupt data")
+            .expect("seed corrupt ordinal");
+
+        // Also persist a real OID into the roaring bitmap so we can verify
+        // fallback correctness after the corrupt ordinal is discarded.
+        let mut oid_a_bytes = [0u8; 20];
+        oid_a_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        let oid_a = OidBytes::sha1(oid_a_bytes);
+        store
+            .commit_finalize(&seen_finalize_output(repo_id, policy_hash, &[oid_a]))
+            .expect("persist oid into roaring bitmap");
+
+        // Re-seed the corrupt ordinal (finalize above may have overwritten it).
+        store
+            .db
+            .put(&ordinal_key, b"corrupt data")
+            .expect("re-seed corrupt ordinal");
+
+        // configure_midx_snapshot must return Ok(()) despite the corrupt
+        // ordinal payload — the corrupt data is gracefully discarded.
+        store
+            .configure_midx_snapshot(
+                test_midx(&[0x11, 0x22, 0x33]),
+                ObjectFormat::Sha1,
+                fingerprint,
+            )
+            .expect("configure with corrupt ordinal must succeed");
+
+        // batch_check_seen must work correctly via roaring fallback.
+        let mut oid_unseen_bytes = [0u8; 20];
+        oid_unseen_bytes[..4].copy_from_slice(&0x22u32.to_be_bytes());
+        let oid_unseen = OidBytes::sha1(oid_unseen_bytes);
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_unseen])
+                .expect("batch_check_seen after corrupt ordinal recovery"),
+            vec![true, false],
+            "roaring fallback must serve correct results after corrupt ordinal discard"
+        );
+    }
+
+    /// Ordinal keys persist across `open()` calls; stale-key rejection is
+    /// handled by `load_persisted_ordinal`'s fingerprint+object-count check
+    /// inside `configure_midx_snapshot`.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn ordinal_key_survives_store_reopen() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 34;
+        let policy_hash = [0xF4; 32];
+
+        // Seed an ordinal key directly into the database.
+        let ordinal_key = build_seen_ordinal_key(repo_id, &policy_hash);
+        {
+            let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+            store
+                .db
+                .put(&ordinal_key, b"persisted-ordinal-payload")
+                .expect("seed ordinal key");
+        }
+
+        // Reopen — ordinal key must survive for configure_midx_snapshot to read.
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("reopen");
+        assert!(
+            store
+                .db
+                .get(&ordinal_key)
+                .expect("ordinal lookup after reopen")
+                .is_some(),
+            "ordinal key must survive open() for cross-scan restoration"
         );
     }
 }

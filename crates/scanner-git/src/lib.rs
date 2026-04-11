@@ -379,8 +379,9 @@ pub use events::{
 
 // ── Stage 7: Finalize & persist ─────────────────────────────────────────
 pub use finalize::{
-    build_finalize_ops, FinalizeInput, FinalizeOutcome, FinalizeOutput, FinalizeStats, RefEntry,
-    WriteOp, NS_BLOB_CTX, NS_FINDING, NS_SEEN_BLOB, NS_SEEN_STAGING,
+    build_finalize_ops, build_seen_ordinal_key, FinalizeInput, FinalizeOutcome, FinalizeOutput,
+    FinalizeStats, RefEntry, WriteOp, NS_BLOB_CTX, NS_FINDING, NS_SEEN_BLOB, NS_SEEN_ORDINAL,
+    NS_SEEN_STAGING,
 };
 pub use ordinal_seen::{HybridSeenStore, MidxOrdinalBitset, OrdinalSeenError};
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};

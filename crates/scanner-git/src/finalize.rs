@@ -33,6 +33,7 @@
 //! | `bc\0` | blob_ctx      | Canonical context per scanned blob  |
 //! | `fn\0` | finding       | Individual finding records          |
 //! | `sb\0` | seen_blob     | Finalize delta for the seen bitmap  |
+//! | `so\0` | seen_ordinal  | Persisted MIDX-ordinal cache        |
 //! | `ss\0` | seen_staging  | Spill-stage seen bitmap staging         |
 //!
 //! Watermark keys use the `rw` prefix from `watermark_keys`.
@@ -58,6 +59,8 @@ pub const NS_BLOB_CTX: [u8; 3] = *b"bc\0";
 pub const NS_FINDING: [u8; 3] = *b"fn\0";
 /// Namespace prefix for the seen bitmap scope key.
 pub const NS_SEEN_BLOB: [u8; 3] = *b"sb\0";
+/// Namespace prefix for the persisted seen-ordinal cache key.
+pub const NS_SEEN_ORDINAL: [u8; 3] = *b"so\0";
 /// Namespace prefix for the staging seen bitmap (spill checkpoints).
 ///
 /// Spill-stage deltas are written here and folded into the live `sb\0`
@@ -69,11 +72,12 @@ pub const NS_SEEN_STAGING: [u8; 3] = *b"ss\0";
 const _: () = {
     assert!(NS_BLOB_CTX[0] < NS_FINDING[0]);
     assert!(NS_FINDING[0] < NS_SEEN_BLOB[0]);
+    assert!(NS_SEEN_BLOB[1] < NS_SEEN_ORDINAL[1]);
 };
 const _: () = {
-    // Staging namespace shares the first byte with the live namespace;
-    // ordering is determined by the second byte (`b` < `s`).
-    assert!(NS_SEEN_BLOB[1] < NS_SEEN_STAGING[1]);
+    // The live, ordinal-cache, and staging namespaces share the first byte;
+    // ordering is determined by the second byte (`b` < `o` < `s`).
+    assert!(NS_SEEN_ORDINAL[1] < NS_SEEN_STAGING[1]);
 };
 
 /// A ref entry from the start set.
@@ -242,6 +246,8 @@ fn ref_wm_key_len(ref_name: &[u8]) -> usize {
 
 /// Byte length of the fixed-width seen-bitmap scope key.
 const SEEN_SCOPE_KEY_LEN: usize = 43;
+/// Byte length of the fixed-width seen-ordinal scope key.
+const SEEN_ORDINAL_KEY_LEN: usize = 43;
 /// Byte length of the fixed-width seen-bitmap staging key (same layout).
 const SEEN_STAGING_KEY_LEN: usize = 43;
 
@@ -271,6 +277,16 @@ pub fn build_seen_scope_key(repo_id: u64, policy_hash: &[u8; 32]) -> Vec<u8> {
     key.extend_from_slice(&repo_id.to_be_bytes());
     key.extend_from_slice(policy_hash);
     debug_assert_eq!(key.len(), SEEN_SCOPE_KEY_LEN);
+    key
+}
+
+/// Builds the scope key for the persisted seen-ordinal cache.
+pub fn build_seen_ordinal_key(repo_id: u64, policy_hash: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SEEN_ORDINAL_KEY_LEN);
+    key.extend_from_slice(&NS_SEEN_ORDINAL);
+    key.extend_from_slice(&repo_id.to_be_bytes());
+    key.extend_from_slice(policy_hash);
+    debug_assert_eq!(key.len(), SEEN_ORDINAL_KEY_LEN);
     key
 }
 

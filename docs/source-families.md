@@ -117,7 +117,9 @@ and after repo execution to decide whether a singleton shard is already covered
 by its cursor or is complete after a durable finalize-backed checkpoint.
 `gossip-scanner-runtime/src/git_persistence.rs` defines the runtime-owned
 adapter that satisfies `scanner-git`'s ref-watermark, seen-blob, and finalize
-persistence seams and maps complete inner finalizes onto the shared
+persistence seams, restores a fingerprint-scoped MIDX ordinal cache for the
+live worker when artifact metadata matches, and maps complete inner finalizes
+onto the shared
 repo-frontier receipt/checkpoint path. `run_git_repo_worker` in
 `gossip-scanner-runtime/src/distributed.rs` composes the full singleton path:
 static discovery, mirror sync, mirror-backed execution through

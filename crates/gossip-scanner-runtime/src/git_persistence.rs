@@ -19,12 +19,13 @@
 //!
 //! Between finalize calls the scan pipeline spills processed OIDs through
 //! [`SeenBitmapPersister::persist_seen_delta`]. These land in a **staging
-//! key** that is invisible to [`SeenBlobStore::batch_check_seen`] — the
-//! query path reads only from the committed **scope key**. On a complete
-//! finalize, staging OIDs are merged into the scope key atomically (or in
-//! a crash-safe multi-phase write on non-atomic backends). On a partial
-//! finalize, staging OIDs are discarded because they may include blobs
-//! from skipped candidates.
+//! key** that stays separate from the committed **scope key**. On a complete
+//! finalize, staging OIDs are merged into the scope key atomically (or in a
+//! crash-safe multi-phase write on non-atomic backends). On a partial finalize,
+//! staging OIDs are discarded because they may include blobs from skipped
+//! candidates. When the adapter is configured with the current MIDX snapshot,
+//! successful staging writes also update the in-memory ordinal cache so the
+//! current scan can dedupe repeated MIDX-resident OIDs before finalize.
 //!
 //! # Complete vs. partial finalizes
 //!
@@ -52,10 +53,11 @@ use gossip_contracts::{
     },
 };
 use scanner_git::{
-    CheckpointAck, FinalizeOutcome, FinalizeOutput, LoadedScanCheckpoint, NS_SEEN_BLOB, OidBytes,
-    PersistError, PersistenceStore, RefWatermark, RefWatermarkStore, RepoOpenError,
-    ScanCheckpointError, ScanCheckpointSink, SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore,
-    SpillError, StageCheckpoint, StartSetId, WriteOp, decode_ref_watermark_value,
+    BytesView, CheckpointAck, FinalizeOutcome, FinalizeOutput, HybridSeenStore,
+    LoadedScanCheckpoint, NS_SEEN_BLOB, ObjectFormat, OidBytes, PersistError, PersistenceStore,
+    RefWatermark, RefWatermarkStore, RepoArtifactFingerprint, RepoOpenError, ScanCheckpointError,
+    ScanCheckpointSink, SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore, SpillError,
+    StageCheckpoint, StartSetId, WriteOp, build_seen_ordinal_key, decode_ref_watermark_value,
     finalize::{build_ref_wm_key, build_seen_scope_key, build_seen_staging_key},
     roaring_seen::{RoaringSeenBitmap, RoaringSeenStore},
 };
@@ -202,7 +204,7 @@ pub struct GitPersistenceAdapter<B> {
     repo_id: u64,
     policy_hash: [u8; 32],
     start_set_id: StartSetId,
-    seen_store: RefCell<Option<RoaringSeenStore>>,
+    seen_store: RefCell<Option<HybridSeenStore>>,
     staging_seen: RefCell<Option<RoaringSeenBitmap>>,
     finalizing: Cell<bool>,
 }
@@ -502,7 +504,7 @@ where
             .seen_store
             .borrow()
             .as_ref()
-            .is_none_or(|store| store.bitmap().oid_len() != oid_len);
+            .is_none_or(|store| store.fallback().bitmap().oid_len() != oid_len);
         if needs_load {
             let loaded = self.load_seen_store_from_backend(oid_len)?;
             *self.seen_store.borrow_mut() = Some(loaded);
@@ -513,11 +515,13 @@ where
     /// Cold-path: read and deserialize the committed scope bitmap from the
     /// backend. Returns an empty bitmap when no scope key exists yet (first
     /// scan of this repo/policy pair).
-    fn load_seen_store_from_backend(&self, oid_len: u8) -> Result<RoaringSeenStore, String> {
+    fn load_seen_store_from_backend(&self, oid_len: u8) -> Result<HybridSeenStore, String> {
         let scope_key = self.seen_scope_key();
         match self.backend.get(&scope_key) {
             Ok(Some(bytes)) => match RoaringSeenBitmap::deserialize(bytes.as_ref()) {
-                Ok(bitmap) if bitmap.oid_len() == oid_len => Ok(RoaringSeenStore::new(bitmap)),
+                Ok(bitmap) if bitmap.oid_len() == oid_len => {
+                    Ok(HybridSeenStore::new(RoaringSeenStore::new(bitmap)))
+                }
                 Ok(bitmap) => Err(format!(
                     "seen-bitmap OID length mismatch: stored={}, requested={}",
                     bitmap.oid_len(),
@@ -525,8 +529,37 @@ where
                 )),
                 Err(err) => Err(format!("corrupt seen-bitmap: {err}")),
             },
-            Ok(None) => Ok(RoaringSeenStore::new(RoaringSeenBitmap::new(oid_len))),
+            Ok(None) => Ok(HybridSeenStore::new(RoaringSeenStore::new(
+                RoaringSeenBitmap::new(oid_len),
+            ))),
             Err(err) => Err(err.to_string()),
+        }
+    }
+
+    /// Restores the seen-store cache after a failed batch write.
+    ///
+    /// The staged store already has the merged delta applied (uncommitted).
+    /// When the backend reload succeeds, the fallback bitmap is swapped to
+    /// the last durably committed state while preserving the MIDX snapshot
+    /// config. When the reload also fails, the cache is cleared entirely so
+    /// the next access forces a cold reload rather than exposing uncommitted
+    /// merged state.
+    fn restore_seen_store_after_failure(&self, staged_seen_store: Option<HybridSeenStore>) {
+        if let Some(mut store) = staged_seen_store {
+            match self.load_seen_store_from_backend(store.fallback().bitmap().oid_len()) {
+                Ok(fresh) => {
+                    store.replace_fallback(fresh.into_fallback());
+                    *self.seen_store.borrow_mut() = Some(store);
+                }
+                Err(reload_err) => {
+                    tracing::warn!(
+                        error = %reload_err,
+                        "seen-store reload failed after batch write failure; \
+                         clearing cache to force reload on next access"
+                    );
+                    *self.seen_store.borrow_mut() = None;
+                }
+            }
         }
     }
 }
@@ -535,8 +568,10 @@ where
 ///
 /// Each call merges the supplied OIDs into a cached staging bitmap, then
 /// writes the merged result to the staging key. The staging bitmap is
-/// invisible to `batch_check_seen` and only folded into the committed scope
-/// on a complete finalize.
+/// kept separate from the committed scope and only folded into the durable
+/// scope key on a complete finalize. When the adapter has an active MIDX
+/// snapshot, the in-memory ordinal cache is updated after the durable staging
+/// write succeeds.
 ///
 /// # Take-mutate-restore caching
 ///
@@ -608,15 +643,30 @@ where
         // Install the merged bitmap into the cache only after the
         // backend write succeeds.
         *guard = Some(merged);
+        drop(guard);
+        // The ordinal cache is a derived optimization; its update failure
+        // must not abort the pipeline after a successful durable write.
+        if let Some(store) = self.seen_store.borrow_mut().as_mut()
+            && let Err(err) = store.mark_seen_batch(oids)
+        {
+            tracing::warn!(
+                error = %err,
+                "ordinal cache update failed after staging write; \
+                 falling back to roaring-only dedup"
+            );
+            store.clear_ordinal_cache();
+        }
         Ok(())
     }
 }
 
-/// Committed-scope queries: checks OIDs against the durable seen-bitmap only.
+/// Committed-scope queries: checks OIDs against the durable seen-bitmap
+/// and, when configured, the in-memory ordinal cache.
 ///
-/// Staging OIDs are intentionally invisible here. The scan pipeline relies
-/// on this separation to avoid false positives from OIDs that may belong to
-/// skipped candidates (which would be discarded on partial finalize).
+/// The committed roaring scope remains the durable source of truth. When the
+/// adapter has an active MIDX snapshot, the in-memory ordinal cache may also
+/// reflect successfully staged OIDs from the current process so repeated
+/// MIDX-resident probes can short-circuit before finalize.
 ///
 /// # Preconditions (debug-asserted)
 ///
@@ -656,7 +706,38 @@ where
                 "seen-store not initialized after successful load",
             ))
         })?;
-        Ok(store.bitmap().batch_contains_sorted(oids))
+        store.batch_check_seen(oids)
+    }
+
+    fn configure_midx_snapshot(
+        &self,
+        midx_bytes: BytesView,
+        object_format: ObjectFormat,
+        artifact_fingerprint: RepoArtifactFingerprint,
+    ) -> Result<(), SpillError> {
+        self.load_seen_store(object_format.oid_len())
+            .map_err(|err| {
+                SpillError::Io(io::Error::other(format!(
+                    "seen-store initialization failed: {err}"
+                )))
+            })?;
+        let ordinal_key = build_seen_ordinal_key(self.repo_id, &self.policy_hash);
+        let ordinal_bytes = self
+            .backend
+            .get(&ordinal_key)
+            .map_err(|err| SpillError::Io(io::Error::other(err.to_string())))?;
+        let mut guard = self.seen_store.borrow_mut();
+        let Some(store) = guard.as_mut() else {
+            return Err(SpillError::Io(io::Error::other(
+                "seen-store not initialized after successful load",
+            )));
+        };
+        store.configure_with_persisted_ordinal(
+            midx_bytes,
+            object_format,
+            artifact_fingerprint,
+            ordinal_bytes.as_deref(),
+        )
     }
 }
 
@@ -870,37 +951,65 @@ where
             seen_oids.extend(staging.all_oids());
         }
 
-        let mut staged_bitmap = None;
-        if !seen_oids.is_empty() {
-            // Both sources are already sorted; `from_oids` re-sorts as a
-            // simplicity trade-off.
-            let delta = SeenBitmapDelta::from_oids(&seen_oids)
-                .map_err(|err| PersistError::backend(err.to_string()))?;
-            let oid_len = delta.oid_len();
-
-            self.load_seen_store(oid_len)
-                .map_err(PersistError::backend)?;
-            // Take ownership of the cached bitmap to avoid cloning. The
-            // cache is repopulated with the merged result below.
-            let merged = {
-                let base = self.seen_store.borrow_mut().take().map_or_else(
-                    || RoaringSeenBitmap::new(oid_len),
-                    RoaringSeenStore::into_bitmap,
-                );
-                let mut staged = base;
-                staged
-                    .merge_delta(&delta)
-                    .map_err(|err| PersistError::backend(err.to_string()))?;
-                staged
+        let mut staged_seen_store = None;
+        let has_active_seen_store = self.seen_store.borrow().is_some();
+        if !seen_oids.is_empty() || has_active_seen_store {
+            let delta = if seen_oids.is_empty() {
+                None
+            } else {
+                Some(
+                    SeenBitmapDelta::from_oids(&seen_oids)
+                        .map_err(|err| PersistError::backend(err.to_string()))?,
+                )
             };
-            let serialized = merged
-                .serialize()
-                .map_err(|err| PersistError::backend(err.to_string()))?;
-            first_phase_ops.push(GitPersistenceOp::Put {
-                key: seen_scope_key,
-                value: serialized,
-            });
-            staged_bitmap = Some(merged);
+            if let Some(delta) = &delta {
+                self.load_seen_store(delta.oid_len())
+                    .map_err(PersistError::backend)?;
+            }
+            let mut guard = self.seen_store.borrow_mut();
+            let Some(mut store) = guard.take() else {
+                if delta.is_some() {
+                    return Err(PersistError::backend(
+                        "seen-store not initialized after successful load",
+                    ));
+                }
+                return Err(PersistError::backend("seen-store cache unexpectedly empty"));
+            };
+            drop(guard);
+
+            if let Some(delta) = &delta {
+                store
+                    .merge_fallback_delta(delta)
+                    .map_err(|err| PersistError::backend(err.to_string()))?;
+                let serialized = store
+                    .fallback()
+                    .bitmap()
+                    .serialize()
+                    .map_err(|err| PersistError::backend(err.to_string()))?;
+                first_phase_ops.push(GitPersistenceOp::Put {
+                    key: seen_scope_key,
+                    value: serialized,
+                });
+            }
+
+            if is_complete {
+                if let Some(ordinal_bytes) = store
+                    .persisted_ordinal_bytes()
+                    .map_err(|err| PersistError::backend(err.to_string()))?
+                {
+                    first_phase_ops.push(GitPersistenceOp::Put {
+                        key: build_seen_ordinal_key(self.repo_id, &self.policy_hash),
+                        value: ordinal_bytes,
+                    });
+                }
+            } else {
+                store.clear_ordinal_cache();
+                first_phase_ops.push(GitPersistenceOp::Delete {
+                    key: build_seen_ordinal_key(self.repo_id, &self.policy_hash),
+                });
+            }
+
+            staged_seen_store = Some(store);
         }
 
         let watermark_ops: Vec<_> = if is_complete {
@@ -939,13 +1048,14 @@ where
                 });
             }
             all_ops.extend(watermark_ops);
-            if !all_ops.is_empty() {
-                self.backend
-                    .apply_batch(&all_ops)
-                    .map_err(|err| PersistError::backend(err.to_string()))?;
+            if !all_ops.is_empty()
+                && let Err(err) = self.backend.apply_batch(&all_ops)
+            {
+                self.restore_seen_store_after_failure(staged_seen_store);
+                return Err(PersistError::backend(err.to_string()));
             }
-            if let Some(bitmap) = staged_bitmap {
-                *self.seen_store.borrow_mut() = Some(RoaringSeenStore::new(bitmap));
+            if let Some(store) = staged_seen_store {
+                *self.seen_store.borrow_mut() = Some(store);
             }
             return Ok(());
         }
@@ -957,10 +1067,11 @@ where
         // AFTER the seen scope Put so a crash between batches cannot lose
         // staged OIDs (the scope key already contains them).
         //
-        // For partial finalize, there is no seen scope Put — staging OIDs
-        // are discarded. The staging Delete goes in first_phase_ops (same
-        // batch as data ops) so a failed batch doesn't leave stale staging
-        // for a later complete run to fold.
+        // For partial finalize, staging OIDs are discarded. The staging
+        // Delete is issued in a preceding batch BEFORE data ops so a
+        // data-op batch failure cannot leave stale staging for a later
+        // complete run to fold. If the staging Delete itself fails, we
+        // propagate the error before attempting data ops.
         //
         // Recovery posture: if the watermark write fails, the seen bitmap
         // is already durable and the in-memory cache reflects it. Callers
@@ -973,17 +1084,20 @@ where
         // before watermarks are durable leaves the checkpoint intact for
         // resume instead of forcing a full re-scan.
         if has_staging && !is_complete {
-            first_phase_ops.push(GitPersistenceOp::Delete {
-                key: seen_staging_key.clone(),
-            });
-        }
-        if !first_phase_ops.is_empty() {
             self.backend
-                .apply_batch(&first_phase_ops)
+                .apply_batch(&[GitPersistenceOp::Delete {
+                    key: seen_staging_key.clone(),
+                }])
                 .map_err(|err| PersistError::backend(err.to_string()))?;
         }
-        if let Some(bitmap) = staged_bitmap {
-            *self.seen_store.borrow_mut() = Some(RoaringSeenStore::new(bitmap));
+        if !first_phase_ops.is_empty()
+            && let Err(err) = self.backend.apply_batch(&first_phase_ops)
+        {
+            self.restore_seen_store_after_failure(staged_seen_store);
+            return Err(PersistError::backend(err.to_string()));
+        }
+        if let Some(store) = staged_seen_store {
+            *self.seen_store.borrow_mut() = Some(store);
         }
         if has_staging && is_complete {
             self.backend
@@ -1111,7 +1225,9 @@ pub mod test_support {
     use std::collections::BTreeMap;
     use std::rc::Rc;
 
-    use scanner_git::{NS_BLOB_CTX, NS_FINDING, NS_REF_WATERMARK, NS_SEEN_STAGING};
+    use scanner_git::{
+        NS_BLOB_CTX, NS_FINDING, NS_REF_WATERMARK, NS_SEEN_ORDINAL, NS_SEEN_STAGING,
+    };
 
     use super::{
         GitPersistenceBackend, GitPersistenceOp, NS_GIT_SCAN_CHECKPOINT_BASE,
@@ -1134,6 +1250,7 @@ pub mod test_support {
         Finding,
         CheckpointBase,
         CheckpointPrefix,
+        SeenOrdinal,
         SeenScope,
         SeenStaging,
         Watermark,
@@ -1154,6 +1271,8 @@ pub mod test_support {
                 Self::CheckpointBase
             } else if key.starts_with(&NS_GIT_SCAN_CHECKPOINT_PREFIX) {
                 Self::CheckpointPrefix
+            } else if key.starts_with(&NS_SEEN_ORDINAL) {
+                Self::SeenOrdinal
             } else if key.starts_with(&NS_SEEN_BLOB) {
                 Self::SeenScope
             } else if key.starts_with(&NS_SEEN_STAGING) {
@@ -1575,7 +1694,7 @@ mod tests {
     use scanner_git::{
         ByteArena, GitScanCommonMetrics, GitScanMode, MappingStats, NS_REF_WATERMARK,
         NS_SEEN_STAGING, RepoArtifactFingerprint, ScanResumeState, ScannedBlobs, SpillStats,
-        TreeDiffStats,
+        TreeDiffStats, build_seen_ordinal_key as ordinal_key_builder,
     };
 
     fn write_context() -> WriteContext {
@@ -3846,5 +3965,480 @@ mod tests {
                 "recovery watermark must carry the recovery finalize value"
             );
         }
+    }
+
+    /// Verifies that a failed `apply_batch` in the atomic `commit_finalize` path
+    /// preserves the MIDX snapshot configuration on the `HybridSeenStore`.
+    ///
+    /// When the store is dropped on write failure, the next `load_seen_store`
+    /// re-creates a bare store without the MIDX snapshot configured during
+    /// scan setup. Subsequent `persist_seen_delta` calls then cannot update the
+    /// ordinal cache, causing MIDX-resident OIDs to become invisible to
+    /// `batch_check_seen` until a full finalize or reconfiguration.
+    ///
+    /// Detection strategy: configure a MIDX snapshot with two objects, fail a
+    /// finalize, then stage a *new* MIDX-resident OID. If the MIDX snapshot
+    /// survived, `persist_seen_delta` updates the ordinal cache and
+    /// `batch_check_seen` returns `true`. If the snapshot was lost, the
+    /// ordinal update is skipped and the OID is invisible (only in the staging
+    /// key, not the committed scope).
+    #[test]
+    fn atomic_commit_finalize_failure_preserves_seen_store() {
+        let backend = TestBackend::atomic();
+        let repo_id = 50;
+        let policy_hash = [0x50; 32];
+
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+
+        // Build a MIDX snapshot containing two objects and configure the
+        // adapter so the HybridSeenStore has ordinal acceleration active.
+        let mut builder = scanner_git::MidxBuilder::new();
+        builder.add_pack(b"pack-test.pack");
+        let mut oid_a_bytes = [0u8; 20];
+        oid_a_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        builder.add_object(oid_a_bytes, 0, 0x11);
+        let mut oid_b_bytes = [0u8; 20];
+        oid_b_bytes[..4].copy_from_slice(&0x22u32.to_be_bytes());
+        builder.add_object(oid_b_bytes, 0, 0x22);
+        let midx_bytes = scanner_git::BytesView::from_vec(builder.build());
+        let fingerprint = RepoArtifactFingerprint {
+            packs_hash: [0xAA; 32],
+            idx_hash: [0xBB; 32],
+        };
+        adapter
+            .configure_midx_snapshot(midx_bytes, scanner_git::ObjectFormat::Sha1, fingerprint)
+            .expect("configure midx snapshot");
+
+        // Stage oid_a so commit_finalize has seen-bitmap work to do.
+        let oid_a = OidBytes::sha1(oid_a_bytes);
+        adapter.persist_seen_delta(&[oid_a]).expect("stage oid_a");
+
+        // Inject a fault so the atomic apply_batch in commit_finalize fails.
+        backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
+        let result = adapter.commit_finalize(&FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: Default::default(),
+        });
+        assert!(
+            result.is_err(),
+            "commit_finalize must fail on injected batch fault"
+        );
+
+        // Stage oid_b after the failed finalize. If the MIDX snapshot survived,
+        // persist_seen_delta calls mark_seen_batch which updates the ordinal
+        // cache for this MIDX-resident OID. If the snapshot was lost (store
+        // dropped and reloaded bare), mark_seen_batch finds no snapshot and
+        // skips the ordinal update.
+        let oid_b = OidBytes::sha1(oid_b_bytes);
+        adapter.persist_seen_delta(&[oid_b]).expect("stage oid_b");
+
+        // batch_check_seen queries the HybridSeenStore. With MIDX ordinal
+        // acceleration, oid_b resolves as seen via the ordinal cache. Without
+        // it, the roaring fallback checks only the committed scope bitmap
+        // (which has no entries since the finalize failed) and returns false.
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid_b])
+                .expect("post-failure batch_check_seen must succeed"),
+            vec![true],
+            "MIDX snapshot must survive a failed atomic commit_finalize \
+             so ordinal acceleration continues working"
+        );
+    }
+
+    /// Non-atomic counterpart of
+    /// `atomic_commit_finalize_failure_preserves_seen_store`. The two-phase
+    /// write path used by non-atomic backends must also preserve the MIDX
+    /// snapshot and ordinal cache when `apply_batch` fails during
+    /// `commit_finalize`.
+    #[test]
+    fn non_atomic_commit_finalize_failure_preserves_seen_store() {
+        let backend = TestBackend::non_atomic();
+        let repo_id = 50;
+        let policy_hash = [0x50; 32];
+
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+
+        let (midx_bytes, oid_a_raw, oid_b_raw) = build_two_object_midx();
+        let fingerprint = RepoArtifactFingerprint {
+            packs_hash: [0xAA; 32],
+            idx_hash: [0xBB; 32],
+        };
+        adapter
+            .configure_midx_snapshot(midx_bytes, scanner_git::ObjectFormat::Sha1, fingerprint)
+            .expect("configure midx snapshot");
+
+        // Stage oid_a so commit_finalize has seen-bitmap work to do.
+        let oid_a = OidBytes::sha1(oid_a_raw);
+        adapter.persist_seen_delta(&[oid_a]).expect("stage oid_a");
+
+        // Inject a fault so the first-phase apply_batch in commit_finalize fails.
+        backend.set_batch_faults(vec![BatchFaultTrigger::any()]);
+        let result = adapter.commit_finalize(&FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: Default::default(),
+        });
+        assert!(
+            result.is_err(),
+            "commit_finalize must fail on injected batch fault"
+        );
+
+        // Stage oid_b after the failed finalize. If the MIDX snapshot survived,
+        // persist_seen_delta updates the ordinal cache for this MIDX-resident
+        // OID. If the snapshot was lost, the ordinal update is skipped.
+        let oid_b = OidBytes::sha1(oid_b_raw);
+        adapter.persist_seen_delta(&[oid_b]).expect("stage oid_b");
+
+        // batch_check_seen queries the HybridSeenStore. With MIDX ordinal
+        // acceleration, oid_b resolves as seen via the ordinal cache.
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid_b])
+                .expect("post-failure batch_check_seen must succeed"),
+            vec![true],
+            "MIDX snapshot must survive a failed non-atomic commit_finalize \
+             so ordinal acceleration continues working"
+        );
+    }
+
+    /// Complete finalize without a configured MIDX snapshot must NOT write an
+    /// `so\0` ordinal key. The ordinal key is only written when the adapter
+    /// has been configured with a MIDX snapshot (tested at the RocksDB level
+    /// in `configured_store_persists_seen_ordinal_and_exposes_staged_midx_oids`).
+    ///
+    /// Partial finalize must discard ordinal state (tested via the cache clear
+    /// in the partial finalize path).
+    #[test]
+    fn complete_finalize_without_midx_omits_ordinal_key() {
+        let repo_id = 42;
+        let policy_hash = [0x42; 32];
+        let ordinal_key = ordinal_key_builder(repo_id, &policy_hash);
+
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+        let oid_a = OidBytes::sha1([0x11; 20]);
+
+        adapter.persist_seen_delta(&[oid_a]).expect("stage one oid");
+
+        adapter
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Complete,
+                stats: Default::default(),
+            })
+            .expect("complete finalize");
+
+        // Without a MIDX snapshot, no ordinal key should be written.
+        assert!(
+            backend.get_value(&ordinal_key).is_none(),
+            "complete finalize without MIDX must NOT write the ordinal key"
+        );
+
+        // Staged OID should still be visible through the roaring path.
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid_a])
+                .expect("batch check after finalize"),
+            vec![true],
+            "staged OID must be visible after complete finalize"
+        );
+    }
+
+    /// Partial finalize must clear the ordinal cache, delete the persisted
+    /// ordinal key, and discard staging so that spill-only OIDs do not
+    /// permanently hide blobs from future scans.
+    #[test]
+    fn partial_finalize_clears_ordinal_and_skips_persist() {
+        let backend = TestBackend::atomic();
+        let repo_id = 51;
+        let policy_hash = [0x51; 32];
+
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+
+        // Build a MIDX snapshot containing three objects and configure the
+        // adapter so the HybridSeenStore has ordinal acceleration active.
+        let mut builder = scanner_git::MidxBuilder::new();
+        builder.add_pack(b"pack-test.pack");
+        let mut oid_a_bytes = [0u8; 20];
+        oid_a_bytes[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        builder.add_object(oid_a_bytes, 0, 0x11);
+        let mut oid_b_bytes = [0u8; 20];
+        oid_b_bytes[..4].copy_from_slice(&0x22u32.to_be_bytes());
+        builder.add_object(oid_b_bytes, 0, 0x22);
+        let mut oid_c_bytes = [0u8; 20];
+        oid_c_bytes[..4].copy_from_slice(&0x33u32.to_be_bytes());
+        builder.add_object(oid_c_bytes, 0, 0x33);
+        let midx_bytes = scanner_git::BytesView::from_vec(builder.build());
+        let fingerprint = RepoArtifactFingerprint {
+            packs_hash: [0x40; 32],
+            idx_hash: [0x41; 32],
+        };
+        adapter
+            .configure_midx_snapshot(midx_bytes, scanner_git::ObjectFormat::Sha1, fingerprint)
+            .expect("configure midx snapshot");
+
+        // Stage an OID via spill-time delta so the ordinal cache is populated.
+        let oid_staged = OidBytes::sha1(oid_a_bytes);
+        adapter
+            .persist_seen_delta(&[oid_staged])
+            .expect("stage oid via spill");
+
+        // Partial finalize with empty data_ops and watermark_ops — staging
+        // is discarded, ordinal is cleared, and no ordinal key is persisted.
+        let output = FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+            stats: Default::default(),
+        };
+        adapter
+            .commit_finalize(&output)
+            .expect("partial finalize must succeed");
+
+        // The ordinal key must NOT exist after partial finalize.
+        let ordinal_key = ordinal_key_builder(repo_id, &policy_hash);
+        assert!(
+            backend.get(&ordinal_key).expect("ordinal lookup").is_none(),
+            "partial finalize must not persist the ordinal key"
+        );
+
+        // The staged OID must NOT be visible because partial finalize
+        // discards the staging bitmap instead of folding it into the
+        // committed scope.
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid_staged])
+                .expect("batch_check_seen after partial finalize"),
+            vec![false],
+            "staging-only OID must not be visible after partial finalize"
+        );
+    }
+
+    /// Helper: builds a two-object MIDX snapshot and its `BytesView`.
+    ///
+    /// Returns `(midx_bytes, oid_a_bytes, oid_b_bytes)` where `oid_a` is
+    /// `0x11`-prefixed and `oid_b` is `0x22`-prefixed, both 20-byte SHA-1.
+    fn build_two_object_midx() -> (scanner_git::BytesView, [u8; 20], [u8; 20]) {
+        let mut builder = scanner_git::MidxBuilder::new();
+        builder.add_pack(b"pack-test.pack");
+        let mut oid_a = [0u8; 20];
+        oid_a[..4].copy_from_slice(&0x11u32.to_be_bytes());
+        builder.add_object(oid_a, 0, 0x11);
+        let mut oid_b = [0u8; 20];
+        oid_b[..4].copy_from_slice(&0x22u32.to_be_bytes());
+        builder.add_object(oid_b, 0, 0x22);
+        (
+            scanner_git::BytesView::from_vec(builder.build()),
+            oid_a,
+            oid_b,
+        )
+    }
+
+    /// Without a persisted ordinal key in the backend, `configure_midx_snapshot`
+    /// still activates ordinal acceleration. The ordinal cache is lazily rebuilt
+    /// from the roaring fallback on the first `batch_check_seen` call, so OIDs
+    /// that have been staged and finalized are visible through the ordinal path.
+    #[test]
+    fn configure_midx_fresh_start_without_persisted_ordinal() {
+        let backend = TestBackend::atomic();
+        let repo_id = 60;
+        let policy_hash = [0x60; 32];
+        let ordinal_key = ordinal_key_builder(repo_id, &policy_hash);
+
+        // No ordinal key exists in the backend.
+        assert!(
+            backend.get_value(&ordinal_key).is_none(),
+            "precondition: no ordinal key in backend"
+        );
+
+        let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+
+        let (midx_bytes, oid_a_raw, oid_b_raw) = build_two_object_midx();
+        let fingerprint = RepoArtifactFingerprint {
+            packs_hash: [0xCC; 32],
+            idx_hash: [0xDD; 32],
+        };
+        adapter
+            .configure_midx_snapshot(midx_bytes, scanner_git::ObjectFormat::Sha1, fingerprint)
+            .expect("configure midx snapshot");
+
+        // Stage oid_a and run a complete finalize so it lands in the committed
+        // scope bitmap. This makes it visible to batch_check_seen.
+        let oid_a = OidBytes::sha1(oid_a_raw);
+        let oid_b = OidBytes::sha1(oid_b_raw);
+        adapter.persist_seen_delta(&[oid_a]).expect("stage oid_a");
+        adapter
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Complete,
+                stats: Default::default(),
+            })
+            .expect("complete finalize");
+
+        // oid_a was staged and finalized so it is seen. oid_b was never staged
+        // so it remains unseen. The ordinal cache is rebuilt from the roaring
+        // fallback on demand.
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("batch_check_seen after fresh-start configure"),
+            vec![true, false],
+            "oid_a must be seen (finalized), oid_b must be unseen (never staged)"
+        );
+    }
+
+    /// After a complete finalize persists the ordinal key, a fresh adapter that
+    /// calls `configure_midx_snapshot` with the same fingerprint restores the
+    /// ordinal cache from the persisted payload. OIDs that were seen in the
+    /// original session remain visible without a roaring rebuild.
+    #[test]
+    fn configure_midx_restores_matching_persisted_ordinal() {
+        let backend = TestBackend::atomic();
+        let repo_id = 61;
+        let policy_hash = [0x61; 32];
+        let ordinal_key = ordinal_key_builder(repo_id, &policy_hash);
+
+        let (midx_bytes, oid_a_raw, oid_b_raw) = build_two_object_midx();
+        let fingerprint = RepoArtifactFingerprint {
+            packs_hash: [0xEE; 32],
+            idx_hash: [0xFF; 32],
+        };
+
+        // First session: configure, stage both OIDs, and complete finalize.
+        // This writes the ordinal key to the backend.
+        {
+            let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+            adapter
+                .configure_midx_snapshot(
+                    midx_bytes.clone(),
+                    scanner_git::ObjectFormat::Sha1,
+                    fingerprint.clone(),
+                )
+                .expect("configure midx snapshot (session 1)");
+            let oid_a = OidBytes::sha1(oid_a_raw);
+            let oid_b = OidBytes::sha1(oid_b_raw);
+            adapter
+                .persist_seen_delta(&[oid_a, oid_b])
+                .expect("stage both oids");
+            adapter
+                .commit_finalize(&FinalizeOutput {
+                    data_ops: Vec::new(),
+                    watermark_ops: Vec::new(),
+                    outcome: FinalizeOutcome::Complete,
+                    stats: Default::default(),
+                })
+                .expect("complete finalize (session 1)");
+        }
+
+        // The ordinal key must be present in the backend after a complete
+        // finalize with an active MIDX snapshot.
+        assert!(
+            backend.get_value(&ordinal_key).is_some(),
+            "complete finalize must persist the ordinal key"
+        );
+
+        // Second session: fresh adapter simulating a process restart.
+        // configure_midx_snapshot reads the persisted ordinal and restores it
+        // because the fingerprint matches.
+        let adapter2 = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+        adapter2
+            .configure_midx_snapshot(
+                midx_bytes,
+                scanner_git::ObjectFormat::Sha1,
+                fingerprint.clone(),
+            )
+            .expect("configure midx snapshot (session 2)");
+
+        let oid_a = OidBytes::sha1(oid_a_raw);
+        let oid_b = OidBytes::sha1(oid_b_raw);
+        assert_eq!(
+            adapter2
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("batch_check_seen after restart with matching fingerprint"),
+            vec![true, true],
+            "both OIDs must be seen after restoring persisted ordinal with matching fingerprint"
+        );
+    }
+
+    /// When the persisted ordinal key was written for a different fingerprint
+    /// (e.g., the MIDX was repacked between scans), `configure_midx_snapshot`
+    /// discards the stale payload. The ordinal cache is rebuilt from the roaring
+    /// fallback on the next query, so OIDs in the committed scope are still
+    /// visible but only through the roaring path.
+    #[test]
+    fn configure_midx_discards_stale_persisted_ordinal() {
+        let backend = TestBackend::atomic();
+        let repo_id = 62;
+        let policy_hash = [0x62; 32];
+        let ordinal_key = ordinal_key_builder(repo_id, &policy_hash);
+
+        let (midx_bytes_a, oid_a_raw, oid_b_raw) = build_two_object_midx();
+        let fingerprint_a = RepoArtifactFingerprint {
+            packs_hash: [0xA0; 32],
+            idx_hash: [0xA1; 32],
+        };
+
+        // First session: configure with fingerprint_a, stage oid_a, finalize.
+        {
+            let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+            adapter
+                .configure_midx_snapshot(
+                    midx_bytes_a,
+                    scanner_git::ObjectFormat::Sha1,
+                    fingerprint_a,
+                )
+                .expect("configure midx snapshot (fingerprint A)");
+            let oid_a = OidBytes::sha1(oid_a_raw);
+            adapter.persist_seen_delta(&[oid_a]).expect("stage oid_a");
+            adapter
+                .commit_finalize(&FinalizeOutput {
+                    data_ops: Vec::new(),
+                    watermark_ops: Vec::new(),
+                    outcome: FinalizeOutcome::Complete,
+                    stats: Default::default(),
+                })
+                .expect("complete finalize (fingerprint A)");
+        }
+        assert!(
+            backend.get_value(&ordinal_key).is_some(),
+            "ordinal key must exist after finalize with fingerprint A"
+        );
+
+        // Second session: configure with fingerprint_b (different from A).
+        // The persisted ordinal belongs to fingerprint_a and must be discarded.
+        let fingerprint_b = RepoArtifactFingerprint {
+            packs_hash: [0xB0; 32],
+            idx_hash: [0xB1; 32],
+        };
+
+        // Rebuild the MIDX with the same objects so the snapshot is structurally
+        // valid but the artifact fingerprint differs.
+        let (midx_bytes_b, _, _) = build_two_object_midx();
+
+        let adapter2 = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
+        adapter2
+            .configure_midx_snapshot(midx_bytes_b, scanner_git::ObjectFormat::Sha1, fingerprint_b)
+            .expect("configure midx snapshot (fingerprint B)");
+
+        // oid_a is in the committed scope bitmap (from the first session's
+        // finalize), so it remains visible through the roaring fallback even
+        // though the persisted ordinal was discarded. oid_b was never staged,
+        // so it remains unseen.
+        let oid_a = OidBytes::sha1(oid_a_raw);
+        let oid_b = OidBytes::sha1(oid_b_raw);
+        assert_eq!(
+            adapter2
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("batch_check_seen after stale ordinal discard"),
+            vec![true, false],
+            "oid_a must be seen (in committed scope), oid_b must be unseen \
+             (ordinal cache rebuilt from roaring, not stale persisted payload)"
+        );
     }
 }

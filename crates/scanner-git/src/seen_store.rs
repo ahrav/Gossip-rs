@@ -7,8 +7,10 @@
 
 use std::collections::HashSet;
 
+use super::bytes::BytesView;
 use super::errors::SpillError;
-use super::object_id::OidBytes;
+use super::object_id::{ObjectFormat, OidBytes};
+use super::repo_open::RepoArtifactFingerprint;
 
 /// Batch query interface for seen-blob filtering.
 ///
@@ -20,6 +22,17 @@ use super::object_id::OidBytes;
 pub trait SeenBlobStore {
     /// Batch query: which OIDs have been seen before?
     fn batch_check_seen(&self, oids: &[OidBytes]) -> Result<Vec<bool>, SpillError>;
+
+    /// Configures the current MIDX snapshot for stores that support ordinal
+    /// acceleration. Implementations that do not use MIDX metadata ignore it.
+    fn configure_midx_snapshot(
+        &self,
+        _midx_bytes: BytesView,
+        _object_format: ObjectFormat,
+        _artifact_fingerprint: RepoArtifactFingerprint,
+    ) -> Result<(), SpillError> {
+        Ok(())
+    }
 }
 
 /// Incremental persistence interface for seen-bitmap scope updates.
