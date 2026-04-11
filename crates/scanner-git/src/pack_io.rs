@@ -579,8 +579,8 @@ mod tests {
         let fixture = builder.build().unwrap();
         let mut io = fixture.pack_io(test_limits()).unwrap();
 
-        assert_object_matches(&mut io, &fixture, base, ObjectKind::Blob, b"base");
-        assert_object_matches(&mut io, &fixture, delta, ObjectKind::Blob, b"base!");
+        assert_object_matches(&mut io, &fixture, base, b"base");
+        assert_object_matches(&mut io, &fixture, delta, b"base!");
     }
 
     #[test]
