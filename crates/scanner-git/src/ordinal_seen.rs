@@ -563,7 +563,22 @@ impl HybridSeenStore {
     ///
     /// Used to roll back the roaring bitmap after a failed durable write
     /// without losing the in-memory MIDX ordinal acceleration config.
+    ///
+    /// # Panics (debug builds)
+    ///
+    /// Panics if the replacement bitmap's OID length does not match the
+    /// configured MIDX snapshot format. Callers must load the replacement
+    /// with the same OID length as the existing fallback.
     pub fn replace_fallback(&mut self, fallback: RoaringSeenStore) {
+        debug_assert!(
+            self.midx_snapshot
+                .get_mut()
+                .as_ref()
+                .is_none_or(|s| s.layout.format.oid_len() == fallback.bitmap().oid_len()),
+            "replace_fallback: OID length mismatch between replacement bitmap ({}) and configured MIDX format ({})",
+            fallback.bitmap().oid_len(),
+            self.midx_snapshot.get_mut().as_ref().map_or(0, |s| s.layout.format.oid_len()),
+        );
         self.fallback = fallback;
         self.ordinal.get_mut().take();
     }
