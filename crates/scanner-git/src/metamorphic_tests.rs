@@ -14,66 +14,34 @@ use crate::multi_pack_test_helpers::{stable_oid, test_limits, MultiPackFixture};
 use crate::object_id::OidBytes;
 use crate::pack_cache::PackCache;
 use crate::pack_candidates::PackCandidate;
-use crate::pack_decode::PackDecodeLimits;
-use crate::pack_exec::{
-    execute_pack_plan, ExternalBase, ExternalBaseProvider, PackExecError, PackExecReport,
-    PackObjectSink,
+use crate::pack_exec::{execute_pack_plan, PackExecReport};
+use crate::pack_exec_test_helpers::{
+    default_test_ctx as ctx, CollectingSink, NoExternal, TEST_DECODE_LIMITS,
 };
 use crate::pack_inflate::ObjectKind;
-use crate::pack_io::PackIoError;
-use crate::pack_plan::{build_pack_plans, OidResolver, PackPlanConfig, PackPlanError, PackView};
+use crate::pack_plan::{build_pack_plans, PackPlanConfig, PackPlanError, PackView};
 use crate::pack_plan_model::PackPlan;
 use crate::test_utils::{for_each_permutation, proptest_cases};
-use crate::tree_candidate::{CandidateContext, ChangeKind};
+use crate::tree_candidate::ChangeKind;
 
+/// Proptest iteration count — low because each case builds full pack plans.
 const PROPTEST_CASES: u32 = 8;
+/// Cache capacity for warmed-cache test paths (256 KiB).
 const CACHE_BYTES: u32 = 256 * 1024;
+/// All single-pack helpers use pack index 0.
 const PACK_ID: u16 = 0;
+/// Byte arena budget — sufficient for the short synthetic paths in these tests.
 const PATH_ARENA_BYTES: u32 = 128;
-const DECODE_LIMITS: PackDecodeLimits = PackDecodeLimits::new(64, 1024, 1024);
 
-#[derive(Default)]
-struct CollectingSink {
-    blobs: HashMap<OidBytes, Vec<u8>>,
-}
+/// OID resolver that always returns `None`.
+///
+/// Suitable for single-pack tests where all delta chains use OFS encoding
+/// and no REF_DELTA base resolution is needed.
+struct NullResolver;
 
-impl PackObjectSink for CollectingSink {
-    fn emit(
-        &mut self,
-        candidate: &PackCandidate,
-        _path: &[u8],
-        bytes: &[u8],
-    ) -> Result<(), PackExecError> {
-        self.blobs.insert(candidate.oid, bytes.to_vec());
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct UnexpectedExternalLookup;
-
-impl ExternalBaseProvider for UnexpectedExternalLookup {
-    fn load_base(&mut self, _oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError> {
-        panic!("single-pack metamorphic tests should not perform external base lookups");
-    }
-}
-
-struct MissingResolver;
-
-impl OidResolver for MissingResolver {
+impl crate::pack_plan::OidResolver for NullResolver {
     fn resolve(&self, _oid: &OidBytes) -> Result<Option<(u16, u64)>, PackPlanError> {
         Ok(None)
-    }
-}
-
-fn ctx(path_ref: ByteRef) -> CandidateContext {
-    CandidateContext {
-        commit_id: 1,
-        parent_idx: 0,
-        change_kind: ChangeKind::Add,
-        ctx_flags: 0,
-        cand_flags: 0,
-        path_ref,
     }
 }
 
@@ -86,13 +54,18 @@ fn candidate(path_ref: ByteRef, oid: OidBytes, offset: u64) -> PackCandidate {
     }
 }
 
+/// Builds a single-pack plan from raw pack bytes and candidates.
+///
+/// Uses [`NullResolver`], so this helper is only suitable for packs where
+/// all delta chains use OFS encoding. REF deltas will be treated as
+/// external dependencies.
 fn single_pack_plan(pack_bytes: &[u8], candidates: Vec<PackCandidate>) -> PackPlan {
     let pack = PackView::parse(pack_bytes, OidBytes::SHA1_LEN).expect("single-pack test pack");
     let config = PackPlanConfig {
         max_delta_depth: 8,
         ..PackPlanConfig::default()
     };
-    let mut plans = build_pack_plans(candidates, &[Some(pack)], &MissingResolver, &config)
+    let mut plans = build_pack_plans(candidates, &[Some(pack)], &NullResolver, &config)
         .expect("single-pack test plan");
     assert_eq!(
         plans.len(),
@@ -109,13 +82,13 @@ fn execute_collect(
     cache: &mut PackCache,
 ) -> (HashMap<OidBytes, Vec<u8>>, PackExecReport) {
     let mut sink = CollectingSink::default();
-    let mut external = UnexpectedExternalLookup;
+    let mut external = NoExternal;
     let spill_dir = tempdir().expect("spill tempdir");
     let report = execute_pack_plan(
         plan,
         pack_bytes,
         paths,
-        &DECODE_LIMITS,
+        &TEST_DECODE_LIMITS,
         cache,
         &mut external,
         &mut sink,
@@ -125,13 +98,12 @@ fn execute_collect(
     (sink.blobs, report)
 }
 
-fn resolve_via_pack_io(
-    fixture: &MultiPackFixture,
-    oid: &OidBytes,
-) -> Result<(ObjectKind, Vec<u8>), PackIoError> {
-    let mut pack_io = fixture.pack_io(test_limits())?;
-    let loaded = pack_io.load_object(oid)?;
-    Ok(loaded.expect("fixture object should resolve"))
+fn resolve_via_pack_io(fixture: &MultiPackFixture, oid: &OidBytes) -> (ObjectKind, Vec<u8>) {
+    let mut pack_io = fixture.pack_io(test_limits()).expect("fixture pack_io");
+    pack_io
+        .load_object(oid)
+        .expect("fixture load_object")
+        .unwrap_or_else(|| panic!("fixture object {oid:?} should resolve"))
 }
 
 fn build_permuted_fixture(order: &[usize]) -> (MultiPackFixture, OidBytes, Vec<u8>) {
@@ -171,7 +143,7 @@ fn delta_equivalence_case() -> impl Strategy<Value = (Vec<u8>, usize, Vec<u8>)> 
         (
             Just(base),
             1..=base_len,
-            prop::collection::vec(any::<u8>(), 0..=32usize),
+            prop::collection::vec(any::<u8>(), 1..=32usize),
         )
     })
 }
@@ -179,17 +151,32 @@ fn delta_equivalence_case() -> impl Strategy<Value = (Vec<u8>, usize, Vec<u8>)> 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(proptest_cases(PROPTEST_CASES)))]
 
+    /// Verifies that resolved bytes are identical regardless of cache state.
+    ///
+    /// Runs the same plan three times (no cache, cold cache, warm cache) and
+    /// a fourth warm pass to confirm idempotence. Uses a mixed delta for
+    /// `mid` so the resolved content depends on base bytes — a base
+    /// resolution bug would surface as a ground-truth mismatch.
     #[test]
     fn cache_bypass_equivalence(
-        base_bytes in prop::collection::vec(any::<u8>(), 0..=32usize),
+        base_bytes in prop::collection::vec(any::<u8>(), 1..=32usize),
         mid_bytes in prop::collection::vec(any::<u8>(), 1..=64usize),
         leaf_bytes in prop::collection::vec(any::<u8>(), 1..=64usize),
         sibling_bytes in prop::collection::vec(any::<u8>(), 1..=64usize),
     ) {
+        // mid copies the first half of base then appends mid_bytes, so
+        // resolved content depends on actual base content.
+        let mid_copy_len = base_bytes.len().div_ceil(2);
+        let mut expected_mid = base_bytes[..mid_copy_len].to_vec();
+        expected_mid.extend_from_slice(&mid_bytes);
+
         let mut builder = SyntheticPackBuilder::new();
         let base_idx = builder.add_non_delta(3, &base_bytes);
-        let mid_idx = builder.add_ofs_delta(base_idx, &make_add_delta(base_bytes.len(), &mid_bytes));
-        let leaf_idx = builder.add_ofs_delta(mid_idx, &make_add_delta(mid_bytes.len(), &leaf_bytes));
+        let mid_idx = builder.add_ofs_delta(
+            base_idx,
+            &make_mixed_delta(base_bytes.len(), 0, mid_copy_len, &mid_bytes),
+        );
+        let leaf_idx = builder.add_ofs_delta(mid_idx, &make_add_delta(expected_mid.len(), &leaf_bytes));
         let sibling_idx = builder.add_ofs_delta(base_idx, &make_add_delta(base_bytes.len(), &sibling_bytes));
         let (pack_bytes, offsets) = builder.build();
 
@@ -209,23 +196,38 @@ proptest! {
             ],
         );
 
+        // Run 1: no cache.
         let mut no_cache = PackCache::new(0);
         let (cache_off, off_report) = execute_collect(&plan, &pack_bytes, &arena, &mut no_cache);
         prop_assert!(off_report.skips.is_empty());
+        prop_assert_eq!(cache_off.len(), 4);
         prop_assert!(no_cache.get(offsets[base_idx]).is_none());
 
+        // Run 2: cold cache (first population).
         let mut warmed_cache = PackCache::new(CACHE_BYTES);
         let (cache_on_cold, cold_report) = execute_collect(&plan, &pack_bytes, &arena, &mut warmed_cache);
         prop_assert!(cold_report.skips.is_empty());
+        prop_assert_eq!(cache_on_cold.len(), 4);
         prop_assert!(warmed_cache.get(offsets[leaf_idx]).is_some());
 
+        // Run 3: warm cache (hits existing entries).
         let (cache_on_warm, warm_report) = execute_collect(&plan, &pack_bytes, &arena, &mut warmed_cache);
         prop_assert!(warm_report.skips.is_empty());
+        prop_assert_eq!(cache_on_warm.len(), 4);
 
+        // Run 4: second warm pass — idempotence check.
+        let (cache_on_warm2, warm2_report) = execute_collect(&plan, &pack_bytes, &arena, &mut warmed_cache);
+        prop_assert!(warm2_report.skips.is_empty());
+        prop_assert_eq!(cache_on_warm2.len(), 4);
+
+        // Metamorphic equivalence: all four runs produce identical blobs.
         prop_assert_eq!(&cache_off, &cache_on_cold);
         prop_assert_eq!(&cache_off, &cache_on_warm);
+        prop_assert_eq!(&cache_off, &cache_on_warm2);
+
+        // Ground-truth: resolved content matches expected values.
         prop_assert_eq!(cache_on_warm.get(&base_oid), Some(&base_bytes));
-        prop_assert_eq!(cache_on_warm.get(&mid_oid), Some(&mid_bytes));
+        prop_assert_eq!(cache_on_warm.get(&mid_oid), Some(&expected_mid));
         prop_assert_eq!(cache_on_warm.get(&leaf_oid), Some(&leaf_bytes));
         prop_assert_eq!(cache_on_warm.get(&sibling_oid), Some(&sibling_bytes));
     }
@@ -268,13 +270,15 @@ proptest! {
 fn permutation_invariance() {
     let mut order = [0usize, 1, 2];
     let (baseline_fixture, baseline_oid, baseline_bytes) = build_permuted_fixture(&order);
-    let baseline = resolve_via_pack_io(&baseline_fixture, &baseline_oid).expect("baseline fixture");
+    let baseline = resolve_via_pack_io(&baseline_fixture, &baseline_oid);
     assert_eq!(baseline.0, ObjectKind::Blob);
     assert_eq!(baseline.1, baseline_bytes);
 
+    // Generates all 6 permutations including identity — the identity overlap
+    // with the baseline is harmless and not worth special-casing.
     for_each_permutation(&mut order, 0, &mut |perm| {
         let (fixture, oid, expected) = build_permuted_fixture(perm);
-        let resolved = resolve_via_pack_io(&fixture, &oid).expect("permuted fixture");
+        let resolved = resolve_via_pack_io(&fixture, &oid);
         assert_eq!(oid, baseline_oid);
         assert_eq!(resolved.0, ObjectKind::Blob);
         assert_eq!(resolved.1, expected);
@@ -289,7 +293,9 @@ fn subset_consistency() {
     let pack_b = full_builder.add_pack(b"pack-b");
     let pack_c = full_builder.add_pack(b"pack-c");
     let base_a = full_builder.add_blob(pack_a, b"subset-base");
-    let target_full = full_builder.add_ofs_delta(pack_a, base_a, b"subset-leaf");
+    // Mixed delta: copies 6 bytes from base ("subset") then appends "-leaf",
+    // so resolved content = "subset-leaf" and depends on actual base bytes.
+    let target_full = full_builder.add_ofs_delta_mixed(pack_a, base_a, 6, b"-leaf");
     let _noise_b = full_builder.add_blob(pack_b, b"subset-noise-b");
     let _noise_c = full_builder.add_blob(pack_c, b"subset-noise-c");
     let full_fixture = full_builder.build().expect("full fixture");
@@ -297,16 +303,16 @@ fn subset_consistency() {
     let mut subset_builder = MultiPackFixture::builder();
     let subset_pack_a = subset_builder.add_pack(b"pack-a");
     let subset_base_a = subset_builder.add_blob(subset_pack_a, b"subset-base");
-    let target_subset = subset_builder.add_ofs_delta(subset_pack_a, subset_base_a, b"subset-leaf");
+    let target_subset =
+        subset_builder.add_ofs_delta_mixed(subset_pack_a, subset_base_a, 6, b"-leaf");
     let subset_fixture = subset_builder.build().expect("subset fixture");
 
     let full_oid = full_fixture.oid(target_full);
     let subset_oid = subset_fixture.oid(target_subset);
     assert_eq!(full_oid, subset_oid);
 
-    let full_resolved = resolve_via_pack_io(&full_fixture, &full_oid).expect("full resolution");
-    let subset_resolved =
-        resolve_via_pack_io(&subset_fixture, &subset_oid).expect("subset resolution");
+    let full_resolved = resolve_via_pack_io(&full_fixture, &full_oid);
+    let subset_resolved = resolve_via_pack_io(&subset_fixture, &subset_oid);
 
     assert_eq!(full_resolved.0, ObjectKind::Blob);
     assert_eq!(subset_resolved.0, ObjectKind::Blob);

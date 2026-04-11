@@ -51,7 +51,7 @@ use crate::delta_test_helpers::{
     kind_code, kind_name, make_add_delta, make_mixed_delta, SyntheticPackBuilder,
 };
 use crate::midx_test_builder::MidxBuilder;
-use crate::pack_decode::PackDecodeLimits;
+use crate::pack_exec_test_helpers::TEST_DECODE_LIMITS;
 use crate::pack_inflate::ObjectKind;
 use crate::pack_io::{PackIo, PackIoError, PackIoLimits};
 #[cfg(feature = "sim-harness")]
@@ -358,6 +358,56 @@ impl MultiPackFixtureBuilder {
         )
     }
 
+    /// Adds an OFS_DELTA object that copies `copy_len` bytes from the base
+    /// then appends `suffix`.
+    ///
+    /// The resolved content is `base_bytes[..copy_len] || suffix`, which
+    /// depends on the actual base content. This makes incorrect base
+    /// resolution observable: if the decoder fetches wrong bytes, the
+    /// resolved output will differ from the golden value.
+    ///
+    /// `copy_len` must be > 0 and <= `base.resolved_bytes.len()`.
+    /// `suffix` must be <= 127 bytes (single add-literal opcode limit).
+    pub(crate) fn add_ofs_delta_mixed(
+        &mut self,
+        pack: PackHandle,
+        base: ObjectHandle,
+        copy_len: usize,
+        suffix: &[u8],
+    ) -> ObjectHandle {
+        let base_object = self.object(base);
+        assert_eq!(
+            base_object.pack_idx, pack.0,
+            "OFS_DELTA base must live in the same pack"
+        );
+        let base_bytes = base_object
+            .resolved_bytes
+            .as_ref()
+            .expect("OFS_DELTA base must have resolved bytes");
+        assert!(
+            copy_len > 0 && copy_len <= base_bytes.len(),
+            "copy_len must be in 1..=base.len()"
+        );
+        let kind = base_object.kind;
+        let base_len = base_bytes.len();
+        let base_entry_idx = base_object.entry_idx;
+
+        let mut resolved = base_bytes[..copy_len].to_vec();
+        resolved.extend_from_slice(suffix);
+        let oid = git_oid(kind, &resolved);
+
+        self.push_object(
+            pack.0,
+            EntrySpec::OfsDelta {
+                base_entry_idx,
+                delta: make_mixed_delta(base_len, 0, copy_len, suffix),
+            },
+            kind,
+            oid,
+            Some(resolved),
+        )
+    }
+
     /// Adds a REF_DELTA object that references an OID absent from the fixture.
     ///
     /// The entry's own OID is a synthetic [`stable_oid`] (not a real Git
@@ -517,12 +567,11 @@ pub(crate) fn stable_oid(label: &[u8]) -> OidBytes {
 
 /// Default [`PackIoLimits`] for multi-pack fixture tests.
 ///
-/// Returns decode limits of `max_header_bytes = 64`,
-/// `max_object_bytes = 1024`, `max_delta_bytes = 1024`,
-/// and `max_delta_depth = 8`.
+/// Returns decode limits matching [`TEST_DECODE_LIMITS`] and
+/// `max_delta_depth = 8`.
 #[must_use]
 pub(crate) fn test_limits() -> PackIoLimits {
-    PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 8)
+    PackIoLimits::new(TEST_DECODE_LIMITS, 8)
 }
 
 fn git_oid(kind: ObjectKind, bytes: &[u8]) -> OidBytes {

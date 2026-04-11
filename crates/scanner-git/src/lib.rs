@@ -158,6 +158,8 @@ pub mod pack_decode;
 pub mod pack_delta;
 /// Implements the pack plan executor with bounded decode and skip tracking.
 pub mod pack_exec;
+#[cfg(test)]
+pub(crate) mod pack_exec_test_helpers;
 /// Implements a zero-copy parser for Git pack index (`.idx`) v2 files.
 pub mod pack_idx;
 /// Provides bounded inflate helpers and delta encoding for pack objects.

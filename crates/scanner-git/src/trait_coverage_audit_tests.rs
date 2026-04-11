@@ -42,7 +42,6 @@ const TRAIT_COVERAGE_AUDIT: &[TraitCoverageAudit] = &[
             "FailingExternalBase",
             "MissingExternalBase",
             "NoExternal",
-            "UnexpectedExternalLookup",
         ],
     },
     TraitCoverageAudit {
@@ -53,7 +52,7 @@ const TRAIT_COVERAGE_AUDIT: &[TraitCoverageAudit] = &[
     TraitCoverageAudit {
         trait_name: "OidResolver",
         real_impls: &["MidxView"],
-        test_stubs: &["MissingResolver"],
+        test_stubs: &["NullResolver"],
     },
     TraitCoverageAudit {
         trait_name: "PackCandidateSink",
