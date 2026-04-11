@@ -978,10 +978,7 @@ impl SeenBlobStore for HybridSeenStore {
                 #[cfg(debug_assertions)]
                 self.in_query.set(false);
                 drop(cache_guard);
-                return Err(SpillError::Io(std::io::Error::other(format!(
-                    "batch_check_seen requires sorted input; violation at index {idx} (batch_size={})",
-                    oids.len()
-                ))));
+                return Err(MidxError::InputNotSorted.into());
             }
             if prev_oid == oid {
                 if prev_was_fallback {
@@ -1780,7 +1777,7 @@ mod tests {
             .batch_check_seen(&probes)
             .expect_err("unsorted input must be rejected");
         assert!(
-            err.to_string().contains("sorted input"),
+            matches!(err, SpillError::MidxError(MidxError::InputNotSorted)),
             "unexpected error: {err}"
         );
     }
@@ -2120,13 +2117,12 @@ mod tests {
                         prop_assert_eq!(actual, expected);
                     }
                     HybridOp::QueryUnsorted(values) => {
-                        // Deliberately unsorted probes. The sorted contract
-                        // is now enforced (returns an error) rather than
-                        // silently falling back to roaring-only search.
+                        // Unsorted probes exercise the sort-contract
+                        // enforcement path. The ordinal cache rejects
+                        // unordered input to prevent silent false negatives
+                        // on OIDs staged only in the ordinal bitset.
                         let probes: Vec<OidBytes> =
                             values.into_iter().map(|value| oid_from_u32(value as u32)).collect();
-                        // Unsorted input may accidentally be sorted; only
-                        // check for error when genuinely unsorted.
                         let is_sorted = probes.windows(2).all(|w| w[0] <= w[1]);
                         match store.batch_check_seen(&probes) {
                             Ok(actual) if is_sorted => {
@@ -2143,9 +2139,7 @@ mod tests {
                                     "unsorted input should be rejected when ordinal cache is active",
                                 ));
                             }
-                            Err(_) if !is_sorted => {
-                                // Expected: unsorted input rejected.
-                            }
+                            Err(_) if !is_sorted => {}
                             Err(e) if is_sorted => {
                                 return Err(proptest::test_runner::TestCaseError::fail(
                                     format!("sorted input should not fail: {e}")
