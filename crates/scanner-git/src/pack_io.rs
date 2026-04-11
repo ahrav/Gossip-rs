@@ -601,12 +601,13 @@ mod tests {
         let fixture = builder.build().unwrap();
         let mut io = fixture.pack_io(test_limits()).unwrap();
 
-        assert_object_matches(&mut io, &fixture, top, ObjectKind::Blob, b"root-mid-leaf");
-        assert_object_matches(&mut io, &fixture, mid, ObjectKind::Blob, b"root-mid");
+        assert_object_matches(&mut io, &fixture, base, b"root");
+        assert_object_matches(&mut io, &fixture, mid, b"root-mid");
+        assert_object_matches(&mut io, &fixture, top, b"root-mid-leaf");
     }
 
-    /// Asserts that `load_object` for `handle` returns the expected kind, literal
-    /// bytes, and matches the fixture's golden value.
+    /// Asserts that `load_object` for `handle` returns the expected literal
+    /// bytes and matches the fixture's golden kind and value.
     ///
     /// Validates the test's literal expectation against the fixture's computed golden
     /// value first, so a mismatch is reported as a test-authoring error rather than
@@ -616,21 +617,20 @@ mod tests {
         io: &mut PackIo<'_>,
         fixture: &MultiPackFixture,
         handle: ObjectHandle,
-        expected_kind: ObjectKind,
         expected_bytes: &[u8],
     ) {
-        let golden = fixture
+        let (golden_kind, golden_bytes) = fixture
             .expected(handle)
             .expect("assert_object_matches requires a handle with a golden value");
         assert_eq!(
-            expected_bytes, golden.1,
+            expected_bytes, golden_bytes,
             "literal expectation does not match fixture golden value"
         );
         let loaded = io
             .load_object(&fixture.oid(handle))
             .unwrap()
             .expect("object should be resolvable");
-        assert_eq!(loaded.0, expected_kind);
+        assert_eq!(loaded.0, golden_kind);
         assert_eq!(loaded.1, expected_bytes);
     }
 
@@ -652,14 +652,14 @@ mod tests {
         let fixture = builder.build().unwrap();
         let mut io = fixture.pack_io(test_limits()).unwrap();
 
-        assert_object_matches(&mut io, &fixture, base, ObjectKind::Blob, b"root");
-        assert_object_matches(&mut io, &fixture, hop_c, ObjectKind::Blob, b"root-c");
-        assert_object_matches(&mut io, &fixture, hop_b, ObjectKind::Blob, b"root-c-b");
-        assert_object_matches(&mut io, &fixture, top, ObjectKind::Blob, b"root-c-b-a");
+        assert_object_matches(&mut io, &fixture, base, b"root");
+        assert_object_matches(&mut io, &fixture, hop_c, b"root-c");
+        assert_object_matches(&mut io, &fixture, hop_b, b"root-c-b");
+        assert_object_matches(&mut io, &fixture, top, b"root-c-b-a");
     }
 
     #[test]
-    fn mixed_ofs_and_ref_delta_chain() {
+    fn cross_pack_mixed_ofs_and_ref_delta_chain() {
         let mut builder = MultiPackFixture::builder();
         let pack_base = builder.add_pack(b"pack-base");
         let pack_delta = builder.add_pack(b"pack-delta");
@@ -700,8 +700,8 @@ mod tests {
         assert!(fixture.expected(missing).is_none());
     }
 
-    /// Two-hop chain where the root base is absent from the MIDX:
-    /// `top -> mid -> <missing>`.  Both mid and top should return `None`.
+    /// Delta chain with two entries (`top -> mid`) whose root base is absent
+    /// from the MIDX.  Both `mid` and `top` should return `None`.
     ///
     /// Uses raw pack/MIDX construction because `MultiPackFixture::add_ref_delta`
     /// requires resolved bytes on the base handle, which is unavailable when the
@@ -803,17 +803,11 @@ mod tests {
         // Intentionally reuse fail_io after the error: verifies the instance remains
         // usable for shorter chains that fit within the same depth limit.
         // hop_b is a 2-hop chain (hop_b -> hop_c -> base) and fits within depth=2.
-        assert_object_matches(&mut fail_io, &fixture, hop_b, ObjectKind::Blob, b"root-c-b");
+        assert_object_matches(&mut fail_io, &fixture, hop_b, b"root-c-b");
 
         let success_limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 3);
         let mut success_io = fixture.pack_io(success_limits).unwrap();
-        assert_object_matches(
-            &mut success_io,
-            &fixture,
-            top,
-            ObjectKind::Blob,
-            b"root-c-b-a",
-        );
+        assert_object_matches(&mut success_io, &fixture, top, b"root-c-b-a");
     }
 
     #[test]
@@ -836,7 +830,7 @@ mod tests {
         ));
 
         // Non-delta base is still loadable at depth=0.
-        assert_object_matches(&mut io, &fixture, base, ObjectKind::Blob, b"base");
+        assert_object_matches(&mut io, &fixture, base, b"base");
     }
 
     #[test]
@@ -855,7 +849,7 @@ mod tests {
         let mut io = fixture.pack_io(limits).unwrap();
 
         // 1-hop chain fits within depth=1.
-        assert_object_matches(&mut io, &fixture, mid, ObjectKind::Blob, b"root-mid");
+        assert_object_matches(&mut io, &fixture, mid, b"root-mid");
 
         // 2-hop chain exceeds depth=1.
         let err = io.load_object(&fixture.oid(top)).unwrap_err();
@@ -863,6 +857,34 @@ mod tests {
             err,
             PackIoError::DeltaDepthExceeded { max_depth: 1 }
         ));
+    }
+
+    #[test]
+    fn ofs_delta_depth_exhaustion_at_boundary() {
+        let mut builder = MultiPackFixture::builder();
+        let pack = builder.add_pack(b"pack-ofs-depth");
+
+        let base = builder.add_blob(pack, b"root");
+        let child = builder.add_ofs_delta(pack, base, b"child");
+        let grandchild = builder.add_ofs_delta(pack, child, b"grandchild");
+
+        let fixture = builder.build().unwrap();
+
+        // depth=1: grandchild (2-deep OFS chain) exceeds, child (1-deep) fits.
+        let fail_limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 1);
+        let mut fail_io = fixture.pack_io(fail_limits).unwrap();
+
+        let err = fail_io.load_object(&fixture.oid(grandchild)).unwrap_err();
+        assert!(matches!(
+            err,
+            PackIoError::DeltaDepthExceeded { max_depth: 1 }
+        ));
+        assert_object_matches(&mut fail_io, &fixture, child, b"child");
+
+        // depth=2: grandchild fits exactly.
+        let ok_limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 2);
+        let mut ok_io = fixture.pack_io(ok_limits).unwrap();
+        assert_object_matches(&mut ok_io, &fixture, grandchild, b"grandchild");
     }
 
     #[test]
