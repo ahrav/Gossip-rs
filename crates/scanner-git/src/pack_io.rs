@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn load_cross_pack_ref_delta_from_fixture() {
+    fn cross_pack_ref_delta_single_hop() {
         let mut builder = MultiPackFixture::builder();
         let pack_base = builder.add_pack(b"pack-base");
         let pack_delta = builder.add_pack(b"pack-delta");
@@ -642,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn load_three_pack_multi_hop_chain_from_fixture() {
+    fn cross_pack_ref_delta_two_hop() {
         let mut builder = MultiPackFixture::builder();
         let pack_c = builder.add_pack(b"pack-c");
         let pack_b = builder.add_pack(b"pack-b");
@@ -668,6 +668,38 @@ mod tests {
         assert_eq!(mid_loaded.0, ObjectKind::Blob);
         assert_eq!(mid_loaded.1, b"root-mid");
         assert_eq!(mid_loaded.1, fixture.expected(mid).unwrap().1);
+    }
+
+    #[test]
+    fn cross_pack_ref_delta_three_hop() {
+        let mut builder = MultiPackFixture::builder();
+        let pack_d = builder.add_pack(b"pack-d");
+        let pack_c = builder.add_pack(b"pack-c");
+        let pack_b = builder.add_pack(b"pack-b");
+        let pack_a = builder.add_pack(b"pack-a");
+
+        let base = builder.add_blob(pack_d, b"root");
+        let hop_c = builder.add_ref_delta_mixed(pack_c, base, 4, b"-c");
+        let hop_b = builder.add_ref_delta_mixed(pack_b, hop_c, 6, b"-b");
+        let top = builder.add_ref_delta_mixed(pack_a, hop_b, 8, b"-a");
+
+        let fixture = builder.build().unwrap();
+        let mut io = fixture.pack_io(test_limits()).unwrap();
+
+        let hop_c_loaded = io.load_object(&fixture.oid(hop_c)).unwrap().unwrap();
+        assert_eq!(hop_c_loaded.0, ObjectKind::Blob);
+        assert_eq!(hop_c_loaded.1, b"root-c");
+        assert_eq!(hop_c_loaded.1, fixture.expected(hop_c).unwrap().1);
+
+        let hop_b_loaded = io.load_object(&fixture.oid(hop_b)).unwrap().unwrap();
+        assert_eq!(hop_b_loaded.0, ObjectKind::Blob);
+        assert_eq!(hop_b_loaded.1, b"root-c-b");
+        assert_eq!(hop_b_loaded.1, fixture.expected(hop_b).unwrap().1);
+
+        let top_loaded = io.load_object(&fixture.oid(top)).unwrap().unwrap();
+        assert_eq!(top_loaded.0, ObjectKind::Blob);
+        assert_eq!(top_loaded.1, b"root-c-b-a");
+        assert_eq!(top_loaded.1, fixture.expected(top).unwrap().1);
     }
 
     #[test]
@@ -713,6 +745,45 @@ mod tests {
     }
 
     #[test]
+    fn cross_pack_missing_intermediate_base() {
+        let missing_base = stable_oid(b"missing-cross-pack-base");
+        let missing_base_oid: [u8; 20] = missing_base.as_slice().try_into().unwrap();
+        let mid_oid = [0x42; 20];
+        let top_oid = [0x43; 20];
+
+        let pack_mid = build_pack_ref_delta(missing_base_oid, b"unused-mid", 4);
+        let pack_top = build_pack_ref_delta(mid_oid, b"unused-top", 10);
+
+        let temp = tempdir().unwrap();
+        let pack_mid_path = temp.path().join("pack-mid.pack");
+        let pack_top_path = temp.path().join("pack-top.pack");
+        fs::write(&pack_mid_path, &pack_mid).unwrap();
+        fs::write(&pack_top_path, &pack_top).unwrap();
+
+        let mut builder = MidxBuilder::default();
+        builder.add_pack(b"pack-mid");
+        builder.add_pack(b"pack-top");
+        builder.add_object(mid_oid, 0, 12);
+        builder.add_object(top_oid, 1, 12);
+        let midx_bytes = builder.build();
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).unwrap();
+
+        let mut io = PackIo::from_parts(
+            midx,
+            vec![pack_mid_path, pack_top_path],
+            Vec::new(),
+            test_limits(),
+        )
+        .unwrap();
+
+        let missing_mid = io.load_object(&OidBytes::sha1(mid_oid)).unwrap();
+        assert!(missing_mid.is_none());
+
+        let missing_top = io.load_object(&OidBytes::sha1(top_oid)).unwrap();
+        assert!(missing_top.is_none());
+    }
+
+    #[test]
     fn fixture_golden_values_match_pack_io() {
         let mut builder = MultiPackFixture::builder();
         let pack_c = builder.add_pack(b"pack-c");
@@ -740,27 +811,35 @@ mod tests {
     }
 
     #[test]
-    fn cross_pack_delta_depth_exceeded_from_fixture() {
+    fn cross_pack_depth_exhaustion_at_boundary() {
         let mut builder = MultiPackFixture::builder();
+        let pack_d = builder.add_pack(b"pack-d");
         let pack_c = builder.add_pack(b"pack-c");
         let pack_b = builder.add_pack(b"pack-b");
         let pack_a = builder.add_pack(b"pack-a");
 
-        let base = builder.add_blob(pack_c, b"base");
-        let mid = builder.add_ref_delta(pack_b, base, b"middle");
-        let top = builder.add_ref_delta(pack_a, mid, b"leaf");
+        let base = builder.add_blob(pack_d, b"root");
+        let hop_c = builder.add_ref_delta_mixed(pack_c, base, 4, b"-c");
+        let hop_b = builder.add_ref_delta_mixed(pack_b, hop_c, 6, b"-b");
+        let top = builder.add_ref_delta_mixed(pack_a, hop_b, 8, b"-a");
 
         let fixture = builder.build().unwrap();
 
-        // Depth limit of 1 is too tight for a 2-deep delta chain.
-        let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 1);
-        let mut io = fixture.pack_io(limits).unwrap();
+        let fail_limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 2);
+        let mut fail_io = fixture.pack_io(fail_limits).unwrap();
 
-        let err = io.load_object(&fixture.oid(top)).unwrap_err();
+        let err = fail_io.load_object(&fixture.oid(top)).unwrap_err();
         assert!(matches!(
             err,
-            PackIoError::DeltaDepthExceeded { max_depth: 1 }
+            PackIoError::DeltaDepthExceeded { max_depth: 2 }
         ));
+
+        let success_limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 3);
+        let mut success_io = fixture.pack_io(success_limits).unwrap();
+        let loaded = success_io.load_object(&fixture.oid(top)).unwrap().unwrap();
+        assert_eq!(loaded.0, ObjectKind::Blob);
+        assert_eq!(loaded.1, b"root-c-b-a");
+        assert_eq!(loaded.1, fixture.expected(top).unwrap().1);
     }
 
     #[test]
