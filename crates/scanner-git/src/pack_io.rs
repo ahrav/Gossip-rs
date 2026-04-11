@@ -484,7 +484,9 @@ mod tests {
     use super::super::delta_test_helpers::{
         encode_entry_header, encode_ofs_distance, encode_varint, zlib_compress,
     };
-    use super::super::multi_pack_test_helpers::{stable_oid, test_limits, MultiPackFixture};
+    use super::super::multi_pack_test_helpers::{
+        stable_oid, test_limits, MultiPackFixture, ObjectHandle,
+    };
     use super::super::object_id::{ObjectFormat, OidBytes};
 
     use super::super::midx_test_builder::MidxBuilder;
@@ -520,17 +522,6 @@ mod tests {
 
     fn write_loose_bytes(objects_dir: &Path, oid: OidBytes, payload: &[u8]) {
         fs::write(loose_object_path(objects_dir, &oid), payload).unwrap();
-    }
-
-    fn build_pack_blob(data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(b"PACK");
-        out.extend_from_slice(&2u32.to_be_bytes());
-        out.extend_from_slice(&1u32.to_be_bytes());
-        out.extend_from_slice(&encode_entry_header(3, data.len()));
-        out.extend_from_slice(&zlib_compress(data));
-        out.extend_from_slice(&[0u8; 20]);
-        out
     }
 
     fn build_pack_ref_delta(base_oid: [u8; 20], result: &[u8], base_len: usize) -> Vec<u8> {
@@ -572,49 +563,6 @@ mod tests {
         out.extend_from_slice(&zlib_compress(&delta));
         out.extend_from_slice(&[0u8; 20]);
         out
-    }
-
-    #[test]
-    fn load_cross_pack_ref_delta() {
-        let base_oid = [0x11; 20];
-        let delta_oid = [0x22; 20];
-
-        let base_bytes = b"base";
-        let result_bytes = b"base!";
-
-        let pack_base = build_pack_blob(base_bytes);
-        let pack_delta = build_pack_ref_delta(base_oid, result_bytes, base_bytes.len());
-
-        let temp = tempdir().unwrap();
-        let pack_base_path = temp.path().join("pack-base.pack");
-        let pack_delta_path = temp.path().join("pack-delta.pack");
-        fs::write(&pack_base_path, &pack_base).unwrap();
-        fs::write(&pack_delta_path, &pack_delta).unwrap();
-
-        let mut builder = MidxBuilder::default();
-        builder.add_pack(b"pack-base");
-        builder.add_pack(b"pack-delta");
-        builder.add_object(base_oid, 0, 12);
-        builder.add_object(delta_oid, 1, 12);
-        let midx_bytes = builder.build();
-        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).unwrap();
-
-        let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 8);
-        let mut io = PackIo::from_parts(
-            midx,
-            vec![pack_base_path, pack_delta_path],
-            Vec::new(),
-            limits,
-        )
-        .unwrap();
-
-        let base = io.load_object(&OidBytes::sha1(base_oid)).unwrap().unwrap();
-        assert_eq!(base.0, ObjectKind::Blob);
-        assert_eq!(base.1, base_bytes);
-
-        let delta = io.load_object(&OidBytes::sha1(delta_oid)).unwrap().unwrap();
-        assert_eq!(delta.0, ObjectKind::Blob);
-        assert_eq!(delta.1, result_bytes);
     }
 
     #[test]
@@ -670,6 +618,25 @@ mod tests {
         assert_eq!(mid_loaded.1, fixture.expected(mid).unwrap().1);
     }
 
+    /// Asserts that `load_object` for `handle` returns the expected kind, literal
+    /// bytes, and matches the fixture's golden value.
+    #[track_caller]
+    fn assert_object_matches(
+        io: &mut PackIo<'_>,
+        fixture: &MultiPackFixture,
+        handle: ObjectHandle,
+        expected_kind: ObjectKind,
+        expected_bytes: &[u8],
+    ) {
+        let loaded = io
+            .load_object(&fixture.oid(handle))
+            .unwrap()
+            .expect("object should be resolvable");
+        assert_eq!(loaded.0, expected_kind);
+        assert_eq!(loaded.1, expected_bytes);
+        assert_eq!(loaded.1, fixture.expected(handle).unwrap().1);
+    }
+
     #[test]
     fn cross_pack_ref_delta_three_hop() {
         let mut builder = MultiPackFixture::builder();
@@ -678,6 +645,8 @@ mod tests {
         let pack_b = builder.add_pack(b"pack-b");
         let pack_a = builder.add_pack(b"pack-a");
 
+        // Chain: base("root") → hop_c("root-c") → hop_b("root-c-b") → top("root-c-b-a").
+        // Each delta copies the full resolved base then appends a suffix.
         let base = builder.add_blob(pack_d, b"root");
         let hop_c = builder.add_ref_delta_mixed(pack_c, base, 4, b"-c");
         let hop_b = builder.add_ref_delta_mixed(pack_b, hop_c, 6, b"-b");
@@ -686,24 +655,14 @@ mod tests {
         let fixture = builder.build().unwrap();
         let mut io = fixture.pack_io(test_limits()).unwrap();
 
-        let hop_c_loaded = io.load_object(&fixture.oid(hop_c)).unwrap().unwrap();
-        assert_eq!(hop_c_loaded.0, ObjectKind::Blob);
-        assert_eq!(hop_c_loaded.1, b"root-c");
-        assert_eq!(hop_c_loaded.1, fixture.expected(hop_c).unwrap().1);
-
-        let hop_b_loaded = io.load_object(&fixture.oid(hop_b)).unwrap().unwrap();
-        assert_eq!(hop_b_loaded.0, ObjectKind::Blob);
-        assert_eq!(hop_b_loaded.1, b"root-c-b");
-        assert_eq!(hop_b_loaded.1, fixture.expected(hop_b).unwrap().1);
-
-        let top_loaded = io.load_object(&fixture.oid(top)).unwrap().unwrap();
-        assert_eq!(top_loaded.0, ObjectKind::Blob);
-        assert_eq!(top_loaded.1, b"root-c-b-a");
-        assert_eq!(top_loaded.1, fixture.expected(top).unwrap().1);
+        assert_object_matches(&mut io, &fixture, base, ObjectKind::Blob, b"root");
+        assert_object_matches(&mut io, &fixture, hop_c, ObjectKind::Blob, b"root-c");
+        assert_object_matches(&mut io, &fixture, hop_b, ObjectKind::Blob, b"root-c-b");
+        assert_object_matches(&mut io, &fixture, top, ObjectKind::Blob, b"root-c-b-a");
     }
 
     #[test]
-    fn load_mixed_ofs_and_ref_delta_chain_from_fixture() {
+    fn mixed_ofs_and_ref_delta_chain() {
         let mut builder = MultiPackFixture::builder();
         let pack_base = builder.add_pack(b"pack-base");
         let pack_delta = builder.add_pack(b"pack-delta");
@@ -725,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_external_base_returns_none_from_fixture() {
+    fn missing_external_base_returns_none() {
         let mut builder = MultiPackFixture::builder();
         let pack = builder.add_pack(b"pack-missing");
         let missing = builder.add_missing_ref_delta(
@@ -744,6 +703,12 @@ mod tests {
         assert!(fixture.expected(missing).is_none());
     }
 
+    /// Two-hop chain where the root base is absent from the MIDX:
+    /// `top -> mid -> <missing>`.  Both mid and top should return `None`.
+    ///
+    /// Uses raw pack/MIDX construction because `MultiPackFixture::add_ref_delta`
+    /// requires resolved bytes on the base handle, which is unavailable when the
+    /// base is intentionally missing.
     #[test]
     fn cross_pack_missing_intermediate_base() {
         let missing_base = stable_oid(b"missing-cross-pack-base");
@@ -776,6 +741,10 @@ mod tests {
         )
         .unwrap();
 
+        // Precondition: the root base OID is truly absent from the index.
+        let base_lookup = io.load_object(&OidBytes::sha1(missing_base_oid)).unwrap();
+        assert!(base_lookup.is_none(), "root base must be absent from MIDX");
+
         let missing_mid = io.load_object(&OidBytes::sha1(mid_oid)).unwrap();
         assert!(missing_mid.is_none());
 
@@ -784,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn fixture_golden_values_match_pack_io() {
+    fn golden_values_match_pack_io() {
         let mut builder = MultiPackFixture::builder();
         let pack_c = builder.add_pack(b"pack-c");
         let pack_b = builder.add_pack(b"pack-b");
@@ -834,12 +803,18 @@ mod tests {
             PackIoError::DeltaDepthExceeded { max_depth: 2 }
         ));
 
+        // hop_b is a 2-hop chain (hop_b -> hop_c -> base) and fits within depth=2.
+        assert_object_matches(&mut fail_io, &fixture, hop_b, ObjectKind::Blob, b"root-c-b");
+
         let success_limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 3);
         let mut success_io = fixture.pack_io(success_limits).unwrap();
-        let loaded = success_io.load_object(&fixture.oid(top)).unwrap().unwrap();
-        assert_eq!(loaded.0, ObjectKind::Blob);
-        assert_eq!(loaded.1, b"root-c-b-a");
-        assert_eq!(loaded.1, fixture.expected(top).unwrap().1);
+        assert_object_matches(
+            &mut success_io,
+            &fixture,
+            top,
+            ObjectKind::Blob,
+            b"root-c-b-a",
+        );
     }
 
     #[test]
