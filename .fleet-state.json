@@ -1,0 +1,706 @@
+{
+  "design-doc-audit": {
+    "docs/README.md": {
+      "blob_sha": "514579ae4c9cc740c89ca130bd2a480d25a3100c",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/adr/0001-git-mvp-execution-model.md": {
+      "blob_sha": "1372f403afe00df11def2438b6801a0e29062aa1",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/architecture-overview.md": {
+      "blob_sha": "4382cd6b9c52ceaff5451b971b3152b35472f5e9",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/architecture.md": {
+      "blob_sha": "002bb3530c5e0a0acde0d1faa167522cf5b6e567",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/counterexample-testing-unification.md": {
+      "blob_sha": "14690cf0609e0e51fa7adcdbf195734a3122140f",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/data-types.md": {
+      "blob_sha": "0ef3ab63f83ff41d8759b65976780eb37880d443",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/eval-harness.md": {
+      "blob_sha": "50a1dc1df4cf6839a8e0b769a9ef5b3d7619f810",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/gossip-connectors/boundary-4-connectors.md": {
+      "blob_sha": "b526f190a13a3be83d01a585d969829cb44b23e7",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/gossip-contracts/boundary-1-identity-spine.md": {
+      "blob_sha": "7588c2e6b5eaf98aec3c11cc0219ec1dc406826e",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/gossip-contracts/boundary-3-shard-algebra.md": {
+      "blob_sha": "91a5a64f398c00aeff213904b0f4f55f12486bfc",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/gossip-contracts/boundary-5-persistence.md": {
+      "blob_sha": "2075f6c95a5c5e19efeabf093ad06bba8e2fd6d9",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/gossip-frontier/shard-algebra.md": {
+      "blob_sha": "3d149d8bffeb1900c59eec589e7b679e000ea38b",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/gossip-persistence-inmemory.md": {
+      "blob_sha": "859df4d5f93b45bf268a6adb32256787018e4de2",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/gossip-scanner-runtime.md": {
+      "blob_sha": "55f3d08c97137d32012efad218a1cc083386eda7",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/gossip-stdx.md": {
+      "blob_sha": "bd86661340279d74f6a179432ec0128cebc278e5",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/gossip-worker.md": {
+      "blob_sha": "f1a3c01f99f5d1431c6393a48057cbdc86a026d2",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/kani-verification.md": {
+      "blob_sha": "e7ddad8b66b21aac4c5dc57d2134a521a9b1a8f3",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/memory-management.md": {
+      "blob_sha": "80fd87d218c29f4d687c8fc8ac5c4cbc4c3a0534",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/pipeline-flow.md": {
+      "blob_sha": "3761ee7c0331ccb5d19e146518f0fff5e2c07bb0",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/pipeline-state-machine.md": {
+      "blob_sha": "57574c76742b308b1f1d838569d88d85884aea34",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/scanner-core-parity.md": {
+      "blob_sha": "26275b29f9fc286bf99d6d143f604a445a69a856",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/scanner-engine-integration-tests.md": {
+      "blob_sha": "d7d1ee5a3625fd54736c8eea7d734dbe1525c2df",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/scanner-engine/content-policy-and-caching.md": {
+      "blob_sha": "b1890c571f5c6e96a6f10b1bc68f42e8250735ee",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-engine/detection-engine.md": {
+      "blob_sha": "90254896f06033c6bde4c2f0887bfd8c287c6490",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-engine/detection-rules.md": {
+      "blob_sha": "163a70cb67f8dc4cf545899cc02548fd2b8d5c89",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-engine/engine-api-types.md": {
+      "blob_sha": "3ea7fbd568604aecf0b65f76eb0001f673992f17",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-engine/engine-decode-state.md": {
+      "blob_sha": "0919967dc7f0326b536fbdfc36122f2b0219b35e",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-engine/engine-internals.md": {
+      "blob_sha": "5fc6990a897ed44355d558718f7ec4e93ee316bf",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-engine/engine-offline-validation.md": {
+      "blob_sha": "2740b193ada2669606bd3d69441e322d8ab81ae7",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-engine/engine-stream-decode.md": {
+      "blob_sha": "b26b89c8bcfc2d42c7a60441ba0a5e4139053af0",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-engine/engine-transforms.md": {
+      "blob_sha": "536a9a5e13fd53cbb503b053c3644e17d5ff2fb5",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-engine/engine-vectorscan-prefilter.md": {
+      "blob_sha": "2ab825b87b47e4f00ac585406a701f9449121d13",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-engine/engine-window-validation.md": {
+      "blob_sha": "d38ea23c61cee659ca3a6a87eaa2f1fab6b4faeb",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-git/commit-walking.md": {
+      "blob_sha": "7b0a512f285b8e43fcb16f96e15b85a21bf5926b",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-git/git-object-store.md": {
+      "blob_sha": "0881d13d9d141b678e5131bbac826f6b16e4d520",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-git/git-pack-execution.md": {
+      "blob_sha": "23c622b2ba37a93a623935ac04bbe9e019af56c9",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-git/git-scanning.md": {
+      "blob_sha": "2eff81fb26449f74d339fa41f85b7909851f0be9",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-git/git_simulation_harness_guide.md": {
+      "blob_sha": "7ef49d9b4c3489e706a821ae4db903634606ab9e",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-git/pack-internals.md": {
+      "blob_sha": "165dff27bda82a9d883b63df70c98108bca8a8a6",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-git/runner-orchestration.md": {
+      "blob_sha": "18293f26b5e417beb6a9c9f498000a85cd04664c",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-git/spill-and-memory.md": {
+      "blob_sha": "a03154cac539375cb1ac683201df6f4baa936e68",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-git/tree-diffing.md": {
+      "blob_sha": "ae940e6e7d1feff36c1e34a05e74b5889ab39f62",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-rs-cli.md": {
+      "blob_sha": "13ad6cc861cdfc20eaec5ee0580ade7010e2cec5",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    },
+    "docs/scanner-scheduler/archive-scanning.md": {
+      "blob_sha": "6f3076f61e0b6ee3d45a850986855ae80684ab42",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/fs-persistence-pipeline.md": {
+      "blob_sha": "99edb8cbd1f6f07091e118593ef9305b07aa1484",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/scanner_harness_modes.md": {
+      "blob_sha": "a2904c7b4ccb369a22214c36f90d1c9454c3667f",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/scanner_test_harness_guide.md": {
+      "blob_sha": "f99edd90bcddb034398ccff5fe8392c77573496c",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/scheduler-device-slots.md": {
+      "blob_sha": "74f6130791475ba757f735190c63e306748aeadc",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/scheduler-engine-abstraction.md": {
+      "blob_sha": "735afcb690127a718452eab7a45eb5141a4a564c",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/scheduler-engine-impl.md": {
+      "blob_sha": "1ac6932150c928ba3df04a635c87fabdf7f271be",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/scheduler-executor.md": {
+      "blob_sha": "10402a56b87efbba98dee74b67f8619c0e6b2276",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/scheduler-global-resource-pool.md": {
+      "blob_sha": "d492b8f43359278c4c70950c663735e4ce0d981f",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/scheduler-local-fs-uring.md": {
+      "blob_sha": "c9abd314d5f0f15628731eb57e1385403e11f550",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/scheduler-remote-backend.md": {
+      "blob_sha": "93ff5e5f80156cfb1d16ac0efd8ab6de6b7527f6",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/scheduler-task-graph.md": {
+      "blob_sha": "e581d1a6f64f95c5b02623b61f2096b936cce7a1",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/scheduler-ts-buffer-pool.md": {
+      "blob_sha": "3c003719ba12a1f765f581394b5f8fb564f89e1b",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/scheduler_test_harness_guide.md": {
+      "blob_sha": "0766d92967ef8d60a5a5c7e27b785a4065511dc7",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/scanner-scheduler/simulation-framework.md": {
+      "blob_sha": "5bb7180206b947278824040441f92707506de6fa",
+      "processed_at": "2026-04-04T21:42:21.138462+00:00",
+      "run_id": "audit-2026-04-04-2122"
+    },
+    "docs/source-families.md": {
+      "blob_sha": "0cc95dd40d306de57ed30a2b82cf8c381dcca24b",
+      "processed_at": "2026-04-04T19:58:32.805366+00:00",
+      "run_id": "audit-2026-04-04"
+    }
+  },
+  "doc-rigor": {
+    "crates/gossip-connectors/benches/streaming_split_estimator.rs": {
+      "blob_sha": "bff3cf2e0307c784faef523ed4ef91e0558b576d",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-connectors/src/common.rs": {
+      "blob_sha": "d053f13fe988da8964c812d5a2fa688a7bdb062a",
+      "processed_at": "2026-04-04T19:51:46.831294+00:00",
+      "run_id": "doc-rigor-2026-04-04"
+    },
+    "crates/gossip-connectors/src/filesystem.rs": {
+      "blob_sha": "7e46a6ade64c06290bb092fb9e8348cc27901364",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-connectors/src/filesystem_tests.rs": {
+      "blob_sha": "e0424e6afc963682f226c9fe94407f518a2dda4a",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-connectors/src/git.rs": {
+      "blob_sha": "62f4147103d55c3d5704fd3670a7e6d3a19822a4",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-connectors/src/git_tests.rs": {
+      "blob_sha": "117e3603be0b741da524f203e4ce360df197a32b",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-connectors/src/in_memory.rs": {
+      "blob_sha": "f35f3c08817925286a6ff787995b9b8a0dc149f5",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-connectors/src/in_memory_tests.rs": {
+      "blob_sha": "b799816cd734a6f45bff39c760abc5b4903d6cd1",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-connectors/src/lib.rs": {
+      "blob_sha": "289a66fd385c57434f76877afc640cecdd6ddb31",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-connectors/src/split_estimator.rs": {
+      "blob_sha": "f38b065a9d2f73a9b0af4577a41daf23d12c110c",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-connectors/src/split_estimator_tests.rs": {
+      "blob_sha": "bdcbf05c7114575cd875ffff6c130bcc609ad87a",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-connectors/tests/identity_smoke.rs": {
+      "blob_sha": "0c088b1ea80268f45af8faa8b8179ac55087c134",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-connectors/tests/streaming_split_estimator_perf.rs": {
+      "blob_sha": "486ead1faffd4fa472aa3d158c01f69af5232a70",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/benches/identity.rs": {
+      "blob_sha": "4dd8881f524b347caad69d4912188f5c9611be97",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/fuzz/fuzz_targets/fuzz_derivation_chain.rs": {
+      "blob_sha": "c7bed4ed56e9358d778d6e801c2fa105799b7279",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/fuzz/fuzz_targets/fuzz_item_identity_key.rs": {
+      "blob_sha": "ed0727dd546253774055526a5299d632859c1e57",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/connector/api.rs": {
+      "blob_sha": "40bf276b26673e4d144aa3cf94969f4cbd77bf97",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/connector/api_tests.rs": {
+      "blob_sha": "66ad024660f25c54555fc90e33777586843c43cd",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/connector/common.rs": {
+      "blob_sha": "675f2e6f7935b4fd20bc361a8d48882ebbb9e654",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/connector/common_tests.rs": {
+      "blob_sha": "ce51d78bb191cdefa17b78fefd0acd7f670512eb",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/connector/conformance.rs": {
+      "blob_sha": "8e38ee9ddaa65f925421746e836a1c7d32c2c53f",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/connector/git.rs": {
+      "blob_sha": "5cef2aa09ff242d4faafef609d79624b06331282",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/connector/mod.rs": {
+      "blob_sha": "06e519a6ad82caf3cc7cfb9703534a0e17205de2",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/connector/ordered.rs": {
+      "blob_sha": "7948839a2fc2a6d37bfc5c9e8eee773e48705fea",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/connector/types.rs": {
+      "blob_sha": "25d3145a84c423ee4a8c79ad9ac26bcb21ba726a",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/connector/types_tests.rs": {
+      "blob_sha": "41d0769c01af6ca697f9793e4396e204adda925d",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/coordination/cursor.rs": {
+      "blob_sha": "80c8e983bbca4310ac3af15cc15ca6e72b434868",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/coordination/limits.rs": {
+      "blob_sha": "2663a27d78b5645803ae8ec205a794181bed3bd7",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/coordination/manifest.rs": {
+      "blob_sha": "19e97cadc05eab5a4344cef260dce22fbabb99a3",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/coordination/mod.rs": {
+      "blob_sha": "6ebe2420ede27c707b665c3b21943a064e003532",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/coordination/pooled.rs": {
+      "blob_sha": "2cb235d389fd196baa6dcdbabd41e25e28bc5de6",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/coordination/restored_state.rs": {
+      "blob_sha": "8824648738a431dd6ea004ea98278debe4a19559",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/coordination/shard_spec.rs": {
+      "blob_sha": "5aa4660a6b602e131d4ed78c008af4016784afde",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/coordination/shard_spec_tests.rs": {
+      "blob_sha": "7293c4cad1293539319c9f5a56078851b96f0079",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/coordination/split.rs": {
+      "blob_sha": "9e3336ccd5443963fbe6addc448dec432b4c8913",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/identity/canonical.rs": {
+      "blob_sha": "23c047beabc8d8dc34b1f616b22453efef761bd4",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/identity/coordination.rs": {
+      "blob_sha": "1e8d39f3d12fdffde82f505629c662fbc5d5c3bc",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/identity/domain.rs": {
+      "blob_sha": "f0e589bd9756fde173c0c53fbe7e0a3a2094443f",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/identity/finding.rs": {
+      "blob_sha": "c9f41df48e859a3158ba72b39df071922c1023f2",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/identity/golden.rs": {
+      "blob_sha": "c19c64ac398d3337e13b44de8c030f34c2b26173",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/identity/hashing.rs": {
+      "blob_sha": "7374cccad3f0cc5641716f44281cf0cb3db5c2f8",
+      "processed_at": "2026-04-04T21:41:09.563832+00:00",
+      "run_id": "doc-rigor-2026-04-04-2122"
+    },
+    "crates/gossip-contracts/src/identity/item.rs": {
+      "blob_sha": "ae7b1e22c15a566a05a7477db81dc28f99011faf",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/identity/macros.rs": {
+      "blob_sha": "1a52b94ec075ad9b14db2b6ddc9e3d4061239ade",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/identity/mod.rs": {
+      "blob_sha": "e22b93d86dbd7cd4683c2a04883370f968debd6c",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/identity/policy.rs": {
+      "blob_sha": "fe0abc53eb3f6a9feadfdeb642240d5885168bdf",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/identity/types.rs": {
+      "blob_sha": "f1c1e29d0fe9d5505f623e6173002ae94440eef0",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/lib.rs": {
+      "blob_sha": "5468841cca207559f6594eb9e5b0a9ad07bc43d8",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/persistence/commit.rs": {
+      "blob_sha": "f5a75c455d0bb4309d2e89e8dc27c7bf357cd229",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/persistence/conformance.rs": {
+      "blob_sha": "fd7c83db8fafc2e688fadae0c07aa8e11bc2d8f0",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/persistence/done_ledger.rs": {
+      "blob_sha": "e5941314604f053c5f62c189015eb5fd6d26bae9",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/persistence/done_ledger_tests.rs": {
+      "blob_sha": "d4c29694b54eb071b1ba501205fbc718f2acc865",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/persistence/error.rs": {
+      "blob_sha": "17f0eb8e3bb72a8ae79c14f62a0b028517fe6ee3",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/persistence/findings.rs": {
+      "blob_sha": "45652291b30afc1f8eeb30377d5c24cb331c8798",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/persistence/findings_tests.rs": {
+      "blob_sha": "2039cf05c06382e85c4203b47e54fed94fa149ed",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/persistence/lattice_property_tests.rs": {
+      "blob_sha": "d68074f67e6ac311339ba3a368f5123d5ba7747e",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/persistence/mod.rs": {
+      "blob_sha": "48ab1c0497f8e64a89d31fb2f23e29f2f9766985",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/persistence/ovid.rs": {
+      "blob_sha": "f9eab6700c97d8d26695b2512910e55e42947c02",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/persistence/page_commit.rs": {
+      "blob_sha": "f8168b0f9a2b575cdf9b251ee927df372daa68e6",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/persistence/write_context.rs": {
+      "blob_sha": "e02b687d56220a3262f99605e7a47f336f7f7a77",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/src/test_util.rs": {
+      "blob_sha": "f6fe21d9231f43421e627a8998ff3a715dbdb317",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-contracts/tests/connector_public_surface.rs": {
+      "blob_sha": "8c170c74223ba71ca95559244a403d2fc1bacf78",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/fuzz/fuzz_targets/fuzz_decode_run_record.rs": {
+      "blob_sha": "eba816eb4ab46e4333f15d5b1c1e66b9e2c8f455",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/fuzz/fuzz_targets/fuzz_decode_shard_record.rs": {
+      "blob_sha": "c91c2d5b7641b5583941b59066c57fe36f618877",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/fuzz/fuzz_targets/fuzz_round_trip_run_record.rs": {
+      "blob_sha": "e3236d2dd156769377af96154a68a3e49e785fc6",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/fuzz/fuzz_targets/fuzz_round_trip_shard_record.rs": {
+      "blob_sha": "2e85682d34d00299a5e3bb09deff1dd4994afced",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/backend.rs": {
+      "blob_sha": "0745086fb93bc6ec2072ebafe7e1e82fc89fcf97",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/backend/coordinator.rs": {
+      "blob_sha": "930acd0445bc3d9f358bc5bdd337c2edb9502b84",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/backend/run_management.rs": {
+      "blob_sha": "482acb87eea86334f9cab2903bf63d6ff08fe06f",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/backend/shard_coordination.rs": {
+      "blob_sha": "db80cd84f85a168df6a4ae5907e0379e3b429db1",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/backend/test_support.rs": {
+      "blob_sha": "f27d0149d0415084dc68b61361edcb1dd092aeb3",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/behavioral_conformance.rs": {
+      "blob_sha": "4f60c9ad402e8e54e0987bdc36bcb7899f16ebc0",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/codec.rs": {
+      "blob_sha": "a77d790bcb2aa92b975a941f870044c5280a9544",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/codec_tests.rs": {
+      "blob_sha": "2bda789a4ad65e0d3069000366b2c5a878e56dfe",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/config.rs": {
+      "blob_sha": "851294ca99aaecf07befc05c4e216e770285af52",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/error.rs": {
+      "blob_sha": "25617810895fad398bd173e2a8c470a994c893a7",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/keyspace.rs": {
+      "blob_sha": "75977788015c790f3217f716287347d1915b6490",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/lib.rs": {
+      "blob_sha": "c176c0bb398a68030067b9d1c4847829f6468def",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/sim_coordinator.rs": {
+      "blob_sha": "c1307b480580c590b8264c2a6845b88ccdfc2835",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/sim_etcd_kv.rs": {
+      "blob_sha": "5288b1883179b7a1a8ff35f98c79dc762af53ecf",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/test_support.rs": {
+      "blob_sha": "ca772614ac83141aa0a88950759ad5086cee7415",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    },
+    "crates/gossip-coordination-etcd/src/tests.rs": {
+      "blob_sha": "0b4f43ae99b60b6cc610b8b69f5c38d43014ca44",
+      "processed_at": "2026-04-04T22:17:46.505981+00:00",
+      "run_id": "doc-rigor-2026-04-04-2158"
+    }
+  }
+}

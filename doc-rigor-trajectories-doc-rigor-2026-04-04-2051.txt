@@ -1,0 +1,10 @@
+batch-01 951c463c asdf22223-doc-rigor--951c463c
+batch-02 c701a4ce asdf22223-doc-rigor--c701a4ce
+batch-03 a44c0643 asdf22223-doc-rigor--a44c0643
+batch-04 4cffe5fd asdf22223-doc-rigor--4cffe5fd
+batch-05 36a360e3 asdf22223-doc-rigor--36a360e3
+batch-06 f7e8ca32 asdf22223-doc-rigor--f7e8ca32
+batch-07 86c11b02 asdf22223-doc-rigor--86c11b02
+batch-08 12ec659c asdf22223-doc-rigor--12ec659c
+batch-09 e352170d asdf22223-doc-rigor--e352170d
+batch-10 847fbfde asdf22223-doc-rigor--847fbfde

@@ -1,0 +1,59 @@
+rules:
+  - id: mutate-before-confirm
+    status: advisory
+    category: correctness
+    subcategory: mutate-before-confirm
+    severity: P1
+    what: "In-memory state mutated before durable write is confirmed"
+    why: "If the write fails, the cache diverges from storage."
+    how: "Write to durable storage first, then update in-memory state only on success."
+    bad_example: |
+      self.cache.insert(key, value);       // memory mutated first
+      self.db.write(batch)?;               // if this fails, cache has phantom entry
+    good_example: |
+      self.db.write(batch)?;               // durable write first
+      self.cache.insert(key, value);       // memory updated only on success
+    scope_dirs:
+      - "crates/gossip-coordination/src/"
+      - "crates/scanner-engine/src/"
+    detection:
+      semantic_hint: "Look for patterns where in-memory state is mutated before a fallible I/O operation."
+      grep_pattern: null
+    lifecycle:
+      created_date: "2026-04-04"
+      last_matched: null
+      match_count: 0
+      false_positive_count: 0
+      last_reviewed: "2026-04-04"
+
+  - id: silently-swallowed-error
+    status: active
+    category: error-handling
+    subcategory: silently-swallowed-error
+    severity: P1
+    what: "Storage/I/O errors discarded via let _ = or if let Ok(...)"
+    why: "Swallowed errors allow operations to succeed despite storage corruption."
+    how: "Propagate the error with ? or log it and return a meaningful error variant."
+    bad_example: |
+      let _ = self.db.delete(&staging_key);       // error silently discarded
+      if let Ok(Some(bytes)) = self.db.get(&key) { // read error treated as absent
+          process(bytes);
+      }
+    good_example: |
+      self.db.delete(&staging_key)?;               // error propagated
+      match self.db.get(&key)? {                   // read error surfaces to caller
+          Some(bytes) => process(bytes),
+          None => { /* genuinely absent */ }
+      }
+    scope_dirs:
+      - "crates/gossip-coordination/src/"
+      - "crates/scanner-engine/src/"
+    detection:
+      semantic_hint: "Look for let _ = expr where expr is fallible."
+      grep_pattern: 'let _ ='
+    lifecycle:
+      created_date: "2026-04-04"
+      last_matched: null
+      match_count: 0
+      false_positive_count: 0
+      last_reviewed: "2026-04-04"

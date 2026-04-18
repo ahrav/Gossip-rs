@@ -538,3 +538,10 @@ directories. The `design-doc-scope-check.sh` hook fires automatically when editi
 - `docs/gossip-coordination/simulation-harness.md` — Simulation architecture, invariants S1–S7, fault levels
 - `docs/gossip-coordination/boundary-2-coordination.md` — Coordination protocol specification
 - `docs/gossip-contracts/boundary-1-identity-spine.md` — Identity type hierarchy
+
+## Review Feedback Loop
+
+Active review pattern rules live in `.claude/review-rules.yaml`. A Stop hook
+(`.claude/hooks/review-pattern-check.sh`) checks modified code against known
+patterns. Run `/detect-patterns` to analyze the findings log and codify new rules.
+Run `/manage-rules` for lifecycle maintenance (staleness, FP tracking, pruning).

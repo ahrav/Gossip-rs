@@ -1,0 +1,11 @@
+connectors e3c41453 asdf22223-design-doc-audit--e3c41453
+coordination 422de456 asdf22223-design-doc-audit--422de456
+cross-cutting 69d9ba47 asdf22223-design-doc-audit--69d9ba47
+diagrams-index 16919f7e asdf22223-design-doc-audit--16919f7e
+identity 741dbca8 asdf22223-design-doc-audit--741dbca8
+persistence 55434cc5 asdf22223-design-doc-audit--55434cc5
+runtime 456b9528 asdf22223-design-doc-audit--456b9528
+scanner-engine be86a3be asdf22223-design-doc-audit--be86a3be
+scanner-git 8e7d28a8 asdf22223-design-doc-audit--8e7d28a8
+scanner-scheduler d61380ab asdf22223-design-doc-audit--d61380ab
+shard-algebra 6fcaf6f4 asdf22223-design-doc-audit--6fcaf6f4

@@ -198,3 +198,21 @@ Run to confirm:
 - `/execute-review-findings` — Phase 2 methodology
 - `/perf-pipeline` — Performance-focused team pipeline
 - `/test-pipeline` — Testing-focused team pipeline
+
+## Known Patterns Injection
+
+Before dispatching Phase 1 agents, read `.claude/review-rules.yaml`. For each
+rule with `status: active`, inject into both Agent A and Agent B prompts:
+
+> **Known Pattern: {rule.what}** ({rule.category})
+> Scope: {rule.scope_dirs} | Why: {rule.why}
+> BAD: {rule.bad_example} | GOOD: {rule.good_example}
+
+If the file does not exist or has no active rules, skip this.
+
+## Findings Log
+
+After the synthesis phase, append each merged finding to
+`.claude/review-findings.jsonl` (one JSON object per line, confidence >= 0.60).
+Use the same schema as `/review-dispatch` (see that skill for the full schema).
+Set `source` to `"review-pipeline"`.

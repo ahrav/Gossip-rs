@@ -1,0 +1,964 @@
+{
+  "source_to_chapters": {
+    "crates/gossip-coordination-etcd/src/codec_tests.rs": [
+      "04-08"
+    ],
+    "crates/gossip-contracts/src/coordination/restored_state.rs": [
+      "04-01"
+    ],
+    "crates/gossip-findings-postgres/src/test_postgres.rs": [
+      "07-05"
+    ],
+    "crates/gossip-persistence-inmemory/src/sim/harness.rs": [
+      "07-05",
+      "08-05"
+    ],
+    "crates/gossip-coordination/src/facade.rs": [
+      "04-13"
+    ],
+    "crates/gossip-contracts/src/coordination/split.rs": [
+      "04-06"
+    ],
+    "crates/gossip-coordination/src/split_execution.rs": [
+      "04-06"
+    ],
+    "crates/gossip-done-ledger-postgres/src/tests.rs": [
+      "07-05"
+    ],
+    "crates/gossip-contracts/src/connector/git.rs": [
+      "06-06"
+    ],
+    "crates/gossip-contracts/src/connector/types.rs": [
+      "06-01",
+      "06-02"
+    ],
+    "crates/gossip-coordination/src/session.rs": [
+      "04-09"
+    ],
+    "crates/gossip-contracts/src/lib.rs": [
+      "00-03"
+    ],
+    "crates/gossip-connectors/src/filesystem.rs": [
+      "06-05"
+    ],
+    "docs/gossip-coordination/coordination-testing.md": [
+      "04-12",
+      "08-05"
+    ],
+    "crates/gossip-persistence-inmemory/src/sim/oracle.rs": [
+      "07-05",
+      "08-05"
+    ],
+    "crates/gossip-coordination/src/session_tests.rs": [
+      "04-09"
+    ],
+    "diagrams/07-lease-lifecycle.md": [
+      "04-03",
+      "04-14"
+    ],
+    "crates/gossip-coordination-etcd/src/sim_coordinator.rs": [
+      "08-05"
+    ],
+    "crates/gossip-contracts/src/connector/common.rs": [
+      "06-01"
+    ],
+    "crates/gossip-contracts/src/persistence/error.rs": [
+      "07-01"
+    ],
+    "diagrams/12-split-operations.md": [
+      "04-06",
+      "05-04"
+    ],
+    "crates/gossip-coordination/src/in_memory_filter_tests.rs": [
+      "04-12"
+    ],
+    "crates/gossip-coordination/src/sim/test_util.rs": [
+      "08-05"
+    ],
+    "crates/gossip-coordination/src/run.rs": [
+      "04-03",
+      "04-07"
+    ],
+    "crates/gossip-coordination/src/lib.rs": [
+      "04-01"
+    ],
+    "crates/gossip-coordination/src/sim/invariants.rs": [
+      "08-05"
+    ],
+    "crates/gossip-contracts/src/identity/finding.rs": [
+      "02-06"
+    ],
+    "crates/gossip-coordination/src/in_memory.rs": [
+      "04-11"
+    ],
+    "crates/gossip-contracts/src/persistence/mod.rs": [
+      "07-01"
+    ],
+    "diagrams/13-shard-algebra-types.md": [
+      "05-02",
+      "05-03"
+    ],
+    "crates/gossip-findings-postgres/src/read_api.rs": [
+      "07-03"
+    ],
+    "crates/gossip-connectors/src/in_memory.rs": [
+      "06-04"
+    ],
+    "crates/gossip-done-ledger-postgres/src/tests/merge_parity_proptest.rs": [
+      "07-02"
+    ],
+    "crates/gossip-connectors/src/split_estimator.rs": [
+      "06-05"
+    ],
+    "crates/gossip-coordination/src/sim/proptest_state_machine_tests.rs": [
+      "08-05"
+    ],
+    "crates/gossip-coordination/src/sim/mega_sim_tests.rs": [
+      "08-05"
+    ],
+    "crates/gossip-coordination-etcd/src/behavioral_conformance.rs": [
+      "04-12"
+    ],
+    "docs/gossip-coordination/simulation-harness.md": [
+      "08-05"
+    ],
+    "crates/gossip-contracts/src/coordination/cursor.rs": [
+      "04-04"
+    ],
+    "crates/gossip-coordination-etcd/src/backend/shard_coordination.rs": [
+      "04-08"
+    ],
+    "crates/gossip-coordination/src/sim/composition_invariants_tests.rs": [
+      "08-05"
+    ],
+    "crates/gossip-persistence-inmemory/tests/differential_oracle.rs": [
+      "07-06"
+    ],
+    "crates/gossip-contracts/src/connector/mod.rs": [
+      "06-01"
+    ],
+    "crates/gossip-coordination-etcd/src/codec.rs": [
+      "04-08"
+    ],
+    "crates/gossip-findings-postgres/src/backend.rs": [
+      "07-03"
+    ],
+    "crates/gossip-pg-common/src/types.rs": [
+      "07-05"
+    ],
+    "diagrams/05-shard-and-run-state-machines.md": [
+      "04-02",
+      "04-07"
+    ],
+    "diagrams/11-tenant-isolation.md": [
+      "08-04"
+    ],
+    "crates/gossip-coordination/src/conformance.rs": [
+      "04-12"
+    ],
+    "crates/gossip-coordination/src/events.rs": [
+      "04-01"
+    ],
+    "crates/gossip-contracts/src/identity/item.rs": [
+      "02-05"
+    ],
+    "crates/gossip-persistence-inmemory/src/tests.rs": [
+      "07-05",
+      "07-06"
+    ],
+    "crates/gossip-coordination/src/error_tests.rs": [
+      "04-01"
+    ],
+    "crates/gossip-contracts/src/coordination/mod.rs": [
+      "04-01"
+    ],
+    "diagrams/00-README.md": [
+      "00-03"
+    ],
+    "crates/gossip-contracts/src/persistence/write_context.rs": [
+      "07-04"
+    ],
+    "crates/gossip-connectors/src/filesystem_tests.rs": [
+      "06-05"
+    ],
+    "crates/gossip-contracts/src/persistence/done_ledger_tests.rs": [
+      "07-02"
+    ],
+    "crates/gossip-coordination/src/sim/harness.rs": [
+      "08-05"
+    ],
+    "crates/gossip-contracts/src/connector/types_tests.rs": [
+      "06-01",
+      "06-02"
+    ],
+    "crates/gossip-coordination/src/shard_limits.rs": [
+      "04-01"
+    ],
+    "crates/gossip-contracts/src/identity/mod.rs": [
+      "02-01"
+    ],
+    "crates/gossip-findings-postgres/src/lib.rs": [
+      "07-03",
+      "07-05"
+    ],
+    "diagrams/08-pagecommit-typestate.md": [
+      "07-04"
+    ],
+    "crates/gossip-coordination/src/sim/fault_injector.rs": [
+      "08-05"
+    ],
+    "crates/gossip-contracts/src/identity/macros.rs": [
+      "01-04",
+      "02-08"
+    ],
+    "crates/gossip-findings-postgres/src/tests.rs": [
+      "07-05"
+    ],
+    "crates/gossip-coordination/src/in_memory_run_tests.rs": [
+      "04-12"
+    ],
+    "crates/gossip-coordination/src/facade_tests.rs": [
+      "04-13"
+    ],
+    "crates/gossip-done-ledger-postgres/src/types.rs": [
+      "07-02"
+    ],
+    "crates/gossip-frontier/src/hint.rs": [
+      "05-03",
+      "05-04"
+    ],
+    "crates/gossip-contracts/src/persistence/ovid.rs": [
+      "07-01"
+    ],
+    "crates/gossip-coordination/src/traits.rs": [
+      "04-08"
+    ],
+    "crates/gossip-coordination/src/record_tests.rs": [
+      "04-02"
+    ],
+    "crates/gossip-coordination/src/sim/composition_invariants.rs": [
+      "08-05"
+    ],
+    "crates/gossip-coordination-etcd/src/backend/run_management.rs": [
+      "04-08"
+    ],
+    "crates/gossip-coordination-etcd/src/config.rs": [
+      "04-08"
+    ],
+    "crates/gossip-coordination-etcd/src/test_support.rs": [
+      "04-12"
+    ],
+    "crates/gossip-coordination/src/run_tests.rs": [
+      "04-07"
+    ],
+    "crates/gossip-coordination/src/sim/mod.rs": [
+      "08-05"
+    ],
+    "crates/gossip-contracts/src/coordination/pooled.rs": [
+      "04-01",
+      "04-11"
+    ],
+    "crates/gossip-coordination/src/sim/invariants_tests.rs": [
+      "08-05"
+    ],
+    "crates/gossip-coordination-etcd/src/lib.rs": [
+      "04-08"
+    ],
+    "crates/gossip-persistence-inmemory/src/findings.rs": [
+      "07-03",
+      "07-05"
+    ],
+    "crates/gossip-pg-common/src/test_support.rs": [
+      "07-05"
+    ],
+    "crates/gossip-contracts/src/test_util.rs": [
+      "08-05"
+    ],
+    "crates/gossip-coordination/src/sim/harness_tests.rs": [
+      "08-05"
+    ],
+    "crates/gossip-coordination/src/sim/worker.rs": [
+      "08-05"
+    ],
+    "crates/gossip-connectors/src/lib.rs": [
+      "06-01"
+    ],
+    "crates/gossip-frontier/src/key_encoding.rs": [
+      "05-02"
+    ],
+    "crates/gossip-frontier/src/hint_tests.rs": [
+      "05-03",
+      "05-04",
+      "05-07"
+    ],
+    "crates/gossip-coordination-etcd/src/keyspace.rs": [
+      "04-08"
+    ],
+    "crates/gossip-coordination/src/sim/sim_behavioral_tests.rs": [
+      "08-05"
+    ],
+    "crates/gossip-coordination-etcd/src/backend/test_support.rs": [
+      "04-12"
+    ],
+    "crates/gossip-contracts/src/connector/api.rs": [
+      "06-03"
+    ],
+    "crates/gossip-contracts/src/connector/common_tests.rs": [
+      "06-01"
+    ],
+    "crates/gossip-contracts/src/persistence/findings.rs": [
+      "07-03"
+    ],
+    "crates/gossip-persistence-inmemory/src/lib.rs": [
+      "07-05"
+    ],
+    "crates/gossip-persistence-inmemory/src/pending.rs": [
+      "07-05"
+    ],
+    "crates/gossip-done-ledger-postgres/src/schema.rs": [
+      "07-02"
+    ],
+    "crates/gossip-findings-postgres/tests/findings_pg_integration.rs": [
+      "07-05"
+    ],
+    "crates/gossip-frontier/src/key_encoding_tests.rs": [
+      "05-02",
+      "05-07"
+    ],
+    "crates/gossip-connectors/src/in_memory_tests.rs": [
+      "06-04"
+    ],
+    "diagrams/01-system-overview.md": [
+      "00-03",
+      "08-01"
+    ],
+    "crates/gossip-persistence-inmemory/tests/conformance.rs": [
+      "07-06"
+    ],
+    "diagrams/02-boundary-dependency-graph.md": [
+      "08-01"
+    ],
+    "tmp/gossip-project-artifacts/distributed-secret-scanner-instructions.md": [
+      "00-01",
+      "00-02"
+    ],
+    "crates/gossip-contracts/src/persistence/findings_tests.rs": [
+      "07-03"
+    ],
+    "crates/gossip-coordination/src/scenario_tests.rs": [
+      "04-12"
+    ],
+    "crates/gossip-persistence-inmemory/src/error.rs": [
+      "07-05"
+    ],
+    "crates/gossip-done-ledger-postgres/src/lib.rs": [
+      "07-02",
+      "07-05"
+    ],
+    "crates/gossip-coordination/src/in_memory_tests.rs": [
+      "04-11",
+      "04-12"
+    ],
+    "crates/gossip-contracts/src/connector/conformance.rs": [
+      "06-01"
+    ],
+    "crates/gossip-coordination/src/error.rs": [
+      "04-01"
+    ],
+    "crates/gossip-pg-common/src/lib.rs": [
+      "07-05"
+    ],
+    "crates/gossip-coordination-etcd/src/backend/coordinator.rs": [
+      "04-08",
+      "04-11"
+    ],
+    "crates/gossip-done-ledger-postgres/src/backend.rs": [
+      "07-02"
+    ],
+    "crates/gossip-persistence-inmemory/src/sim/invariants.rs": [
+      "07-05",
+      "08-05"
+    ],
+    "specs/coordination/ShardFencing.tla": [
+      "04-03"
+    ],
+    "crates/gossip-coordination-etcd/src/tests.rs": [
+      "04-12"
+    ],
+    "crates/gossip-coordination-etcd/src/backend.rs": [
+      "04-08",
+      "04-11"
+    ],
+    "crates/gossip-contracts/src/identity/golden.rs": [
+      "02-09"
+    ],
+    "crates/gossip-frontier/src/lib.rs": [
+      "05-01"
+    ],
+    "crates/gossip-coordination/src/sim/backend.rs": [
+      "08-05"
+    ],
+    "crates/gossip-contracts/src/identity/coordination.rs": [
+      "02-04",
+      "04-01"
+    ],
+    "crates/gossip-contracts/src/persistence/conformance.rs": [
+      "07-05",
+      "07-06"
+    ],
+    "crates/gossip-coordination/src/run_errors.rs": [
+      "04-01"
+    ],
+    "crates/gossip-connectors/src/git.rs": [
+      "06-06"
+    ],
+    "crates/gossip-connectors/src/split_estimator_tests.rs": [
+      "06-05"
+    ],
+    "crates/gossip-frontier/src/builder.rs": [
+      "05-05",
+      "05-06"
+    ],
+    "diagrams/10-failure-modes-and-recovery.md": [
+      "08-03"
+    ],
+    "crates/gossip-contracts/src/connector/api_tests.rs": [
+      "06-03"
+    ],
+    "crates/gossip-frontier/src/builder_tests.rs": [
+      "05-05",
+      "05-06",
+      "05-07"
+    ],
+    "crates/gossip-findings-postgres/src/schema.rs": [
+      "07-03"
+    ],
+    "crates/gossip-coordination/src/conformance_tests.rs": [
+      "04-12"
+    ],
+    "crates/gossip-contracts/src/persistence/lattice_property_tests.rs": [
+      "07-02"
+    ],
+    "crates/gossip-coordination-etcd/src/sim_etcd_kv.rs": [
+      "08-05"
+    ],
+    "crates/gossip-contracts/src/coordination/manifest.rs": [
+      "04-01"
+    ],
+    "crates/gossip-contracts/src/identity/hashing.rs": [
+      "01-01",
+      "02-02"
+    ],
+    "crates/gossip-coordination/src/record.rs": [
+      "04-02"
+    ],
+    "crates/gossip-coordination/src/sim/overload_tests.rs": [
+      "08-05"
+    ],
+    "crates/gossip-contracts/src/coordination/shard_spec_tests.rs": [
+      "04-02"
+    ],
+    "crates/gossip-persistence-inmemory/src/done_ledger.rs": [
+      "07-02",
+      "07-05"
+    ],
+    "crates/gossip-done-ledger-postgres/src/migrations.rs": [
+      "07-02"
+    ],
+    "crates/gossip-contracts/src/identity/domain.rs": [
+      "01-03",
+      "02-03"
+    ],
+    "crates/gossip-coordination/src/lease.rs": [
+      "04-03",
+      "04-14"
+    ],
+    "crates/gossip-contracts/src/connector/ordered.rs": [
+      "06-03"
+    ],
+    "crates/gossip-persistence-inmemory/src/store.rs": [
+      "07-05"
+    ],
+    "crates/gossip-findings-postgres/src/error.rs": [
+      "07-03"
+    ],
+    "crates/gossip-findings-postgres/src/migrations.rs": [
+      "07-03"
+    ],
+    "crates/gossip-connectors/src/common.rs": [
+      "06-05",
+      "06-06"
+    ],
+    "diagrams/03-id-derivation-dag.md": [
+      "02-04",
+      "02-05"
+    ],
+    "diagrams/06-fencing-protocol.md": [
+      "04-03"
+    ],
+    "crates/gossip-coordination-etcd/src/error.rs": [
+      "04-01"
+    ],
+    "crates/gossip-persistence-inmemory/src/sim/mod.rs": [
+      "07-05",
+      "08-05"
+    ],
+    "crates/gossip-coordination/src/sim/overload.rs": [
+      "08-05"
+    ],
+    "crates/gossip-done-ledger-postgres/src/test_postgres.rs": [
+      "07-05"
+    ],
+    "crates/gossip-pg-common/src/migration.rs": [
+      "07-05"
+    ],
+    "crates/gossip-contracts/src/persistence/page_commit.rs": [
+      "07-04"
+    ],
+    "crates/gossip-contracts/src/identity/canonical.rs": [
+      "01-02",
+      "02-02"
+    ],
+    "crates/gossip-findings-postgres/src/types.rs": [
+      "07-03"
+    ],
+    "crates/gossip-done-ledger-postgres/src/error.rs": [
+      "07-02"
+    ],
+    "crates/gossip-coordination/src/sim/scan_driver_sim.rs": [
+      "08-05"
+    ],
+    "crates/gossip-findings-postgres/src/tests/merge_parity_proptest.rs": [
+      "07-03"
+    ],
+    "crates/gossip-contracts/src/coordination/shard_spec.rs": [
+      "04-02",
+      "04-10"
+    ],
+    "crates/gossip-coordination/src/validation.rs": [
+      "04-10"
+    ],
+    "crates/gossip-contracts/src/identity/types.rs": [
+      "01-04",
+      "02-04"
+    ],
+    "crates/gossip-coordination/src/sim/shared.rs": [
+      "08-05"
+    ],
+    "crates/gossip-coordination/src/test_fixtures.rs": [
+      "04-12"
+    ],
+    "crates/gossip-contracts/src/persistence/commit.rs": [
+      "07-04"
+    ],
+    "crates/gossip-persistence-inmemory/src/sim/tests.rs": [
+      "07-05",
+      "08-05"
+    ],
+    "crates/gossip-findings-postgres/tests/common/mod.rs": [
+      "07-05"
+    ],
+    "diagrams/04-end-to-end-scan-flow.md": [
+      "08-02"
+    ],
+    "crates/gossip-contracts/src/coordination/limits.rs": [
+      "04-01"
+    ],
+    "crates/gossip-connectors/src/git_tests.rs": [
+      "06-06"
+    ],
+    "crates/gossip-contracts/src/identity/policy.rs": [
+      "02-07"
+    ],
+    "crates/gossip-coordination/src/sim/composition_tests.rs": [
+      "08-05"
+    ],
+    "tmp/gossip-project-artifacts/phase0-outline.md": [
+      "00-01"
+    ],
+    "crates/gossip-coordination/src/sim/composition.rs": [
+      "08-05"
+    ],
+    "crates/gossip-contracts/src/persistence/done_ledger.rs": [
+      "07-02"
+    ]
+  },
+  "chapter_to_sources": {
+    "02-04": [
+      "crates/gossip-contracts/src/identity/coordination.rs",
+      "crates/gossip-contracts/src/identity/types.rs",
+      "diagrams/03-id-derivation-dag.md"
+    ],
+    "01-02": [
+      "crates/gossip-contracts/src/identity/canonical.rs"
+    ],
+    "02-03": [
+      "crates/gossip-contracts/src/identity/domain.rs"
+    ],
+    "04-11": [
+      "crates/gossip-contracts/src/coordination/pooled.rs",
+      "crates/gossip-coordination-etcd/src/backend.rs",
+      "crates/gossip-coordination-etcd/src/backend/coordinator.rs",
+      "crates/gossip-coordination/src/in_memory.rs",
+      "crates/gossip-coordination/src/in_memory_tests.rs"
+    ],
+    "08-01": [
+      "diagrams/01-system-overview.md",
+      "diagrams/02-boundary-dependency-graph.md"
+    ],
+    "08-02": [
+      "diagrams/04-end-to-end-scan-flow.md"
+    ],
+    "05-02": [
+      "crates/gossip-frontier/src/key_encoding.rs",
+      "crates/gossip-frontier/src/key_encoding_tests.rs",
+      "diagrams/13-shard-algebra-types.md"
+    ],
+    "04-09": [
+      "crates/gossip-coordination/src/session.rs",
+      "crates/gossip-coordination/src/session_tests.rs"
+    ],
+    "01-03": [
+      "crates/gossip-contracts/src/identity/domain.rs"
+    ],
+    "02-01": [
+      "crates/gossip-contracts/src/identity/mod.rs"
+    ],
+    "07-01": [
+      "crates/gossip-contracts/src/persistence/error.rs",
+      "crates/gossip-contracts/src/persistence/mod.rs",
+      "crates/gossip-contracts/src/persistence/ovid.rs"
+    ],
+    "06-02": [
+      "crates/gossip-contracts/src/connector/types.rs",
+      "crates/gossip-contracts/src/connector/types_tests.rs"
+    ],
+    "07-03": [
+      "crates/gossip-contracts/src/persistence/findings.rs",
+      "crates/gossip-contracts/src/persistence/findings_tests.rs",
+      "crates/gossip-findings-postgres/src/backend.rs",
+      "crates/gossip-findings-postgres/src/error.rs",
+      "crates/gossip-findings-postgres/src/lib.rs",
+      "crates/gossip-findings-postgres/src/migrations.rs",
+      "crates/gossip-findings-postgres/src/read_api.rs",
+      "crates/gossip-findings-postgres/src/schema.rs",
+      "crates/gossip-findings-postgres/src/tests/merge_parity_proptest.rs",
+      "crates/gossip-findings-postgres/src/types.rs",
+      "crates/gossip-persistence-inmemory/src/findings.rs"
+    ],
+    "02-09": [
+      "crates/gossip-contracts/src/identity/golden.rs"
+    ],
+    "01-01": [
+      "crates/gossip-contracts/src/identity/hashing.rs"
+    ],
+    "04-12": [
+      "crates/gossip-coordination-etcd/src/backend/test_support.rs",
+      "crates/gossip-coordination-etcd/src/behavioral_conformance.rs",
+      "crates/gossip-coordination-etcd/src/test_support.rs",
+      "crates/gossip-coordination-etcd/src/tests.rs",
+      "crates/gossip-coordination/src/conformance.rs",
+      "crates/gossip-coordination/src/conformance_tests.rs",
+      "crates/gossip-coordination/src/in_memory_filter_tests.rs",
+      "crates/gossip-coordination/src/in_memory_run_tests.rs",
+      "crates/gossip-coordination/src/in_memory_tests.rs",
+      "crates/gossip-coordination/src/scenario_tests.rs",
+      "crates/gossip-coordination/src/test_fixtures.rs",
+      "docs/gossip-coordination/coordination-testing.md"
+    ],
+    "02-07": [
+      "crates/gossip-contracts/src/identity/policy.rs"
+    ],
+    "05-04": [
+      "crates/gossip-frontier/src/hint.rs",
+      "crates/gossip-frontier/src/hint_tests.rs",
+      "diagrams/12-split-operations.md"
+    ],
+    "04-10": [
+      "crates/gossip-contracts/src/coordination/shard_spec.rs",
+      "crates/gossip-coordination/src/validation.rs"
+    ],
+    "04-02": [
+      "crates/gossip-contracts/src/coordination/shard_spec.rs",
+      "crates/gossip-contracts/src/coordination/shard_spec_tests.rs",
+      "crates/gossip-coordination/src/record.rs",
+      "crates/gossip-coordination/src/record_tests.rs",
+      "diagrams/05-shard-and-run-state-machines.md"
+    ],
+    "06-01": [
+      "crates/gossip-connectors/src/lib.rs",
+      "crates/gossip-contracts/src/connector/common.rs",
+      "crates/gossip-contracts/src/connector/common_tests.rs",
+      "crates/gossip-contracts/src/connector/conformance.rs",
+      "crates/gossip-contracts/src/connector/mod.rs",
+      "crates/gossip-contracts/src/connector/types.rs",
+      "crates/gossip-contracts/src/connector/types_tests.rs"
+    ],
+    "07-06": [
+      "crates/gossip-contracts/src/persistence/conformance.rs",
+      "crates/gossip-persistence-inmemory/src/tests.rs",
+      "crates/gossip-persistence-inmemory/tests/conformance.rs",
+      "crates/gossip-persistence-inmemory/tests/differential_oracle.rs"
+    ],
+    "06-04": [
+      "crates/gossip-connectors/src/in_memory.rs",
+      "crates/gossip-connectors/src/in_memory_tests.rs"
+    ],
+    "07-05": [
+      "crates/gossip-contracts/src/persistence/conformance.rs",
+      "crates/gossip-done-ledger-postgres/src/lib.rs",
+      "crates/gossip-done-ledger-postgres/src/test_postgres.rs",
+      "crates/gossip-done-ledger-postgres/src/tests.rs",
+      "crates/gossip-findings-postgres/src/lib.rs",
+      "crates/gossip-findings-postgres/src/test_postgres.rs",
+      "crates/gossip-findings-postgres/src/tests.rs",
+      "crates/gossip-findings-postgres/tests/common/mod.rs",
+      "crates/gossip-findings-postgres/tests/findings_pg_integration.rs",
+      "crates/gossip-persistence-inmemory/src/done_ledger.rs",
+      "crates/gossip-persistence-inmemory/src/error.rs",
+      "crates/gossip-persistence-inmemory/src/findings.rs",
+      "crates/gossip-persistence-inmemory/src/lib.rs",
+      "crates/gossip-persistence-inmemory/src/pending.rs",
+      "crates/gossip-persistence-inmemory/src/sim/harness.rs",
+      "crates/gossip-persistence-inmemory/src/sim/invariants.rs",
+      "crates/gossip-persistence-inmemory/src/sim/mod.rs",
+      "crates/gossip-persistence-inmemory/src/sim/oracle.rs",
+      "crates/gossip-persistence-inmemory/src/sim/tests.rs",
+      "crates/gossip-persistence-inmemory/src/store.rs",
+      "crates/gossip-persistence-inmemory/src/tests.rs",
+      "crates/gossip-pg-common/src/lib.rs",
+      "crates/gossip-pg-common/src/migration.rs",
+      "crates/gossip-pg-common/src/test_support.rs",
+      "crates/gossip-pg-common/src/types.rs"
+    ],
+    "05-07": [
+      "crates/gossip-frontier/src/builder_tests.rs",
+      "crates/gossip-frontier/src/hint_tests.rs",
+      "crates/gossip-frontier/src/key_encoding_tests.rs"
+    ],
+    "08-04": [
+      "diagrams/11-tenant-isolation.md"
+    ],
+    "02-06": [
+      "crates/gossip-contracts/src/identity/finding.rs"
+    ],
+    "01-04": [
+      "crates/gossip-contracts/src/identity/macros.rs",
+      "crates/gossip-contracts/src/identity/types.rs"
+    ],
+    "04-07": [
+      "crates/gossip-coordination/src/run.rs",
+      "crates/gossip-coordination/src/run_tests.rs",
+      "diagrams/05-shard-and-run-state-machines.md"
+    ],
+    "08-05": [
+      "crates/gossip-contracts/src/test_util.rs",
+      "crates/gossip-coordination-etcd/src/sim_coordinator.rs",
+      "crates/gossip-coordination-etcd/src/sim_etcd_kv.rs",
+      "crates/gossip-coordination/src/sim/backend.rs",
+      "crates/gossip-coordination/src/sim/composition.rs",
+      "crates/gossip-coordination/src/sim/composition_invariants.rs",
+      "crates/gossip-coordination/src/sim/composition_invariants_tests.rs",
+      "crates/gossip-coordination/src/sim/composition_tests.rs",
+      "crates/gossip-coordination/src/sim/fault_injector.rs",
+      "crates/gossip-coordination/src/sim/harness.rs",
+      "crates/gossip-coordination/src/sim/harness_tests.rs",
+      "crates/gossip-coordination/src/sim/invariants.rs",
+      "crates/gossip-coordination/src/sim/invariants_tests.rs",
+      "crates/gossip-coordination/src/sim/mega_sim_tests.rs",
+      "crates/gossip-coordination/src/sim/mod.rs",
+      "crates/gossip-coordination/src/sim/overload.rs",
+      "crates/gossip-coordination/src/sim/overload_tests.rs",
+      "crates/gossip-coordination/src/sim/proptest_state_machine_tests.rs",
+      "crates/gossip-coordination/src/sim/scan_driver_sim.rs",
+      "crates/gossip-coordination/src/sim/shared.rs",
+      "crates/gossip-coordination/src/sim/sim_behavioral_tests.rs",
+      "crates/gossip-coordination/src/sim/test_util.rs",
+      "crates/gossip-coordination/src/sim/worker.rs",
+      "crates/gossip-persistence-inmemory/src/sim/harness.rs",
+      "crates/gossip-persistence-inmemory/src/sim/invariants.rs",
+      "crates/gossip-persistence-inmemory/src/sim/mod.rs",
+      "crates/gossip-persistence-inmemory/src/sim/oracle.rs",
+      "crates/gossip-persistence-inmemory/src/sim/tests.rs",
+      "docs/gossip-coordination/coordination-testing.md",
+      "docs/gossip-coordination/simulation-harness.md"
+    ],
+    "02-08": [
+      "crates/gossip-contracts/src/identity/macros.rs"
+    ],
+    "02-05": [
+      "crates/gossip-contracts/src/identity/item.rs",
+      "diagrams/03-id-derivation-dag.md"
+    ],
+    "05-06": [
+      "crates/gossip-frontier/src/builder.rs",
+      "crates/gossip-frontier/src/builder_tests.rs"
+    ],
+    "05-05": [
+      "crates/gossip-frontier/src/builder.rs",
+      "crates/gossip-frontier/src/builder_tests.rs"
+    ],
+    "04-06": [
+      "crates/gossip-contracts/src/coordination/split.rs",
+      "crates/gossip-coordination/src/split_execution.rs",
+      "diagrams/12-split-operations.md"
+    ],
+    "04-08": [
+      "crates/gossip-coordination-etcd/src/backend.rs",
+      "crates/gossip-coordination-etcd/src/backend/coordinator.rs",
+      "crates/gossip-coordination-etcd/src/backend/run_management.rs",
+      "crates/gossip-coordination-etcd/src/backend/shard_coordination.rs",
+      "crates/gossip-coordination-etcd/src/codec.rs",
+      "crates/gossip-coordination-etcd/src/codec_tests.rs",
+      "crates/gossip-coordination-etcd/src/config.rs",
+      "crates/gossip-coordination-etcd/src/keyspace.rs",
+      "crates/gossip-coordination-etcd/src/lib.rs",
+      "crates/gossip-coordination/src/traits.rs"
+    ],
+    "02-02": [
+      "crates/gossip-contracts/src/identity/canonical.rs",
+      "crates/gossip-contracts/src/identity/hashing.rs"
+    ],
+    "04-14": [
+      "crates/gossip-coordination/src/lease.rs",
+      "diagrams/07-lease-lifecycle.md"
+    ],
+    "04-04": [
+      "crates/gossip-contracts/src/coordination/cursor.rs"
+    ],
+    "04-03": [
+      "crates/gossip-coordination/src/lease.rs",
+      "crates/gossip-coordination/src/run.rs",
+      "diagrams/06-fencing-protocol.md",
+      "diagrams/07-lease-lifecycle.md",
+      "specs/coordination/ShardFencing.tla"
+    ],
+    "04-01": [
+      "crates/gossip-contracts/src/coordination/limits.rs",
+      "crates/gossip-contracts/src/coordination/manifest.rs",
+      "crates/gossip-contracts/src/coordination/mod.rs",
+      "crates/gossip-contracts/src/coordination/pooled.rs",
+      "crates/gossip-contracts/src/coordination/restored_state.rs",
+      "crates/gossip-contracts/src/identity/coordination.rs",
+      "crates/gossip-coordination-etcd/src/error.rs",
+      "crates/gossip-coordination/src/error.rs",
+      "crates/gossip-coordination/src/error_tests.rs",
+      "crates/gossip-coordination/src/events.rs",
+      "crates/gossip-coordination/src/lib.rs",
+      "crates/gossip-coordination/src/run_errors.rs",
+      "crates/gossip-coordination/src/shard_limits.rs"
+    ],
+    "04-13": [
+      "crates/gossip-coordination/src/facade.rs",
+      "crates/gossip-coordination/src/facade_tests.rs"
+    ],
+    "07-04": [
+      "crates/gossip-contracts/src/persistence/commit.rs",
+      "crates/gossip-contracts/src/persistence/page_commit.rs",
+      "crates/gossip-contracts/src/persistence/write_context.rs",
+      "diagrams/08-pagecommit-typestate.md"
+    ],
+    "00-03": [
+      "crates/gossip-contracts/src/lib.rs",
+      "diagrams/00-README.md",
+      "diagrams/01-system-overview.md"
+    ],
+    "07-02": [
+      "crates/gossip-contracts/src/persistence/done_ledger.rs",
+      "crates/gossip-contracts/src/persistence/done_ledger_tests.rs",
+      "crates/gossip-contracts/src/persistence/lattice_property_tests.rs",
+      "crates/gossip-done-ledger-postgres/src/backend.rs",
+      "crates/gossip-done-ledger-postgres/src/error.rs",
+      "crates/gossip-done-ledger-postgres/src/lib.rs",
+      "crates/gossip-done-ledger-postgres/src/migrations.rs",
+      "crates/gossip-done-ledger-postgres/src/schema.rs",
+      "crates/gossip-done-ledger-postgres/src/tests/merge_parity_proptest.rs",
+      "crates/gossip-done-ledger-postgres/src/types.rs",
+      "crates/gossip-persistence-inmemory/src/done_ledger.rs"
+    ],
+    "06-05": [
+      "crates/gossip-connectors/src/common.rs",
+      "crates/gossip-connectors/src/filesystem.rs",
+      "crates/gossip-connectors/src/filesystem_tests.rs",
+      "crates/gossip-connectors/src/split_estimator.rs",
+      "crates/gossip-connectors/src/split_estimator_tests.rs"
+    ],
+    "08-03": [
+      "diagrams/10-failure-modes-and-recovery.md"
+    ],
+    "06-03": [
+      "crates/gossip-contracts/src/connector/api.rs",
+      "crates/gossip-contracts/src/connector/api_tests.rs",
+      "crates/gossip-contracts/src/connector/ordered.rs"
+    ],
+    "05-01": [
+      "crates/gossip-frontier/src/lib.rs"
+    ],
+    "00-01": [
+      "tmp/gossip-project-artifacts/distributed-secret-scanner-instructions.md",
+      "tmp/gossip-project-artifacts/phase0-outline.md"
+    ],
+    "06-06": [
+      "crates/gossip-connectors/src/common.rs",
+      "crates/gossip-connectors/src/git.rs",
+      "crates/gossip-connectors/src/git_tests.rs",
+      "crates/gossip-contracts/src/connector/git.rs"
+    ],
+    "00-02": [
+      "tmp/gossip-project-artifacts/distributed-secret-scanner-instructions.md"
+    ],
+    "05-03": [
+      "crates/gossip-frontier/src/hint.rs",
+      "crates/gossip-frontier/src/hint_tests.rs",
+      "diagrams/13-shard-algebra-types.md"
+    ]
+  },
+  "section_to_crates": {
+    "09": [],
+    "11": [
+      "gossip-scanner-runtime/src/",
+      "scanner-scheduler/src/",
+      "scanner-git/src/"
+    ],
+    "07": [
+      "gossip-contracts/src/persistence/",
+      "gossip-persistence-inmemory/src/"
+    ],
+    "13": [
+      "scanner-scheduler/src/"
+    ],
+    "04": [
+      "gossip-contracts/src/coordination/",
+      "gossip-coordination/src/",
+      "gossip-coordination-etcd/src/"
+    ],
+    "05": [
+      "gossip-frontier/src/"
+    ],
+    "08": [],
+    "03": [],
+    "14": [
+      "gossip-scanner-runtime/src/",
+      "gossip-worker/src/",
+      "scanner-rs-cli/src/"
+    ],
+    "06": [
+      "gossip-contracts/src/connector/",
+      "gossip-connectors/src/",
+      "gossip-scanner-runtime/src/"
+    ],
+    "10": [
+      "scanner-engine/src/"
+    ],
+    "00": [],
+    "01": [
+      "gossip-contracts/src/identity/"
+    ],
+    "12": [
+      "scanner-git/src/"
+    ],
+    "02": [
+      "gossip-contracts/src/identity/"
+    ]
+  }
+}
