@@ -169,12 +169,45 @@ Create one `bd create` per finding. Each task description must be **fully self-c
 5. Verify clean: `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings`
 ```
 
-**Design / Complexity**:
+**Design / Complexity** (apply `/reduce-complexity` methodology):
 ```
-1. Read surrounding code to understand existing patterns
-2. Refactor to address the finding while preserving behavior
-3. Run full test suite to confirm no regressions: `cargo test`
-4. Verify clean: `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings`
+1. Classify the target function(s) using the /reduce-complexity framework:
+   a. Measure LOC (opening `{` to closing `}`, excluding blanks/comment-only lines),
+      max nesting depth (with Rust match discount: exhaustive match on ≤6 variants is +0),
+      and parameter count.
+   b. Classify as ESSENTIAL (domain-inherent), ACCIDENTAL (reducible), or MIXED.
+      Use the judgment tests: domain necessity, distinct error recovery per branch,
+      sequential coupling, and accidental indicators (duplicated blocks, flattenable
+      nesting, always-together params).
+   c. If ESSENTIAL: STOP and report back. The finding may be misguided — complexity
+      is inherent to the problem (sequential state machines, distinct error handling
+      per NFS error class, etc.). Do NOT refactor just to satisfy a metric.
+2. For ACCIDENTAL/MIXED, select AT MOST 3 techniques from the reduce-complexity
+   catalog, preferring higher-confidence techniques first:
+   - `auto-apply` (high confidence): guard clauses, redundant else removal, remove
+     unnecessary Result, type aliases for repeated complex types
+   - `suggest` (medium): pass by reference, `?` operator, merge match arms, let-else
+   - `flag-for-review` (low): extract function, collapse if-chains, polymorphism,
+     decompose state machine
+3. Apply reduce-complexity safety checks BEFORE editing:
+   - Unsafe exclusion zone: if the function contains `unsafe` or calls unsafe helpers
+     in the same module, SKIP extract-function suggestions. Unsafe invariants
+     (e.g. `set_len` + `truncate`, `#[repr(align)]`, FFI contracts) often span
+     multiple statements and are invisible to refactoring.
+   - Over-abstraction brake (for extract-function): if `param_count + return_fields
+     >= body_lines / 3`, the extraction interface is nearly as complex as the body —
+     flag for user review rather than extract.
+   - Async boundary: extracting code containing `.await` may introduce `Send` bound
+     violations on captured non-Send types — verify with `cargo check` immediately
+     after extraction.
+   - Clippy annotation respect: if the function has `#[allow(clippy::...)]`, the
+     developer made a deliberate decision. Lower confidence by one level and report
+     alongside the fix.
+4. Refactor to address the finding while preserving behavior. Do NOT exceed 3
+   techniques — more than that signals the function needs broader redesign, which
+   should be filed as a separate task.
+5. Run full test suite to confirm no regressions: `cargo test`
+6. Verify clean: `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings`
 ```
 
 ### Priority Mapping for `bd create`
@@ -340,7 +373,93 @@ Output the standard doc-verify report format with BLOCK/WARN/INFO findings.
 - If no modified files contain doc comments (verified via quick Grep for doc-comment prefixes),
   skip with a note in the summary.
 
-## Phase 6: Summary Report
+## Phase 6: Complexity Regression Check
+
+After Phase 5 doc-verification, run a targeted `/reduce-complexity` pass on every
+source file modified during execution. Fixes — especially defensive ones for bug
+and safety findings — commonly add guard code, error handling branches, and edge
+case paths. Left unchecked, these accumulate into accidental complexity that later
+reviewers will flag again.
+
+This phase catches complexity regressions introduced by the fixes, NOT pre-existing
+complexity in the files. Only new or significantly worsened hotspots matter here.
+
+### Step 1: Build Before/After Comparison
+
+For each modified `.rs` file, compute the per-function complexity metrics (LOC,
+max nesting, parameter count) for:
+- **Before**: the file at the merge base or the commit prior to execution
+- **After**: the file after all waves completed (current working tree)
+
+Functions whose metrics crossed a threshold boundary (e.g. Advisory → Moderate,
+Moderate → High) or whose LOC grew by ≥30% are flagged as regressions.
+
+Use git to fetch the before state:
+
+```bash
+git show HEAD:<file-path>  # or git show <merge-base>:<file-path>
+```
+
+Skip this step entirely if no `.rs` files under `src/` were modified (e.g., only
+test files, configs, or docs changed).
+
+### Step 2: Dispatch Reduce-Complexity Agent
+
+Launch a `Task` agent with `subagent_type="general-purpose"`. The agent prompt:
+
+```
+You are checking for complexity regressions introduced by code review fixes.
+
+Follow the /reduce-complexity methodology Phases 1-4 exactly:
+  Phase 1: Detection — measure LOC, nesting, params for every function in the
+           modified files (after state)
+  Phase 2: Classification — ESSENTIAL / ACCIDENTAL / MIXED for each flagged function
+  Phase 3: Suggestions — AT MOST 3 techniques per function
+  Phase 4: Safety checks — unsafe exclusion zone, over-abstraction brake,
+           async boundary warnings, clippy annotation respect
+
+Scope: ONLY report complexity regressions — functions that newly crossed a threshold
+OR grew by ≥30% LOC. Use git to compare against HEAD or the merge base:
+
+  git show <before-ref>:<file-path>   # before state for comparison
+
+Pre-existing complexity in these files is OUT OF SCOPE for this check. Do not flag
+hotspots that were already present before the fixes.
+
+Files to analyze (after-state in working tree):
+{list of modified .rs files}
+
+For each regression, report:
+- Function name and location (file:line)
+- Before/after metrics (LOC, nesting, params)
+- Classification (ESSENTIAL / ACCIDENTAL / MIXED)
+- Which finding introduced the complexity (cross-reference Phase 2 task IDs)
+- Top technique to address it, with over-abstraction and safety check results
+
+Output a concise ranked table sorted by severity (newly-Critical > newly-High >
+newly-Moderate).
+```
+
+### Step 3: Handle Regressions
+
+- **No regressions**: Note in summary and proceed.
+- **Accidental regressions found**: Present findings to the user. The fixes introduced
+  reducible complexity — simple ones (guard clauses, redundant else, let-else on new
+  happy paths added for bug fixes) can be applied inline as a follow-up pass. Broader
+  regressions (extract function, state machine decomposition) should become new beads
+  tasks for a subsequent session rather than bolted onto this execution.
+- **Essential regressions only**: Report them in the summary but do not act.
+  Essential complexity introduced by fixes is usually correct — a bug fix that adds
+  a distinct error recovery branch is a legitimate complexity increase.
+
+### When to Skip
+
+- If `--skip-complexity-check` flag is set.
+- If no `.rs` files under `src/` were modified.
+- If the execution was entirely documentation findings (Phase 2 type=documentation
+  for all tasks).
+
+## Phase 7: Summary Report
 
 After all waves complete, present:
 
@@ -375,6 +494,15 @@ After all waves complete, present:
 - BLOCKs: N (list if any)
 - WARNs: N
 - Verdict: PASS / PASS WITH WARNINGS / FAIL
+
+### Complexity Regression Check (Phase 6)
+
+- Files scanned: N
+- Regressions found: N (newly-Critical / newly-High / newly-Moderate)
+- Classification breakdown: X ESSENTIAL / Y ACCIDENTAL / Z MIXED
+- Applied inline: N (guard clauses, redundant else, let-else)
+- Filed as new beads tasks: N (extract function, state machine decomposition)
+- Verdict: PASS / PASS WITH REGRESSIONS (list top 3)
 ```
 
 ## Anti-Patterns
@@ -391,6 +519,11 @@ After all waves complete, present:
 | Writing a new standalone test when rstest cases exist | Test proliferation, maintenance burden, inconsistent patterns | Add a `#[case]` to the existing rstest instead |
 | Ignoring existing proptest coverage for a bug | Duplicates coverage, misses the property violation | Tighten the property assertion or add a targeted `prop_assert` |
 | Skipping doc-verify after fixes | Fixes can invalidate doc comments, creating silent drift | Always run Phase 5 doc-verify on modified files |
+| Refactoring an ESSENTIAL complexity finding to satisfy a metric | Breaks incident-response narrative; fabricates "simpler" code by hiding real complexity | Classify first; reject the finding if complexity is inherent |
+| Applying >3 reduce-complexity techniques to a single function in one pass | Signals broader redesign is needed — incremental fixes will not land it | File a new beads task for redesign; apply at most 3 techniques here |
+| Extracting code containing `.await` without checking `Send` bounds | `cargo check` fails mid-wave; dependent fixes stall | Run `cargo check` immediately after any async extraction |
+| Extracting a function out of an `unsafe`-invariant span | Silently breaks invariants; Miri will not catch all cases | Unsafe exclusion zone — skip extract-function entirely for these |
+| Skipping Phase 6 complexity regression check on fix-heavy waves | Defensive fixes accumulate into nested guard code that later reviewers re-flag | Always run Phase 6 when `.rs` files under `src/` were modified |
 
 ## Configuration
 
@@ -403,6 +536,7 @@ After all waves complete, present:
 | `--skip=consider` | Also skip CONSIDER findings (only CRITICAL and SHOULD FIX) |
 | `--dry-run` | Parse and normalize findings without creating beads tasks |
 | `--skip-doc-verify` | Skip Phase 5 doc verification |
+| `--skip-complexity-check` | Skip Phase 6 complexity regression check |
 
 ## Related Skills
 
@@ -412,3 +546,4 @@ After all waves complete, present:
 - `/test-strategy` — choose appropriate test type (unit, property, fuzz, Kani)
 - `/test-consolidate` — referenced in bug resolution steps to avoid test duplication
 - `/doc-verify` — runs as Phase 5 to catch documentation drift from fixes
+- `/reduce-complexity` — drives the Design/Complexity resolution steps (Phase 2) and the Phase 6 regression check; use it to classify ESSENTIAL vs ACCIDENTAL complexity and to apply safety-annotated reduction techniques
