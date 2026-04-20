@@ -7,11 +7,20 @@ description: Use when a beads task exists and needs validation before implementa
 
 Audits and enriches beads tasks created by `/create-task` (or any source) so that
 when a developer picks up the work, they can focus purely on implementation. Catches
-stale references, missing edge cases, scope bloat, design flaws, and ambiguity —
-while changes are still cheap (editing a description vs. reworking code).
+stale references, missing edge cases, scope bloat, design flaws, ambiguity, and
+*unjustified complexity* — while changes are still cheap (editing a description vs.
+reworking code).
 
 **Core principle:** A task that survives this review should require zero research
 from the implementing developer. They read, they code, they ship.
+
+**Simplicity principle (MANDATORY):** Every reviewed task must bias toward the
+*minimum viable change*. Review uses the `/reduce-complexity` framework to
+distinguish essential complexity (domain-inherent, leave alone) from accidental
+complexity (reducible). Accidental complexity in the proposed approach MUST be
+flagged as MAJOR or BLOCKER, not a nit. New abstractions, config knobs, traits,
+or modules require justification by ≥2 concrete current call sites; "future
+flexibility" is not a justification and should be rejected.
 
 **Key capability:** Domain-specific skills (testing, unsafe, distributed systems,
 SIMD, performance, security, etc.) are dispatched automatically when the task
@@ -229,20 +238,38 @@ specialists do that.
 
 ---
 
-### Agent 3 — Feasibility & Design
+### Agent 3 — Feasibility, Design & Simplicity
 
 ```
-Your specialty: FEASIBILITY & DESIGN
+Your specialty: FEASIBILITY, DESIGN & SIMPLICITY
+
+Apply the /reduce-complexity framework (essential vs. accidental complexity)
+to every design decision the task proposes. The simplest correct solution
+wins. Any complexity the task introduces must be justified as essential; if
+it is accidental, flag it as MAJOR or BLOCKER.
 
 Focus exclusively on:
 - Is the proposed approach actually feasible given the codebase architecture?
   Read the relevant modules and assess whether the task's implementation
   guidance is compatible with existing patterns.
-- Are there simpler alternatives the task overlooks? Check for existing
-  utilities in gossip-stdx, sibling modules, or trait implementations that
-  could be reused (per duplication prevention rules).
+- SIMPLICITY CHECK — Is there a materially simpler approach? Apply these
+  tests from /reduce-complexity to the PROPOSED design, not just existing code:
+    1. Domain necessity: Would a clean-room reimplementation of the same
+       requirement have similar structure? If no, complexity is accidental.
+    2. Reuse check: Does an existing utility in `src/utils.rs`, a sibling
+       module, or a trait impl already solve this? Extending is almost
+       always simpler than creating.
+    3. Extraction check: Does the task propose a new function/trait/module
+       that would have only 1 call site? That's premature abstraction.
+    4. Parameter check: Does a new function take ≥6 parameters? Likely
+       signals two concerns merged into one.
+    5. Delete-first check: Could the requirement be satisfied by REMOVING
+       code rather than adding it? Always consider deletion first.
 - Does the approach introduce unnecessary complexity? (New abstractions,
-  generics, indirection that aren't justified)
+  generics, indirection, config knobs, traits not driven by ≥2 call sites)
+- Could any step in Desired State be collapsed, merged, or deleted?
+- Does the task propose a new module/file when the logic fits naturally in
+  an existing one? (Unnecessary fragmentation is accidental complexity.)
 - Are there performance concerns the task should flag?
   - Hot path allocations (check if touched code is in HOT tier)
   - Lock contention or oversized critical sections
@@ -254,6 +281,14 @@ Focus exclusively on:
 - Are there design trade-offs the task should document but doesn't?
 - Will the approach compose well with in-flight work? Check `bd list --status=in_progress`
   for potentially conflicting changes.
+
+Classification rubric for simplicity findings:
+- BLOCKER: Task proposes an abstraction/module/knob with zero or one current
+  call site; or proposes reimplementing an existing utility.
+- MAJOR: Task adds a layer of indirection that a direct call would replace;
+  or crosses an extra module boundary without benefit.
+- MINOR: Wording in Desired State implies unnecessary generality ("configurable",
+  "pluggable") without concrete current need.
 
 Do NOT review reference accuracy, edge case enumeration, or scope — other
 specialists do that.
@@ -313,21 +348,22 @@ and Phase 1 findings to determine which domain skills to dispatch. Maximum
 | Task mentions testing strategy, or acceptance criteria lack test type guidance, or task touches code with no test coverage | `/test-strategy` | Specific test types (unit, rstest, proptest, fuzz, Kani, sim), patterns, and commands |
 | Referenced files contain `unsafe` blocks, or task adds new unsafe code | `/unsafe-review` | Safety invariant audit, test coverage matrix (Miri/Kani/fuzz/proptest gaps) |
 | Task adds unsafe AND needs safe public API wrapping | `/safe-over-unsafe` | API boundary design, module privacy soundness checklist |
-| Referenced files are in `gossip-coordination/`, `gossip-contracts/src/coordination/`, or task touches leases/shards/epochs/fencing | `/dist-sys-auditor` | Citation verification, locked decision compliance, anti-pattern check |
+| Referenced files are in `modules touching proxy/cache logic → `/performance-analyzer`
 | Task touches coordination AND mentions simulation or fault tolerance | `/sim-review` | DST compatibility check, sans-IO pattern enforcement |
 | Task is labeled performance or touches HOT-tier code paths, or Phase 1 feasibility agent flagged performance concerns | `/performance-analyzer` | Allocation audit, cache analysis, hot-path verification |
 | Task involves SIMD, vectorization, or `std::arch` intrinsics | `/simd-optimize` | ISA detection, pattern classification, implementation strategy |
 | Task involves assembly-level optimization or codegen quality | `/asm-forge` | ASM audit scope, codegen red flags to include in task guidance |
 | Task modifies public API surface (`pub fn`, `pub struct`, `pub trait`) | `/interface-design-review` | Misuse-resistance audit, enforcement hierarchy check |
 | Task touches parsing, buffer handling, or security-sensitive operations | `/security-reviewer` | Memory safety audit, CWE mapping, high-risk file identification |
+| Task modifies any file flagged HIGH/CRITICAL by /reduce-complexity, OR proposes a new abstraction, OR Phase 1 feasibility agent flagged accidental complexity, OR task claims to "refactor" or "simplify" | `/reduce-complexity` | LOC/nesting/parameter hotspots on affected files, essential vs. accidental classification, concrete reduction suggestions, anti-abstraction brake checks |
 
 ### Detection Logic
 
 1. **File-based signals**: For each referenced file, check which crate and
    module it belongs to. Map to domain skills:
-   - `gossip-coordination/` or `gossip-contracts/src/coordination/` → `/dist-sys-auditor`
-   - `gossip-stdx/src/` data structures with unsafe → `/unsafe-review`
-   - `scanner-engine/src/engine/` hot paths → `/performance-analyzer`
+   - `modules touching proxy/cache logic → `/performance-analyzer`
+   - `src/utils.rs/src/` data structures with unsafe → `/unsafe-review`
+   - `src/` hot paths → `/performance-analyzer`
    - Files containing `std::arch::` or SIMD intrinsics → `/simd-optimize`
 
 2. **Content-based signals**: Grep the task description for keywords:
@@ -337,6 +373,9 @@ and Phase 1 findings to determine which domain skills to dispatch. Maximum
    - "benchmark", "latency", "throughput", "hot path", "allocation" → `/performance-analyzer`
    - "test strategy", "property test", "fuzz", "simulation" → `/test-strategy`
    - "public API", "trait", "builder", "interface" → `/interface-design-review`
+   - "refactor", "simplify", "cleanup", "reduce complexity", "too complex",
+     "new abstraction", "new trait", "new module", "extensible", "flexible",
+     "future-proof", "configurable" → `/reduce-complexity`
 
 3. **Phase 1 escalation**: If a Phase 1 specialist flags a domain-specific
    concern that they cannot fully evaluate (e.g., feasibility agent says "this
@@ -348,9 +387,15 @@ and Phase 1 findings to determine which domain skills to dispatch. Maximum
 
 5. **Priority when > 3 skills triggered**: Rank by relevance to the task type:
    - Bug tasks: prioritize `/test-strategy`, `/unsafe-review`, `/security-reviewer`
-   - Feature tasks: prioritize `/interface-design-review`, `/dist-sys-auditor`, `/test-strategy`
+   - Feature tasks: prioritize `/interface-design-review`, `/reduce-complexity`, `/test-strategy`
    - Performance tasks: prioritize `/performance-analyzer`, `/asm-forge`, `/simd-optimize`
    - Safety tasks: prioritize `/unsafe-review`, `/safe-over-unsafe`, `/security-reviewer`
+   - Refactor/simplify tasks: prioritize `/reduce-complexity`, `/dedup-audit`, `/interface-design-review`
+
+**Mandatory inclusion:** `/reduce-complexity` is always a candidate. Include it
+whenever the task introduces new abstraction, new module, new trait, a new
+config knob, generalization, or is labeled "refactor"/"simplify" — even if no
+other signal fires.
 
 ### Dispatch Protocol
 
@@ -695,6 +740,7 @@ Use **standard mode** (4 agents) for everything else.
 - `/deeper-research` — 21-agent research for critical gaps
 
 **Domain enrichment (dispatched in Phase 1.5):**
+- `/reduce-complexity` — essential vs. accidental complexity framework; always a candidate when abstractions, modules, or "refactor"/"simplify" language appear
 - `/test-strategy` — test type recommendations (unit, rstest, proptest, fuzz, Kani, sim)
 - `/unsafe-review` — safety invariant audit, test coverage matrix
 - `/safe-over-unsafe` — safe API boundary design for unsafe internals

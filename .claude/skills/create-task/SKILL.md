@@ -11,6 +11,14 @@ an implementing agent 90% of the context it needs inline.
 
 **Core principle:** Invest effort at creation time to save 10x at implementation time.
 
+**Simplicity principle (MANDATORY):** The simplest correct solution wins. Every task
+this skill produces must bias toward the *minimum viable change* — reuse over create,
+extend over abstract, delete over refactor. Distinguish essential complexity
+(domain-inherent, cannot be removed) from accidental complexity (reducible) and
+eliminate the accidental. See `/reduce-complexity` for the full framework. Task
+descriptions that encourage "flexible", "extensible", "future-proof" designs without
+concrete current need are anti-patterns — reject them.
+
 ## Invocation
 
 ```
@@ -104,11 +112,29 @@ For the primary functions/types affected:
 - Note which modules depend on the affected code
 - Identify downstream effects of changes
 
-### Step 4: Find Reusable Patterns
-Check for existing utilities that could be reused (per duplication prevention rules):
-- Search `crates/gossip-stdx/src/` for related helpers
+### Step 4: Find Reusable Patterns (simplicity-first search)
+Check for existing utilities that could be reused (per duplication prevention rules).
+**Rule of thumb:** if a helper exists, extend it; if a pattern exists, mirror it; if
+a type exists that is 80% of what you need, grow it instead of cloning it.
+
+- Search `src/utils.rs` and `src/` broadly for related helpers
 - Check sibling modules for similar patterns
 - Note any existing abstractions that should be extended rather than duplicated
+- Flag candidates where the task can be reduced to calling existing code with
+  different arguments — these are the cheapest wins
+
+### Step 4.5: Identify Simplification Opportunities
+Before writing the Desired State, look for ways the work can be *smaller*:
+
+- Can any step be deleted entirely? (dead paths, unused fields, redundant checks)
+- Can two branches merge into one? (guard clauses, early returns, let-else)
+- Is there a built-in or stdlib answer that removes a homegrown helper?
+- Is the current approach essentially or accidentally complex? If accidentally
+  complex, the task should *reduce* it, not just patch around it.
+
+Record these as "Simplification Opportunities" in the research output. They feed
+directly into the Desired State and Implementation Guidance so the task biases
+toward the minimum viable change.
 
 ### Step 5: Search Related Beads Tasks
 Run: `bd search "{keywords from title}" --limit 10`
@@ -148,6 +174,11 @@ For each relevant snippet:
 | Utility | Location | How to Reuse |
 |---------|----------|-------------|
 (or "None found")
+
+### Simplification Opportunities
+| Opportunity | Where | Effect |
+|-------------|-------|--------|
+(accidental complexity to remove as part of this task, or "None — scope is essential complexity only")
 
 ### Related Tasks
 | Task ID | Title | Relationship | Notes |
@@ -214,12 +245,16 @@ description (if `--quick`).
 {What exists today with code snippets and file:line references.}
 
 ```rust
-// crates/scanner-engine/src/engine/core.rs:142-158 — current boundary check
+// src/cache.rs:42-58 — current boundary check
 {actual code from research}
 ```
 
 ## Desired State
-{What should exist after. Specific behavior, interface, or structure.}
+{What should exist after. Specific behavior, interface, or structure.
+**Simplicity gate:** Describe the minimum viable change. If the task proposes a new
+abstraction, a new module, a new trait, a new config knob, or a generalization,
+justify it by naming at least 2 concrete current call sites that need the
+flexibility. "Future-proofing" and "extensibility" are not justifications.}
 
 ## Implementation Guidance
 
@@ -231,7 +266,7 @@ description (if `--quick`).
 {Existing patterns to mirror, with file:line refs. "None" if nothing specific.}
 
 ### Utilities to Reuse
-{From crates/gossip-stdx/src/ or siblings. "None found" if nothing applies.}
+{From src/ for  or siblings. "None found" if nothing applies.}
 
 ### Blast Radius
 {Callers, downstream effects, call sites needing updates.}
@@ -248,7 +283,11 @@ Each snippet has a file:line header.}
 ## Acceptance Criteria
 - [ ] {Specific verifiable condition}
 - [ ] All existing tests pass: `cargo test`
-- [ ] Code compiles clean: `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings`
+- [ ] Code compiles clean: `cargo fmt && cargo check && cargo clippy --all-targets -- -D warnings`
+- [ ] No net increase in accidental complexity — run `/reduce-complexity` on each
+      modified file; any new HIGH/CRITICAL hotspots must be justified as essential
+      or addressed in the same change.
+- [ ] No duplicated logic introduced (per duplication prevention rules in CLAUDE.md).
 
 ## Pointers
 {Where to look for the remaining ~10%: docs, related commits, design docs, files to read.}
@@ -349,9 +388,14 @@ Type: {type} | Priority: P{priority}
 | Skipping Related Work search | Creates duplicates, misses dependencies | Always run `bd search` |
 | Research agent reading 20+ files | Diminishing returns, bloats context | Cap at 8 files, focus on most relevant |
 | Silently creating a duplicate | Wastes implementation effort | Always present possible duplicates to user |
+| Describing a "flexible" or "generic" solution without current call sites | Premature abstraction — accidental complexity baked in | Require 2+ concrete call sites before allowing abstraction; otherwise specify concrete change |
+| Task that adds a new module/trait/config knob to "make it easier to extend later" | YAGNI violation — pays a complexity tax now for a hypothetical future | Specify the minimum change; open a follow-up task IF extension is actually needed later |
+| Scope-creeping: "while we're here, also refactor X" | Mixes concerns, inflates blast radius, blocks review | Split into separate tasks; each task does ONE thing |
 
 ## Related Skills
 
+- `/reduce-complexity` — complexity framework this skill relies on to shape Desired State and Simplification Opportunities; invoke directly when in doubt about essential vs. accidental complexity
 - `/plan-forge` — creates implementation plans; use `--create-tasks` to auto-generate tasks from plan steps
 - `/execute-review-findings` — converts review findings to tasks (uses compatible template)
 - `/review-dispatch` — produces findings that may become tasks
+- `/review-task` — validates a task created by this skill; also runs simplicity checks

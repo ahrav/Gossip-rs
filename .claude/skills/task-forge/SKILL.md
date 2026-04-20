@@ -13,6 +13,15 @@ what to build.
 **Core principle:** Invest enrichment effort at creation time to eliminate rework
 at implementation time.
 
+**Simplicity principle (MANDATORY):** Enrichment must reduce complexity, never
+add it. Every enrichment recommendation is evaluated against the
+`/reduce-complexity` framework: essential complexity stays, accidental is
+removed. If Agent B (Implementation) recommends a new abstraction, helper, or
+module, it must cite ≥2 concrete call sites that justify the shape — otherwise
+inline the logic. `/reduce-complexity` is dispatched whenever the task
+introduces new abstractions, touches a file that already exceeds complexity
+thresholds, or is labeled "refactor" / "simplify".
+
 ## When to Use
 
 - Creating any non-trivial beads task (features, bugs touching multiple files,
@@ -127,17 +136,17 @@ Present classification to user with override option (`enrich`, `skip`, `complex`
 For STANDARD/COMPLEX tasks, select domain skills using weighted signals.
 Dispatch when total weight >= threshold.
 
-**Crate-to-skill fast lookup (first filter):**
+**Module-to-skill fast lookup (first filter):**
 
-| Crate | Domain skill candidates |
-|-------|----------------------|
-| `gossip-coordination` | `/dist-sys-auditor`, `/sim-review`, `/invariant-test-review` |
-| `gossip-stdx` | `/unsafe-review` (if unsafe), `/performance-analyzer` |
-| `scanner-engine` | `/performance-analyzer`, `/simd-optimize` (if simd files), `/security-reviewer`, `/bench-compare` |
-| `scanner-git` | `/security-reviewer`, `/performance-analyzer` |
-| `scanner-scheduler` | `/performance-analyzer`, `/sim-review` (if sim paths), `/bench-compare` |
-| `gossip-scanner-runtime` | `/dist-sys-auditor`, `/causal-profile` |
-| `gossip-connectors` | `/interface-design-review`, `/security-reviewer` |
+| Module/File | Domain skill candidates |
+|-------------|----------------------|
+| `src/app.rs` | `/performance-analyzer`, `/security-reviewer`, `/interface-design-review` |
+| `src/cache.rs` | `/performance-analyzer`, `/security-reviewer`, `/bench-compare` |
+| `src/s3_dynamo_cache_handlers.rs` | `/performance-analyzer`, `/security-reviewer` |
+| `src/config.rs` | `/interface-design-review`, `/security-reviewer` |
+| `src/utils.rs` | `/performance-analyzer`, `/security-reviewer` |
+| `src/interceptors/` | `/performance-analyzer`, `/security-reviewer` |
+| `src/metrics/` | `/performance-analyzer`, `/interface-design-review` |
 
 **Signal tables (second filter):**
 
@@ -151,8 +160,9 @@ Dispatch when total weight >= threshold.
 | `/sim-review` | Path in sim/ (5), keywords: simulation/deterministic/DST (4) | 4 |
 | `/unsafe-review` | File contains `unsafe` (5), keywords: raw pointer/MaybeUninit/transmute (4) | 4 |
 | `/safe-over-unsafe` | New `pub` API wrapping unsafe (5). Only if `/unsafe-review` also triggers. | 5 |
-| `/interface-design-review` | New pub fn/struct/trait (4), in gossip-contracts/ (5) | 4 |
+| `/interface-design-review` | New pub fn/struct/trait (4), in media-cache-contracts/ (5) | 4 |
 | `/security-reviewer` | Path in scanner-git/ (4), keywords: parse/buffer/input validation (3), manual `&[u8]` indexing (4) | 4 |
+| `/reduce-complexity` | New abstraction/trait/module proposed (5), keywords: refactor/simplify/cleanup/extensible/flexible/configurable (4), file already >300 LOC or function >100 LOC in "Files to Modify" (3), task_type == refactor or label contains "complexity"/"tech-debt" (5) | 4 |
 
 **Budget caps:**
 
@@ -198,7 +208,6 @@ Use these before writing code — they shape the approach.
 | Skill | Recommend When | Why |
 |-------|---------------|-----|
 | `/test-strategy` | Task creates new test files or significantly changes coverage | Choose the right test type (unit/rstest/proptest/fuzz/kani/sim) |
-| `/sim-scaffold` | Task creates new module in gossip-coordination | Generate DST-ready boilerplate with sans-IO pattern and proptest harnesses |
 | `/invariant-test-review` | Task adds/modifies state-machine, simulation, or oracle tests | Ensure tests actually prove the claimed invariant, not just pass |
 | `/run-fuzz` | Task handles untrusted input, parsers, or data structure serialization | Crash discovery via cargo-fuzz before merging |
 
@@ -233,9 +242,6 @@ Use these before writing code — they shape the approach.
 |-------|---------------|-----|
 | `/dist-sys-auditor` | Task modifies coordination protocols or distributed state | Audit against academic literature and battle-tested systems |
 | `/tla-spec` | Task changes coordination protocol semantics (leases, epochs, fences) | Formally verify safety/liveness properties before coding |
-| `/sim-review` | Task modifies gossip-coordination or coordination contracts | DST-compatibility code review |
-| `/sim-run` | Task changes coordination protocol behavior | Validate with deterministic simulation before merge |
-| `/jepsen-test` | Task modifies coordination protocol behavior under real network conditions | Real partition testing when DST alone isn't sufficient |
 
 **Design & Architecture**
 
@@ -260,7 +266,7 @@ Use these before writing code — they shape the approach.
 | `/doc-rigor` | Always — run after implementation | Write-then-verify documentation pipeline |
 | `/doc-rigor-verify` | Task changes pub API signatures, command examples, or platform-specific behavior | Independent accuracy verification with zero confirmation bias |
 | `/doc-verify` | Task adds unsafe invariants or changes pub API contracts | Fresh-agent verification against code reality |
-| `/doc-code-audit` | Task touches code in scope of a design doc (`docs/scope-map.toml`) | Verify design doc still matches code |
+| `/doc-code-audit` | Task touches code in scope of a design doc (`project documentation`) | Verify design doc still matches code |
 | `/design-doc-audit` | Task touches multiple files covered by design docs, or adds new source files | Comprehensive doc coverage and accuracy check |
 
 **Testing Verification**
@@ -327,7 +333,6 @@ and a **why** (what it catches or validates):
 ```
 | Phase | Skill | When to Invoke | Why |
 |-------|-------|---------------|-----|
-| During | `/sim-scaffold` | Before writing coordination module | Generate DST-ready boilerplate |
 | During | `/bench-compare` | After implementing the optimization | Validate no >5% regression |
 | After | `/invariant-test-review` | After writing sim tests | Ensure tests prove claimed invariant |
 | After | `/doc-rigor` | After all code is written | Write-then-verify documentation |
@@ -399,9 +404,9 @@ Agent A embeds the `/test-strategy` decision framework directly:
 | Property | proptest | Invariants over input domains, roundtrips |
 | Fuzz | cargo-fuzz | Untrusted input, parsers, security-critical |
 | Model Check | Kani | Memory safety proofs, absence of panics in unsafe |
-| Simulation | CoordinationSim | Coordination protocol invariants S1-S9, fault tolerance |
-| Simulation | TigerHarness | Scanner engine detection pipeline |
-| Simulation | SchedulerSim | Scheduler work-stealing, chunking |
+| Simulation | Integration tests | Coordination protocol invariants S1-S9, fault tolerance |
+| Simulation | Unit tests | Scanner engine detection pipeline |
+| Simulation | Integration tests | Scheduler work-stealing, chunking |
 
 ## Decision Framework
 
@@ -410,9 +415,9 @@ Agent A embeds the `/test-strategy` decision framework directly:
 - Large/infinite input space -> proptest
 - Untrusted/adversarial input -> fuzz test
 - Memory safety in unsafe -> Kani proof
-- Coordination protocol change -> CoordinationSim
-- Scanner engine change -> TigerHarness
-- Scheduler change -> SchedulerSim
+- Cache behavior change -> Integration tests
+- Proxy behavior change -> Integration tests
+- Config change -> Unit tests
 
 ## Your Steps
 
@@ -471,7 +476,6 @@ For each:
 ### Recommended Skills for Implementing Agent
 List 0-5 skills from your testing domain that the implementing agent should
 invoke. Only recommend if directly relevant. Consider the full palette:
-`/test-strategy`, `/invariant-test-review`, `/sim-scaffold`, `/sim-review`,
 `/sim-run`, `/run-fuzz`, `/jepsen-test`, `/test-pipeline`, `/test-dedup`,
 `/test-consolidate`. Order as a chain if multiple apply.
 | Skill | When to Invoke | Why |
@@ -479,10 +483,28 @@ invoke. Only recommend if directly relevant. Consider the full palette:
 
 ### Agent B — Implementation Enrichment
 
-**Specialty: IMPLEMENTATION APPROACH OPTIMIZATION**
+**Specialty: IMPLEMENTATION APPROACH OPTIMIZATION (simplicity-first)**
+
+Agent B embeds the `/reduce-complexity` framework directly: every
+recommendation must be evaluated against essential-vs-accidental complexity,
+reuse-over-create, and the anti-abstraction brake.
 
 ```
 ## Your Steps
+
+0. **Simplicity gate (RUN FIRST)**: Before evaluating performance or structure,
+   ask: can this task be done with LESS code rather than more?
+   - Can any existing function be called with different args instead of a new helper?
+   - Can the change be expressed as a 1-line edit rather than a new module?
+   - Is the task proposing a new abstraction? If yes, grep for current call
+     sites that would use it. Require ≥2; otherwise recommend INLINE.
+   - Apply /reduce-complexity thresholds to any new function sketch:
+     • LOC projected > 100 → break up or delete scope
+     • nesting > 4 → use guard clauses / let-else / early returns
+     • params >= 6 → struct the args OR split the function's two concerns
+   - Apply the over-abstraction brake:
+     `param_count + return_type_fields >= body_lines / 3` → warn
+     single call site + >3 params → warn
 
 1. **Classify allocation tier**: For each file in "Files to Modify":
    - HOT: inside engine/core.rs, coordination acquire/complete/checkpoint
@@ -492,13 +514,15 @@ invoke. Only recommend if directly relevant. Consider the full palette:
    - Check existing patterns in the file (ByteSlab, InlineVec, with_capacity)
 
 2. **Evaluate proposed approach**: For the task's "Desired State":
-   - Is it the most efficient for the allocation tier?
+   - Is it the simplest correct approach for the allocation tier?
    - Better algorithm? (linear scan vs binary search vs hash, given data size)
    - Better data structure? (Vec vs InlineVec for small collections,
      HashMap vs BTreeMap for ordered access)
-   - Can gossip-stdx utilities be reused?
+   - Can src/utils.rs utilities be reused?
+   - **Prefer reuse over create.** If an existing utility is 80% correct,
+     extend it; don't clone it.
 
-3. **Check reusable utilities**: Search crates/gossip-stdx/src/ for:
+3. **Check reusable utilities**: Search src/utils.rs for:
    - ByteSlab/ByteSlot — byte pooling
    - InlineVec<T, N> — stack-first small collections
    - RingBuffer<T, N> — fixed-capacity circular queue
@@ -514,7 +538,21 @@ invoke. Only recommend if directly relevant. Consider the full palette:
 5. **Find existing patterns**: Has this algorithm been implemented elsewhere?
    What error handling and return types do sibling functions use?
 
+6. **Simplification opportunities**: For each file in "Files to Modify",
+   list accidental complexity the implementing agent should eliminate as part
+   of this change (dead branches, redundant checks, unused fields, unnecessary
+   wrappers, duplicated logic with sibling modules). Flag as MUST if the task
+   fix is blocked by it, SHOULD otherwise.
+
 ## Output Format
+
+### Simplicity Analysis (apply /reduce-complexity framework)
+| Proposed element | Current call sites | Verdict | Rationale |
+|------------------|-------------------|---------|-----------|
+(Verdict: KEEP, INLINE, REUSE-EXISTING, DELETE-SCOPE, PARAMETERIZE-LESS)
+
+### Simplification Opportunities
+| File:line/function | Accidental complexity | Fix | Priority |
 
 ### Allocation Tier Classification
 | File | Tier | Evidence | Constraints |
@@ -688,10 +726,22 @@ Check for contradictions between agents:
 **Conflict resolution precedence:**
 1. Project policy always wins (allocation tiers, comment policy, no-versioning)
 2. Correctness/safety always wins over performance/ergonomics
-3. Implementation agent wins on HOT-path constraints
-4. Testing agent wins on coverage decisions (what to test)
-5. Documentation agent wins on doc scope (what to document)
-6. Higher confidence wins when no domain precedence applies
+3. **Simplicity wins over ergonomic sugar.** When agents disagree on an
+   abstraction, prefer the approach with fewer moving parts, fewer call sites,
+   and less indirection — per the `/reduce-complexity` framework.
+4. Implementation agent wins on HOT-path constraints
+5. Testing agent wins on coverage decisions (what to test)
+6. Documentation agent wins on doc scope (what to document)
+7. Higher confidence wins when no domain precedence applies
+
+**Cross-agent simplicity filter:** After resolving conflicts, sweep the final
+recommendation set for unjustified complexity:
+- Any recommendation that adds a new module/trait/abstraction with <2 current
+  call sites → demote to a note, not a requirement.
+- Any recommendation to "make it more generic" / "add a knob" without concrete
+  need → drop.
+- Prefer DELETE and REUSE recommendations over CREATE when semantically
+  equivalent.
 
 ### 2. Deduplicate
 
@@ -736,14 +786,15 @@ For each recommended skill, produce:
 - **Why** (what it catches, validates, or improves — grounded in enrichment findings)
 
 **Ordering:** Skills the agent should invoke DURING implementation first
-(e.g., `/sim-scaffold`, `/design-tournament`), then skills for AFTER
 implementation (e.g., `/bench-compare`, `/doc-rigor`, `/review-dispatch`).
 
 **Deduplication:** If multiple agents recommend the same skill, keep the
 most specific "when" and "why". Merge, don't list twice.
 
-**Minimum set:** Always include `/doc-rigor` (after implementation) and
-`/simplify` (before closing). Omit only if task is TRIVIAL.
+**Minimum set:** Always include `/doc-rigor` (after implementation),
+`/reduce-complexity` (after implementation, before closing — verify no new
+HIGH/CRITICAL hotspots were introduced on modified files), and `/simplify`
+(before closing). Omit only if task is TRIVIAL.
 
 ### 6. Rate Enrichment Quality
 
