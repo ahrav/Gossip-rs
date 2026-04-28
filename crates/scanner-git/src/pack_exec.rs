@@ -3302,8 +3302,9 @@ mod tests {
     use super::*;
     use crate::byte_arena::{ByteArena, ByteRef};
     use crate::multi_pack_test_helpers::{stable_oid, test_limits, MultiPackFixture};
+    use crate::pack_exec_test_helpers::{default_test_ctx as ctx, CollectingSink, NoExternal};
     use crate::pack_plan_model::{CandidateAtOffset, DeltaKind, PackPlanStats};
-    use crate::tree_candidate::{CandidateContext, ChangeKind};
+    use crate::tree_candidate::CandidateContext;
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -3320,43 +3321,6 @@ mod tests {
         ) -> Result<(), PackExecError> {
             self.emitted.push(candidate.oid);
             Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct CollectingSink {
-        blobs: HashMap<OidBytes, Vec<u8>>,
-    }
-
-    impl PackObjectSink for CollectingSink {
-        fn emit(
-            &mut self,
-            candidate: &PackCandidate,
-            _path: &[u8],
-            bytes: &[u8],
-        ) -> Result<(), PackExecError> {
-            self.blobs.insert(candidate.oid, bytes.to_vec());
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct NoExternal;
-
-    impl ExternalBaseProvider for NoExternal {
-        fn load_base(&mut self, _oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError> {
-            panic!("unexpected external base lookup in test");
-        }
-    }
-
-    fn ctx(path_ref: ByteRef) -> CandidateContext {
-        CandidateContext {
-            commit_id: 1,
-            parent_idx: 0,
-            change_kind: ChangeKind::Add,
-            ctx_flags: 0,
-            cand_flags: 0,
-            path_ref,
         }
     }
 

@@ -123,6 +123,8 @@ pub mod json_write;
 pub mod limits;
 /// Maps unique blobs to pack/loose candidates via MIDX lookup.
 pub mod mapping_bridge;
+#[cfg(test)]
+mod metamorphic_tests;
 /// Implements a zero-copy multi-pack index (MIDX) parser.
 pub mod midx;
 /// Builds MIDX byte buffers in-memory using k-way merge of pack indexes.
@@ -156,6 +158,8 @@ pub mod pack_decode;
 pub mod pack_delta;
 /// Implements the pack plan executor with bounded decode and skip tracking.
 pub mod pack_exec;
+#[cfg(test)]
+pub(crate) mod pack_exec_test_helpers;
 /// Implements a zero-copy parser for Git pack index (`.idx`) v2 files.
 pub mod pack_idx;
 /// Provides bounded inflate helpers and delta encoding for pack objects.

@@ -94,12 +94,30 @@ pub fn make_copy_delta(base_size: usize, off: usize, size: usize) -> Vec<u8> {
 }
 
 /// Build a mixed delta that copies from the base then adds literal bytes.
+///
+/// The copy instruction encodes a single offset byte and a single size byte,
+/// so `copy_off` and `copy_size` must each fit in a `u8`. The add instruction
+/// uses the length byte directly as the opcode (bit 7 clear), so `literal`
+/// must be <= 127 bytes.
 pub fn make_mixed_delta(
     base_size: usize,
     copy_off: usize,
     copy_size: usize,
     literal: &[u8],
 ) -> Vec<u8> {
+    assert!(
+        copy_off <= u8::MAX as usize,
+        "copy_off must fit in a single byte (0..=255), got {copy_off}"
+    );
+    assert!(
+        copy_size <= u8::MAX as usize,
+        "copy_size must fit in a single byte (0..=255), got {copy_size}"
+    );
+    assert!(
+        literal.len() <= 0x7f,
+        "literal must be <= 127 bytes for a single add-literal opcode, got {}",
+        literal.len()
+    );
     let result_size = copy_size + literal.len();
     let mut delta = Vec::new();
     push_varint(base_size, &mut delta);
