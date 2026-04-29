@@ -111,7 +111,7 @@ runs:
         echo "SCCACHE_CONF=$HOME/.config/sccache/config" >> "$GITHUB_ENV"
 
     - name: Setup sccache
-      uses: mozilla-actions/sccache-action@d651010b8da762cde178750d8eda7b5febfe147a # v0.0.9
+      uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       with:
         version: "v0.14.0"
         token: ${{ inputs.github-token }}
