@@ -55,7 +55,7 @@ sim-harness = ["scanner-scheduler/sim-harness", "dep:tempfile"]
 aegis-pure-rust = ["scanner-engine/aegis-pure-rust"]
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 gossip-stdx = { workspace = true, features = ["stdx-proptest", "git-test-support"] }
 proptest = "1.10"
 rstest = "0.25"

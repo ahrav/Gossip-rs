@@ -27,7 +27,7 @@ gossip-contracts = { workspace = true, features = ["test-support"] }
 gossip-persistence-inmemory = { workspace = true, features = ["test-support"] }
 proptest = "1.10"
 rstest = "0.25"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 rand = "0.9"
 rand_chacha = "0.9"
 

@@ -49,7 +49,7 @@ test-support = []
 aegis-pure-rust = ["aegis/pure-rust"]  # Use pure-Rust AEGIS on machines without SHA3 NEON (clang < 14)
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 gossip-stdx = { workspace = true, features = ["stdx-proptest"] }
 proptest = "1.10"
 rstest = "0.25"
