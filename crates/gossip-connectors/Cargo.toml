@@ -24,7 +24,7 @@ crossbeam-channel = "0.5"
 libc = "0.2"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 gossip-contracts = { workspace = true, features = ["test-support"] }
 gossip-stdx = { workspace = true, features = ["stdx-proptest"] }
 proptest = "1.10"
