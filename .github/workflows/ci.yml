@@ -272,7 +272,7 @@ jobs:
     needs: [changes]
     services:
       etcd:
-        image: quay.io/coreos/etcd:v3.5.15
+        image: quay.io/coreos/etcd:v3.7.1
         env:
           ETCD_NAME: node1
           ETCD_DATA_DIR: /etcd-data
