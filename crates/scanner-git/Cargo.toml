@@ -24,7 +24,7 @@ blake3 = "1.5"
 bytemuck = { version = "1", features = ["derive"] }
 crc32fast = "1.4"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-ng"] }
-gix-commitgraph = "0.34"
+gix-commitgraph = "0.39"
 gix-hash = { version = "0.22", features = ["sha256"] }
 gix-ref = "0.60"
 libc = "0.2"
