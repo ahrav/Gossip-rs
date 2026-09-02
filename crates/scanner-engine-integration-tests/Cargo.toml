@@ -33,7 +33,7 @@ base64 = "0.22"
 blake3 = "1.5"
 crc32fast = "1.4"
 flate2 = "1.1"
-gix-commitgraph = "0.34"
+gix-commitgraph = "0.39"
 gossip-stdx = { workspace = true, features = ["git-test-support"] }
 memchr = "2.7"
 proptest.workspace = true
