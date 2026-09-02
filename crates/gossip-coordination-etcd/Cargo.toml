@@ -28,7 +28,7 @@ etcd-client = { version = "0.18", default-features = false }
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt", "time", "sync", "net"] }
 tracing.workspace = true
-rand = { version = "0.9", optional = true }
+rand = { version = "0.10", optional = true }
 rand_chacha = { version = "0.9", optional = true }
 testcontainers = { workspace = true, optional = true }
 
@@ -39,5 +39,5 @@ etcd-client = { version = "0.18", default-features = false, features = ["pub-res
 rstest.workspace = true
 proptest.workspace = true
 testcontainers.workspace = true
-rand = "0.9"
+rand = "0.10"
 rand_chacha = "0.9"
