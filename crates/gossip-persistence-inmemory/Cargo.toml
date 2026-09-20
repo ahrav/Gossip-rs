@@ -16,7 +16,7 @@ test-support = ["gossip-contracts/test-support", "dep:rand", "dep:rand_chacha"]
 [dependencies]
 gossip-contracts = { workspace = true }
 thiserror.workspace = true
-rand = { version = "0.9", optional = true }
+rand = { version = "0.10", optional = true }
 rand_chacha = { version = "0.9", optional = true }
 
 [dev-dependencies]
@@ -25,5 +25,5 @@ gossip-done-ledger-postgres = { workspace = true, features = ["test-utils"] }
 gossip-pg-common = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
 postgres.workspace = true
-rand = "0.9"
+rand = "0.10"
 rand_chacha = "0.9"
